@@ -22,6 +22,7 @@ Conversation flow:
 """
 
 import base64
+import io
 import json
 import logging
 import os
@@ -29,10 +30,13 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
+import anthropic
+import pytesseract
 import requests
 from dotenv import load_dotenv
+from PIL import Image
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -71,7 +75,8 @@ logger = logging.getLogger("ardhisasa.bot")
 
 load_dotenv()
 
-BOT_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
+BOT_TOKEN        = os.environ["TELEGRAM_BOT_TOKEN"]
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ALLOWED_IDS = set(
     int(x.strip())
     for x in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",")
@@ -188,7 +193,10 @@ def get_valid_tokens(cred_type: str) -> Optional[AuthTokens]:
 # States
 # ──────────────────────────────────────────────────────────
 class S(Enum):
-    REF_NUMBERS        = auto()
+    INPUT_METHOD       = auto()   # choose text or photo input
+    REF_NUMBERS        = auto()   # typing refs manually
+    RECV_PHOTOS        = auto()   # receiving photo(s) for OCR
+    CONFIRM_REFS       = auto()   # review extracted refs before proceeding
     REASSIGN_CONFIRM   = auto()   # some refs already assigned — ask what to do
     PICK_VALUER_SOURCE = auto()   # choose saved valuer or search new
     VALUER_NAME        = auto()   # enter name when searching new
@@ -204,6 +212,7 @@ class S(Enum):
 @dataclass
 class Session:
     refs:             List[str] = field(default_factory=list)
+    extracted_refs:   List[str] = field(default_factory=list)   # OCR-extracted refs awaiting confirmation
     already_assigned: List[Dict] = field(default_factory=list)  # [{ref, valuer_name, assigned_at}]
     valuer_name:      str = ""
     cred_type:        str = "publicuser"
@@ -335,6 +344,69 @@ async def _show_valuer_keyboard(message, sess: Session, results: List[Dict]) -> 
 
 
 # ──────────────────────────────────────────────────────────
+# OCR helpers
+# ──────────────────────────────────────────────────────────
+
+# Matches patterns like LS/VAL/2024/001 — 3+ slash-separated alphanumeric segments
+_REF_RE = re.compile(r'\b[A-Z0-9]{2,}(?:/[A-Z0-9]{2,}){2,}\b')
+
+
+def _extract_refs_from_text(text: str) -> List[str]:
+    return list(dict.fromkeys(_REF_RE.findall(text.upper())))  # dedup, preserve order
+
+
+async def ocr_extract_refs(photo_bytes: bytes) -> Tuple[List[str], str]:
+    """
+    Try Tesseract first; fall back to Claude Vision if nothing found.
+    Returns (refs, source) where source is "tesseract" or "claude".
+    """
+    # ── Tesseract ─────────────────────────────────────────
+    try:
+        img  = Image.open(io.BytesIO(photo_bytes))
+        text = pytesseract.image_to_string(img)
+        refs = _extract_refs_from_text(text)
+        if refs:
+            return refs, "tesseract"
+    except Exception as e:
+        logger.warning("Tesseract failed: %s", e)
+
+    # ── Claude Vision fallback ────────────────────────────
+    if not ANTHROPIC_API_KEY:
+        return [], "none"
+    try:
+        client  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        b64_img = base64.standard_b64encode(photo_bytes).decode()
+        resp    = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=512,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/jpeg", "data": b64_img},
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Extract every reference number from this document image. "
+                            "Reference numbers follow a pattern like LS/VAL/2024/001 — "
+                            "alphanumeric segments separated by forward slashes. "
+                            "Return ONLY the reference numbers, one per line, nothing else."
+                        ),
+                    },
+                ],
+            }],
+        )
+        text = resp.content[0].text
+        refs = _extract_refs_from_text(text)
+        return refs, "claude"
+    except Exception as e:
+        logger.warning("Claude Vision failed: %s", e)
+        return [], "none"
+
+
+# ──────────────────────────────────────────────────────────
 # /start  /help
 # ──────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -424,17 +496,145 @@ async def cmd_assign(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["session"] = Session()
     await update.message.reply_text(
         "📋 *New Assignment Flow*\n\n"
-        "Step 1 — Enter *reference numbers*:\n"
-        "_Comma-separated or one per line, e.g._\n"
-        "`LS/VAL/2024/001, LS/VAL/2024/002`",
+        "Step 1 — How would you like to provide the reference numbers?",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove(),
     )
-    return S.REF_NUMBERS
+    await update.message.reply_text(
+        "Choose an input method:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Type Reference Numbers", callback_data="input:text")],
+            [InlineKeyboardButton("📷 Add Photo(s)",           callback_data="input:photo")],
+        ]),
+    )
+    return S.INPUT_METHOD
 
 
 # ──────────────────────────────────────────────────────────
-# Step 2 — receive refs → check existing assignments → pick valuer source
+# Step 1a — input method chosen
+# ──────────────────────────────────────────────────────────
+async def recv_input_method(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    method = query.data.split(":")[1]
+
+    if method == "text":
+        await query.edit_message_text(
+            "✏️ Enter *reference numbers*:\n"
+            "_Comma-separated or one per line, e.g._\n"
+            "`LS/VAL/2024/001, LS/VAL/2024/002`",
+            parse_mode="Markdown",
+        )
+        return S.REF_NUMBERS
+    else:
+        await query.edit_message_text(
+            "📷 Send a photo of the document.\n"
+            "_You can send multiple photos one by one._\n\n"
+            "Tap *✅ Done — Review refs* when finished.",
+            parse_mode="Markdown",
+        )
+        return S.RECV_PHOTOS
+
+
+# ──────────────────────────────────────────────────────────
+# Step 1b — receive photo(s) → OCR → accumulate refs
+# ──────────────────────────────────────────────────────────
+async def recv_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    sess = get_sess(ctx)
+    await update.message.reply_text("🔍 Processing photo…")
+
+    photo_file = await update.message.photo[-1].get_file()   # largest size
+    photo_bytes = await photo_file.download_as_bytearray()
+
+    refs, source = await ocr_extract_refs(bytes(photo_bytes))
+
+    if not refs:
+        await update.message.reply_text(
+            "⚠️ Could not extract any reference numbers from this photo.\n"
+            "Try a clearer image, or send another photo.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Done — Review refs", callback_data="photo:done"),
+            ]]) if sess.extracted_refs else None,
+        )
+        return S.RECV_PHOTOS
+
+    # Merge, avoiding duplicates
+    new_refs = [r for r in refs if r not in sess.extracted_refs]
+    sess.extracted_refs.extend(new_refs)
+
+    source_label = "Tesseract OCR" if source == "tesseract" else "Claude Vision"
+    running = "\n".join(f"  • `{r}`" for r in sess.extracted_refs)
+    await update.message.reply_text(
+        f"✅ *{len(new_refs)} new ref(s) found* via {source_label}.\n\n"
+        f"*Running total ({len(sess.extracted_refs)}):*\n{running}\n\n"
+        "_Send another photo or tap Done._",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Done — Review refs", callback_data="photo:done"),
+        ]]),
+    )
+    return S.RECV_PHOTOS
+
+
+async def recv_photo_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    sess = get_sess(ctx)
+
+    if not sess.extracted_refs:
+        await query.edit_message_text(
+            "⚠️ No reference numbers extracted yet. Send at least one photo."
+        )
+        return S.RECV_PHOTOS
+
+    refs_list = "\n".join(f"  • `{r}`" for r in sess.extracted_refs)
+    await query.edit_message_text(
+        f"📋 *Extracted Reference Numbers ({len(sess.extracted_refs)}):*\n\n"
+        f"{refs_list}\n\n"
+        "Are these correct?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm & Proceed", callback_data="refs:confirm")],
+            [InlineKeyboardButton("✏️ Edit (retype manually)", callback_data="refs:edit")],
+            [InlineKeyboardButton("❌ Cancel",              callback_data="refs:cancel")],
+        ]),
+    )
+    return S.CONFIRM_REFS
+
+
+# ──────────────────────────────────────────────────────────
+# Step 1c — confirm extracted refs
+# ──────────────────────────────────────────────────────────
+async def recv_confirm_refs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    sess   = get_sess(ctx)
+    choice = query.data.split(":")[1]
+
+    if choice == "cancel":
+        await query.edit_message_text("❌ Assignment cancelled.")
+        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    if choice == "edit":
+        await query.edit_message_text(
+            "✏️ Enter the *correct reference numbers*:\n"
+            "_Comma-separated or one per line._",
+            parse_mode="Markdown",
+        )
+        return S.REF_NUMBERS
+
+    # confirm — treat extracted refs as the final list
+    sess.refs = sess.extracted_refs[:]
+    await query.edit_message_text(
+        f"✅ *{len(sess.refs)} reference(s) confirmed.*",
+        parse_mode="Markdown",
+    )
+    return await _check_assignments_and_proceed(query.message, sess)
+
+
+# ──────────────────────────────────────────────────────────
+# Step 2 — receive refs (typed) → check existing assignments
 # ──────────────────────────────────────────────────────────
 async def recv_refs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess = get_sess(ctx)
@@ -443,7 +643,13 @@ async def recv_refs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ No valid references found. Try again.")
         return S.REF_NUMBERS
 
-    # ── Check for already-assigned refs ───────────────────
+    sess.refs = refs
+    return await _check_assignments_and_proceed(update.message, sess)
+
+
+async def _check_assignments_and_proceed(message, sess: Session) -> int:
+    """Check refs against saved assignments, then route accordingly."""
+    refs     = sess.refs
     existing = load_saved_assignments()
     already  = [
         {"ref": r, "valuer_name": existing[r]["valuer_name"], "assigned_at": existing[r]["assigned_at"]}
@@ -453,7 +659,6 @@ async def recv_refs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if already:
         sess.already_assigned = already
-        sess.refs = refs  # keep all for now; user will decide
 
         already_lines = "\n".join(
             f"  • `{a['ref']}` → *{a['valuer_name']}* _(on {a['assigned_at']})_"
@@ -461,23 +666,20 @@ async def recv_refs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         new_lines = ("\n".join(f"  • `{r}`" for r in new_refs)) if new_refs else "_None_"
 
-        kbd = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Reassign existing + assign new", callback_data="reassign:all")],
-            [InlineKeyboardButton("⏭ Skip existing, assign new only",  callback_data="reassign:skip")],
-            [InlineKeyboardButton("❌ Cancel",                          callback_data="reassign:cancel")],
-        ])
-        await update.message.reply_text(
+        await message.reply_text(
             f"⚠️ *Some references are already assigned:*\n{already_lines}\n\n"
             f"*New (unassigned):*\n{new_lines}\n\n"
             "What would you like to do?",
             parse_mode="Markdown",
-            reply_markup=kbd,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Reassign existing + assign new", callback_data="reassign:all")],
+                [InlineKeyboardButton("⏭ Skip existing, assign new only",  callback_data="reassign:skip")],
+                [InlineKeyboardButton("❌ Cancel",                          callback_data="reassign:cancel")],
+            ]),
         )
         return S.REASSIGN_CONFIRM
 
-    # ── All refs are new — proceed normally ───────────────
-    sess.refs = refs
-    return await _proceed_to_valuer_pick(update.message, sess, refs)
+    return await _proceed_to_valuer_pick(message, sess, refs)
 
 
 async def _proceed_to_valuer_pick(message, sess: Session, refs: List[str]) -> int:
@@ -905,7 +1107,13 @@ def main():
             MessageHandler(filters.Regex(f"^{re.escape(BTN_ASSIGN)}$"), cmd_assign),
         ],
         states={
+            S.INPUT_METHOD:       [CallbackQueryHandler(recv_input_method, pattern=r"^input:")],
             S.REF_NUMBERS:        [MessageHandler(not_cancel, recv_refs)],
+            S.RECV_PHOTOS:        [
+                MessageHandler(filters.PHOTO, recv_photo),
+                CallbackQueryHandler(recv_photo_done, pattern=r"^photo:done$"),
+            ],
+            S.CONFIRM_REFS:       [CallbackQueryHandler(recv_confirm_refs, pattern=r"^refs:")],
             S.REASSIGN_CONFIRM:   [CallbackQueryHandler(recv_reassign_confirm, pattern=r"^reassign:")],
             S.PICK_VALUER_SOURCE: [CallbackQueryHandler(recv_valuer_source, pattern=r"^src:")],
             S.VALUER_NAME:        [MessageHandler(not_cancel, recv_valuer_name)],
