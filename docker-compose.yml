@@ -1,0 +1,17 @@
+services:
+  ardhisasa-bot:
+    build: .
+    container_name: ardhisasa_bot
+    restart: unless-stopped
+    env_file: .env
+    # No ports needed — bot uses long-polling, not webhooks
+    volumes:
+      - bot_data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bot_data:
