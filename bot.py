@@ -244,8 +244,10 @@ class RS(Enum):
     SELECT_STAFF      = auto()
     CHOOSE_CRED       = auto()
     WAIT_OTP          = auto()
+    TASK_TYPE         = auto()   # choose Stamp Duty vs County Stamp Duty (when staff has both)
     TASK_COUNT        = auto()
-    AMOUNT_RANGE      = auto()
+    AMOUNT_RANGE      = auto()   # shows Enter / Skip buttons
+    AMOUNT_TEXT       = auto()   # text input for min-max after choosing Enter
     SCHEDULE_CHOICE   = auto()
     SCHEDULE_INTERVAL = auto()
     RT_CONFIRM        = auto()
@@ -1174,34 +1176,40 @@ def persist_schedule(sched: Dict):
 def _validate_staff(user_data: Dict) -> Tuple[bool, str, str, str, str]:
     """
     Check eligibility for task receipt.
+    All detail fields live inside staff_details, not at the top level.
     Returns (ok, error_msg, task_type, staff_registry, staff_county).
-    task_type is "STAMP_DUTY" or "COUNTY_STAMP_DUTY".
+    task_type is "STAMP_DUTY", "COUNTY_STAMP_DUTY", or "BOTH" (user must choose).
+    registry/county are populated only for COUNTY_STAMP_DUTY / BOTH.
     """
     if user_data.get("account_status", "").upper() != "ACTIVE":
         return False, "Account status is not ACTIVE.", "", "", ""
 
+    sd = user_data.get("staff_details") or {}
+
     dept_code = (
-        user_data.get("department_details", {})
-                 .get("department", {})
-                 .get("code", "")
+        sd.get("department_details", {})
+          .get("department", {})
+          .get("code", "")
     )
     if dept_code.upper() != "DLV":
         return False, f"Department is '{dept_code}', expected DLV.", "", "", ""
 
-    role_names = [r.get("rolename", "").upper() for r in user_data.get("roles", [])]
+    roles      = sd.get("roles") or []
+    role_names = [r.get("rolename", "").upper() for r in roles]
     if "VALUER" not in role_names:
         return False, f"No VALUER role found. Roles: {role_names}", "", "", ""
 
-    ardhipay_roles = [r.get("rolename", "").upper() for r in user_data.get("ardhipay_roles", [])]
+    has_county_valuer = "COUNTY_VALUER" in role_names
 
-    if "COUNTY_VALUER" in ardhipay_roles:
-        county_units = user_data.get("county_units", [])
+    if has_county_valuer:
+        county_units = sd.get("county_units") or []
         if not county_units:
             return False, "COUNTY_VALUER role but no county_units found on account.", "", "", ""
-        county_obj = county_units[0].get("county", {})
-        registry   = county_obj.get("registry", "").upper()
-        county     = (county_obj.get("name") or county_obj.get("county", "")).upper()
-        return True, "", "COUNTY_STAMP_DUTY", registry, county
+        primary  = next((u for u in county_units if u.get("is_primary")), county_units[0])
+        registry = primary.get("registry", "").upper()
+        county   = primary.get("county", "").upper()
+        # Has both VALUER and COUNTY_VALUER — let the user pick the task pool
+        return True, "", "BOTH", registry, county
 
     return True, "", "STAMP_DUTY", "", ""
 
@@ -1484,6 +1492,49 @@ def _get_rt(ctx: ContextTypes.DEFAULT_TYPE) -> RTSession:
     return ctx.user_data["rt_session"]
 
 
+def _fetch_staff_detail(rt: RTSession, list_entry: Dict) -> Dict:
+    """
+    Fetch the full staff profile from the detail endpoint.
+    The list-user-accounts response only returns summary fields;
+    department_details / roles / ardhipay_roles / county_units come from here.
+    Falls back to the list entry if all attempts fail.
+    """
+    headers = {
+        "Authorization": f"Bearer {rt.tokens.access_token}",
+        "JWTAUTH":       f"Bearer {rt.tokens.jwt}",
+    }
+    account_id = list_entry.get("id", "")
+    user_id    = list_entry.get("staff_details", {}).get("user_id", account_id)
+
+    candidates = [
+        f"{BASE_URL}/acl/api/v1/accounts/get-user-detail?user_id={user_id}",
+        f"{BASE_URL}/acl/api/v1/accounts/get-user-detail/{user_id}",
+        f"{BASE_URL}/acl/api/v1/accounts/user-details?user_id={user_id}",
+        f"{BASE_URL}/acl/api/v1/accounts/view-user?user_id={user_id}",
+        f"{BASE_URL}/acl/api/v1/accounts/{account_id}",
+    ]
+
+    for url in candidates:
+        try:
+            resp = rt.session.get(url, headers=headers, timeout=15)
+            logger.info("Staff detail probe %s → HTTP %s body: %.300s", url, resp.status_code, resp.text)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            if data.get("department_details") or data.get("roles") or data.get("ardhipay_roles"):
+                logger.info("Staff detail fetched from: %s  keys: %s", url, list(data.keys()))
+                return data
+        except Exception as e:
+            logger.warning("Detail attempt failed (%s): %s", url, e)
+
+    logger.warning(
+        "Could not fetch staff detail — falling back to list entry.\n"
+        "list entry staff_details: %s",
+        json.dumps(list_entry.get("staff_details"), default=str),
+    )
+    return list_entry
+
+
 async def _rt_do_staff_search(message, rt: RTSession) -> int:
     """Search the accounts endpoint and show a selection keyboard."""
     try:
@@ -1733,10 +1784,13 @@ async def recv_rt_select_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     rt        = _get_rt(ctx)
     idx       = int(query.data.split(":")[1])
-    user_data = rt.staff_results[idx]
+    list_entry = rt.staff_results[idx]
 
-    sd   = user_data.get("staff_details", {})
+    sd   = list_entry.get("staff_details", {})
     name = " ".join(filter(None, [sd.get("firstname"), sd.get("middlename"), sd.get("lastname")]))
+
+    await query.edit_message_text(f"🔍 Fetching full profile for *{name}*…", parse_mode="Markdown")
+    user_data = _fetch_staff_detail(rt, list_entry)
 
     ok, err_msg, task_type, registry, county = _validate_staff(user_data)
     if not ok:
@@ -1748,21 +1802,58 @@ async def recv_rt_select_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     rt.staff_data     = user_data
-    rt.task_type      = task_type
     rt.staff_registry = registry
     rt.staff_county   = county
 
-    ardhipay_labels = ", ".join(
-        r.get("rolename", "") for r in user_data.get("ardhipay_roles", [])
-    ) or "None"
-    type_label  = "County Stamp Duty" if task_type == "COUNTY_STAMP_DUTY" else "Stamp Duty"
-    county_line = f"\n*County:* {county}  |  *Registry:* {registry}" if task_type == "COUNTY_STAMP_DUTY" else ""
+    sd_roles = (user_data.get("staff_details") or {}).get("roles") or []
+    role_labels = ", ".join(r.get("rolename", "") for r in sd_roles) or "None"
 
+    if task_type == "BOTH":
+        # Staff has both VALUER and COUNTY_VALUER — let user pick the task pool
+        await query.edit_message_text(
+            f"✅ *Staff Validated*\n\n"
+            f"*Name:* {name}\n"
+            f"*Roles:* {role_labels}\n"
+            f"*County:* {county}  |  *Registry:* {registry}\n\n"
+            "Step 3 — Which task pool do you want to assign from?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏛 Stamp Duty (national, from_ardhipay=false)",
+                                      callback_data="rt_type:STAMP_DUTY")],
+                [InlineKeyboardButton("🏙 County Stamp Duty (from_ardhipay=true)",
+                                      callback_data="rt_type:COUNTY_STAMP_DUTY")],
+            ]),
+        )
+        return RS.TASK_TYPE
+
+    # Only VALUER — go straight to task count
+    rt.task_type = task_type
+    type_label   = "County Stamp Duty" if task_type == "COUNTY_STAMP_DUTY" else "Stamp Duty"
     await query.edit_message_text(
         f"✅ *Staff Validated*\n\n"
         f"*Name:* {name}\n"
-        f"*Task Type:* {type_label}{county_line}\n"
-        f"*ArdhiPay Roles:* {ardhipay_labels}\n\n"
+        f"*Task Type:* {type_label}\n"
+        f"*Roles:* {role_labels}\n\n"
+        "Step 3 — How many tasks do you want to assign?",
+        parse_mode="Markdown",
+    )
+    return RS.TASK_COUNT
+
+
+async def recv_rt_task_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handles the Stamp Duty / County Stamp Duty choice."""
+    query = update.callback_query
+    await query.answer()
+    rt    = _get_rt(ctx)
+    rt.task_type = query.data.split(":")[1]   # "STAMP_DUTY" or "COUNTY_STAMP_DUTY"
+
+    type_label  = "County Stamp Duty" if rt.task_type == "COUNTY_STAMP_DUTY" else "Stamp Duty"
+    county_line = (
+        f"\n*County:* {rt.staff_county}  |  *Registry:* {rt.staff_registry}"
+        if rt.task_type == "COUNTY_STAMP_DUTY" else ""
+    )
+    await query.edit_message_text(
+        f"✅ *Task pool:* {type_label}{county_line}\n\n"
         "Step 3 — How many tasks do you want to assign?",
         parse_mode="Markdown",
     )
@@ -1782,39 +1873,66 @@ async def recv_rt_task_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rt.task_count = count
     await update.message.reply_text(
         f"✅ *{count} task(s)* requested.\n\n"
-        "Step 4 — Enter a *consideration amount range* to filter tasks:\n"
-        "_Format:_ `min-max`  _(e.g._ `100000-500000`_)_\n"
-        "_Or type_ `skip` _for no amount filter._",
+        "Step 4 — Would you like to filter by consideration amount?",
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 Enter Amount Range", callback_data="rt_amount:enter")],
+            [InlineKeyboardButton("⏭ Skip",               callback_data="rt_amount:skip")],
+        ]),
     )
     return RS.AMOUNT_RANGE
 
 
-async def recv_rt_amount_range(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rt   = _get_rt(ctx)
-    text = update.message.text.strip().lower()
+async def recv_rt_amount_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handles the Enter / Skip button on the amount range step."""
+    query  = update.callback_query
+    await query.answer()
+    rt     = _get_rt(ctx)
+    choice = query.data.split(":")[1]
 
-    if text != "skip":
-        try:
-            parts = re.split(r"[-–]", text, maxsplit=1)
-            if len(parts) != 2:
-                raise ValueError
-            lo = float(parts[0].strip().replace(",", ""))
-            hi = float(parts[1].strip().replace(",", ""))
-            rt.amount_min, rt.amount_max = (lo, hi) if lo <= hi else (hi, lo)
-        except ValueError:
-            await update.message.reply_text(
-                "⚠️ Invalid format. Use `min-max` (e.g. `100000-500000`) or type `skip`.",
-                parse_mode="Markdown",
-            )
-            return RS.AMOUNT_RANGE
+    if choice == "skip":
+        rt.amount_min = rt.amount_max = None
+        await query.edit_message_text(
+            "⏭ No amount filter applied.\n\n"
+            "Step 5 — Run now or set up a recurring schedule?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("▶️ Run Now",              callback_data="rt_sched:now")],
+                [InlineKeyboardButton("⏰ Schedule (repeating)", callback_data="rt_sched:schedule")],
+            ]),
+        )
+        return RS.SCHEDULE_CHOICE
 
-    range_label = (
-        f"KES {rt.amount_min:,.0f} – KES {rt.amount_max:,.0f}"
-        if rt.amount_min is not None else "No filter"
+    # "enter" — ask for the range as text
+    await query.edit_message_text(
+        "💰 Enter the *consideration amount range*:\n"
+        "_Format:_ `min-max`  _(e.g._ `100000-500000`_)_",
+        parse_mode="Markdown",
     )
+    return RS.AMOUNT_TEXT
+
+
+async def recv_rt_amount_range(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handles the typed min-max range after the user chose 'Enter Amount Range'."""
+    rt   = _get_rt(ctx)
+    text = update.message.text.strip()
+
+    try:
+        parts = re.split(r"[-–]", text, maxsplit=1)
+        if len(parts) != 2:
+            raise ValueError
+        lo = float(parts[0].strip().replace(",", ""))
+        hi = float(parts[1].strip().replace(",", ""))
+        rt.amount_min, rt.amount_max = (lo, hi) if lo <= hi else (hi, lo)
+    except ValueError:
+        await update.message.reply_text(
+            "⚠️ Invalid format. Use `min-max` e.g. `100000-500000`.",
+            parse_mode="Markdown",
+        )
+        return RS.AMOUNT_TEXT
+
     await update.message.reply_text(
-        f"✅ Amount range: *{range_label}*\n\n"
+        f"✅ Amount range: *KES {rt.amount_min:,.0f} – KES {rt.amount_max:,.0f}*\n\n"
         "Step 5 — Run now or set up a recurring schedule?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
@@ -2171,6 +2289,7 @@ def main():
             MessageHandler(filters.TEXT, fallback),
         ],
         allow_reentry=True,
+        per_message=False,
     )
 
     recv_conv = ConversationHandler(
@@ -2183,8 +2302,10 @@ def main():
             RS.SELECT_STAFF:      [CallbackQueryHandler(recv_rt_select_staff, pattern=r"^rt_staff:")],
             RS.CHOOSE_CRED:       [CallbackQueryHandler(recv_rt_cred_choice, pattern=r"^cred:")],
             RS.WAIT_OTP:          [MessageHandler(not_cancel, recv_rt_otp)],
+            RS.TASK_TYPE:         [CallbackQueryHandler(recv_rt_task_type, pattern=r"^rt_type:")],
             RS.TASK_COUNT:        [MessageHandler(not_cancel, recv_rt_task_count)],
-            RS.AMOUNT_RANGE:      [MessageHandler(not_cancel, recv_rt_amount_range)],
+            RS.AMOUNT_RANGE:      [CallbackQueryHandler(recv_rt_amount_choice, pattern=r"^rt_amount:")],
+            RS.AMOUNT_TEXT:       [MessageHandler(not_cancel, recv_rt_amount_range)],
             RS.SCHEDULE_CHOICE:   [CallbackQueryHandler(recv_rt_schedule_choice, pattern=r"^rt_sched:")],
             RS.SCHEDULE_INTERVAL: [MessageHandler(not_cancel, recv_rt_schedule_interval)],
             RS.RT_CONFIRM:        [CallbackQueryHandler(recv_rt_confirm, pattern=r"^rt_confirm:")],
@@ -2195,6 +2316,7 @@ def main():
             MessageHandler(filters.TEXT, fallback),
         ],
         allow_reentry=True,
+        per_message=False,
     )
 
     app.add_handler(CommandHandler("start",         cmd_start))
