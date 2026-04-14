@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
@@ -92,6 +93,11 @@ DATA_DIR           = os.path.join(os.path.dirname(__file__), "data")
 SAVED_VALUERS_FILE      = os.path.join(DATA_DIR, "saved_valuers.json")
 SAVED_TOKENS_FILE       = os.path.join(DATA_DIR, "saved_tokens.json")
 SAVED_ASSIGNMENTS_FILE  = os.path.join(DATA_DIR, "saved_assignments.json")
+SAVED_TASK_BATCHES_FILE = os.path.join(DATA_DIR, "saved_task_batches.json")
+SAVED_SCHEDULES_FILE    = os.path.join(DATA_DIR, "saved_schedules.json")
+
+# base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
+CPARAMS_DLV = base64.b64encode(b'{"active_role":"DLV"}').decode()
 
 
 def _ensure_data_dir():
@@ -179,11 +185,11 @@ def persist_tokens(cred_type: str, access_token: str, jwt: str):
 
 
 def get_valid_tokens(cred_type: str) -> Optional[AuthTokens]:
-    """Return cached AuthTokens if still valid (60 s buffer), else None."""
+    """Return cached AuthTokens if still valid (5 min buffer), else None."""
     entry = _load_tokens_raw().get(cred_type)
     if not entry:
         return None
-    if entry.get("expires_at", 0) < time.time() + 60:
+    if entry.get("expires_at", 0) < time.time() + 300:
         logger.info("Cached tokens for %s are expired.", cred_type)
         return None
     return AuthTokens(access_token=entry["access_token"], jwt=entry["jwt"])
@@ -223,6 +229,42 @@ class Session:
     saved_valuer:     Optional[Dict] = None   # {"name", "uid", "account_number"}
 
 
+# ──────────────────────────────────────────────────────────
+# States — Receive Tasks conversation
+# ──────────────────────────────────────────────────────────
+class RS(Enum):
+    STAFF_NAME        = auto()
+    SELECT_STAFF      = auto()
+    CHOOSE_CRED       = auto()
+    WAIT_OTP          = auto()
+    TASK_COUNT        = auto()
+    AMOUNT_RANGE      = auto()
+    SCHEDULE_CHOICE   = auto()
+    SCHEDULE_INTERVAL = auto()
+    RT_CONFIRM        = auto()
+
+
+# ──────────────────────────────────────────────────────────
+# Per-user session — Receive Tasks
+# ──────────────────────────────────────────────────────────
+@dataclass
+class RTSession:
+    staff_name:               str = ""
+    staff_results:            List[Dict] = field(default_factory=list)
+    staff_data:               Optional[Dict] = None
+    cred_type:                str = "publicuser"
+    session:                  Optional[object] = None   # requests.Session
+    tokens:                   Optional[AuthTokens] = None
+    task_count:               int = 0
+    amount_min:               Optional[float] = None
+    amount_max:               Optional[float] = None
+    task_type:                str = ""   # "STAMP_DUTY" or "COUNTY_STAMP_DUTY"
+    staff_registry:           str = ""
+    staff_county:             str = ""
+    matched_tasks:            List[Dict] = field(default_factory=list)
+    schedule_interval_minutes: Optional[int] = None
+
+
 CRED_MAP = {
     "publicuser": PUBLIC_CREDENTIALS,
     "staff":      STAFF_CREDENTIALS_ICT,
@@ -239,6 +281,7 @@ CRED_LABELS = {
 # Main menu button labels & keyboard
 # ──────────────────────────────────────────────────────────
 BTN_ASSIGN  = "📋 New Assignment"
+BTN_RECEIVE = "📥 Receive Tasks"
 BTN_VALUERS = "👥 Saved Valuers"
 BTN_DELETE  = "🗑 Delete Valuer"
 BTN_HELP    = "❓ Help"
@@ -246,7 +289,7 @@ BTN_CANCEL  = "🛑 Cancel"
 
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
-    f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
+    f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_RECEIVE)}|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
     f"|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -255,7 +298,7 @@ _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
 def _main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton(BTN_ASSIGN)],
+            [KeyboardButton(BTN_ASSIGN),  KeyboardButton(BTN_RECEIVE)],
             [KeyboardButton(BTN_VALUERS), KeyboardButton(BTN_DELETE)],
             [KeyboardButton(BTN_HELP),    KeyboardButton(BTN_CANCEL)],
         ],
@@ -1072,6 +1115,857 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────
+# Receive Tasks — persistence helpers
+# ──────────────────────────────────────────────────────────
+
+def load_task_batches() -> List[Dict]:
+    try:
+        with open(SAVED_TASK_BATCHES_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def persist_task_batch(batch: Dict):
+    _ensure_data_dir()
+    batches = load_task_batches()
+    batches.append(batch)
+    with open(SAVED_TASK_BATCHES_FILE, "w") as f:
+        json.dump(batches, f, indent=2)
+    logger.info("Saved task batch %s (%d tasks)", batch["batch_id"], len(batch["tasks"]))
+
+
+def load_schedules() -> List[Dict]:
+    try:
+        with open(SAVED_SCHEDULES_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_schedules(schedules: List[Dict]):
+    _ensure_data_dir()
+    with open(SAVED_SCHEDULES_FILE, "w") as f:
+        json.dump(schedules, f, indent=2)
+
+
+def persist_schedule(sched: Dict):
+    schedules = load_schedules()
+    schedules = [s for s in schedules if s["schedule_id"] != sched["schedule_id"]]
+    schedules.append(sched)
+    _save_schedules(schedules)
+    logger.info("Saved schedule %s (%dmin interval)", sched["schedule_id"], sched["interval_minutes"])
+
+
+# ──────────────────────────────────────────────────────────
+# Receive Tasks — staff validation
+# ──────────────────────────────────────────────────────────
+
+def _validate_staff(user_data: Dict) -> Tuple[bool, str, str, str, str]:
+    """
+    Check eligibility for task receipt.
+    Returns (ok, error_msg, task_type, staff_registry, staff_county).
+    task_type is "STAMP_DUTY" or "COUNTY_STAMP_DUTY".
+    """
+    if user_data.get("account_status", "").upper() != "ACTIVE":
+        return False, "Account status is not ACTIVE.", "", "", ""
+
+    dept_code = (
+        user_data.get("department_details", {})
+                 .get("department", {})
+                 .get("code", "")
+    )
+    if dept_code.upper() != "DLV":
+        return False, f"Department is '{dept_code}', expected DLV.", "", "", ""
+
+    role_names = [r.get("rolename", "").upper() for r in user_data.get("roles", [])]
+    if "VALUER" not in role_names:
+        return False, f"No VALUER role found. Roles: {role_names}", "", "", ""
+
+    ardhipay_roles = [r.get("rolename", "").upper() for r in user_data.get("ardhipay_roles", [])]
+
+    if "COUNTY_VALUER" in ardhipay_roles:
+        county_units = user_data.get("county_units", [])
+        if not county_units:
+            return False, "COUNTY_VALUER role but no county_units found on account.", "", "", ""
+        county_obj = county_units[0].get("county", {})
+        registry   = county_obj.get("registry", "").upper()
+        county     = (county_obj.get("name") or county_obj.get("county", "")).upper()
+        return True, "", "COUNTY_STAMP_DUTY", registry, county
+
+    return True, "", "STAMP_DUTY", "", ""
+
+
+# ──────────────────────────────────────────────────────────
+# Receive Tasks — API helpers
+# ──────────────────────────────────────────────────────────
+
+def _rt_auth_headers(rt: RTSession) -> Dict:
+    return {
+        "Authorization": f"Bearer {rt.tokens.access_token}",
+        "JWTAUTH":       f"Bearer {rt.tokens.jwt}",
+        "cparams":       CPARAMS_DLV,
+    }
+
+
+def _fetch_tasks(rt: RTSession, needed: int) -> List[Dict]:
+    """
+    Paginate the task list endpoint, returning tasks that pass the
+    node/status pre-filter (and county+registry filter for COUNTY_STAMP_DUTY).
+    Stops once we have needed*5 candidates (to leave headroom for detail filtering).
+    """
+    headers = _rt_auth_headers(rt)
+    if rt.task_type == "STAMP_DUTY":
+        base_params: Dict = {
+            "filter": "Pending", "role": "DLV",
+            "request_type": "STAMP_DUTY", "search": "",
+        }
+    else:
+        base_params = {
+            "filter": "Ongoing", "from_ardhipay": "true",
+            "role": "DLV", "request_type": "COUNTY_STAMP_DUTY", "search": "",
+        }
+
+    tasks: List[Dict] = []
+    page = 1
+    target = max(needed * 5, 50)
+
+    while len(tasks) < target:
+        resp = rt.session.get(
+            f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
+            headers=headers, params={**base_params, "page": page}, timeout=30,
+        )
+        resp.raise_for_status()
+        data    = resp.json()
+        results = data.get("results", [])
+        if not results:
+            break
+
+        for task in results:
+            if (task.get("application_status") == "ONGOING"
+                    and task.get("node") == "VALUATION_STAMP_DUTY_CREATED"):
+                if rt.task_type == "COUNTY_STAMP_DUTY":
+                    if (task.get("registry", "").upper() != rt.staff_registry
+                            or task.get("county", "").upper() != rt.staff_county):
+                        continue
+                tasks.append(task)
+
+        if not data.get("next"):
+            break
+        page += 1
+
+    return tasks
+
+
+def _fetch_task_detail(rt: RTSession, task_id: str) -> Optional[Dict]:
+    """
+    Call the detail-view endpoint and return the payload only if all three
+    conditions are met: application_status=ONGOING, node=VALUATION_STAMP_DUTY_CREATED,
+    node_code=APPLICATION_AWAITING_VALUATION.
+    Returns None if any condition fails or the request errors.
+    """
+    try:
+        resp = rt.session.get(
+            f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view",
+            headers=_rt_auth_headers(rt),
+            params={"request_id": task_id},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.warning("detail-view failed for %s: %s", task_id, e)
+        return None
+
+    if (data.get("application_status") != "ONGOING"
+            or data.get("node") != "VALUATION_STAMP_DUTY_CREATED"):
+        return None
+
+    ext = data.get("external_process_details", {})
+    if ext.get("node_code") != "APPLICATION_AWAITING_VALUATION":
+        return None
+
+    return data
+
+
+def _verify_and_filter_tasks(
+    rt: RTSession,
+    candidates: List[Dict],
+) -> List[Dict]:
+    """
+    For each candidate, call detail-view, apply the three mandatory checks,
+    then apply the optional consideration_amount range filter.
+    Stops once rt.task_count tasks are matched.
+    """
+    matched: List[Dict] = []
+    for task in candidates:
+        if len(matched) >= rt.task_count:
+            break
+        detail = _fetch_task_detail(rt, task["id"])
+        if detail is None:
+            continue
+        ext    = detail.get("external_process_details", {})
+        amount = float(ext.get("consideration_amount") or 0)
+        if rt.amount_min is not None and amount < rt.amount_min:
+            continue
+        if rt.amount_max is not None and amount > rt.amount_max:
+            continue
+        matched.append({
+            "id":                   task["id"],
+            "reference_number":     task["reference_number"],
+            "consideration_amount": amount,
+            "parcel_number":        task.get("parcel_number", ""),
+            "registry":             task.get("registry", ""),
+            "county":               task.get("county", ""),
+            "date_created":         task.get("date_created", ""),
+        })
+    return matched
+
+
+async def _do_assign_tasks(
+    bot,
+    chat_id: int,
+    http_sess,
+    tokens: AuthTokens,
+    tasks: List[Dict],
+    staff_uid: str,
+    staff_name: str,
+    cred_type: str,
+):
+    """POST assignments and send a result summary to chat_id."""
+    url     = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/fix_application_details"
+    headers = {
+        "Authorization": f"Bearer {tokens.access_token}",
+        "JWTAUTH":       f"Bearer {tokens.jwt}",
+    }
+
+    ok_refs: List[str]   = []
+    fail_refs: List[str] = []
+    result_lines: List[str] = []
+
+    for task in tasks:
+        ref = task["reference_number"]
+        try:
+            r = http_sess.post(
+                url, headers=headers,
+                json={
+                    "reference_number":   ref,
+                    "valuation_officer":  staff_uid,
+                    "node":               "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            ok_refs.append(ref)
+            result_lines.append(f"✅ `{ref}` — KES {task['consideration_amount']:,.0f}")
+            persist_assignment(ref, staff_name, staff_uid)
+        except Exception as e:
+            fail_refs.append(ref)
+            result_lines.append(f"❌ `{ref}` — {e}")
+
+    # Persist the batch
+    batch = {
+        "batch_id":   str(uuid.uuid4()),
+        "staff_name": staff_name,
+        "staff_uid":  staff_uid,
+        "cred_type":  cred_type,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "tasks":      [t for t in tasks if t["reference_number"] in ok_refs],
+        "failed":     fail_refs,
+    }
+    persist_task_batch(batch)
+
+    summary = (
+        f"🏁 *Receive Tasks Complete*\n\n"
+        f"*Valuer:* {staff_name}\n"
+        f"*Assigned:* {len(ok_refs)} / {len(tasks)}\n"
+        f"*Failed:*   {len(fail_refs)} / {len(tasks)}\n\n"
+        + "\n".join(result_lines)
+    )
+    if len(summary) > 4000:
+        summary = summary[:4000] + "\n…_(truncated)_"
+
+    await bot.send_message(chat_id, summary, parse_mode="Markdown")
+
+
+# ──────────────────────────────────────────────────────────
+# Receive Tasks — scheduled job
+# ──────────────────────────────────────────────────────────
+
+async def _receive_tasks_job(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue callback: runs receive-tasks automatically on a schedule."""
+    job_data  = context.job.data
+    chat_id   = job_data["chat_id"]
+    sched     = job_data["schedule"]
+    cred_type = sched["cred_type"]
+
+    tokens = get_valid_tokens(cred_type)
+    if not tokens:
+        await context.bot.send_message(
+            chat_id,
+            "⚠️ *Scheduled receive-tasks failed:* cached tokens are expired.\n"
+            "Use */receive* to re-authenticate and reschedule.",
+            parse_mode="Markdown",
+        )
+        return
+
+    await context.bot.send_message(chat_id, "⏰ *Scheduled receive-tasks running…*", parse_mode="Markdown")
+
+    rt = RTSession()
+    rt.tokens               = tokens
+    rt.session              = build_session()
+    rt.task_type            = sched["task_type"]
+    rt.staff_registry       = sched.get("staff_registry", "")
+    rt.staff_county         = sched.get("staff_county", "")
+    rt.task_count           = sched["task_count"]
+    rt.amount_min           = sched.get("amount_min")
+    rt.amount_max           = sched.get("amount_max")
+
+    try:
+        candidates = _fetch_tasks(rt, rt.task_count)
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"❌ Task fetch failed: `{e}`", parse_mode="Markdown")
+        return
+
+    if not candidates:
+        await context.bot.send_message(chat_id, "ℹ️ Scheduled run: no eligible tasks found.")
+        return
+
+    matched = _verify_and_filter_tasks(rt, candidates)
+    if not matched:
+        await context.bot.send_message(chat_id, "ℹ️ Scheduled run: no tasks passed detail-view verification.")
+        return
+
+    await _do_assign_tasks(
+        context.bot, chat_id,
+        rt.session, tokens,
+        matched,
+        sched["staff_uid"], sched["staff_name"], cred_type,
+    )
+
+
+def _restore_schedules(app) -> None:
+    """Re-register active scheduled jobs from persistent storage on startup."""
+    schedules = load_schedules()
+    restored  = 0
+    for sched in schedules:
+        if not sched.get("active", True):
+            continue
+        interval = sched["interval_minutes"] * 60
+        app.job_queue.run_repeating(
+            _receive_tasks_job,
+            interval=interval,
+            first=interval,
+            data={"chat_id": sched["chat_id"], "schedule": sched},
+            name=f"rt_{sched['schedule_id']}",
+        )
+        restored += 1
+    if restored:
+        logger.info("Restored %d scheduled receive-tasks job(s).", restored)
+
+
+# ──────────────────────────────────────────────────────────
+# Receive Tasks — conversation helpers
+# ──────────────────────────────────────────────────────────
+
+def _get_rt(ctx: ContextTypes.DEFAULT_TYPE) -> RTSession:
+    if "rt_session" not in ctx.user_data:
+        ctx.user_data["rt_session"] = RTSession()
+    return ctx.user_data["rt_session"]
+
+
+async def _rt_do_staff_search(message, rt: RTSession) -> int:
+    """Search the accounts endpoint and show a selection keyboard."""
+    try:
+        headers = {
+            "Authorization": f"Bearer {rt.tokens.access_token}",
+            "JWTAUTH":       f"Bearer {rt.tokens.jwt}",
+        }
+        resp = rt.session.get(
+            f"{BASE_URL}/acl/api/v1/accounts/list-user-accounts",
+            headers=headers,
+            params={"account_type": "STAFF", "filter_type": "ACTIVE",
+                    "page": 1, "search": rt.staff_name},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+    except Exception as e:
+        await message.reply_text(
+            f"❌ Staff search failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu()
+        )
+        return ConversationHandler.END
+
+    if not results:
+        await message.reply_text(
+            f"⚠️ No staff found matching *{rt.staff_name}*.",
+            parse_mode="Markdown", reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
+    rt.staff_results = results
+    rows = []
+    for i, v in enumerate(results):
+        sd   = v.get("staff_details", {})
+        name = " ".join(filter(None, [sd.get("firstname"), sd.get("middlename"), sd.get("lastname")]))
+        rows.append([InlineKeyboardButton(name or f"Staff {i+1}", callback_data=f"rt_staff:{i}")])
+
+    await message.reply_text(
+        f"Found *{len(results)}* staff member(s). Select one:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return RS.SELECT_STAFF
+
+
+async def _rt_fetch_and_show(message, rt: RTSession) -> int:
+    """Fetch + verify tasks, display them, and ask for confirmation."""
+    await message.reply_text("⏳ Fetching eligible tasks from the queue…")
+
+    # Peek at the total count first
+    headers = _rt_auth_headers(rt)
+    if rt.task_type == "STAMP_DUTY":
+        peek_params: Dict = {
+            "filter": "Pending", "role": "DLV",
+            "request_type": "STAMP_DUTY", "search": "", "page": 1,
+        }
+    else:
+        peek_params = {
+            "filter": "Ongoing", "from_ardhipay": "true",
+            "role": "DLV", "request_type": "COUNTY_STAMP_DUTY", "search": "", "page": 1,
+        }
+
+    try:
+        peek = rt.session.get(
+            f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
+            headers=headers, params=peek_params, timeout=30,
+        )
+        peek.raise_for_status()
+        total_count = peek.json().get("count", "?")
+    except Exception:
+        total_count = "?"
+
+    await message.reply_text(
+        f"📊 Total tasks in queue: *{total_count}*\n"
+        f"🔍 Scanning for up to *{rt.task_count}* eligible task(s)…",
+        parse_mode="Markdown",
+    )
+
+    try:
+        candidates = _fetch_tasks(rt, rt.task_count)
+    except Exception as e:
+        await message.reply_text(f"❌ Task fetch failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    if not candidates:
+        await message.reply_text(
+            "ℹ️ No eligible tasks found matching your filters.", reply_markup=_main_menu()
+        )
+        return ConversationHandler.END
+
+    await message.reply_text(f"🔍 Verifying *{len(candidates)}* candidate(s) via detail-view…", parse_mode="Markdown")
+
+    matched = _verify_and_filter_tasks(rt, candidates)
+    if not matched:
+        await message.reply_text(
+            "ℹ️ No tasks passed the detail-view verification checks.", reply_markup=_main_menu()
+        )
+        return ConversationHandler.END
+
+    rt.matched_tasks = matched
+
+    # Build display list
+    sd   = rt.staff_data.get("staff_details", {})
+    name = " ".join(filter(None, [sd.get("firstname"), sd.get("middlename"), sd.get("lastname")]))
+    lines = []
+    for i, t in enumerate(matched, 1):
+        lines.append(
+            f"{i}. `{t['reference_number']}`\n"
+            f"   💰 KES {t['consideration_amount']:,.0f}\n"
+            f"   📍 {t['parcel_number']} | 🏢 {t['registry']}\n"
+            f"   📅 {t['date_created'][:10]}"
+        )
+
+    summary = (
+        f"📋 *Tasks for {name}* ({len(matched)} task(s))\n\n"
+        + "\n\n".join(lines)
+        + "\n\nConfirm assignment?"
+    )
+    if len(summary) > 4000:
+        summary = (
+            f"📋 *{len(matched)} tasks* ready to assign to *{name}*.\n"
+            "_(List too long to display in full)_\n\nConfirm assignment?"
+        )
+
+    await message.reply_text(
+        summary,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm & Assign", callback_data="rt_confirm:yes")],
+            [InlineKeyboardButton("❌ Cancel",           callback_data="rt_confirm:no")],
+        ]),
+    )
+    return RS.RT_CONFIRM
+
+
+# ──────────────────────────────────────────────────────────
+# Receive Tasks — conversation handlers
+# ──────────────────────────────────────────────────────────
+
+async def cmd_receive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    ctx.user_data["rt_session"] = RTSession()
+    await update.message.reply_text(
+        "📥 *Receive Tasks Flow*\n\n"
+        "Step 1 — Enter the staff member's name to search:",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return RS.STAFF_NAME
+
+
+async def recv_rt_staff_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    rt = _get_rt(ctx)
+    rt.staff_name = update.message.text.strip()
+    await update.message.reply_text(
+        f"🔍 Searching for: *{rt.staff_name}*\n\n"
+        "Step 2 — Choose *credential profile*:",
+        parse_mode="Markdown",
+        reply_markup=_cred_keyboard(),
+    )
+    return RS.CHOOSE_CRED
+
+
+async def recv_rt_cred_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    rt        = _get_rt(ctx)
+    cred_type = query.data.split(":")[1]
+    rt.cred_type = cred_type
+    creds     = CRED_MAP[cred_type]
+
+    cached = get_valid_tokens(cred_type)
+    if cached:
+        rt.tokens  = cached
+        rt.session = build_session()
+        await query.edit_message_text(
+            f"🔑 Cached login: *{CRED_LABELS[cred_type]}*\n\n"
+            f"🔍 Searching for *{rt.staff_name}*…",
+            parse_mode="Markdown",
+        )
+        return await _rt_do_staff_search(query.message, rt)
+
+    # Full login
+    rt.session = build_session()
+    await query.edit_message_text(
+        f"✅ Credential: *{CRED_LABELS[cred_type]}*\n\n🔐 Sending login request…",
+        parse_mode="Markdown",
+    )
+    try:
+        resp = rt.session.post(
+            f"{AUTH_BASE_URL}/login",
+            json={"username": creds["username"], "password": creds["password"],
+                  "usertype": creds["usertype"], "otpcode": ""},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("success") is False:
+            raise RuntimeError(data.get("error") or data.get("message"))
+    except Exception as e:
+        await query.message.reply_text(
+            f"❌ Login failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu()
+        )
+        return ConversationHandler.END
+
+    await query.message.reply_text(
+        "📲 OTP sent to registered device.\n\nPlease *reply with the OTP code*:",
+        parse_mode="Markdown",
+    )
+    return RS.WAIT_OTP
+
+
+async def recv_rt_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    rt    = _get_rt(ctx)
+    otp   = update.message.text.strip()
+    creds = CRED_MAP[rt.cred_type]
+
+    await update.message.reply_text("🔄 Verifying OTP…")
+    try:
+        resp = rt.session.post(
+            f"{AUTH_BASE_URL}/otpverify",
+            json={"username": creds["username"], "password": creds["password"], "otpcode": otp},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data         = resp.json()
+        access_token = data.get("details", {}).get("access_token")
+        jwt          = data.get("details", {}).get("jwt")
+        if not access_token or not jwt:
+            raise RuntimeError(f"Tokens missing. Keys: {list(data.keys())}")
+        rt.tokens = AuthTokens(access_token=access_token, jwt=jwt)
+        persist_tokens(rt.cred_type, access_token, jwt)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ OTP failed: `{e}`\n\nSend the OTP again or tap 🛑 Cancel.",
+            parse_mode="Markdown",
+        )
+        return RS.WAIT_OTP
+
+    await update.message.reply_text("✅ Authenticated!")
+    return await _rt_do_staff_search(update.message, rt)
+
+
+async def recv_rt_select_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    rt        = _get_rt(ctx)
+    idx       = int(query.data.split(":")[1])
+    user_data = rt.staff_results[idx]
+
+    sd   = user_data.get("staff_details", {})
+    name = " ".join(filter(None, [sd.get("firstname"), sd.get("middlename"), sd.get("lastname")]))
+
+    ok, err_msg, task_type, registry, county = _validate_staff(user_data)
+    if not ok:
+        await query.edit_message_text(
+            f"❌ *Validation failed for {name}:*\n{err_msg}",
+            parse_mode="Markdown",
+        )
+        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    rt.staff_data     = user_data
+    rt.task_type      = task_type
+    rt.staff_registry = registry
+    rt.staff_county   = county
+
+    ardhipay_labels = ", ".join(
+        r.get("rolename", "") for r in user_data.get("ardhipay_roles", [])
+    ) or "None"
+    type_label  = "County Stamp Duty" if task_type == "COUNTY_STAMP_DUTY" else "Stamp Duty"
+    county_line = f"\n*County:* {county}  |  *Registry:* {registry}" if task_type == "COUNTY_STAMP_DUTY" else ""
+
+    await query.edit_message_text(
+        f"✅ *Staff Validated*\n\n"
+        f"*Name:* {name}\n"
+        f"*Task Type:* {type_label}{county_line}\n"
+        f"*ArdhiPay Roles:* {ardhipay_labels}\n\n"
+        "Step 3 — How many tasks do you want to assign?",
+        parse_mode="Markdown",
+    )
+    return RS.TASK_COUNT
+
+
+async def recv_rt_task_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    rt = _get_rt(ctx)
+    try:
+        count = int(update.message.text.strip())
+        if count <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Please enter a positive whole number.")
+        return RS.TASK_COUNT
+
+    rt.task_count = count
+    await update.message.reply_text(
+        f"✅ *{count} task(s)* requested.\n\n"
+        "Step 4 — Enter a *consideration amount range* to filter tasks:\n"
+        "_Format:_ `min-max`  _(e.g._ `100000-500000`_)_\n"
+        "_Or type_ `skip` _for no amount filter._",
+        parse_mode="Markdown",
+    )
+    return RS.AMOUNT_RANGE
+
+
+async def recv_rt_amount_range(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    rt   = _get_rt(ctx)
+    text = update.message.text.strip().lower()
+
+    if text != "skip":
+        try:
+            parts = re.split(r"[-–]", text, maxsplit=1)
+            if len(parts) != 2:
+                raise ValueError
+            lo = float(parts[0].strip().replace(",", ""))
+            hi = float(parts[1].strip().replace(",", ""))
+            rt.amount_min, rt.amount_max = (lo, hi) if lo <= hi else (hi, lo)
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Invalid format. Use `min-max` (e.g. `100000-500000`) or type `skip`.",
+                parse_mode="Markdown",
+            )
+            return RS.AMOUNT_RANGE
+
+    range_label = (
+        f"KES {rt.amount_min:,.0f} – KES {rt.amount_max:,.0f}"
+        if rt.amount_min is not None else "No filter"
+    )
+    await update.message.reply_text(
+        f"✅ Amount range: *{range_label}*\n\n"
+        "Step 5 — Run now or set up a recurring schedule?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ Run Now",              callback_data="rt_sched:now")],
+            [InlineKeyboardButton("⏰ Schedule (repeating)", callback_data="rt_sched:schedule")],
+        ]),
+    )
+    return RS.SCHEDULE_CHOICE
+
+
+async def recv_rt_schedule_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    rt     = _get_rt(ctx)
+    choice = query.data.split(":")[1]
+
+    if choice == "now":
+        await query.edit_message_text("▶️ Running now…")
+        return await _rt_fetch_and_show(query.message, rt)
+
+    await query.edit_message_text(
+        "⏰ *Schedule Setup*\n\n"
+        "Enter the repeat interval in minutes:\n"
+        "_(e.g._ `60` _= every hour,_ `1440` _= daily)_",
+        parse_mode="Markdown",
+    )
+    return RS.SCHEDULE_INTERVAL
+
+
+async def recv_rt_schedule_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    rt = _get_rt(ctx)
+    try:
+        minutes = int(update.message.text.strip())
+        if minutes < 1:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Enter a positive number of minutes.")
+        return RS.SCHEDULE_INTERVAL
+
+    rt.schedule_interval_minutes = minutes
+    await update.message.reply_text(
+        f"⏰ Will repeat every *{minutes} minute(s)*.\n\nFetching tasks for preview…",
+        parse_mode="Markdown",
+    )
+    return await _rt_fetch_and_show(update.message, rt)
+
+
+async def recv_rt_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "rt_confirm:no":
+        await query.edit_message_text("❌ Receive tasks cancelled.")
+        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    rt   = _get_rt(ctx)
+    sd   = rt.staff_data.get("staff_details", {})
+    name = " ".join(filter(None, [sd.get("firstname"), sd.get("middlename"), sd.get("lastname")]))
+    uid  = sd.get("user_id", rt.staff_data.get("id", "?"))
+
+    await query.edit_message_text(
+        f"⚙️ Assigning *{len(rt.matched_tasks)}* task(s) to *{name}*…",
+        parse_mode="Markdown",
+    )
+
+    await _do_assign_tasks(
+        ctx.bot, query.message.chat_id,
+        rt.session, rt.tokens,
+        rt.matched_tasks, uid, name, rt.cred_type,
+    )
+
+    # Register repeating schedule if requested
+    if rt.schedule_interval_minutes:
+        sched = {
+            "schedule_id":      str(uuid.uuid4()),
+            "staff_uid":        uid,
+            "staff_name":       name,
+            "cred_type":        rt.cred_type,
+            "task_count":       rt.task_count,
+            "amount_min":       rt.amount_min,
+            "amount_max":       rt.amount_max,
+            "task_type":        rt.task_type,
+            "staff_registry":   rt.staff_registry,
+            "staff_county":     rt.staff_county,
+            "interval_minutes": rt.schedule_interval_minutes,
+            "chat_id":          query.message.chat_id,
+            "active":           True,
+        }
+        persist_schedule(sched)
+        ctx.job_queue.run_repeating(
+            _receive_tasks_job,
+            interval=rt.schedule_interval_minutes * 60,
+            first=rt.schedule_interval_minutes * 60,
+            data={"chat_id": query.message.chat_id, "schedule": sched},
+            name=f"rt_{sched['schedule_id']}",
+        )
+        await query.message.reply_text(
+            f"⏰ *Schedule saved:* runs every *{rt.schedule_interval_minutes} minute(s)*.\n"
+            f"Use */schedules* to view active schedules.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu(),
+        )
+    else:
+        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu())
+
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────────────────
+# /schedules — list saved schedules
+# ──────────────────────────────────────────────────────────
+
+async def cmd_schedules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    schedules = [s for s in load_schedules() if s.get("active", True)]
+    if not schedules:
+        await update.message.reply_text("📭 No active schedules.", reply_markup=_main_menu())
+        return
+    lines = []
+    for s in schedules:
+        range_str = (
+            f"KES {s['amount_min']:,.0f}–{s['amount_max']:,.0f}"
+            if s.get("amount_min") is not None else "any amount"
+        )
+        lines.append(
+            f"• *{s['staff_name']}* — every *{s['interval_minutes']}min*\n"
+            f"  Tasks: {s['task_count']} | {s['task_type']} | {range_str}\n"
+            f"  ID: `{s['schedule_id'][:8]}…`"
+        )
+    await update.message.reply_text(
+        "⏰ *Active Schedules:*\n\n" + "\n\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=_main_menu(),
+    )
+
+
+# ──────────────────────────────────────────────────────────
+# /task_batches — view saved task batch history
+# ──────────────────────────────────────────────────────────
+
+async def cmd_task_batches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    batches = load_task_batches()
+    if not batches:
+        await update.message.reply_text("📭 No saved task batches yet.", reply_markup=_main_menu())
+        return
+    lines = []
+    for b in batches[-10:]:   # most recent 10
+        lines.append(
+            f"• *{b['staff_name']}*  —  {b['created_at']}\n"
+            f"  Assigned: {len(b['tasks'])}  |  Failed: {len(b.get('failed', []))}"
+        )
+    await update.message.reply_text(
+        "📦 *Recent Task Batches (last 10):*\n\n" + "\n\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=_main_menu(),
+    )
+
+
+# ──────────────────────────────────────────────────────────
 # /cancel
 # ──────────────────────────────────────────────────────────
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1095,8 +1989,12 @@ async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────
+async def _post_init(app) -> None:
+    _restore_schedules(app)
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
     # Text filter that excludes the cancel button (so it reaches fallbacks)
     not_cancel = filters.TEXT & ~filters.COMMAND & ~_CANCEL_FILTER
@@ -1130,11 +2028,38 @@ def main():
         allow_reentry=True,
     )
 
+    recv_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("receive", cmd_receive),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_RECEIVE)}$"), cmd_receive),
+        ],
+        states={
+            RS.STAFF_NAME:        [MessageHandler(not_cancel, recv_rt_staff_name)],
+            RS.SELECT_STAFF:      [CallbackQueryHandler(recv_rt_select_staff, pattern=r"^rt_staff:")],
+            RS.CHOOSE_CRED:       [CallbackQueryHandler(recv_rt_cred_choice, pattern=r"^cred:")],
+            RS.WAIT_OTP:          [MessageHandler(not_cancel, recv_rt_otp)],
+            RS.TASK_COUNT:        [MessageHandler(not_cancel, recv_rt_task_count)],
+            RS.AMOUNT_RANGE:      [MessageHandler(not_cancel, recv_rt_amount_range)],
+            RS.SCHEDULE_CHOICE:   [CallbackQueryHandler(recv_rt_schedule_choice, pattern=r"^rt_sched:")],
+            RS.SCHEDULE_INTERVAL: [MessageHandler(not_cancel, recv_rt_schedule_interval)],
+            RS.RT_CONFIRM:        [CallbackQueryHandler(recv_rt_confirm, pattern=r"^rt_confirm:")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(_CANCEL_FILTER, cmd_cancel),
+            MessageHandler(filters.TEXT, fallback),
+        ],
+        allow_reentry=True,
+    )
+
     app.add_handler(CommandHandler("start",         cmd_start))
     app.add_handler(CommandHandler("help",          cmd_help))
     app.add_handler(CommandHandler("valuers",       cmd_valuers))
     app.add_handler(CommandHandler("delete_valuer", cmd_delete_valuer))
+    app.add_handler(CommandHandler("schedules",     cmd_schedules))
+    app.add_handler(CommandHandler("task_batches",  cmd_task_batches))
     app.add_handler(conv)
+    app.add_handler(recv_conv)
 
     # Button handlers outside an active conversation
     app.add_handler(CallbackQueryHandler(recv_delete_valuer, pattern=r"^del:"))
