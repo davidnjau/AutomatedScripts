@@ -1283,9 +1283,9 @@ def _fetch_tasks(rt: RTSession, needed: int) -> List[Dict]:
 
 def _fetch_task_detail(rt: RTSession, task_id: str) -> Optional[Dict]:
     """
-    Call the detail-view endpoint and return the payload only if all three
-    conditions are met: application_status=ONGOING, node=VALUATION_STAMP_DUTY_CREATED,
-    node_code=APPLICATION_AWAITING_VALUATION.
+    Call the detail-view endpoint and return the payload only if all conditions
+    are met: application_status=ONGOING, node=VALUATION_STAMP_DUTY_CREATED,
+    node_code=APPLICATION_AWAITING_VALUATION, and no valuer already assigned.
     Returns None if any condition fails or the request errors.
     """
     try:
@@ -1301,12 +1301,27 @@ def _fetch_task_detail(rt: RTSession, task_id: str) -> Optional[Dict]:
         logger.warning("detail-view failed for %s: %s", task_id, e)
         return None
 
+    logger.debug(
+        "detail-view %s keys=%s ext_keys=%s",
+        task_id,
+        list(data.keys()),
+        list((data.get("external_process_details") or {}).keys()),
+    )
+
     if (data.get("application_status") != "ONGOING"
             or data.get("node") != "VALUATION_STAMP_DUTY_CREATED"):
         return None
 
     ext = data.get("external_process_details", {})
     if ext.get("node_code") != "APPLICATION_AWAITING_VALUATION":
+        return None
+
+    # Reject tasks that already have an assigned valuer
+    if (data.get("valuation_officer")
+            or data.get("officer_id")
+            or ext.get("valuation_officer")
+            or ext.get("officer_id")):
+        logger.info("detail-view: task %s already has an assigned valuer — skipping", task_id)
         return None
 
     return data
