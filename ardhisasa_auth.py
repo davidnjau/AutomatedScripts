@@ -36,6 +36,12 @@ STAFF_CREDENTIALS_ICT = {
     "usertype": "staff",
 }
 
+STAFF_CREDENTIALS_VALUER = {
+    "username": "2015001311",
+    "password": "Marcel(2025)",
+    "usertype": "staff",
+}
+
 PUBLIC_CREDENTIALS = {
     "username": "33745057",
     "password": "Sc281-6736/2014",

@@ -64,6 +64,7 @@ from ardhisasa_auth import (
     PUBLIC_CREDENTIALS,
     STAFF_CREDENTIALS_ICT,
     STAFF_CREDENTIALS_SUPPORT,
+    STAFF_CREDENTIALS_VALUER,
     AuthTokens,
     build_session,
 )
@@ -277,15 +278,17 @@ class RTSession:
 
 
 CRED_MAP = {
-    "publicuser": PUBLIC_CREDENTIALS,
-    "staff":      STAFF_CREDENTIALS_ICT,
-    "staff2":     STAFF_CREDENTIALS_SUPPORT,
+    "publicuser":   PUBLIC_CREDENTIALS,
+    "staff":        STAFF_CREDENTIALS_ICT,
+    "staff2":       STAFF_CREDENTIALS_SUPPORT,
+    "staff_valuer": STAFF_CREDENTIALS_VALUER,
 }
 
 CRED_LABELS = {
-    "publicuser": "👤 Public User",
-    "staff":      "🏢 ICT",
-    "staff2":     "🏢 Support Reg",
+    "publicuser":   "👤 Public User",
+    "staff":        "🏢 ICT",
+    "staff2":       "🏢 Support Reg",
+    "staff_valuer": "🏢 Staff Valuer",
 }
 
 # ──────────────────────────────────────────────────────────
@@ -348,9 +351,10 @@ def parse_refs(raw: str) -> List[str]:
 
 def _cred_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(CRED_LABELS["publicuser"], callback_data="cred:publicuser")],
-        [InlineKeyboardButton(CRED_LABELS["staff"],      callback_data="cred:staff")],
-        [InlineKeyboardButton(CRED_LABELS["staff2"],     callback_data="cred:staff2")],
+        [InlineKeyboardButton(CRED_LABELS["publicuser"],   callback_data="cred:publicuser")],
+        [InlineKeyboardButton(CRED_LABELS["staff"],        callback_data="cred:staff")],
+        [InlineKeyboardButton(CRED_LABELS["staff2"],       callback_data="cred:staff2")],
+        [InlineKeyboardButton(CRED_LABELS["staff_valuer"], callback_data="cred:staff_valuer")],
     ])
 
 
