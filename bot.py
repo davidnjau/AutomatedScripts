@@ -27,6 +27,9 @@ import json
 import logging
 import os
 import re
+import signal
+import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -98,6 +101,10 @@ SAVED_SCHEDULES_FILE    = os.path.join(DATA_DIR, "saved_schedules.json")
 
 # base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
 CPARAMS_DLV = base64.b64encode(b'{"active_role":"DLV"}').decode()
+
+DAEMON_SCRIPT = os.path.join(os.path.dirname(__file__), "token_refresh_daemon.py")
+DAEMON_PID_FILE = os.path.join(DATA_DIR, "daemon.pid")
+DAEMON_LOG_FILE = os.path.join(DATA_DIR, "daemon.log")
 
 
 def _ensure_data_dir():
@@ -282,6 +289,7 @@ CRED_LABELS = {
 # ──────────────────────────────────────────────────────────
 BTN_ASSIGN  = "📋 New Assignment"
 BTN_RECEIVE = "📥 Receive Tasks"
+BTN_DAEMON  = "🔄 Token Daemon"
 BTN_VALUERS = "👥 Saved Valuers"
 BTN_DELETE  = "🗑 Delete Valuer"
 BTN_HELP    = "❓ Help"
@@ -289,7 +297,8 @@ BTN_CANCEL  = "🛑 Cancel"
 
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
-    f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_RECEIVE)}|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
+    f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_RECEIVE)}|{re.escape(BTN_DAEMON)}"
+    f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
     f"|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -299,6 +308,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton(BTN_ASSIGN),  KeyboardButton(BTN_RECEIVE)],
+            [KeyboardButton(BTN_DAEMON)],
             [KeyboardButton(BTN_VALUERS), KeyboardButton(BTN_DELETE)],
             [KeyboardButton(BTN_HELP),    KeyboardButton(BTN_CANCEL)],
         ],
@@ -1966,6 +1976,141 @@ async def cmd_task_batches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────
+# Token refresh daemon — process management
+# ──────────────────────────────────────────────────────────
+
+def _daemon_read_pid() -> Optional[int]:
+    """Return the PID stored in the pid file, or None if missing/invalid."""
+    try:
+        with open(DAEMON_PID_FILE) as f:
+            return int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _daemon_running() -> bool:
+    """Return True if the daemon process is alive."""
+    pid = _daemon_read_pid()
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)   # signal 0 = probe only, no actual signal sent
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _daemon_start() -> Tuple[bool, str]:
+    """
+    Launch token_refresh_daemon.py in a detached process.
+    Uses start_new_session=True so it is not killed when the bot receives SIGTERM.
+    stdout/stderr are appended to DAEMON_LOG_FILE.
+    Returns (success, message).
+    """
+    if _daemon_running():
+        return False, f"Already running (PID {_daemon_read_pid()})."
+
+    if not os.path.exists(DAEMON_SCRIPT):
+        return False, f"Script not found: {DAEMON_SCRIPT}"
+
+    _ensure_data_dir()
+    log_fh = open(DAEMON_LOG_FILE, "a")
+    proc = subprocess.Popen(
+        [sys.executable, "-u", DAEMON_SCRIPT],
+        stdout=log_fh,
+        stderr=log_fh,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,   # detach from bot's process group
+        close_fds=True,
+    )
+    with open(DAEMON_PID_FILE, "w") as f:
+        f.write(str(proc.pid))
+    logger.info("Token refresh daemon started (PID %d)", proc.pid)
+    return True, f"Started (PID {proc.pid}). Logs → `{DAEMON_LOG_FILE}`"
+
+
+def _daemon_stop() -> Tuple[bool, str]:
+    """Send SIGTERM to the daemon. Returns (success, message)."""
+    if not _daemon_running():
+        return False, "Daemon is not running."
+    pid = _daemon_read_pid()
+    try:
+        os.kill(pid, signal.SIGTERM)
+        # Give it a moment, then confirm it's gone
+        for _ in range(10):
+            time.sleep(0.3)
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+        try:
+            os.remove(DAEMON_PID_FILE)
+        except FileNotFoundError:
+            pass
+        logger.info("Token refresh daemon stopped (PID %d)", pid)
+        return True, f"Daemon (PID {pid}) stopped."
+    except Exception as e:
+        return False, f"Failed to stop daemon: {e}"
+
+
+def _daemon_status_text() -> str:
+    running = _daemon_running()
+    pid     = _daemon_read_pid()
+    if running:
+        return f"🟢 *Running* (PID {pid})"
+    elif pid:
+        return "🔴 *Not running* (stale PID file — process died)"
+    else:
+        return "🔴 *Not running*"
+
+
+def _daemon_keyboard() -> InlineKeyboardMarkup:
+    running = _daemon_running()
+    rows = []
+    if running:
+        rows.append([InlineKeyboardButton("⏹ Stop Daemon",   callback_data="daemon:stop")])
+    else:
+        rows.append([InlineKeyboardButton("▶️ Start Daemon",  callback_data="daemon:start")])
+    rows.append([InlineKeyboardButton("🔁 Refresh Status", callback_data="daemon:status")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_daemon(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    await update.message.reply_text(
+        f"🔄 *Token Refresh Daemon*\n\n"
+        f"Status: {_daemon_status_text()}\n\n"
+        f"The daemon watches the token cache and silently refreshes "
+        f"each token *5 minutes before it expires*.\n"
+        f"Logs are written to `data/daemon.log`.",
+        parse_mode="Markdown",
+        reply_markup=_daemon_keyboard(),
+    )
+
+
+async def recv_daemon_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query  = update.callback_query
+    await query.answer()
+    action = query.data.split(":")[1]
+
+    if action == "start":
+        ok, msg = _daemon_start()
+    elif action == "stop":
+        ok, msg = _daemon_stop()
+    else:
+        ok, msg = True, "Status refreshed."
+
+    status = _daemon_status_text()
+    await query.edit_message_text(
+        f"🔄 *Token Refresh Daemon*\n\n"
+        f"Status: {status}\n\n"
+        f"{'✅' if ok else '❌'} {msg}",
+        parse_mode="Markdown",
+        reply_markup=_daemon_keyboard(),
+    )
+
+
+# ──────────────────────────────────────────────────────────
 # /cancel
 # ──────────────────────────────────────────────────────────
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2058,11 +2203,14 @@ def main():
     app.add_handler(CommandHandler("delete_valuer", cmd_delete_valuer))
     app.add_handler(CommandHandler("schedules",     cmd_schedules))
     app.add_handler(CommandHandler("task_batches",  cmd_task_batches))
+    app.add_handler(CommandHandler("daemon",        cmd_daemon))
     app.add_handler(conv)
     app.add_handler(recv_conv)
 
     # Button handlers outside an active conversation
-    app.add_handler(CallbackQueryHandler(recv_delete_valuer, pattern=r"^del:"))
+    app.add_handler(CallbackQueryHandler(recv_delete_valuer,  pattern=r"^del:"))
+    app.add_handler(CallbackQueryHandler(recv_daemon_action,  pattern=r"^daemon:"))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DAEMON)}$"),  cmd_daemon))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"),    cmd_help))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_VALUERS)}$"), cmd_valuers))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DELETE)}$"),  cmd_delete_valuer))
