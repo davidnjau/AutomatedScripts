@@ -240,6 +240,7 @@ class Session:
 # States — Receive Tasks conversation
 # ──────────────────────────────────────────────────────────
 class RS(Enum):
+    PICK_STAFF_SOURCE = auto()   # choose saved valuer or search new
     STAFF_NAME        = auto()
     SELECT_STAFF      = auto()
     CHOOSE_CRED       = auto()
@@ -261,6 +262,7 @@ class RTSession:
     staff_name:               str = ""
     staff_results:            List[Dict] = field(default_factory=list)
     staff_data:               Optional[Dict] = None
+    saved_valuer:             Optional[Dict] = None   # {"name", "uid", "account_number"} — pre-selected
     cred_type:                str = "publicuser"
     session:                  Optional[object] = None   # requests.Session
     tokens:                   Optional[AuthTokens] = None
@@ -1535,6 +1537,97 @@ def _fetch_staff_detail(rt: RTSession, list_entry: Dict) -> Dict:
     return list_entry
 
 
+async def _rt_resolve_saved_valuer(message, rt: RTSession) -> int:
+    """
+    After auth, fetch and validate a pre-selected saved valuer.
+    Searches by name and matches on account_number, then runs validation.
+    """
+    sv = rt.saved_valuer
+    try:
+        headers = {
+            "Authorization": f"Bearer {rt.tokens.access_token}",
+            "JWTAUTH":       f"Bearer {rt.tokens.jwt}",
+        }
+        resp = rt.session.get(
+            f"{BASE_URL}/acl/api/v1/accounts/list-user-accounts",
+            headers=headers,
+            params={"account_type": "STAFF", "filter_type": "ACTIVE",
+                    "page": 1, "search": sv["name"]},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+    except Exception as e:
+        await message.reply_text(
+            f"❌ Could not fetch profile for *{sv['name']}*: `{e}`",
+            parse_mode="Markdown", reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
+    # Match by account_number first, fall back to uid, then first result
+    match = (
+        next((r for r in results if r.get("account_number") == sv["account_number"]), None)
+        or next((r for r in results if r.get("id") == sv["uid"]), None)
+        or (results[0] if len(results) == 1 else None)
+    )
+    if not match:
+        await message.reply_text(
+            f"⚠️ Could not uniquely identify *{sv['name']}* from search results.\n"
+            "Use 🔍 Search new valuer to select manually.",
+            parse_mode="Markdown", reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
+    user_data = _fetch_staff_detail(rt, match)
+
+    sd   = user_data.get("staff_details", {})
+    name = " ".join(filter(None, [sd.get("firstname"), sd.get("middlename"), sd.get("lastname")]))
+
+    ok, err_msg, task_type, registry, county = _validate_staff(user_data)
+    if not ok:
+        await message.reply_text(
+            f"❌ *Validation failed for {name}:*\n{err_msg}",
+            parse_mode="Markdown", reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
+    rt.staff_data     = user_data
+    rt.staff_registry = registry
+    rt.staff_county   = county
+
+    sd_roles    = sd.get("roles") or []
+    role_labels = ", ".join(r.get("rolename", "") for r in sd_roles) or "None"
+
+    if task_type == "BOTH":
+        await message.reply_text(
+            f"✅ *Staff Validated*\n\n"
+            f"*Name:* {name}\n"
+            f"*Roles:* {role_labels}\n"
+            f"*County:* {county}  |  *Registry:* {registry}\n\n"
+            "Step 3 — Which task pool do you want to assign from?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏛 Stamp Duty (national, from_ardhipay=false)",
+                                      callback_data="rt_type:STAMP_DUTY")],
+                [InlineKeyboardButton("🏙 County Stamp Duty (from_ardhipay=true)",
+                                      callback_data="rt_type:COUNTY_STAMP_DUTY")],
+            ]),
+        )
+        return RS.TASK_TYPE
+
+    rt.task_type = task_type
+    type_label   = "County Stamp Duty" if task_type == "COUNTY_STAMP_DUTY" else "Stamp Duty"
+    await message.reply_text(
+        f"✅ *Staff Validated*\n\n"
+        f"*Name:* {name}\n"
+        f"*Task Type:* {type_label}\n"
+        f"*Roles:* {role_labels}\n\n"
+        "Step 3 — How many tasks do you want to assign?",
+        parse_mode="Markdown",
+    )
+    return RS.TASK_COUNT
+
+
 async def _rt_do_staff_search(message, rt: RTSession) -> int:
     """Search the accounts endpoint and show a selection keyboard."""
     try:
@@ -1676,13 +1769,59 @@ async def _rt_fetch_and_show(message, rt: RTSession) -> int:
 async def cmd_receive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     ctx.user_data["rt_session"] = RTSession()
+    saved = load_saved_valuers()
+
     await update.message.reply_text(
-        "📥 *Receive Tasks Flow*\n\n"
-        "Step 1 — Enter the staff member's name to search:",
+        "📥 *Receive Tasks Flow*\n\nStep 1 — Select a valuer or search for a new one:",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove(),
     )
+
+    if saved:
+        rows = [
+            [InlineKeyboardButton(f"👤 {sv['name']}", callback_data=f"rt_src:{i}")]
+            for i, sv in enumerate(saved)
+        ]
+        rows.append([InlineKeyboardButton("🔍 Search new valuer", callback_data="rt_src:new")])
+        await update.message.reply_text(
+            "Choose a saved valuer or search new:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return RS.PICK_STAFF_SOURCE
+
+    # No saved valuers — go straight to name search
+    await update.message.reply_text(
+        "Enter the staff member's name to search:",
+        parse_mode="Markdown",
+    )
     return RS.STAFF_NAME
+
+
+async def recv_rt_pick_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    rt   = _get_rt(ctx)
+    data = query.data.split(":")[1]
+
+    if data == "new":
+        await query.edit_message_text(
+            "🔍 Enter the staff member's name to search:",
+            parse_mode="Markdown",
+        )
+        return RS.STAFF_NAME
+
+    saved = load_saved_valuers()
+    sv    = saved[int(data)]
+    rt.saved_valuer = sv
+    rt.staff_name   = sv["name"]
+
+    await query.edit_message_text(
+        f"👤 Selected: *{sv['name']}*\n\n"
+        "Step 2 — Choose *credential profile*:",
+        parse_mode="Markdown",
+        reply_markup=_cred_keyboard(),
+    )
+    return RS.CHOOSE_CRED
 
 
 async def recv_rt_staff_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1710,6 +1849,13 @@ async def recv_rt_cred_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if cached:
         rt.tokens  = cached
         rt.session = build_session()
+        if rt.saved_valuer:
+            await query.edit_message_text(
+                f"🔑 Cached login: *{CRED_LABELS[cred_type]}*\n\n"
+                f"🔍 Fetching profile for *{rt.saved_valuer['name']}*…",
+                parse_mode="Markdown",
+            )
+            return await _rt_resolve_saved_valuer(query.message, rt)
         await query.edit_message_text(
             f"🔑 Cached login: *{CRED_LABELS[cred_type]}*\n\n"
             f"🔍 Searching for *{rt.staff_name}*…",
@@ -1775,6 +1921,8 @@ async def recv_rt_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return RS.WAIT_OTP
 
     await update.message.reply_text("✅ Authenticated!")
+    if rt.saved_valuer:
+        return await _rt_resolve_saved_valuer(update.message, rt)
     return await _rt_do_staff_search(update.message, rt)
 
 
@@ -2299,6 +2447,7 @@ def main():
         ],
         states={
             RS.STAFF_NAME:        [MessageHandler(not_cancel, recv_rt_staff_name)],
+            RS.PICK_STAFF_SOURCE: [CallbackQueryHandler(recv_rt_pick_source, pattern=r"^rt_src:")],
             RS.SELECT_STAFF:      [CallbackQueryHandler(recv_rt_select_staff, pattern=r"^rt_staff:")],
             RS.CHOOSE_CRED:       [CallbackQueryHandler(recv_rt_cred_choice, pattern=r"^cred:")],
             RS.WAIT_OTP:          [MessageHandler(not_cancel, recv_rt_otp)],
