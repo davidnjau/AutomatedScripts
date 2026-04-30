@@ -2477,10 +2477,11 @@ def _fetch_dlv_detail_one(http_sess, tokens: AuthTokens, task_id: str) -> Option
         return None
 
 
-def _load_implementor_tasks(tokens: AuthTokens) -> List[Dict]:
+def _load_implementor_tasks(tokens: AuthTokens) -> Tuple[List[Dict], int]:
     """
     Fetch all pending assessor tasks created in the last 10 days,
-    enrich each with detail fields, return sorted newest-first.
+    enrich each with detail fields, return (enriched_tasks, raw_count).
+    raw_count = total results seen before date filtering.
     """
     http_sess = build_session()
     cutoff = datetime.now(timezone.utc) - timedelta(days=10)
@@ -2491,28 +2492,27 @@ def _load_implementor_tasks(tokens: AuthTokens) -> List[Dict]:
     }
 
     candidates: List[Dict] = []
+    raw_count = 0
     page = 1
     while True:
-        try:
-            resp = http_sess.get(
-                f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/assessor",
-                headers=headers,
-                params={"filter": "Pending", "page": page, "search": ""},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logger.warning("impl list page %d failed: %s", page, e)
-            break
+        resp = http_sess.get(
+            f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/assessor",
+            headers=headers,
+            params={"filter": "Pending", "page": page, "search": ""},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
 
         results = data.get("results", [])
         if not results:
             break
 
+        raw_count += len(results)
         for task in results:
             dt = _parse_task_date(task.get("date_created", ""))
-            if dt and dt >= cutoff:
+            # Fail-open: include tasks whose date can't be parsed
+            if dt is None or dt >= cutoff:
                 candidates.append(task)
 
         if not data.get("next"):
@@ -2545,13 +2545,14 @@ def _load_implementor_tasks(tokens: AuthTokens) -> List[Dict]:
             })
 
     enriched.sort(key=lambda x: x["date_created"], reverse=True)
-    return enriched
+    return enriched, raw_count
 
 
-def _load_dlv_tasks(tokens: AuthTokens) -> List[Dict]:
+def _load_dlv_tasks(tokens: AuthTokens) -> Tuple[List[Dict], int]:
     """
     Fetch all pending DLV/VALUER tasks created in the last 2 days,
-    enrich each with detail fields, return sorted newest-first.
+    enrich each with detail fields, return (enriched_tasks, raw_count).
+    raw_count = total results seen before date filtering.
     """
     http_sess = build_session()
     cutoff = datetime.now(timezone.utc) - timedelta(days=2)
@@ -2562,31 +2563,30 @@ def _load_dlv_tasks(tokens: AuthTokens) -> List[Dict]:
     }
 
     candidates: List[Dict] = []
+    raw_count = 0
     page = 1
     while True:
-        try:
-            resp = http_sess.get(
-                f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
-                headers=headers,
-                params={
-                    "filter": "Pending", "role": "VALUER",
-                    "request_type": "STAMP_DUTY", "search": "", "page": page,
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logger.warning("DLV list page %d failed: %s", page, e)
-            break
+        resp = http_sess.get(
+            f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
+            headers=headers,
+            params={
+                "filter": "Pending", "role": "VALUER",
+                "request_type": "STAMP_DUTY", "search": "", "page": page,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
 
         results = data.get("results", [])
         if not results:
             break
 
+        raw_count += len(results)
         for task in results:
             dt = _parse_task_date(task.get("date_created", ""))
-            if dt and dt >= cutoff:
+            # Fail-open: include tasks whose date can't be parsed
+            if dt is None or dt >= cutoff:
                 candidates.append(task)
 
         if not data.get("next"):
@@ -2616,7 +2616,7 @@ def _load_dlv_tasks(tokens: AuthTokens) -> List[Dict]:
             })
 
     enriched.sort(key=lambda x: x["date_created"], reverse=True)
-    return enriched
+    return enriched, raw_count
 
 
 def _tasks_keyboard(tasks: List[Dict], checked: set, prefix: str) -> InlineKeyboardMarkup:
@@ -2658,7 +2658,7 @@ async def cmd_impl_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⏳ Fetching Implementor Tasks (last 10 days)…")
     try:
-        tasks = _load_implementor_tasks(tokens)
+        tasks, raw_count = _load_implementor_tasks(tokens)
     except Exception as e:
         await update.message.reply_text(
             f"❌ Failed to fetch tasks: `{e}`", parse_mode="Markdown", reply_markup=_main_menu()
@@ -2667,7 +2667,9 @@ async def cmd_impl_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not tasks:
         await update.message.reply_text(
-            "ℹ️ No pending implementor tasks in the last 10 days.",
+            f"ℹ️ No pending implementor tasks in the last 10 days.\n"
+            f"_(API returned {raw_count} total result(s) before date filter)_",
+            parse_mode="Markdown",
             reply_markup=_main_menu(),
         )
         return
@@ -2676,6 +2678,7 @@ async def cmd_impl_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["impl_checked"] = set()
     await update.message.reply_text(
         f"📊 *Implementor Tasks* — {len(tasks)} task(s) in last 10 days\n"
+        f"_(fetched {raw_count} total from API)_\n"
         "Tap any row to check/uncheck:",
         parse_mode="Markdown",
         reply_markup=_tasks_keyboard(tasks, set(), "impl_ck"),
@@ -2696,7 +2699,7 @@ async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⏳ Fetching DLV Tasks (last 2 days)…")
     try:
-        tasks = _load_dlv_tasks(tokens)
+        tasks, raw_count = _load_dlv_tasks(tokens)
     except Exception as e:
         await update.message.reply_text(
             f"❌ Failed to fetch tasks: `{e}`", parse_mode="Markdown", reply_markup=_main_menu()
@@ -2705,7 +2708,9 @@ async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not tasks:
         await update.message.reply_text(
-            "ℹ️ No pending DLV tasks in the last 2 days.",
+            f"ℹ️ No pending DLV tasks in the last 2 days.\n"
+            f"_(API returned {raw_count} total result(s) before date filter)_",
+            parse_mode="Markdown",
             reply_markup=_main_menu(),
         )
         return
@@ -2714,6 +2719,7 @@ async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["dlv_checked"] = set()
     await update.message.reply_text(
         f"📋 *DLV Tasks* — {len(tasks)} task(s) in last 2 days\n"
+        f"_(fetched {raw_count} total from API)_\n"
         "Tap any row to check/uncheck:",
         parse_mode="Markdown",
         reply_markup=_tasks_keyboard(tasks, set(), "dlv_ck"),
@@ -2734,7 +2740,7 @@ async def recv_impl_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await query.edit_message_text("⏳ Refreshing Implementor Tasks…")
         try:
-            tasks = _load_implementor_tasks(tokens)
+            tasks, raw_count = _load_implementor_tasks(tokens)
         except Exception as e:
             await query.edit_message_text(f"❌ Refresh failed: {e}")
             return
@@ -2743,6 +2749,7 @@ async def recv_impl_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["impl_checked"] = checked
         await query.edit_message_text(
             f"📊 *Implementor Tasks* — {len(tasks)} task(s) in last 10 days\n"
+            f"_(fetched {raw_count} total from API)_\n"
             "Tap any row to check/uncheck:",
             parse_mode="Markdown",
             reply_markup=_tasks_keyboard(tasks, checked, "impl_ck"),
@@ -2788,7 +2795,7 @@ async def recv_dlv_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await query.edit_message_text("⏳ Refreshing DLV Tasks…")
         try:
-            tasks = _load_dlv_tasks(tokens)
+            tasks, raw_count = _load_dlv_tasks(tokens)
         except Exception as e:
             await query.edit_message_text(f"❌ Refresh failed: {e}")
             return
@@ -2797,6 +2804,7 @@ async def recv_dlv_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["dlv_checked"] = checked
         await query.edit_message_text(
             f"📋 *DLV Tasks* — {len(tasks)} task(s) in last 2 days\n"
+            f"_(fetched {raw_count} total from API)_\n"
             "Tap any row to check/uncheck:",
             parse_mode="Markdown",
             reply_markup=_tasks_keyboard(tasks, checked, "dlv_ck"),
