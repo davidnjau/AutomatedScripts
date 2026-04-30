@@ -2422,17 +2422,21 @@ def _any_valid_tokens() -> Optional[AuthTokens]:
     return None
 
 
-def _parse_task_date(date_str: str) -> Optional[datetime]:
-    """Parse an ISO 8601 date string to an aware datetime (UTC)."""
-    if not date_str:
-        return None
-    try:
-        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        return None
+def _date_cutoff_str(days: int) -> str:
+    """Return a YYYY-MM-DD cutoff string for N days ago (UTC)."""
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def _within_days(date_created: str, cutoff: str) -> bool:
+    """
+    Compare date_created from the API response against a YYYY-MM-DD cutoff.
+    ISO date strings are lexicographically sortable, so simple string compare works.
+    If date_created is missing or unparseable, include the task (fail-open).
+    """
+    if not date_created:
+        return True
+    # Take only the date part (first 10 chars: YYYY-MM-DD) regardless of time/timezone suffix
+    return date_created[:10] >= cutoff
 
 
 def _fetch_impl_detail_one(http_sess, tokens: AuthTokens, task_id: str) -> Optional[Dict]:
@@ -2484,7 +2488,7 @@ def _load_implementor_tasks(tokens: AuthTokens) -> Tuple[List[Dict], int]:
     raw_count = total results seen before date filtering.
     """
     http_sess = build_session()
-    cutoff = datetime.now(timezone.utc) - timedelta(days=10)
+    cutoff = _date_cutoff_str(10)
     headers = {
         "Authorization": f"Bearer {tokens.access_token}",
         "JWTAUTH":       f"Bearer {tokens.jwt}",
@@ -2510,9 +2514,7 @@ def _load_implementor_tasks(tokens: AuthTokens) -> Tuple[List[Dict], int]:
 
         raw_count += len(results)
         for task in results:
-            dt = _parse_task_date(task.get("date_created", ""))
-            # Fail-open: include tasks whose date can't be parsed
-            if dt is None or dt >= cutoff:
+            if _within_days(task.get("date_created", ""), cutoff):
                 candidates.append(task)
 
         if not data.get("next"):
@@ -2555,7 +2557,7 @@ def _load_dlv_tasks(tokens: AuthTokens) -> Tuple[List[Dict], int]:
     raw_count = total results seen before date filtering.
     """
     http_sess = build_session()
-    cutoff = datetime.now(timezone.utc) - timedelta(days=2)
+    cutoff = _date_cutoff_str(2)
     headers = {
         "Authorization": f"Bearer {tokens.access_token}",
         "JWTAUTH":       f"Bearer {tokens.jwt}",
@@ -2584,9 +2586,7 @@ def _load_dlv_tasks(tokens: AuthTokens) -> Tuple[List[Dict], int]:
 
         raw_count += len(results)
         for task in results:
-            dt = _parse_task_date(task.get("date_created", ""))
-            # Fail-open: include tasks whose date can't be parsed
-            if dt is None or dt >= cutoff:
+            if _within_days(task.get("date_created", ""), cutoff):
                 candidates.append(task)
 
         if not data.get("next"):
