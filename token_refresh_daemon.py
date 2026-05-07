@@ -6,16 +6,19 @@ Always-on daemon that monitors data/saved_tokens.json and automatically
 re-authenticates every credential profile before its token expires.
 
 Refresh strategy (in order):
-  1. Try POST /auth/refresh (silent, no OTP) — works if the API supports it.
-  2. If that fails, do the full re-auth flow automatically:
+  1. Try POST /auth/refresh (silent, no OTP required).
+  2. If that fails, start the full re-auth flow:
        a. POST /login  → the API sends an OTP to the registered device.
-       b. Send a Telegram message to every ALLOWED_TELEGRAM_ID asking for the OTP.
-       c. Wait for the user to reply with the OTP (polls Telegram getUpdates).
-       d. POST /otpverify → save fresh tokens to cache.
+       b. Write {cred_type: {triggered_at, cookies}} to data/pending_otp.json
+          so the bot can complete the OTP step.
+       c. Broadcast a Telegram message asking the user to send `/otp CODE`
+          directly in the bot chat.
+       d. The bot's /otp command handler calls POST /otpverify and saves tokens.
 
-The daemon sends one Telegram message per credential per expiry window.
-OTP replies are matched to the oldest pending login request.
-Pending logins time out after OTP_TIMEOUT seconds (default 5 min).
+NOTE: The daemon does NOT poll Telegram getUpdates.  Both the main bot and
+this daemon share the same bot token; if both polled getUpdates they would
+compete for updates and OTP replies would be lost.  File-based IPC avoids
+this conflict entirely.
 
 Usage:
     python token_refresh_daemon.py              # foreground
@@ -30,7 +33,6 @@ import base64
 import json
 import logging
 import os
-import re
 import signal
 import sys
 import time
@@ -56,14 +58,14 @@ load_dotenv()
 # ──────────────────────────────────────────────────────────
 # Paths & config
 # ──────────────────────────────────────────────────────────
-_BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-CACHE_FILE     = os.path.join(_BASE_DIR, "data", "saved_tokens.json")
-PID_FILE       = os.path.join(_BASE_DIR, "data", "daemon.pid")
-LOG_FILE       = os.path.join(_BASE_DIR, "data", "daemon.log")
+_BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+CACHE_FILE       = os.path.join(_BASE_DIR, "data", "saved_tokens.json")
+PENDING_OTP_FILE = os.path.join(_BASE_DIR, "data", "pending_otp.json")
+PID_FILE         = os.path.join(_BASE_DIR, "data", "daemon.pid")
+LOG_FILE         = os.path.join(_BASE_DIR, "data", "daemon.log")
 
 REFRESH_BEFORE = 10 * 60   # act when token expires within this many seconds
 POLL_INTERVAL  = 60        # seconds between token checks
-TG_POLL_TIMEOUT = 20       # seconds for Telegram long-poll per iteration
 OTP_TIMEOUT    = 5 * 60    # seconds before a pending OTP request is abandoned
 
 TELEGRAM_API   = "https://api.telegram.org"
@@ -106,13 +108,10 @@ logger.addHandler(_sh)
 # HTTP helpers
 # ──────────────────────────────────────────────────────────
 def _api_session() -> requests.Session:
-    """requests.Session with retry + browser headers for the Ardhisasa API."""
-    sess   = build_session()
-    return sess
+    return build_session()
 
 
 def _tg_session() -> requests.Session:
-    """Lightweight session for Telegram API calls."""
     sess  = requests.Session()
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503])
     sess.mount("https://", HTTPAdapter(max_retries=retry))
@@ -150,60 +149,44 @@ def _fmt_ts(ts: float) -> str:
 
 
 # ──────────────────────────────────────────────────────────
-# Telegram helpers
+# Pending-OTP file helpers  (file-based IPC with bot.py)
 # ──────────────────────────────────────────────────────────
-def _tg_send(tg: requests.Session, chat_id: int, text: str) -> Optional[int]:
-    """Send a message; returns the message_id or None on failure."""
+def _load_pending_otp() -> Dict:
+    try:
+        with open(PENDING_OTP_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_pending_otp(data: Dict) -> None:
+    os.makedirs(os.path.dirname(PENDING_OTP_FILE), exist_ok=True)
+    with open(PENDING_OTP_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+# ──────────────────────────────────────────────────────────
+# Telegram helper (send only — no getUpdates)
+# ──────────────────────────────────────────────────────────
+def _tg_send(tg: requests.Session, chat_id: int, text: str) -> None:
     try:
         resp = tg.post(
             f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
             timeout=15,
         )
-        if resp.ok:
-            return resp.json().get("result", {}).get("message_id")
-        logger.warning("Telegram send failed for %s: %s", chat_id, resp.text[:200])
+        if not resp.ok:
+            logger.warning("Telegram send failed for %s: %s", chat_id, resp.text[:200])
     except Exception as e:
         logger.warning("Telegram error for %s: %s", chat_id, e)
-    return None
 
 
 def _tg_broadcast(tg: requests.Session, text: str) -> None:
     if not BOT_TOKEN:
-        logger.warning("TELEGRAM_BOT_TOKEN not set — cannot send message.")
+        logger.warning("TELEGRAM_BOT_TOKEN not set — cannot send Telegram message.")
         return
     for chat_id in ALLOWED_IDS:
         _tg_send(tg, chat_id, text)
-
-
-def _tg_get_updates(tg: requests.Session, offset: int, timeout: int) -> Tuple[List[Dict], int]:
-    """
-    Long-poll Telegram for new updates.
-    Returns (updates, new_offset).
-    """
-    try:
-        resp = tg.get(
-            f"{TELEGRAM_API}/bot{BOT_TOKEN}/getUpdates",
-            params={"offset": offset, "timeout": timeout, "allowed_updates": ["message"]},
-            timeout=timeout + 10,
-        )
-        if not resp.ok:
-            return [], offset
-        updates = resp.json().get("result", [])
-        if updates:
-            offset = updates[-1]["update_id"] + 1
-        return updates, offset
-    except Exception as e:
-        logger.debug("getUpdates error: %s", e)
-        return [], offset
-
-
-def _tg_skip_pending(tg: requests.Session, offset: int) -> int:
-    """Consume all queued updates on startup so old messages are ignored."""
-    updates, new_offset = _tg_get_updates(tg, offset, timeout=0)
-    if new_offset != offset:
-        logger.info("Skipped %d queued Telegram update(s).", len(updates))
-    return new_offset
 
 
 # ──────────────────────────────────────────────────────────
@@ -214,9 +197,7 @@ def _try_silent_refresh(
     access_token: str,
     jwt_token: str,
 ) -> Optional[Tuple[str, str]]:
-    """
-    POST /auth/refresh. Returns (new_access_token, new_jwt) or None.
-    """
+    """POST /auth/refresh. Returns (new_access_token, new_jwt) or None."""
     try:
         resp = api.post(
             f"{AUTH_BASE_URL}/refresh",
@@ -240,24 +221,25 @@ def _try_silent_refresh(
 
 
 # ──────────────────────────────────────────────────────────
-# Full re-auth (login → wait for OTP → verify)
+# Full re-auth — trigger login and hand off OTP to the bot
 # ──────────────────────────────────────────────────────────
-def _trigger_login(
+def _trigger_login_for_bot(
     api:       requests.Session,
     tg:        requests.Session,
     cred_type: str,
-) -> Optional[requests.Session]:
+) -> bool:
     """
-    POST /login for cred_type. Broadcasts an OTP prompt via Telegram.
-    Returns the api session to use for /otpverify, or None on login failure.
+    POST /login for cred_type, write to pending_otp.json so the bot can
+    complete the OTP step via the /otp command.
+    Returns True if login was triggered successfully.
     """
     creds = CRED_MAP.get(cred_type)
     if not creds:
         logger.error("[%s] No credentials found.", cred_type)
-        return None
+        return False
 
     label = CRED_LABELS.get(cred_type, cred_type)
-    logger.info("[%s] Triggering login (OTP flow)…", cred_type)
+    logger.info("[%s] Triggering login — OTP will be completed via bot /otp command.", cred_type)
 
     try:
         resp = api.post(
@@ -278,49 +260,32 @@ def _trigger_login(
         logger.error("[%s] Login failed: %s", cred_type, e)
         _tg_broadcast(
             tg,
-            f"❌ *Auto-refresh failed for {label}*\n\n"
-            f"Login error: `{e}`\n\n"
-            f"Please tap *🔑 Refresh Auth* to re-authenticate manually.",
+            f"❌ *Auto-refresh login failed for {label}*\n\n"
+            f"Error: `{e}`\n\n"
+            f"Please tap *🔑 Refresh Auth* in the bot to re-authenticate manually.",
         )
-        return None
+        return False
+
+    # Store cookie state so the bot can resume the session for /otpverify
+    cookies = dict(api.cookies)
+    pending = _load_pending_otp()
+    pending[cred_type] = {
+        "triggered_at": time.time(),
+        "cookies":      cookies,
+    }
+    _save_pending_otp(pending)
 
     logger.info("[%s] Login OK — OTP dispatched to registered device.", cred_type)
     _tg_broadcast(
         tg,
         f"🔐 *OTP Required — {label}*\n\n"
         f"An OTP has been sent to the registered device.\n\n"
-        f"Please *reply with the OTP code* to complete the token refresh.",
+        f"Reply with:\n"
+        f"`/otp YOUR_CODE`\n\n"
+        f"_(e.g._ `/otp 123456`_)_\n\n"
+        f"Or tap *🔑 Refresh Auth* to handle it manually.",
     )
-    return api
-
-
-def _verify_otp(
-    api:       requests.Session,
-    cred_type: str,
-    otp:       str,
-) -> Optional[Tuple[str, str]]:
-    """POST /otpverify. Returns (access_token, jwt) or None."""
-    creds = CRED_MAP[cred_type]
-    try:
-        resp = api.post(
-            f"{AUTH_BASE_URL}/otpverify",
-            json={
-                "username": creds["username"],
-                "password": creds["password"],
-                "otpcode":  otp.strip(),
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data         = resp.json()
-        access_token = data.get("details", {}).get("access_token")
-        jwt_token    = data.get("details", {}).get("jwt")
-        if access_token and jwt_token:
-            return access_token, jwt_token
-        logger.warning("[%s] OTP verify response missing tokens. Keys: %s", cred_type, list(data.keys()))
-    except Exception as e:
-        logger.warning("[%s] OTP verify error: %s", cred_type, e)
-    return None
+    return True
 
 
 # ──────────────────────────────────────────────────────────
@@ -335,9 +300,32 @@ def _handle_signal(sig, _frame):
     _stop = True
 
 
+def _kill_previous_instance() -> None:
+    """Kill any previously running daemon instance recorded in the PID file."""
+    try:
+        with open(PID_FILE) as f:
+            old_pid = int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        return
+
+    if old_pid == os.getpid():
+        return
+
+    try:
+        os.kill(old_pid, signal.SIGTERM)
+        logger.info("Sent SIGTERM to previous daemon instance (PID %d).", old_pid)
+        time.sleep(1)
+    except ProcessLookupError:
+        pass   # already gone
+    except Exception as e:
+        logger.warning("Could not stop previous daemon (PID %d): %s", old_pid, e)
+
+
 def run() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT,  _handle_signal)
+
+    _kill_previous_instance()
 
     os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
     with open(PID_FILE, "w") as f:
@@ -346,50 +334,52 @@ def run() -> None:
     api_sess = _api_session()
     tg_sess  = _tg_session()
 
-    # pending_otp: {cred_type: {"session": requests.Session, "login_time": float}}
-    pending_otp: Dict[str, Dict] = {}
-    # alerted: {cred_type: expiry_bucket} — prevents repeated login triggers per expiry
+    # alerted: {cred_type: expiry_bucket} — prevents repeated login triggers per expiry window
     alerted: Dict[str, int] = {}
-    tg_offset = 0
 
     logger.info("=" * 60)
     logger.info("Token refresh daemon started  (PID %d)", os.getpid())
     logger.info("Cache     : %s", CACHE_FILE)
+    logger.info("Pending   : %s", PENDING_OTP_FILE)
     logger.info("Refresh   : %d min before expiry", REFRESH_BEFORE // 60)
     logger.info("Poll      : every %d s", POLL_INTERVAL)
+    logger.info("OTP mode  : file-based IPC — user sends /otp CODE in bot chat")
     logger.info("=" * 60)
-
-    if BOT_TOKEN:
-        tg_offset = _tg_skip_pending(tg_sess, tg_offset)
-    else:
-        logger.warning("TELEGRAM_BOT_TOKEN not set — OTP prompts will not be sent.")
 
     last_token_check = 0.0
 
     while not _stop:
         now = time.time()
 
-        # ── 1. Check token cache every POLL_INTERVAL ──────
         if now - last_token_check >= POLL_INTERVAL:
             last_token_check = now
             cache         = _load_cache()
             cache_changed = False
+            pending_otp   = _load_pending_otp()
+            pending_changed = False
 
-            # Prune pending_otp entries that have timed out
+            # ── Prune timed-out pending OTP entries ───────
             for ct in list(pending_otp):
-                age = now - pending_otp[ct]["login_time"]
+                age = now - pending_otp[ct].get("triggered_at", 0)
                 if age > OTP_TIMEOUT:
-                    logger.warning("[%s] OTP not received within %ds — abandoning.", ct, OTP_TIMEOUT)
+                    logger.warning(
+                        "[%s] OTP not submitted within %d min — clearing pending entry.",
+                        ct, OTP_TIMEOUT // 60,
+                    )
                     _tg_broadcast(
                         tg_sess,
                         f"⏰ *OTP timed out for {CRED_LABELS.get(ct, ct)}*\n\n"
-                        f"No OTP was received within {OTP_TIMEOUT // 60} minutes.\n"
-                        f"The daemon will retry on the next check.",
+                        f"No `/otp` response received within {OTP_TIMEOUT // 60} minutes.\n"
+                        f"The daemon will retry on the next check cycle.",
                     )
                     del pending_otp[ct]
-                    # Clear alerted so the next cycle re-triggers
-                    alerted.pop(ct, None)
+                    pending_changed = True
+                    alerted.pop(ct, None)   # allow re-trigger next cycle
 
+            if pending_changed:
+                _save_pending_otp(pending_otp)
+
+            # ── Check each cached credential ──────────────
             for cred_type, entry in list(cache.items()):
                 if cred_type in pending_otp:
                     logger.debug("[%s] OTP pending — skipping token check.", cred_type)
@@ -419,12 +409,10 @@ def run() -> None:
                     continue
 
                 if secs_left <= 0:
-                    status_line = f"*Expired at:* {_fmt_ts(exp)}"
-                    log_msg     = "already expired"
+                    log_msg = f"already expired ({_fmt_ts(exp)})"
                 else:
-                    mins_left   = max(int(secs_left // 60), 0)
-                    status_line = f"*Expires in:* {mins_left} min ({_fmt_ts(exp)})"
-                    log_msg     = f"expiring in {mins_left}m"
+                    mins_left = max(int(secs_left // 60), 0)
+                    log_msg   = f"expiring in {mins_left}m ({_fmt_ts(exp)})"
 
                 logger.info("[%s] Token %s — attempting refresh…", cred_type, log_msg)
 
@@ -438,92 +426,31 @@ def run() -> None:
                         "jwt":          new_jwt,
                         "expires_at":   new_exp,
                     }
-                    cache_changed        = True
-                    alerted[cred_type]   = int(new_exp // 60)
+                    cache_changed      = True
+                    alerted[cred_type] = int(new_exp // 60)
                     logger.info("[%s] ✅ Silent refresh OK. New expiry: %s", cred_type, _fmt_ts(new_exp))
                     _tg_broadcast(
                         tg_sess,
-                        f"✅ *Token refreshed automatically*\n\n"
+                        f"✅ *Token auto-refreshed*\n\n"
                         f"*Profile:* {label}\n"
                         f"*New expiry:* {_fmt_ts(new_exp)}",
                     )
                     continue
 
-                # ── b. Full OTP re-auth ────────────────────
-                login_sess = _trigger_login(api_sess, tg_sess, cred_type)
-                if login_sess:
-                    pending_otp[cred_type] = {
-                        "session":    login_sess,
-                        "login_time": now,
-                    }
-                alerted[cred_type] = bucket
+                # ── b. Full OTP re-auth via bot /otp ──────
+                triggered = _trigger_login_for_bot(api_sess, tg_sess, cred_type)
+                alerted[cred_type] = bucket   # prevent re-trigger until timeout clears it
 
             if cache_changed:
                 _save_cache(cache)
 
-        # ── 2. Poll Telegram for OTP replies ──────────────
-        if not BOT_TOKEN or not pending_otp:
-            # Nothing to wait for — short sleep then re-check tokens
-            for _ in range(min(10, max(1, int(POLL_INTERVAL - (time.time() - last_token_check))))):
-                if _stop:
-                    break
-                time.sleep(1)
-            continue
-
-        updates, tg_offset = _tg_get_updates(tg_sess, tg_offset, timeout=TG_POLL_TIMEOUT)
-
-        for update in updates:
-            msg = update.get("message", {})
-            if not msg:
-                continue
-            sender_id = msg.get("from", {}).get("id")
-            if ALLOWED_IDS and sender_id not in ALLOWED_IDS:
-                continue
-            text = (msg.get("text") or "").strip()
-            chat_id = msg.get("chat", {}).get("id")
-
-            # Accept any 4-8 digit string as OTP
-            if not re.fullmatch(r"\d{4,8}", text):
-                continue
-
-            if not pending_otp:
-                _tg_send(tg_sess, chat_id, "ℹ️ No pending OTP request at this time.")
-                continue
-
-            # Pick the oldest pending cred_type
-            cred_type = min(pending_otp, key=lambda c: pending_otp[c]["login_time"])
-            label     = CRED_LABELS.get(cred_type, cred_type)
-            sess      = pending_otp[cred_type]["session"]
-
-            logger.info("[%s] Received OTP from chat_id=%s — verifying…", cred_type, chat_id)
-            result = _verify_otp(sess, cred_type, text)
-
-            if result:
-                access_token, jwt_token = result
-                new_exp = _decode_exp(jwt_token) or (time.time() + 3600)
-                cache   = _load_cache()
-                cache[cred_type] = {
-                    "access_token": access_token,
-                    "jwt":          jwt_token,
-                    "expires_at":   new_exp,
-                }
-                _save_cache(cache)
-                alerted[cred_type] = int(new_exp // 60)
-                del pending_otp[cred_type]
-                logger.info("[%s] ✅ Re-authenticated. New expiry: %s", cred_type, _fmt_ts(new_exp))
-                _tg_send(
-                    tg_sess, chat_id,
-                    f"✅ *Re-authenticated successfully!*\n\n"
-                    f"*Profile:* {label}\n"
-                    f"*Token expires:* {_fmt_ts(new_exp)}",
-                )
-            else:
-                logger.warning("[%s] OTP verification failed.", cred_type)
-                _tg_send(
-                    tg_sess, chat_id,
-                    f"❌ *Invalid OTP for {label}*\n\n"
-                    f"Please reply with the correct OTP code, or tap *🛑 Cancel* to abort.",
-                )
+        # Sleep between checks
+        elapsed = time.time() - last_token_check
+        sleep_for = max(1, POLL_INTERVAL - elapsed)
+        for _ in range(int(sleep_for)):
+            if _stop:
+                break
+            time.sleep(1)
 
     logger.info("Token refresh daemon stopped.")
     try:
