@@ -319,21 +319,23 @@ CRED_LABELS = {
 # ──────────────────────────────────────────────────────────
 # Main menu button labels & keyboard
 # ──────────────────────────────────────────────────────────
-BTN_ASSIGN      = "📋 New Assignment"
-BTN_RECEIVE     = "📥 Receive Tasks"
-BTN_AUTH        = "🔑 Refresh Auth"
-BTN_DAEMON      = "🔄 Token Daemon"
-BTN_VALUERS     = "👥 Saved Valuers"
-BTN_DELETE      = "🗑 Delete Valuer"
-BTN_IMPL_TASKS  = "📊 Implementor Tasks"
-BTN_DLV_TASKS   = "📋 DLV Tasks"
-BTN_HELP        = "❓ Help"
-BTN_CANCEL      = "🛑 Cancel"
+BTN_ASSIGN        = "📋 New Assignment"
+BTN_RECEIVE       = "📥 Receive Tasks"
+BTN_AUTH          = "🔑 Refresh Auth"
+BTN_TOKEN_STATUS  = "🔒 Token Status"
+BTN_DAEMON        = "🔄 Token Daemon"
+BTN_VALUERS       = "👥 Saved Valuers"
+BTN_DELETE        = "🗑 Delete Valuer"
+BTN_IMPL_TASKS    = "📊 Implementor Tasks"
+BTN_DLV_TASKS     = "📋 DLV Tasks"
+BTN_HELP          = "❓ Help"
+BTN_CANCEL        = "🛑 Cancel"
 
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
     f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_RECEIVE)}|{re.escape(BTN_AUTH)}"
-    f"|{re.escape(BTN_DAEMON)}|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
+    f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_DAEMON)}"
+    f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
     f"|{re.escape(BTN_IMPL_TASKS)}|{re.escape(BTN_DLV_TASKS)}"
     f"|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
@@ -345,7 +347,8 @@ def _main_menu() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton(BTN_ASSIGN),      KeyboardButton(BTN_RECEIVE)],
             [KeyboardButton(BTN_IMPL_TASKS),  KeyboardButton(BTN_DLV_TASKS)],
-            [KeyboardButton(BTN_AUTH),        KeyboardButton(BTN_DAEMON)],
+            [KeyboardButton(BTN_AUTH),        KeyboardButton(BTN_TOKEN_STATUS)],
+            [KeyboardButton(BTN_DAEMON)],
             [KeyboardButton(BTN_VALUERS),     KeyboardButton(BTN_DELETE)],
             [KeyboardButton(BTN_HELP),        KeyboardButton(BTN_CANCEL)],
         ],
@@ -2388,6 +2391,42 @@ async def cmd_daemon(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_token_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+
+    raw   = _load_tokens_raw()
+    now   = time.time()
+    lines = []
+
+    for cred_type, label in CRED_LABELS.items():
+        entry = raw.get(cred_type)
+        if not entry:
+            lines.append(f"{label}\n  ⚫ No token cached")
+            continue
+
+        exp = entry.get("expires_at") or _jwt_exp(entry.get("jwt", ""))
+        if not exp:
+            lines.append(f"{label}\n  ⚠️ Expiry unreadable")
+            continue
+
+        secs_left = exp - now
+        exp_str   = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        if secs_left <= 0:
+            lines.append(f"{label}\n  🔴 Expired — {exp_str}")
+        elif secs_left < 10 * 60:
+            mins = int(secs_left // 60)
+            lines.append(f"{label}\n  🟡 Expires in {mins}m — {exp_str}")
+        else:
+            hrs  = int(secs_left // 3600)
+            mins = int((secs_left % 3600) // 60)
+            time_str = f"{hrs}h {mins}m" if hrs else f"{mins}m"
+            lines.append(f"{label}\n  🟢 Valid — expires in {time_str} ({exp_str})")
+
+    text = "🔒 *Token Status*\n\n" + "\n\n".join(lines)
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu())
+
+
 async def recv_daemon_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query  = update.callback_query
     await query.answer()
@@ -3318,8 +3357,9 @@ def main():
     # Button handlers outside an active conversation
     app.add_handler(CallbackQueryHandler(recv_delete_valuer,  pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(recv_daemon_action,  pattern=r"^daemon:"))
-    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_AUTH)}$"),        cmd_auth))
-    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DAEMON)}$"),      cmd_daemon))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_AUTH)}$"),         cmd_auth))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_TOKEN_STATUS)}$"), cmd_token_status))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DAEMON)}$"),       cmd_daemon))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"),        cmd_help))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_VALUERS)}$"),     cmd_valuers))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DELETE)}$"),      cmd_delete_valuer))
