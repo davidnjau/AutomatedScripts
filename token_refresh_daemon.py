@@ -2,165 +2,335 @@
 """
 token_refresh_daemon.py
 =======================
-Daemon that watches .ardhisasa_token_cache.json and silently refreshes
-each user's tokens 5 minutes before their JWT expires.
+Always-on daemon that monitors data/saved_tokens.json and keeps every
+credential profile authenticated.
 
-Reads the cache on startup — no manual token entry needed.
+Behaviour for each credential profile in the cache:
+  1. If the token expires in more than REFRESH_BEFORE (10 min) → no action.
+  2. If the token expires within REFRESH_BEFORE:
+       a. Try a silent refresh via POST /acl/api/v1/auth/refresh (no OTP needed
+          if the API supports it).  On success the cache is updated in-place.
+       b. If the refresh endpoint is not supported / fails → send a Telegram
+          alert to every ALLOWED_TELEGRAM_ID prompting the user to tap
+          🔑 Refresh Auth in the bot.
+  3. Each expiry window triggers at most one refresh / one alert (no spam).
 
 Usage:
-    # Run in the background (survives terminal closure)
-    nohup python token_refresh_daemon.py &
+    python token_refresh_daemon.py              # foreground
+    nohup python token_refresh_daemon.py &      # background
 
-    # Or in a dedicated terminal
-    python token_refresh_daemon.py
+The bot menu button "🔄 Token Daemon" launches this script as a subprocess
+and writes its PID to data/daemon.pid.
 
-    # Stop it
-    kill <pid>          # pid is printed on startup
+Environment variables (read from .env):
+    TELEGRAM_BOT_TOKEN       — required for Telegram alerts
+    ALLOWED_TELEGRAM_IDS     — comma-separated chat IDs to alert
 """
 
+import base64
 import json
 import logging
 import os
+import signal
 import sys
 import time
+from datetime import datetime, timezone
+from typing import Dict, Optional, Tuple
 
-from ardhisasa_auth import (
-    AuthTokens,
-    _CACHE_FILE,
-    _decode_jwt_exp,
-    _save_cached_tokens,
-    build_session,
-    refresh_tokens,
-)
+import requests
+from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+load_dotenv()
 
-REFRESH_BEFORE_EXPIRY = 5 * 60   # seconds — refresh this long before expiry
-POLL_INTERVAL         = 30       # seconds — how often to recheck after a refresh
+# ──────────────────────────────────────────────────────────
+# Paths & config
+# ──────────────────────────────────────────────────────────
+_BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
+CACHE_FILE     = os.path.join(_BASE_DIR, "data", "saved_tokens.json")
+PID_FILE       = os.path.join(_BASE_DIR, "data", "daemon.pid")
+LOG_FILE       = os.path.join(_BASE_DIR, "data", "daemon.log")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+REFRESH_BEFORE = 10 * 60   # seconds before expiry to act (10 minutes)
+POLL_INTERVAL  = 60        # seconds between cache checks
+
+AUTH_BASE_URL  = "https://ardhisasa-api.lands.go.ke/acl/api/v1/auth"
+TELEGRAM_API   = "https://api.telegram.org"
+
+BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+ALLOWED_IDS = [
+    int(x.strip())
+    for x in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",")
+    if x.strip()
+]
+
+CRED_LABELS: Dict[str, str] = {
+    "publicuser":   "👤 Public User",
+    "staff":        "🏢 ICT",
+    "staff2":       "🏢 Support Reg",
+    "staff_valuer": "🏢 Staff Valuer",
+}
+
+# ──────────────────────────────────────────────────────────
+# Logging — stdout + file
+# ──────────────────────────────────────────────────────────
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+
+_fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_fh.setFormatter(_fmt)
+_sh = logging.StreamHandler(sys.stdout)
+_sh.setFormatter(_fmt)
+
 logger = logging.getLogger("token_refresh_daemon")
+logger.setLevel(logging.INFO)
+logger.addHandler(_fh)
+logger.addHandler(_sh)
 
-# ---------------------------------------------------------------------------
-# Cache helpers
-# ---------------------------------------------------------------------------
 
-def _load_raw_cache() -> dict:
-    if not os.path.exists(_CACHE_FILE):
-        return {}
+# ──────────────────────────────────────────────────────────
+# HTTP session
+# ──────────────────────────────────────────────────────────
+def _build_session() -> requests.Session:
+    session = requests.Session()
+    retry   = Retry(
+        total=3,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.headers.update({
+        "Accept":           "application/json, text/plain, */*",
+        "Accept-Language":  "en-GB,en-US;q=0.9,en;q=0.8",
+        "Content-Type":     "application/json",
+        "Origin":           "https://ardhisasa.lands.go.ke",
+        "Referer":          "https://ardhisasa.lands.go.ke/",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/136.0.0.0 Safari/537.36"
+        ),
+    })
+    return session
+
+
+# ──────────────────────────────────────────────────────────
+# Token cache helpers
+# ──────────────────────────────────────────────────────────
+def _load_cache() -> Dict:
     try:
-        with open(_CACHE_FILE, "r") as f:
+        with open(CACHE_FILE) as f:
             return json.load(f)
-    except Exception as exc:
-        logger.warning("Could not read cache file: %s", exc)
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
-def _soonest_expiry(cache: dict) -> tuple:
-    """Return (username, exp_unix) for the entry whose JWT expires soonest."""
-    soonest_user = None
-    soonest_exp  = None
-    for username, entry in cache.items():
-        exp = _decode_jwt_exp(entry.get("jwt", ""))
-        if exp is None:
-            continue
-        if soonest_exp is None or exp < soonest_exp:
-            soonest_exp  = exp
-            soonest_user = username
-    return soonest_user, soonest_exp
+def _save_cache(cache: Dict) -> None:
+    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+    with open(CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2)
 
 
-# ---------------------------------------------------------------------------
-# Refresh logic
-# ---------------------------------------------------------------------------
+def _decode_exp(token: str) -> Optional[float]:
+    """Return the `exp` claim from a JWT, or None if undecodable."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (4 - len(payload) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
+    except Exception:
+        return None
 
-def _refresh_all_due(session, cache: dict) -> None:
-    """Refresh every entry whose token is due (within REFRESH_BEFORE_EXPIRY)."""
-    now = time.time()
-    for username, entry in cache.items():
-        exp = _decode_jwt_exp(entry.get("jwt", ""))
-        if exp is None:
-            continue
-        if (exp - now) > REFRESH_BEFORE_EXPIRY:
-            continue  # not due yet
 
-        rt = entry.get("refresh_token")
-        if not rt:
-            logger.warning("No refresh_token for '%s' — cannot refresh.", username)
-            continue
+def _fmt_exp(exp_ts: float) -> str:
+    return datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-        logger.info("Refreshing tokens for '%s' (expires in %.0fs)...", username, exp - now)
-        new_tokens = refresh_tokens(session, rt)
 
-        if new_tokens:
-            _save_cached_tokens(username, new_tokens)
-            new_exp = _decode_jwt_exp(new_tokens.jwt)
-            logger.info(
-                "Tokens refreshed for '%s'. New expiry: %s",
-                username,
-                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(new_exp)) if new_exp else "unknown",
+# ──────────────────────────────────────────────────────────
+# Silent token refresh
+# ──────────────────────────────────────────────────────────
+def _try_refresh(
+    session:      requests.Session,
+    access_token: str,
+    jwt_token:    str,
+) -> Optional[Tuple[str, str]]:
+    """
+    POST /auth/refresh with the current bearer tokens.
+    Returns (new_access_token, new_jwt) on success, None if unsupported or failed.
+    """
+    try:
+        resp = session.post(
+            f"{AUTH_BASE_URL}/refresh",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "JWTAUTH":       f"Bearer {jwt_token}",
+            },
+            json={},
+            timeout=30,
+        )
+        if resp.status_code not in (200, 201):
+            logger.debug("Refresh endpoint returned HTTP %s — likely unsupported.", resp.status_code)
+            return None
+        data      = resp.json()
+        new_at    = data.get("details", {}).get("access_token") or data.get("access_token")
+        new_jwt   = data.get("details", {}).get("jwt")          or data.get("jwt")
+        if new_at and new_jwt:
+            return new_at, new_jwt
+        logger.debug("Refresh response did not contain tokens. Keys: %s", list(data.keys()))
+    except Exception as e:
+        logger.debug("Refresh request error: %s", e)
+    return None
+
+
+# ──────────────────────────────────────────────────────────
+# Telegram alert
+# ──────────────────────────────────────────────────────────
+def _send_alert(session: requests.Session, text: str) -> None:
+    if not BOT_TOKEN:
+        logger.warning("TELEGRAM_BOT_TOKEN not set — skipping alert.")
+        return
+    if not ALLOWED_IDS:
+        logger.warning("ALLOWED_TELEGRAM_IDS not set — skipping alert.")
+        return
+    for chat_id in ALLOWED_IDS:
+        try:
+            resp = session.post(
+                f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+                timeout=15,
             )
-        else:
-            logger.warning(
-                "Refresh failed for '%s'. Token expires at %s — manual re-login may be required.",
-                username,
-                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)),
-            )
+            if resp.ok:
+                logger.info("Alert sent → chat_id=%s", chat_id)
+            else:
+                logger.warning("Telegram send failed for chat_id=%s: %s", chat_id, resp.text[:200])
+        except Exception as e:
+            logger.warning("Telegram error for chat_id=%s: %s", chat_id, e)
 
 
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────
 # Main loop
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────
+_stop = False
+
+
+def _handle_signal(sig, _frame):
+    global _stop
+    logger.info("Signal %s received — shutting down gracefully.", sig)
+    _stop = True
+
 
 def run() -> None:
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT,  _handle_signal)
+
+    # Write PID file so the bot can track/kill this process
+    os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    session = _build_session()
+
+    # alerted[cred_type] = expiry_bucket already handled (prevents re-alerting
+    # every 60 s for the same expiry window)
+    alerted: Dict[str, int] = {}
+
+    logger.info("=" * 60)
     logger.info("Token refresh daemon started  (PID %d)", os.getpid())
-    logger.info("Watching: %s", _CACHE_FILE)
-    logger.info("Will refresh tokens %d minutes before expiry.", REFRESH_BEFORE_EXPIRY // 60)
+    logger.info("Cache     : %s", CACHE_FILE)
+    logger.info("Refresh   : %d min before expiry", REFRESH_BEFORE // 60)
+    logger.info("Poll      : every %d s", POLL_INTERVAL)
+    logger.info("=" * 60)
 
-    session = build_session()
-
-    while True:
-        cache = _load_raw_cache()
+    while not _stop:
+        cache = _load_cache()
+        now   = time.time()
+        cache_changed = False
 
         if not cache:
-            logger.info("Cache is empty — rechecking in 60s.")
-            time.sleep(60)
-            continue
+            logger.debug("Cache empty — nothing to monitor.")
+        else:
+            for cred_type, entry in list(cache.items()):
+                access_token = entry.get("access_token", "")
+                jwt_token    = entry.get("jwt", "")
+                exp          = entry.get("expires_at") or _decode_exp(jwt_token)
+                label        = CRED_LABELS.get(cred_type, cred_type)
 
-        username, soonest_exp = _soonest_expiry(cache)
-        if soonest_exp is None:
-            logger.warning("No decodable JWT found in cache — rechecking in 60s.")
-            time.sleep(60)
-            continue
+                if not exp:
+                    logger.warning("[%s] Cannot decode expiry — skipping.", cred_type)
+                    continue
 
-        now        = time.time()
-        refresh_at = soonest_exp - REFRESH_BEFORE_EXPIRY
-        sleep_secs = max(refresh_at - now, POLL_INTERVAL)
+                secs_left = exp - now
 
-        logger.info(
-            "Next refresh for '%s' at %s (in %.0fm %.0fs)",
-            username,
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(refresh_at)),
-            sleep_secs // 60,
-            sleep_secs % 60,
-        )
+                if secs_left <= 0:
+                    logger.info("[%s] Token expired at %s.", cred_type, _fmt_exp(exp))
+                    continue
 
-        time.sleep(sleep_secs)
+                if secs_left > REFRESH_BEFORE:
+                    logger.debug(
+                        "[%s] OK — expires in %dm %ds (%s).",
+                        cred_type, int(secs_left // 60), int(secs_left % 60), _fmt_exp(exp),
+                    )
+                    continue
 
-        # Re-read cache after sleeping — tokens may have been updated externally
-        cache = _load_raw_cache()
-        _refresh_all_due(session, cache)
+                # ── Within refresh window ─────────────────────────
+                mins_left = max(int(secs_left // 60), 0)
+                # One-minute resolution bucket: only act once per expiry window
+                bucket = int(exp // 60)
+                if alerted.get(cred_type) == bucket:
+                    continue
+
+                logger.info(
+                    "[%s] Expiring in %d min (%s) — attempting silent refresh…",
+                    cred_type, mins_left, _fmt_exp(exp),
+                )
+
+                result = _try_refresh(session, access_token, jwt_token)
+
+                if result:
+                    new_access, new_jwt = result
+                    new_exp = _decode_exp(new_jwt) or (now + 3600)
+                    cache[cred_type] = {
+                        "access_token": new_access,
+                        "jwt":          new_jwt,
+                        "expires_at":   new_exp,
+                    }
+                    cache_changed = True
+                    alerted[cred_type] = int(new_exp // 60)
+                    logger.info(
+                        "[%s] ✅ Refreshed successfully. New expiry: %s",
+                        cred_type, _fmt_exp(new_exp),
+                    )
+                else:
+                    # Refresh not supported / failed — alert the user
+                    logger.warning(
+                        "[%s] Silent refresh unavailable. Sending Telegram alert.", cred_type
+                    )
+                    _send_alert(
+                        session,
+                        f"⚠️ *Token Expiring Soon*\n\n"
+                        f"*Profile:* {label}\n"
+                        f"*Expires at:* {_fmt_exp(exp)} (in {mins_left} min)\n\n"
+                        f"Tap *🔑 Refresh Auth* in the bot to re-authenticate before it expires.",
+                    )
+                    alerted[cred_type] = bucket
+
+        if cache_changed:
+            _save_cache(cache)
+
+        # Sleep in small increments so SIGTERM is handled promptly
+        for _ in range(POLL_INTERVAL):
+            if _stop:
+                break
+            time.sleep(1)
+
+    logger.info("Token refresh daemon stopped.")
+    try:
+        os.remove(PID_FILE)
+    except FileNotFoundError:
+        pass
 
 
 if __name__ == "__main__":
-    try:
-        run()
-    except KeyboardInterrupt:
-        logger.info("Token refresh daemon stopped.")
-        sys.exit(0)
+    run()
