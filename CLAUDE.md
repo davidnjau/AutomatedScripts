@@ -46,7 +46,8 @@ Three source files:
 - Reference numbers can be typed manually or extracted from photos via `pytesseract` + Claude Vision (Anthropic API) as fallback
 - Supports bulk assignment — one valuer to multiple reference numbers in a single flow
 - Detects already-assigned references before proceeding and asks the user whether to reassign
-- `CPARAMS_DLV` — base64-encoded `{"active_role":"DLV"}` header required for DLV task endpoints
+- Three `cparams` constants (base64-encoded role JSON sent as `cparams` header): `CPARAMS_DLV` (`{"active_role":"DLV"}`), `CPARAMS_ASSESSOR` (`{"active_role":"ASSESSOR_OF_STAMP_DUTY"}`), `CPARAMS_VALUER_ROLE` (`{"active_role":"VALUER"}`) — each required by the respective task endpoints
+- OCR pipeline in `ocr_extract_refs()`: tries `pytesseract` first, falls back to Claude Vision (`claude-opus-4-6`) if no refs found; reference numbers matched by `_REF_RE = r'\b[A-Z0-9]{2,}(?:/[A-Z0-9]{2,}){2,}\b'`
 - `CRED_MAP` / `CRED_LABELS` dicts in `bot.py` must be updated in sync with any credential changes in `ardhisasa_auth.py`
 
 **`token_refresh_daemon.py`** — Background token refresh daemon:
@@ -80,13 +81,14 @@ Three source files:
   → CHOOSE_CRED → WAIT_OTP (if needed)
   → TASK_TYPE: choose Stamp Duty vs County Stamp Duty (shown only when staff has both)
   → TASK_COUNT: how many tasks to pull
-  → AMOUNT_RANGE: set min/max amount filter (or skip)
+  → AMOUNT_RANGE: set min/max amount filter (Enter or Skip buttons)
+  → AMOUNT_TEXT: text input for min-max values (if Enter chosen)
   → SCHEDULE_CHOICE: run once or on an interval
   → SCHEDULE_INTERVAL: enter interval in minutes (if scheduled)
   → RT_CONFIRM → fetch + assign matching tasks → show results
 ```
 
-Menu buttons: `📋 New Assignment`, `📥 Receive Tasks`, `🔄 Token Daemon`, `👥 Saved Valuers`, `🗑 Delete Valuer`, `❓ Help`, `🛑 Cancel`.
+Menu buttons: `📋 New Assignment`, `📥 Receive Tasks`, `📊 Implementor Tasks`, `📋 DLV Tasks`, `🔄 Token Daemon`, `👥 Saved Valuers`, `🗑 Delete Valuer`, `❓ Help`, `🛑 Cancel`.
 
 ### Key API Endpoints
 

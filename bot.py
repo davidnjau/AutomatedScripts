@@ -281,6 +281,27 @@ class RTSession:
     schedule_interval_minutes: Optional[int] = None
 
 
+# ──────────────────────────────────────────────────────────
+# States — Refresh Auth conversation
+# ──────────────────────────────────────────────────────────
+class AS(Enum):
+    CHOOSE_CRED   = auto()
+    FORCE_CONFIRM = auto()
+    WAIT_OTP      = auto()
+
+
+@dataclass
+class AuthSession:
+    cred_type:    str = ""
+    http_session: Optional[requests.Session] = None
+
+
+def _get_auth_sess(ctx: ContextTypes.DEFAULT_TYPE) -> AuthSession:
+    if "auth_session" not in ctx.user_data:
+        ctx.user_data["auth_session"] = AuthSession()
+    return ctx.user_data["auth_session"]
+
+
 CRED_MAP = {
     "publicuser":   PUBLIC_CREDENTIALS,
     "staff":        STAFF_CREDENTIALS_ICT,
@@ -300,6 +321,7 @@ CRED_LABELS = {
 # ──────────────────────────────────────────────────────────
 BTN_ASSIGN      = "📋 New Assignment"
 BTN_RECEIVE     = "📥 Receive Tasks"
+BTN_AUTH        = "🔑 Refresh Auth"
 BTN_DAEMON      = "🔄 Token Daemon"
 BTN_VALUERS     = "👥 Saved Valuers"
 BTN_DELETE      = "🗑 Delete Valuer"
@@ -310,8 +332,8 @@ BTN_CANCEL      = "🛑 Cancel"
 
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
-    f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_RECEIVE)}|{re.escape(BTN_DAEMON)}"
-    f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
+    f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_RECEIVE)}|{re.escape(BTN_AUTH)}"
+    f"|{re.escape(BTN_DAEMON)}|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
     f"|{re.escape(BTN_IMPL_TASKS)}|{re.escape(BTN_DLV_TASKS)}"
     f"|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
@@ -323,7 +345,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton(BTN_ASSIGN),      KeyboardButton(BTN_RECEIVE)],
             [KeyboardButton(BTN_IMPL_TASKS),  KeyboardButton(BTN_DLV_TASKS)],
-            [KeyboardButton(BTN_DAEMON)],
+            [KeyboardButton(BTN_AUTH),        KeyboardButton(BTN_DAEMON)],
             [KeyboardButton(BTN_VALUERS),     KeyboardButton(BTN_DELETE)],
             [KeyboardButton(BTN_HELP),        KeyboardButton(BTN_CANCEL)],
         ],
@@ -3037,6 +3059,162 @@ async def handle_ta_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────
+# Refresh Auth — conversation handlers
+# ──────────────────────────────────────────────────────────
+
+def _auth_cred_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(CRED_LABELS["publicuser"],   callback_data="auth_cred:publicuser")],
+        [InlineKeyboardButton(CRED_LABELS["staff"],        callback_data="auth_cred:staff")],
+        [InlineKeyboardButton(CRED_LABELS["staff2"],       callback_data="auth_cred:staff2")],
+        [InlineKeyboardButton(CRED_LABELS["staff_valuer"], callback_data="auth_cred:staff_valuer")],
+        [InlineKeyboardButton("❌ Cancel",                 callback_data="auth_cred:cancel")],
+    ])
+
+
+async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    ctx.user_data["auth_session"] = AuthSession()
+    await update.message.reply_text(
+        "🔑 *Refresh Auth*\n\nSelect a credential profile to authenticate:",
+        parse_mode="Markdown",
+        reply_markup=_auth_cred_keyboard(),
+    )
+    return AS.CHOOSE_CRED
+
+
+async def recv_auth_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    cred_type = query.data.split(":")[1]
+
+    if cred_type == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    auth_sess           = _get_auth_sess(ctx)
+    auth_sess.cred_type = cred_type
+
+    cached = get_valid_tokens(cred_type)
+    if cached:
+        entry   = _load_tokens_raw().get(cred_type, {})
+        exp_ts  = entry.get("expires_at", 0)
+        exp_str = (
+            datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            if exp_ts else "unknown"
+        )
+        await query.edit_message_text(
+            f"✅ *{CRED_LABELS[cred_type]}* already has valid cached tokens.\n"
+            f"*Expires:* {exp_str}\n\n"
+            "Force a fresh login anyway?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Yes, re-authenticate", callback_data="auth_force:yes")],
+                [InlineKeyboardButton("✅ No, keep current",     callback_data="auth_force:no")],
+            ]),
+        )
+        return AS.FORCE_CONFIRM
+
+    # No valid tokens — go straight to login
+    return await _auth_trigger_login(query, auth_sess)
+
+
+async def recv_auth_force(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    auth_sess = _get_auth_sess(ctx)
+
+    if query.data.split(":")[1] == "no":
+        await query.edit_message_text(
+            f"✅ Keeping existing tokens for *{CRED_LABELS[auth_sess.cred_type]}*.",
+            parse_mode="Markdown",
+        )
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    return await _auth_trigger_login(query, auth_sess)
+
+
+async def _auth_trigger_login(query, auth_sess: AuthSession) -> int:
+    """Send the login request and transition to WAIT_OTP, or END on failure."""
+    creds = CRED_MAP[auth_sess.cred_type]
+    auth_sess.http_session = build_session()
+
+    await query.edit_message_text(
+        f"🔐 Sending login request for *{CRED_LABELS[auth_sess.cred_type]}*…",
+        parse_mode="Markdown",
+    )
+    try:
+        resp = auth_sess.http_session.post(
+            f"{AUTH_BASE_URL}/login",
+            json={"username": creds["username"], "password": creds["password"],
+                  "usertype": creds["usertype"], "otpcode": ""},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("success") is False and "error" in data:
+            raise RuntimeError(data.get("error") or data.get("message"))
+    except Exception as e:
+        await query.message.reply_text(
+            f"❌ Login failed: `{e}`\n\nUse the menu to retry.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
+    await query.message.reply_text(
+        "📲 OTP sent to the registered device.\n\nPlease *reply with the OTP code*:",
+        parse_mode="Markdown",
+    )
+    return AS.WAIT_OTP
+
+
+async def recv_auth_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    auth_sess = _get_auth_sess(ctx)
+    otp       = update.message.text.strip()
+    creds     = CRED_MAP[auth_sess.cred_type]
+
+    await update.message.reply_text("🔄 Verifying OTP…")
+    try:
+        resp = auth_sess.http_session.post(
+            f"{AUTH_BASE_URL}/otpverify",
+            json={"username": creds["username"], "password": creds["password"], "otpcode": otp},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data         = resp.json()
+        access_token = data.get("details", {}).get("access_token")
+        jwt          = data.get("details", {}).get("jwt")
+        if not access_token or not jwt:
+            raise RuntimeError(f"Tokens missing. Keys: {list(data.keys())}")
+
+        persist_tokens(auth_sess.cred_type, access_token, jwt)
+
+        exp_ts  = _jwt_exp(jwt)
+        exp_str = (
+            datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            if exp_ts else "unknown"
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ OTP verification failed: `{e}`\n\nSend the OTP again or tap 🛑 Cancel.",
+            parse_mode="Markdown",
+        )
+        return AS.WAIT_OTP
+
+    await update.message.reply_text(
+        f"✅ *Authenticated successfully!*\n\n"
+        f"*Profile:* {CRED_LABELS[auth_sess.cred_type]}\n"
+        f"*Token expires:* {exp_str}",
+        parse_mode="Markdown",
+        reply_markup=_main_menu(),
+    )
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────
 async def _post_init(app) -> None:
@@ -3107,6 +3285,25 @@ def main():
         per_message=False,
     )
 
+    auth_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("auth", cmd_auth),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_AUTH)}$"), cmd_auth),
+        ],
+        states={
+            AS.CHOOSE_CRED:   [CallbackQueryHandler(recv_auth_cred,  pattern=r"^auth_cred:")],
+            AS.FORCE_CONFIRM: [CallbackQueryHandler(recv_auth_force, pattern=r"^auth_force:")],
+            AS.WAIT_OTP:      [MessageHandler(not_cancel, recv_auth_otp)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(_CANCEL_FILTER, cmd_cancel),
+            MessageHandler(filters.TEXT, fallback),
+        ],
+        allow_reentry=True,
+        per_message=False,
+    )
+
     app.add_handler(CommandHandler("start",         cmd_start))
     app.add_handler(CommandHandler("help",          cmd_help))
     app.add_handler(CommandHandler("valuers",       cmd_valuers))
@@ -3116,10 +3313,12 @@ def main():
     app.add_handler(CommandHandler("daemon",        cmd_daemon))
     app.add_handler(conv)
     app.add_handler(recv_conv)
+    app.add_handler(auth_conv)
 
     # Button handlers outside an active conversation
     app.add_handler(CallbackQueryHandler(recv_delete_valuer,  pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(recv_daemon_action,  pattern=r"^daemon:"))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_AUTH)}$"),        cmd_auth))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DAEMON)}$"),      cmd_daemon))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"),        cmd_help))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_VALUERS)}$"),     cmd_valuers))
