@@ -264,7 +264,17 @@ def run() -> None:
                 secs_left = exp - now
 
                 if secs_left <= 0:
-                    logger.info("[%s] Token expired at %s.", cred_type, _fmt_exp(exp))
+                    bucket = int(exp // 60)
+                    if alerted.get(cred_type) != bucket:
+                        logger.warning("[%s] Token already expired at %s — alerting.", cred_type, _fmt_exp(exp))
+                        _send_alert(
+                            session,
+                            f"🔴 *Token Expired*\n\n"
+                            f"*Profile:* {label}\n"
+                            f"*Expired at:* {_fmt_exp(exp)}\n\n"
+                            f"Tap *🔑 Refresh Auth* in the bot to re-authenticate.",
+                        )
+                        alerted[cred_type] = bucket
                     continue
 
                 if secs_left > REFRESH_BEFORE:
