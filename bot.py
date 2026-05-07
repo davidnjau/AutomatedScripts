@@ -106,6 +106,7 @@ SAVED_SCHEDULES_FILE    = os.path.join(DATA_DIR, "saved_schedules.json")
 CPARAMS_DLV          = base64.b64encode(b'{"active_role":"DLV"}').decode()
 CPARAMS_ASSESSOR     = base64.b64encode(b'{"active_role":"ASSESSOR_OF_STAMP_DUTY"}').decode()
 CPARAMS_VALUER_ROLE  = base64.b64encode(b'{"active_role":"VALUER"}').decode()
+CPARAMS_SUPPORT      = base64.b64encode(b'{"active_role":"SUPPORT"}').decode()
 
 DAEMON_SCRIPT = os.path.join(os.path.dirname(__file__), "token_refresh_daemon.py")
 DAEMON_PID_FILE = os.path.join(DATA_DIR, "daemon.pid")
@@ -302,6 +303,33 @@ def _get_auth_sess(ctx: ContextTypes.DEFAULT_TYPE) -> AuthSession:
     return ctx.user_data["auth_session"]
 
 
+# ──────────────────────────────────────────────────────────
+# States — Fetch Tasks conversation
+# ──────────────────────────────────────────────────────────
+class FT(Enum):
+    CHOOSE_CRED   = auto()
+    WAIT_OTP      = auto()
+    DAYS_BACK     = auto()   # inline-button preset OR free text
+    COUNTY_FILTER = auto()   # ask whether to filter by county/registry
+    COUNTY_TEXT   = auto()   # text input for county/registry filter
+
+
+@dataclass
+class FTSession:
+    cred_type:    str = "staff2"   # default to Support Reg (has SUPPORT role)
+    http_session: Optional[requests.Session] = None
+    tokens:       Optional[AuthTokens] = None
+    days_back:    int = 5
+    tasks:        List[Dict] = field(default_factory=list)
+    stats:        Dict = field(default_factory=dict)
+
+
+def _get_ft_sess(ctx: ContextTypes.DEFAULT_TYPE) -> FTSession:
+    if "ft_session" not in ctx.user_data:
+        ctx.user_data["ft_session"] = FTSession()
+    return ctx.user_data["ft_session"]
+
+
 CRED_MAP = {
     "publicuser":   PUBLIC_CREDENTIALS,
     "staff":        STAFF_CREDENTIALS_ICT,
@@ -326,7 +354,7 @@ BTN_TOKEN_STATUS  = "🔒 Token Status"
 BTN_DAEMON        = "🔄 Token Daemon"
 BTN_VALUERS       = "👥 Saved Valuers"
 BTN_DELETE        = "🗑 Delete Valuer"
-BTN_IMPL_TASKS    = "📊 Implementor Tasks"
+BTN_FETCH_TASKS   = "📊 Fetch Tasks"
 BTN_DLV_TASKS     = "📋 DLV Tasks"
 BTN_HELP          = "❓ Help"
 BTN_CANCEL        = "🛑 Cancel"
@@ -336,7 +364,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_RECEIVE)}|{re.escape(BTN_AUTH)}"
     f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_DAEMON)}"
     f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
-    f"|{re.escape(BTN_IMPL_TASKS)}|{re.escape(BTN_DLV_TASKS)}"
+    f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_DLV_TASKS)}"
     f"|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -346,7 +374,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton(BTN_ASSIGN),      KeyboardButton(BTN_RECEIVE)],
-            [KeyboardButton(BTN_IMPL_TASKS),  KeyboardButton(BTN_DLV_TASKS)],
+            [KeyboardButton(BTN_FETCH_TASKS),  KeyboardButton(BTN_DLV_TASKS)],
             [KeyboardButton(BTN_AUTH),        KeyboardButton(BTN_TOKEN_STATUS)],
             [KeyboardButton(BTN_DAEMON)],
             [KeyboardButton(BTN_VALUERS),     KeyboardButton(BTN_DELETE)],
@@ -2500,25 +2528,258 @@ def _within_days(date_created: str, cutoff: str) -> bool:
     return date_created[:10] >= cutoff
 
 
-def _fetch_impl_detail_one(http_sess, tokens: AuthTokens, task_id: str) -> Optional[Dict]:
-    """Fetch registration detail view for one implementor task."""
-    headers = {
+def _ft_headers(tokens: AuthTokens) -> dict:
+    return {
         "Authorization": f"Bearer {tokens.access_token}",
         "JWTAUTH":       f"Bearer {tokens.jwt}",
-        "cparams":       CPARAMS_ASSESSOR,
+        "cparams":       CPARAMS_SUPPORT,
     }
+
+
+def _has_stamp_duty_invoice(invoices: list) -> bool:
+    """Return True if any invoice is for stamp duty (task already processed)."""
+    for inv in invoices:
+        pf = str(inv.get("payment_for", "")).lower()
+        if "stamp" in pf:
+            return True
+    return False
+
+
+def _fetch_hq_list(http_sess, tokens: AuthTokens, cutoff: str) -> List[Dict]:
+    """Fetch HQ digitised TRANSFER applications up to cutoff date."""
+    headers = _ft_headers(tokens)
+    candidates: List[Dict] = []
+    page = 1
+    stop = False
+    while not stop:
+        try:
+            resp = http_sess.get(
+                f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/hod-or-clr",
+                headers=headers,
+                params={"filter": "Ongoing", "page": page, "search": ""},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.warning("HQ list page %d failed: %s", page, e)
+            break
+
+        results = data.get("results", [])
+        if not results:
+            break
+        for task in results:
+            if task.get("date_created", "")[:10] < cutoff:
+                stop = True
+                break
+            if (task.get("application_type") == "TRANSFER"
+                    and task.get("from_ardhipay") is False):
+                candidates.append(task)
+        if not data.get("next") or stop:
+            break
+        page += 1
+
+    return candidates
+
+
+def _fetch_county_list(http_sess, tokens: AuthTokens, cutoff: str) -> List[Dict]:
+    """Fetch County undigitised TRANSFER applications up to cutoff date."""
+    headers = _ft_headers(tokens)
+    candidates: List[Dict] = []
+    page = 1
+    stop = False
+    while not stop:
+        try:
+            resp = http_sess.get(
+                f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/hod-or-clr",
+                headers=headers,
+                params={"filter": "Ongoing", "from_ardhipay": "true", "page": page, "search": ""},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.warning("County list page %d failed: %s", page, e)
+            break
+
+        results = data.get("results", [])
+        if not results:
+            break
+        for task in results:
+            if task.get("date_created", "")[:10] < cutoff:
+                stop = True
+                break
+            if task.get("application_type") == "TRANSFER":
+                candidates.append(task)
+        if not data.get("next") or stop:
+            break
+        page += 1
+
+    return candidates
+
+
+def _fetch_hq_detail_2a(http_sess, tokens: AuthTokens, application_id: str) -> Optional[Dict]:
+    """Fetch registration detail (2a) using application_id."""
     try:
         resp = http_sess.get(
             f"{BASE_URL}/registrationservice/api/v1/transfer/transfer-request-staff-detailed-view",
-            headers=headers,
+            headers=_ft_headers(tokens),
+            params={"request_id": application_id},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.warning("HQ 2a detail failed for %s: %s", application_id, e)
+        return None
+
+
+def _fetch_hq_detail_2b(http_sess, tokens: AuthTokens, task_id: str) -> Optional[Dict]:
+    """Fetch stamp-duty detail (2b) using task id — has officer assignments."""
+    try:
+        resp = http_sess.get(
+            f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/detail-view",
+            headers=_ft_headers(tokens),
             params={"request_id": task_id},
             timeout=30,
         )
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        logger.warning("impl detail failed for %s: %s", task_id, e)
+        logger.warning("HQ 2b detail failed for %s: %s", task_id, e)
         return None
+
+
+def _fetch_county_detail(http_sess, tokens: AuthTokens, task_id: str) -> Optional[Dict]:
+    """Fetch county stamp-duty detail view."""
+    try:
+        resp = http_sess.get(
+            f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/detail-view",
+            headers=_ft_headers(tokens),
+            params={"request_id": task_id},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.warning("County detail failed for %s: %s", task_id, e)
+        return None
+
+
+def _load_fetch_tasks(tokens: AuthTokens, days_back: int) -> Tuple[List[Dict], Dict]:
+    """
+    Fetch qualifying HQ + County TRANSFER applications in the last days_back days.
+    Returns (tasks, stats).
+    Each task: source, reference_number, date_created, county, registry,
+               consideration, currency_code, parcel_number, officers.
+    """
+    http_sess = build_session()
+    cutoff = _date_cutoff_str(days_back)
+
+    # Both list fetches run in parallel
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        hq_future     = pool.submit(_fetch_hq_list,    http_sess, tokens, cutoff)
+        county_future = pool.submit(_fetch_county_list, http_sess, tokens, cutoff)
+        hq_candidates     = hq_future.result()
+        county_candidates = county_future.result()
+
+    stats: Dict = {
+        "hq_raw":     len(hq_candidates),
+        "county_raw": len(county_candidates),
+        "hq_kept":    0,
+        "county_kept": 0,
+    }
+    tasks: List[Dict] = []
+
+    # ── HQ: 2a + 2b in parallel per task ─────────────────────
+    if hq_candidates:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            fut2a = {
+                pool.submit(_fetch_hq_detail_2a, http_sess, tokens, t["application_id"]): t
+                for t in hq_candidates
+            }
+            fut2b = {
+                pool.submit(_fetch_hq_detail_2b, http_sess, tokens, t["id"]): t
+                for t in hq_candidates
+            }
+            res2a: Dict[str, Optional[Dict]] = {}
+            res2b: Dict[str, Optional[Dict]] = {}
+            for f in _futures_as_completed(fut2a):
+                res2a[fut2a[f]["id"]] = f.result()
+            for f in _futures_as_completed(fut2b):
+                res2b[fut2b[f]["id"]] = f.result()
+
+        for t in hq_candidates:
+            d2a = res2a.get(t["id"])
+            if not d2a:
+                continue
+            if _has_stamp_duty_invoice(d2a.get("invoices", [])):
+                continue
+            if (d2a.get("stamp_duty_status") != "SENT_TO_COLLECTOR"
+                    or d2a.get("application_status", "").upper() != "ONGOING"):
+                continue
+
+            d2b = res2b.get(t["id"])
+            officers = []
+            if d2b:
+                officers = [
+                    {"name": o.get("names", ""), "role": o.get("role", "")}
+                    for o in d2b.get("details", {}).get("officers", [])
+                ]
+
+            tasks.append({
+                "source":             "HQ",
+                "reference_number":   t.get("reference_number", ""),
+                "date_created":       t.get("date_created", ""),
+                "county":             d2a.get("county") or t.get("county", ""),
+                "registry":           d2a.get("registry") or t.get("registry", ""),
+                "consideration":      str(d2a.get("consideration", "")),
+                "consideration_type": d2a.get("consideration_type", ""),
+                "currency_code":      d2a.get("currency_code", "KES"),
+                "parcel_number":      t.get("parcel_number", ""),
+                "officers":           officers,
+            })
+            stats["hq_kept"] += 1
+
+    # ── County: detail per task ───────────────────────────────
+    if county_candidates:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            county_fut = {
+                pool.submit(_fetch_county_detail, http_sess, tokens, t["id"]): t
+                for t in county_candidates
+            }
+            for f in _futures_as_completed(county_fut):
+                t   = county_fut[f]
+                det = (f.result() or {}).get("details", {})
+                if not det:
+                    continue
+                if (det.get("node") != "STAMP_DUTY_PAYMENT_DEFINITION"
+                        or det.get("application_status", "").upper() != "ONGOING"):
+                    continue
+                ext = det.get("external_process_details") or {}
+                if _has_stamp_duty_invoice(ext.get("invoice", [])):
+                    continue
+
+                officers = [
+                    {"name": o.get("names", ""), "role": o.get("role", "")}
+                    for o in det.get("officers", [])
+                ]
+                tasks.append({
+                    "source":             "County",
+                    "reference_number":   det.get("reference_number") or t.get("reference_number", ""),
+                    "date_created":       t.get("date_created", ""),
+                    "county":             det.get("county") or t.get("county", ""),
+                    "registry":           det.get("registry") or t.get("registry", ""),
+                    "consideration":      str(ext.get("consideration_amount", "")),
+                    "consideration_type": ext.get("process_type", ""),
+                    "currency_code":      ext.get("currency_code", "KES"),
+                    "parcel_number":      ext.get("parcel_number") or t.get("parcel_number", ""),
+                    "officers":           officers,
+                })
+                stats["county_kept"] += 1
+
+    tasks.sort(key=lambda x: x["date_created"], reverse=True)
+    return tasks, stats
 
 
 def _fetch_dlv_detail_one(http_sess, tokens: AuthTokens, task_id: str) -> Optional[Dict]:
@@ -2542,73 +2803,20 @@ def _fetch_dlv_detail_one(http_sess, tokens: AuthTokens, task_id: str) -> Option
         return None
 
 
-def _load_implementor_tasks(tokens: AuthTokens) -> Tuple[List[Dict], int]:
-    """
-    Fetch all pending assessor tasks created in the last 10 days,
-    enrich each with detail fields, return (enriched_tasks, raw_count).
-    raw_count = total results seen before date filtering.
-    """
-    http_sess = build_session()
-    cutoff = _date_cutoff_str(10)
-    headers = {
-        "Authorization": f"Bearer {tokens.access_token}",
-        "JWTAUTH":       f"Bearer {tokens.jwt}",
-        "cparams":       CPARAMS_ASSESSOR,
-    }
-
-    candidates: List[Dict] = []
-    raw_count = 0
-    page = 1
-    while True:
-        resp = http_sess.get(
-            f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/assessor",
-            headers=headers,
-            params={"filter": "Pending", "page": page, "search": ""},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        results = data.get("results", [])
-        if not results:
-            break
-
-        raw_count += len(results)
-        for task in results:
-            if _within_days(task.get("date_created", ""), cutoff):
-                candidates.append(task)
-
-        if not data.get("next"):
-            break
-        page += 1
-
-    enriched: List[Dict] = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        future_map = {
-            pool.submit(_fetch_impl_detail_one, http_sess, tokens, t["id"]): t
-            for t in candidates
-        }
-        for future in _futures_as_completed(future_map):
-            list_task = future_map[future]
-            detail    = future.result()
-            consideration = ""
-            county    = list_task.get("county", "")
-            registry  = list_task.get("registry", "")
-            if detail:
-                consideration = str(detail.get("consideration", ""))
-                county    = detail.get("county", county)
-                registry  = detail.get("registry", registry)
-            enriched.append({
-                "id":               list_task["id"],
-                "reference_number": list_task.get("reference_number", ""),
-                "date_created":     list_task.get("date_created", ""),
-                "consideration":    consideration,
-                "county":           county,
-                "registry":         registry,
-            })
-
-    enriched.sort(key=lambda x: x["date_created"], reverse=True)
-    return enriched, raw_count
+def _days_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1 day",  callback_data="ft_days:1"),
+            InlineKeyboardButton("2 days", callback_data="ft_days:2"),
+            InlineKeyboardButton("3 days", callback_data="ft_days:3"),
+        ],
+        [
+            InlineKeyboardButton("5 days",  callback_data="ft_days:5"),
+            InlineKeyboardButton("7 days",  callback_data="ft_days:7"),
+            InlineKeyboardButton("10 days", callback_data="ft_days:10"),
+        ],
+        [InlineKeyboardButton("✏️ Enter custom", callback_data="ft_days:custom")],
+    ])
 
 
 def _load_dlv_tasks(tokens: AuthTokens) -> Tuple[List[Dict], int]:
@@ -2705,45 +2913,266 @@ def _tasks_keyboard(tasks: List[Dict], checked: set, prefix: str) -> InlineKeybo
     return InlineKeyboardMarkup(rows)
 
 
-async def cmd_impl_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_fetch_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
-    tokens = _any_valid_tokens()
-    if not tokens:
-        await update.message.reply_text(
-            "⚠️ No valid cached tokens found.\n"
-            "Please authenticate first via *New Assignment* or *Receive Tasks*, then try again.",
-            parse_mode="Markdown",
-            reply_markup=_main_menu(),
-        )
-        return
+    ctx.user_data["ft_session"] = FTSession()
+    await update.message.reply_text(
+        "📊 *Fetch Tasks* — Select the account to use:",
+        parse_mode="Markdown",
+        reply_markup=_cred_keyboard(),
+    )
+    return FT.CHOOSE_CRED
 
-    await update.message.reply_text("⏳ Fetching Implementor Tasks (last 10 days)…")
+
+async def recv_ft_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    cred_type = query.data.split(":")[1]
+    sess = _get_ft_sess(ctx)
+    sess.cred_type = cred_type
+
+    cached = get_valid_tokens(cred_type)
+    if cached:
+        sess.tokens = cached
+        await query.edit_message_text(
+            f"✅ Using cached tokens for *{CRED_LABELS[cred_type]}*.\n\n"
+            "How many *days back* should I look?\nTap a button or type a number:",
+            parse_mode="Markdown",
+            reply_markup=_days_keyboard(),
+        )
+        return FT.DAYS_BACK
+
+    sess.http_session = build_session()
+    creds = CRED_MAP[cred_type]
+    await query.edit_message_text(
+        f"🔐 Sending login request for *{CRED_LABELS[cred_type]}*…",
+        parse_mode="Markdown",
+    )
     try:
-        tasks, raw_count = _load_implementor_tasks(tokens)
+        resp = sess.http_session.post(
+            f"{AUTH_BASE_URL}/login",
+            json={"username": creds["username"], "password": creds["password"],
+                  "usertype": creds["usertype"], "otpcode": ""},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("success") is False and "error" in data:
+            raise RuntimeError(data.get("error") or data.get("message"))
+    except Exception as e:
+        await query.message.reply_text(
+            f"❌ Login failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu()
+        )
+        return ConversationHandler.END
+
+    await query.message.reply_text(
+        "📲 OTP sent to the registered device.\nPlease *reply with the OTP code*:",
+        parse_mode="Markdown",
+    )
+    return FT.WAIT_OTP
+
+
+async def recv_ft_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    otp   = update.message.text.strip()
+    sess  = _get_ft_sess(ctx)
+    creds = CRED_MAP[sess.cred_type]
+
+    await update.message.reply_text("🔄 Verifying OTP…")
+    try:
+        resp = sess.http_session.post(
+            f"{AUTH_BASE_URL}/otpverify",
+            json={"username": creds["username"], "password": creds["password"], "otpcode": otp},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data         = resp.json()
+        access_token = data.get("details", {}).get("access_token")
+        jwt          = data.get("details", {}).get("jwt")
+        if not access_token or not jwt:
+            raise RuntimeError(f"Tokens missing. Keys: {list(data.keys())}")
+        persist_tokens(sess.cred_type, access_token, jwt)
+        sess.tokens = AuthTokens(access_token=access_token, jwt=jwt)
     except Exception as e:
         await update.message.reply_text(
-            f"❌ Failed to fetch tasks: `{e}`", parse_mode="Markdown", reply_markup=_main_menu()
+            f"❌ OTP verification failed: `{e}`\n\nSend the OTP again or tap 🛑 Cancel.",
+            parse_mode="Markdown",
         )
-        return
+        return FT.WAIT_OTP
+
+    await update.message.reply_text(
+        f"✅ Authenticated as *{CRED_LABELS[sess.cred_type]}*.\n\n"
+        "How many *days back* should I look?\nTap a button or type a number:",
+        parse_mode="Markdown",
+        reply_markup=_days_keyboard(),
+    )
+    return FT.DAYS_BACK
+
+
+async def recv_ft_days_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    val  = query.data.split(":")[1]
+    sess = _get_ft_sess(ctx)
+
+    if val == "custom":
+        await query.edit_message_text(
+            "Enter the number of days to look back (1–90):",
+        )
+        return FT.DAYS_BACK
+
+    sess.days_back = int(val)
+    await query.edit_message_text(
+        f"⏳ Fetching tasks from the last *{sess.days_back}* day(s)…",
+        parse_mode="Markdown",
+    )
+    return await _ft_do_fetch(query.message, ctx, sess)
+
+
+async def recv_ft_days_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    sess = _get_ft_sess(ctx)
+    try:
+        days = int(text)
+        if days < 1 or days > 90:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "Please enter a number between 1 and 90:",
+            reply_markup=_days_keyboard(),
+        )
+        return FT.DAYS_BACK
+
+    sess.days_back = days
+    await update.message.reply_text(
+        f"⏳ Fetching tasks from the last *{sess.days_back}* day(s)…",
+        parse_mode="Markdown",
+    )
+    return await _ft_do_fetch(update.message, ctx, sess)
+
+
+async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession):
+    """Run _load_fetch_tasks, save results, prompt county/registry filter."""
+    try:
+        tasks, stats = _load_fetch_tasks(sess.tokens, sess.days_back)
+    except Exception as e:
+        await message.reply_text(
+            f"❌ Fetch failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu()
+        )
+        return ConversationHandler.END
+
+    sess.tasks = tasks
+    sess.stats = stats
+
+    hq_raw  = stats.get("hq_raw",     0)
+    c_raw   = stats.get("county_raw", 0)
+    hq_kept = stats.get("hq_kept",    0)
+    c_kept  = stats.get("county_kept", 0)
 
     if not tasks:
-        await update.message.reply_text(
-            f"ℹ️ No pending implementor tasks in the last 10 days.\n"
-            f"_(API returned {raw_count} total result(s) before date filter)_",
+        await message.reply_text(
+            f"ℹ️ No qualifying tasks in the last *{sess.days_back}* day(s).\n"
+            f"_(HQ: {hq_raw} seen → {hq_kept} matched | "
+            f"County: {c_raw} seen → {c_kept} matched)_",
             parse_mode="Markdown",
             reply_markup=_main_menu(),
         )
+        return ConversationHandler.END
+
+    await message.reply_text(
+        f"✅ Found *{len(tasks)}* task(s) in the last *{sess.days_back}* day(s).\n"
+        f"_(HQ: {hq_raw} → {hq_kept} matched | County: {c_raw} → {c_kept} matched)_\n\n"
+        "Filter by county / registry?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🗺 Yes, filter", callback_data="ft_county:yes"),
+                InlineKeyboardButton("📋 Show all",    callback_data="ft_county:no"),
+            ]
+        ]),
+    )
+    return FT.COUNTY_FILTER
+
+
+async def recv_ft_county_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    sess = _get_ft_sess(ctx)
+
+    if query.data == "ft_county:no":
+        await query.edit_message_text("📋 Preparing results…")
+        await _ft_show_results(query.message, sess.tasks)
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        "Enter county and/or registry to filter by (partial match, case-insensitive):\n"
+        "e.g. `nairobi` or `MBEERE`",
+        parse_mode="Markdown",
+    )
+    return FT.COUNTY_TEXT
+
+
+async def recv_ft_county_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text     = update.message.text.strip().lower()
+    sess     = _get_ft_sess(ctx)
+    filtered = [
+        t for t in sess.tasks
+        if text in t.get("county", "").lower() or text in t.get("registry", "").lower()
+    ]
+    if not filtered:
+        await update.message.reply_text(
+            f"ℹ️ No tasks match `{text}`. Showing all {len(sess.tasks)} task(s).",
+            parse_mode="Markdown",
+        )
+        filtered = sess.tasks
+
+    await _ft_show_results(update.message, filtered)
+    return ConversationHandler.END
+
+
+async def _ft_show_results(message, tasks: List[Dict]):
+    """Send tasks as formatted text, splitting at Telegram's 4096-char limit."""
+    if not tasks:
+        await message.reply_text("No tasks to display.", reply_markup=_main_menu())
         return
 
-    ctx.user_data["impl_tasks"]   = tasks
-    ctx.user_data["impl_checked"] = set()
-    await update.message.reply_text(
-        f"📊 *Implementor Tasks* — {len(tasks)} task(s) in last 10 days\n"
-        f"_(fetched {raw_count} total from API)_\n"
-        "Tap any row to check/uncheck:",
-        parse_mode="Markdown",
-        reply_markup=_tasks_keyboard(tasks, set(), "impl_ck"),
-    )
+    lines = []
+    for i, t in enumerate(tasks, 1):
+        src    = t.get("source", "")
+        ref    = t.get("reference_number", "—")
+        cnty   = (t.get("county") or "—").upper()
+        reg    = (t.get("registry") or "—").upper()
+        date   = (t.get("date_created") or "")[:10]
+        parcel = t.get("parcel_number") or "—"
+        try:
+            cons = f"KES {int(float(t['consideration'])):,}" if t.get("consideration") else "—"
+        except (ValueError, TypeError):
+            cons = t.get("consideration") or "—"
+        officers_str = ", ".join(
+            f"{o['name']} ({o['role']})" for o in t.get("officers", []) if o.get("name")
+        ) or "none"
+
+        lines.append(
+            f"{i}. [{src}] *{ref}*\n"
+            f"   📍 {cnty} / {reg} | 📅 {date}\n"
+            f"   💰 {cons} | 🏠 {parcel}\n"
+            f"   👤 {officers_str}"
+        )
+
+    chunk = ""
+    for line in lines:
+        candidate = (chunk + "\n\n" + line).strip()
+        if len(candidate) > 4000:
+            await message.reply_text(chunk, parse_mode="Markdown")
+            chunk = line
+        else:
+            chunk = candidate
+
+    if chunk:
+        await message.reply_text(
+            chunk + f"\n\n_Total: {len(tasks)} task(s)_",
+            parse_mode="Markdown",
+            reply_markup=_main_menu(),
+        )
 
 
 async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2784,61 +3213,6 @@ async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Tap any row to check/uncheck:",
         parse_mode="Markdown",
         reply_markup=_tasks_keyboard(tasks, set(), "dlv_ck"),
-    )
-
-
-async def recv_impl_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    idx_str = query.data.split(":")[1]
-    tasks   = ctx.user_data.get("impl_tasks", [])
-    checked = ctx.user_data.get("impl_checked", set())
-
-    if idx_str == "refresh":
-        tokens = _any_valid_tokens()
-        if not tokens:
-            await query.answer("No valid tokens — authenticate first.", show_alert=True)
-            return
-        await query.edit_message_text("⏳ Refreshing Implementor Tasks…")
-        try:
-            tasks, raw_count = _load_implementor_tasks(tokens)
-        except Exception as e:
-            await query.edit_message_text(f"❌ Refresh failed: {e}")
-            return
-        checked = set()
-        ctx.user_data["impl_tasks"]   = tasks
-        ctx.user_data["impl_checked"] = checked
-        await query.edit_message_text(
-            f"📊 *Implementor Tasks* — {len(tasks)} task(s) in last 10 days\n"
-            f"_(fetched {raw_count} total from API)_\n"
-            "Tap any row to check/uncheck:",
-            parse_mode="Markdown",
-            reply_markup=_tasks_keyboard(tasks, checked, "impl_ck"),
-        )
-        return
-
-    if idx_str == "assign":
-        if not checked:
-            await query.answer("No tasks selected.", show_alert=True)
-            return
-        selected = [tasks[i] for i in sorted(checked) if i < len(tasks)]
-        ctx.user_data["ta_pending"] = {"type": "impl", "tasks": selected, "search_results": []}
-        await query.message.reply_text(
-            f"📤 Assigning *{len(selected)}* implementor task(s).\n\n"
-            "Select the valuer to assign to:",
-            parse_mode="Markdown",
-            reply_markup=_ta_valuer_picker_keyboard("impl"),
-        )
-        return
-
-    idx = int(idx_str)
-    if idx in checked:
-        checked.discard(idx)
-    else:
-        checked.add(idx)
-    ctx.user_data["impl_checked"] = checked
-    await query.edit_message_reply_markup(
-        reply_markup=_tasks_keyboard(tasks, checked, "impl_ck"),
     )
 
 
@@ -3350,9 +3724,34 @@ def main():
     app.add_handler(CommandHandler("schedules",     cmd_schedules))
     app.add_handler(CommandHandler("task_batches",  cmd_task_batches))
     app.add_handler(CommandHandler("daemon",        cmd_daemon))
+    fetch_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("fetch", cmd_fetch_tasks),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_FETCH_TASKS)}$"), cmd_fetch_tasks),
+        ],
+        states={
+            FT.CHOOSE_CRED:   [CallbackQueryHandler(recv_ft_cred,           pattern=r"^cred:")],
+            FT.WAIT_OTP:      [MessageHandler(not_cancel, recv_ft_otp)],
+            FT.DAYS_BACK:     [
+                CallbackQueryHandler(recv_ft_days_callback, pattern=r"^ft_days:"),
+                MessageHandler(not_cancel, recv_ft_days_text),
+            ],
+            FT.COUNTY_FILTER: [CallbackQueryHandler(recv_ft_county_filter, pattern=r"^ft_county:")],
+            FT.COUNTY_TEXT:   [MessageHandler(not_cancel, recv_ft_county_text)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(_CANCEL_FILTER, cmd_cancel),
+            MessageHandler(filters.TEXT, fallback),
+        ],
+        allow_reentry=True,
+        per_message=False,
+    )
+
     app.add_handler(conv)
     app.add_handler(recv_conv)
     app.add_handler(auth_conv)
+    app.add_handler(fetch_conv)
 
     # Button handlers outside an active conversation
     app.add_handler(CallbackQueryHandler(recv_delete_valuer,  pattern=r"^del:"))
@@ -3363,9 +3762,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"),        cmd_help))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_VALUERS)}$"),     cmd_valuers))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DELETE)}$"),      cmd_delete_valuer))
-    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_IMPL_TASKS)}$"),  cmd_impl_tasks))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_TASKS)}$"),   cmd_dlv_tasks))
-    app.add_handler(CallbackQueryHandler(recv_impl_check, pattern=r"^impl_ck:"))
     app.add_handler(CallbackQueryHandler(recv_dlv_check,  pattern=r"^dlv_ck:"))
     app.add_handler(CallbackQueryHandler(recv_ta_valuer,  pattern=r"^ta:"))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_CANCEL)}$"),      cmd_cancel))
