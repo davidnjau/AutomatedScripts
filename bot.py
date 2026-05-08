@@ -329,9 +329,10 @@ class FTSession:
     http_session: Optional[requests.Session] = None
     tokens:       Optional[AuthTokens] = None
     days_back:    int = 5
-    tasks:        List[Dict] = field(default_factory=list)
+    tasks:        List[Dict] = field(default_factory=list)   # amount-filtered tasks
     stats:        Dict = field(default_factory=dict)
-    county_text:  str = ""   # remembered county/registry filter text
+    amount_min:   Optional[float] = None
+    amount_max:   Optional[float] = None
 
 
 def _get_ft_sess(ctx: ContextTypes.DEFAULT_TYPE) -> FTSession:
@@ -3038,10 +3039,11 @@ async def recv_ft_days_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     sess.days_back = int(val)
     await query.edit_message_text(
-        f"⏳ Fetching tasks from the last *{sess.days_back}* day(s)…",
+        f"✅ *{sess.days_back}* day(s) selected.\n\nFilter by *consideration amount*?",
         parse_mode="Markdown",
+        reply_markup=_ft_amount_keyboard(),
     )
-    return await _ft_do_fetch(query.message, ctx, sess)
+    return FT.AMOUNT_FILTER
 
 
 async def recv_ft_days_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3060,6 +3062,77 @@ async def recv_ft_days_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     sess.days_back = days
     await update.message.reply_text(
+        f"✅ *{sess.days_back}* day(s) selected.\n\nFilter by *consideration amount*?",
+        parse_mode="Markdown",
+        reply_markup=_ft_amount_keyboard(),
+    )
+    return FT.AMOUNT_FILTER
+
+
+def _ft_amount_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("0 – 1M",    callback_data="ft_amount:0_1m"),
+            InlineKeyboardButton("1M – 5M",   callback_data="ft_amount:1m_5m"),
+        ],
+        [
+            InlineKeyboardButton("5M – 10M",  callback_data="ft_amount:5m_10m"),
+            InlineKeyboardButton("✏️ Custom",  callback_data="ft_amount:custom"),
+        ],
+        [
+            InlineKeyboardButton("📋 No filter", callback_data="ft_amount:all"),
+        ],
+    ])
+
+
+async def recv_ft_amount_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    sess = _get_ft_sess(ctx)
+
+    choice = query.data
+
+    if choice == "ft_amount:custom":
+        await query.edit_message_text(
+            "Enter the amount range as *min max* (space-separated), in KES:\n"
+            "e.g. `500000 2000000`",
+            parse_mode="Markdown",
+        )
+        return FT.AMOUNT_TEXT
+
+    ranges = {
+        "ft_amount:0_1m":   (0.0,         1_000_000.0),
+        "ft_amount:1m_5m":  (1_000_000.0, 5_000_000.0),
+        "ft_amount:5m_10m": (5_000_000.0, 10_000_000.0),
+        "ft_amount:all":    (None,         None),
+    }
+    sess.amount_min, sess.amount_max = ranges.get(choice, (None, None))
+    await query.edit_message_text(
+        f"⏳ Fetching tasks from the last *{sess.days_back}* day(s)…",
+        parse_mode="Markdown",
+    )
+    return await _ft_do_fetch(query.message, ctx, sess)
+
+
+async def recv_ft_amount_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text  = update.message.text.strip()
+    sess  = _get_ft_sess(ctx)
+    parts = text.replace(",", "").split()
+    try:
+        if len(parts) == 2:
+            sess.amount_min, sess.amount_max = float(parts[0]), float(parts[1])
+        elif len(parts) == 1:
+            sess.amount_min, sess.amount_max = 0.0, float(parts[0])
+        else:
+            raise ValueError
+    except (ValueError, IndexError):
+        await update.message.reply_text(
+            "❌ Could not parse that. Enter two numbers separated by a space, e.g. `500000 2000000`",
+            parse_mode="Markdown",
+        )
+        return FT.AMOUNT_TEXT
+
+    await update.message.reply_text(
         f"⏳ Fetching tasks from the last *{sess.days_back}* day(s)…",
         parse_mode="Markdown",
     )
@@ -3067,7 +3140,7 @@ async def recv_ft_days_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession):
-    """Run _load_fetch_tasks, save results, prompt county/registry filter."""
+    """Fetch tasks, apply amount filter, save to sess.tasks, then ask county filter."""
     try:
         tasks, stats = _load_fetch_tasks(sess.tokens, sess.days_back)
     except Exception as e:
@@ -3076,13 +3149,27 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
         )
         return ConversationHandler.END
 
-    sess.tasks = tasks
     sess.stats = stats
-
     hq_raw  = stats.get("hq_raw",     0)
     c_raw   = stats.get("county_raw", 0)
     hq_kept = stats.get("hq_kept",    0)
     c_kept  = stats.get("county_kept", 0)
+
+    # Apply amount filter
+    if sess.amount_min is not None or sess.amount_max is not None:
+        def _in_range(t):
+            try:
+                val = float(t.get("consideration") or 0)
+            except (ValueError, TypeError):
+                return False
+            if sess.amount_min is not None and val < sess.amount_min:
+                return False
+            if sess.amount_max is not None and val > sess.amount_max:
+                return False
+            return True
+        tasks = [t for t in tasks if _in_range(t)]
+
+    sess.tasks = tasks
 
     if not tasks:
         await message.reply_text(
@@ -3109,158 +3196,34 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
     return FT.COUNTY_FILTER
 
 
-def _ft_amount_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("0 – 1M",    callback_data="ft_amount:0_1m"),
-            InlineKeyboardButton("1M – 5M",   callback_data="ft_amount:1m_5m"),
-        ],
-        [
-            InlineKeyboardButton("5M – 10M",  callback_data="ft_amount:5m_10m"),
-            InlineKeyboardButton("✏️ Custom",  callback_data="ft_amount:custom"),
-        ],
-        [
-            InlineKeyboardButton("📋 No filter", callback_data="ft_amount:all"),
-        ],
-    ])
-
-
 async def recv_ft_county_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     sess = _get_ft_sess(ctx)
 
     if query.data == "ft_county:no":
-        sess.county_text = ""
-    else:
-        await query.edit_message_text(
-            "Enter county and/or registry to filter by (partial match, case-insensitive):\n"
-            "e.g. `nairobi` or `MBEERE`",
-            parse_mode="Markdown",
-        )
-        return FT.COUNTY_TEXT
+        await query.edit_message_text("📋 Preparing results…")
+        await _ft_show_results(query.message, sess.tasks)
+        return ConversationHandler.END
 
     await query.edit_message_text(
-        "Filter by *consideration amount*?",
+        "Enter county and/or registry to filter by (partial match, case-insensitive):\n"
+        "e.g. `nairobi` or `MBEERE`",
         parse_mode="Markdown",
-        reply_markup=_ft_amount_keyboard(),
     )
-    return FT.AMOUNT_FILTER
+    return FT.COUNTY_TEXT
 
 
 async def recv_ft_county_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().lower()
-    sess = _get_ft_sess(ctx)
-    # Check county match now so we can warn, but store for final combined filter
-    matched = [
+    text     = update.message.text.strip().lower()
+    sess     = _get_ft_sess(ctx)
+    filtered = [
         t for t in sess.tasks
         if text in t.get("county", "").lower() or text in t.get("registry", "").lower()
     ]
-    if not matched:
-        await update.message.reply_text(
-            f"ℹ️ No tasks match `{text}`. County filter will be ignored.",
-            parse_mode="Markdown",
-        )
-        sess.county_text = ""
-    else:
-        sess.county_text = text
-
-    await update.message.reply_text(
-        "Filter by *consideration amount*?",
-        parse_mode="Markdown",
-        reply_markup=_ft_amount_keyboard(),
-    )
-    return FT.AMOUNT_FILTER
-
-
-def _ft_apply_filters(
-    tasks: List[Dict],
-    county_text: str,
-    amount_min: Optional[float],
-    amount_max: Optional[float],
-) -> List[Dict]:
-    result = tasks
-    if county_text:
-        result = [
-            t for t in result
-            if county_text in t.get("county", "").lower()
-            or county_text in t.get("registry", "").lower()
-        ]
-    if amount_min is not None or amount_max is not None:
-        def in_range(t):
-            try:
-                val = float(t.get("consideration") or 0)
-            except (ValueError, TypeError):
-                return False
-            if amount_min is not None and val < amount_min:
-                return False
-            if amount_max is not None and val > amount_max:
-                return False
-            return True
-        result = [t for t in result if in_range(t)]
-    return result
-
-
-async def recv_ft_amount_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    sess = _get_ft_sess(ctx)
-
-    choice = query.data  # e.g. "ft_amount:0_1m"
-
-    ranges = {
-        "ft_amount:0_1m":   (0,         1_000_000),
-        "ft_amount:1m_5m":  (1_000_000, 5_000_000),
-        "ft_amount:5m_10m": (5_000_000, 10_000_000),
-        "ft_amount:all":    (None,       None),
-    }
-
-    if choice == "ft_amount:custom":
-        await query.edit_message_text(
-            "Enter the amount range as *min max* (space-separated), in KES:\n"
-            "e.g. `500000 2000000`",
-            parse_mode="Markdown",
-        )
-        return FT.AMOUNT_TEXT
-
-    amount_min, amount_max = ranges.get(choice, (None, None))
-    filtered = _ft_apply_filters(sess.tasks, sess.county_text, amount_min, amount_max)
-
-    if not filtered:
-        await query.edit_message_text(
-            "ℹ️ No tasks match the selected filters. Showing all results.",
-            parse_mode="Markdown",
-        )
-        filtered = sess.tasks
-
-    await query.edit_message_text("📋 Preparing results…")
-    await _ft_show_results(query.message, filtered)
-    return ConversationHandler.END
-
-
-async def recv_ft_amount_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    sess = _get_ft_sess(ctx)
-
-    parts = text.replace(",", "").split()
-    try:
-        if len(parts) == 2:
-            amount_min, amount_max = float(parts[0]), float(parts[1])
-        elif len(parts) == 1:
-            amount_min, amount_max = 0.0, float(parts[0])
-        else:
-            raise ValueError("unexpected format")
-    except (ValueError, IndexError):
-        await update.message.reply_text(
-            "❌ Could not parse that. Enter two numbers separated by a space, e.g. `500000 2000000`",
-            parse_mode="Markdown",
-        )
-        return FT.AMOUNT_TEXT
-
-    filtered = _ft_apply_filters(sess.tasks, sess.county_text, amount_min, amount_max)
     if not filtered:
         await update.message.reply_text(
-            f"ℹ️ No tasks in KES {int(amount_min):,} – {int(amount_max):,}. Showing all results.",
+            f"ℹ️ No tasks match `{text}` — showing all *{len(sess.tasks)}* result(s).",
             parse_mode="Markdown",
         )
         filtered = sess.tasks
