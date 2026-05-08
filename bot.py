@@ -101,7 +101,6 @@ SAVED_TOKENS_FILE       = os.path.join(DATA_DIR, "saved_tokens.json")
 SAVED_ASSIGNMENTS_FILE  = os.path.join(DATA_DIR, "saved_assignments.json")
 SAVED_TASK_BATCHES_FILE = os.path.join(DATA_DIR, "saved_task_batches.json")
 SAVED_SCHEDULES_FILE    = os.path.join(DATA_DIR, "saved_schedules.json")
-PENDING_OTP_FILE        = os.path.join(DATA_DIR, "pending_otp.json")
 
 # base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
 CPARAMS_DLV          = base64.b64encode(b'{"active_role":"DLV"}').decode()
@@ -184,32 +183,25 @@ def _load_tokens_raw() -> Dict:
         return {}
 
 
-def persist_tokens(cred_type: str, access_token: str, jwt: str):
+def persist_tokens(cred_type: str, access_token: str, jwt: str, refresh_token: str = ""):
     _ensure_data_dir()
     tokens = _load_tokens_raw()
     exp = _jwt_exp(jwt) or (time.time() + 3600)
-    tokens[cred_type] = {
+    entry: Dict = {
         "access_token": access_token,
         "jwt":          jwt,
         "expires_at":   exp,
     }
+    if refresh_token:
+        entry["refresh_token"] = refresh_token
+    elif tokens.get(cred_type, {}).get("refresh_token"):
+        # Preserve existing refresh_token if a new one wasn't returned
+        entry["refresh_token"] = tokens[cred_type]["refresh_token"]
+    tokens[cred_type] = entry
     with open(SAVED_TOKENS_FILE, "w") as f:
         json.dump(tokens, f, indent=2)
     logger.info("Cached tokens for cred_type=%s (exp=%s)", cred_type, exp)
 
-
-def _load_pending_otp() -> Dict:
-    try:
-        with open(PENDING_OTP_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def _save_pending_otp(data: Dict) -> None:
-    _ensure_data_dir()
-    with open(PENDING_OTP_FILE, "w") as f:
-        json.dump(data, f, indent=2)
 
 
 def get_valid_tokens(cred_type: str) -> Optional[AuthTokens]:
@@ -1048,13 +1040,15 @@ async def recv_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         resp.raise_for_status()
         data = resp.json()
 
-        access_token = data.get("details", {}).get("access_token")
-        jwt          = data.get("details", {}).get("jwt")
+        details      = data.get("details", {})
+        access_token = details.get("access_token")
+        jwt          = details.get("jwt")
+        refresh_token = details.get("refresh_token", "")
         if not access_token or not jwt:
             raise RuntimeError(f"Tokens missing. Keys: {list(data.keys())}")
 
         sess.tokens = AuthTokens(access_token=access_token, jwt=jwt)
-        persist_tokens(sess.cred_type, access_token, jwt)   # cache for future sessions
+        persist_tokens(sess.cred_type, access_token, jwt, refresh_token)
 
     except Exception as e:
         await update.message.reply_text(
@@ -1986,13 +1980,15 @@ async def recv_rt_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             timeout=30,
         )
         resp.raise_for_status()
-        data         = resp.json()
-        access_token = data.get("details", {}).get("access_token")
-        jwt          = data.get("details", {}).get("jwt")
+        data          = resp.json()
+        details       = data.get("details", {})
+        access_token  = details.get("access_token")
+        jwt           = details.get("jwt")
+        refresh_token = details.get("refresh_token", "")
         if not access_token or not jwt:
             raise RuntimeError(f"Tokens missing. Keys: {list(data.keys())}")
         rt.tokens = AuthTokens(access_token=access_token, jwt=jwt)
-        persist_tokens(rt.cred_type, access_token, jwt)
+        persist_tokens(rt.cred_type, access_token, jwt, refresh_token)
     except Exception as e:
         await update.message.reply_text(
             f"❌ OTP failed: `{e}`\n\nSend the OTP again or tap 🛑 Cancel.",
@@ -2419,101 +2415,6 @@ def _daemon_keyboard() -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("▶️ Start Daemon",  callback_data="daemon:start")])
     rows.append([InlineKeyboardButton("🔁 Refresh Status", callback_data="daemon:status")])
     return InlineKeyboardMarkup(rows)
-
-
-async def cmd_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    /otp CODE — Complete a daemon-triggered token refresh.
-    The daemon POSTs /login and writes data/pending_otp.json.
-    The user sends /otp CODE here; we call /otpverify and save the new tokens.
-    """
-    if not allowed(update): return await deny(update)
-
-    args = update.message.text.strip().split(maxsplit=1)
-    if len(args) < 2 or not args[1].strip():
-        await update.message.reply_text(
-            "Usage: `/otp YOUR_CODE`\ne.g. `/otp 123456`",
-            parse_mode="Markdown",
-        )
-        return
-
-    otp_code = args[1].strip()
-
-    pending = _load_pending_otp()
-    if not pending:
-        await update.message.reply_text(
-            "ℹ️ No pending OTP refresh request from the daemon.\n"
-            "If you want to re-authenticate, use *🔑 Refresh Auth*.",
-            parse_mode="Markdown",
-            reply_markup=_main_menu(),
-        )
-        return
-
-    # Pick the oldest pending entry
-    cred_type = min(pending, key=lambda c: pending[c].get("triggered_at", 0))
-    label     = CRED_LABELS.get(cred_type, cred_type)
-    creds     = CRED_MAP.get(cred_type)
-    if not creds:
-        await update.message.reply_text(f"❌ Unknown credential type `{cred_type}`.", parse_mode="Markdown")
-        return
-
-    await update.message.reply_text(f"🔄 Verifying OTP for *{label}*…", parse_mode="Markdown")
-
-    # Restore cookies from the daemon's login session if present
-    http_sess = build_session()
-    saved_cookies = pending[cred_type].get("cookies", {})
-    if saved_cookies:
-        http_sess.cookies.update(saved_cookies)
-
-    try:
-        resp = http_sess.post(
-            f"{AUTH_BASE_URL}/otpverify",
-            json={"username": creds["username"], "password": creds["password"], "otpcode": otp_code},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data         = resp.json()
-        access_token = data.get("details", {}).get("access_token")
-        jwt          = data.get("details", {}).get("jwt")
-        if not access_token or not jwt:
-            raise RuntimeError(f"Tokens missing in response. Keys: {list(data.keys())}")
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ OTP verification failed for *{label}*: `{e}`\n\n"
-            f"Send the correct OTP again with `/otp CODE`, or tap *🔑 Refresh Auth*.",
-            parse_mode="Markdown",
-        )
-        return
-
-    persist_tokens(cred_type, access_token, jwt)
-
-    # Remove this entry from pending_otp.json
-    del pending[cred_type]
-    _save_pending_otp(pending)
-
-    exp_ts  = _jwt_exp(jwt)
-    exp_str = (
-        datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        if exp_ts else "unknown"
-    )
-    await update.message.reply_text(
-        f"✅ *Token refreshed for {label}*\n\n"
-        f"*Expires:* {exp_str}",
-        parse_mode="Markdown",
-        reply_markup=_main_menu(),
-    )
-    logger.info("Daemon OTP verified for %s via /otp command. Expiry: %s", cred_type, exp_str)
-
-    # If there are more pending entries, prompt the user
-    pending = _load_pending_otp()
-    if pending:
-        next_ct    = min(pending, key=lambda c: pending[c].get("triggered_at", 0))
-        next_label = CRED_LABELS.get(next_ct, next_ct)
-        await update.message.reply_text(
-            f"ℹ️ There is another pending OTP refresh for *{next_label}*.\n"
-            f"Please check your device for the OTP and send `/otp CODE`.",
-            parse_mode="Markdown",
-        )
 
 
 async def cmd_daemon(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3095,12 +2996,14 @@ async def recv_ft_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             timeout=30,
         )
         resp.raise_for_status()
-        data         = resp.json()
-        access_token = data.get("details", {}).get("access_token")
-        jwt          = data.get("details", {}).get("jwt")
+        data          = resp.json()
+        details       = data.get("details", {})
+        access_token  = details.get("access_token")
+        jwt           = details.get("jwt")
+        refresh_token = details.get("refresh_token", "")
         if not access_token or not jwt:
             raise RuntimeError(f"Tokens missing. Keys: {list(data.keys())}")
-        persist_tokens(sess.cred_type, access_token, jwt)
+        persist_tokens(sess.cred_type, access_token, jwt, refresh_token)
         sess.tokens = AuthTokens(access_token=access_token, jwt=jwt)
     except Exception as e:
         await update.message.reply_text(
@@ -3707,13 +3610,15 @@ async def recv_auth_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             timeout=30,
         )
         resp.raise_for_status()
-        data         = resp.json()
-        access_token = data.get("details", {}).get("access_token")
-        jwt          = data.get("details", {}).get("jwt")
+        data          = resp.json()
+        details       = data.get("details", {})
+        access_token  = details.get("access_token")
+        jwt           = details.get("jwt")
+        refresh_token = details.get("refresh_token", "")
         if not access_token or not jwt:
             raise RuntimeError(f"Tokens missing. Keys: {list(data.keys())}")
 
-        persist_tokens(auth_sess.cred_type, access_token, jwt)
+        persist_tokens(auth_sess.cred_type, access_token, jwt, refresh_token)
 
         exp_ts  = _jwt_exp(jwt)
         exp_str = (
@@ -3834,7 +3739,6 @@ def main():
     app.add_handler(CommandHandler("schedules",     cmd_schedules))
     app.add_handler(CommandHandler("task_batches",  cmd_task_batches))
     app.add_handler(CommandHandler("daemon",        cmd_daemon))
-    app.add_handler(CommandHandler("otp",           cmd_otp))
     fetch_conv = ConversationHandler(
         entry_points=[
             CommandHandler("fetch", cmd_fetch_tasks),
