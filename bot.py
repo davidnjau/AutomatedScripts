@@ -314,25 +314,27 @@ def _get_auth_sess(ctx: ContextTypes.DEFAULT_TYPE) -> AuthSession:
 # States — Fetch Tasks conversation
 # ──────────────────────────────────────────────────────────
 class FT(Enum):
-    CHOOSE_CRED   = auto()
-    WAIT_OTP      = auto()
-    DAYS_BACK     = auto()   # inline-button preset OR free text
-    COUNTY_FILTER = auto()   # ask whether to filter by county/registry
-    COUNTY_TEXT   = auto()   # text input for county/registry filter
-    AMOUNT_FILTER = auto()   # 4-button amount range picker
-    AMOUNT_TEXT   = auto()   # free-text custom min/max amount
+    CHOOSE_CRED      = auto()
+    WAIT_OTP         = auto()
+    DAYS_BACK        = auto()   # inline-button preset OR free text
+    COUNTY_FILTER    = auto()   # county button picker
+    REGISTRY_FILTER  = auto()   # registry button picker
+    AMOUNT_FILTER    = auto()   # 4-button amount range picker
+    AMOUNT_TEXT      = auto()   # free-text custom min/max amount
 
 
 @dataclass
 class FTSession:
-    cred_type:    str = "staff2"   # default to Support Reg (has SUPPORT role)
-    http_session: Optional[requests.Session] = None
-    tokens:       Optional[AuthTokens] = None
-    days_back:    int = 5
-    tasks:        List[Dict] = field(default_factory=list)   # amount-filtered tasks
-    stats:        Dict = field(default_factory=dict)
-    amount_min:   Optional[float] = None
-    amount_max:   Optional[float] = None
+    cred_type:       str = "staff2"   # default to Support Reg (has SUPPORT role)
+    http_session:    Optional[requests.Session] = None
+    tokens:          Optional[AuthTokens] = None
+    days_back:       int = 5
+    tasks:           List[Dict] = field(default_factory=list)
+    stats:           Dict = field(default_factory=dict)
+    county_filter:   str = ""           # "nairobi" or "" (all)
+    registry_filter: str = ""           # "central", "nairobi", or "" (all)
+    amount_min:      Optional[float] = None
+    amount_max:      Optional[float] = None
 
 
 def _get_ft_sess(ctx: ContextTypes.DEFAULT_TYPE) -> FTSession:
@@ -3039,11 +3041,11 @@ async def recv_ft_days_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     sess.days_back = int(val)
     await query.edit_message_text(
-        f"✅ *{sess.days_back}* day(s) selected.\n\nFilter by *consideration amount*?",
+        f"✅ *{sess.days_back}* day(s) selected.\n\nFilter by *county*?",
         parse_mode="Markdown",
-        reply_markup=_ft_amount_keyboard(),
+        reply_markup=_ft_county_keyboard(),
     )
-    return FT.AMOUNT_FILTER
+    return FT.COUNTY_FILTER
 
 
 async def recv_ft_days_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3062,27 +3064,79 @@ async def recv_ft_days_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     sess.days_back = days
     await update.message.reply_text(
-        f"✅ *{sess.days_back}* day(s) selected.\n\nFilter by *consideration amount*?",
+        f"✅ *{sess.days_back}* day(s) selected.\n\nFilter by *county*?",
         parse_mode="Markdown",
-        reply_markup=_ft_amount_keyboard(),
+        reply_markup=_ft_county_keyboard(),
     )
-    return FT.AMOUNT_FILTER
+    return FT.COUNTY_FILTER
+
+
+def _ft_county_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🌆 Nairobi",      callback_data="ft_county:nairobi"),
+            InlineKeyboardButton("📋 All Counties", callback_data="ft_county:all"),
+        ],
+    ])
+
+
+def _ft_registry_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📁 Central",        callback_data="ft_registry:central"),
+            InlineKeyboardButton("📁 Nairobi",         callback_data="ft_registry:nairobi"),
+        ],
+        [
+            InlineKeyboardButton("📋 All Registries", callback_data="ft_registry:all"),
+        ],
+    ])
 
 
 def _ft_amount_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("0 – 1M",    callback_data="ft_amount:0_1m"),
-            InlineKeyboardButton("1M – 5M",   callback_data="ft_amount:1m_5m"),
+            InlineKeyboardButton("0 – 1M",       callback_data="ft_amount:0_1m"),
+            InlineKeyboardButton("1M – 5M",      callback_data="ft_amount:1m_5m"),
         ],
         [
-            InlineKeyboardButton("5M – 10M",  callback_data="ft_amount:5m_10m"),
-            InlineKeyboardButton("✏️ Custom",  callback_data="ft_amount:custom"),
+            InlineKeyboardButton("5M – 10M",     callback_data="ft_amount:5m_10m"),
+            InlineKeyboardButton("✏️ Custom",     callback_data="ft_amount:custom"),
         ],
         [
             InlineKeyboardButton("📋 No filter", callback_data="ft_amount:all"),
         ],
     ])
+
+
+async def recv_ft_county_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    sess = _get_ft_sess(ctx)
+
+    sess.county_filter = "" if query.data == "ft_county:all" else query.data.split(":")[1]
+    label = f"*{sess.county_filter.title()}*" if sess.county_filter else "*All Counties*"
+    await query.edit_message_text(
+        f"County: {label}\n\nFilter by *registry*?",
+        parse_mode="Markdown",
+        reply_markup=_ft_registry_keyboard(),
+    )
+    return FT.REGISTRY_FILTER
+
+
+async def recv_ft_registry_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    sess = _get_ft_sess(ctx)
+
+    sess.registry_filter = "" if query.data == "ft_registry:all" else query.data.split(":")[1]
+    reg_label    = f"*{sess.registry_filter.title()}*" if sess.registry_filter else "*All Registries*"
+    county_label = f"*{sess.county_filter.title()}*"   if sess.county_filter   else "*All Counties*"
+    await query.edit_message_text(
+        f"County: {county_label} | Registry: {reg_label}\n\nFilter by *amount*?",
+        parse_mode="Markdown",
+        reply_markup=_ft_amount_keyboard(),
+    )
+    return FT.AMOUNT_FILTER
 
 
 async def recv_ft_amount_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3140,7 +3194,7 @@ async def recv_ft_amount_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession):
-    """Fetch tasks, apply amount filter, save to sess.tasks, then ask county filter."""
+    """Fetch tasks, apply county / registry / amount filters, then show results."""
     try:
         tasks, stats = _load_fetch_tasks(sess.tokens, sess.days_back)
     except Exception as e:
@@ -3155,7 +3209,15 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
     hq_kept = stats.get("hq_kept",    0)
     c_kept  = stats.get("county_kept", 0)
 
-    # Apply amount filter
+    # County filter
+    if sess.county_filter:
+        tasks = [t for t in tasks if sess.county_filter in (t.get("county") or "").lower()]
+
+    # Registry filter
+    if sess.registry_filter:
+        tasks = [t for t in tasks if sess.registry_filter in (t.get("registry") or "").lower()]
+
+    # Amount filter
     if sess.amount_min is not None or sess.amount_max is not None:
         def _in_range(t):
             try:
@@ -3171,9 +3233,22 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
 
     sess.tasks = tasks
 
+    # Build active-filter summary for the header
+    filter_parts = []
+    if sess.county_filter:
+        filter_parts.append(f"County: {sess.county_filter.title()}")
+    if sess.registry_filter:
+        filter_parts.append(f"Registry: {sess.registry_filter.title()}")
+    if sess.amount_min is not None or sess.amount_max is not None:
+        lo = f"KES {int(sess.amount_min):,}" if sess.amount_min is not None else "0"
+        hi = f"KES {int(sess.amount_max):,}" if sess.amount_max is not None else "∞"
+        filter_parts.append(f"Amount: {lo} – {hi}")
+    filter_line = ("_Filters: " + " | ".join(filter_parts) + "_\n") if filter_parts else ""
+
     if not tasks:
         await message.reply_text(
             f"ℹ️ No qualifying tasks in the last *{sess.days_back}* day(s).\n"
+            f"{filter_line}"
             f"_(HQ: {hq_raw} seen → {hq_kept} matched | "
             f"County: {c_raw} seen → {c_kept} matched)_",
             parse_mode="Markdown",
@@ -3182,53 +3257,12 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
         return ConversationHandler.END
 
     await message.reply_text(
-        f"✅ Found *{len(tasks)}* task(s) in the last *{sess.days_back}* day(s).\n"
-        f"_(HQ: {hq_raw} → {hq_kept} matched | County: {c_raw} → {c_kept} matched)_\n\n"
-        "Filter by county / registry?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🗺 Yes, filter", callback_data="ft_county:yes"),
-                InlineKeyboardButton("📋 Show all",    callback_data="ft_county:no"),
-            ]
-        ]),
-    )
-    return FT.COUNTY_FILTER
-
-
-async def recv_ft_county_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    sess = _get_ft_sess(ctx)
-
-    if query.data == "ft_county:no":
-        await query.edit_message_text("📋 Preparing results…")
-        await _ft_show_results(query.message, sess.tasks)
-        return ConversationHandler.END
-
-    await query.edit_message_text(
-        "Enter county and/or registry to filter by (partial match, case-insensitive):\n"
-        "e.g. `nairobi` or `MBEERE`",
+        f"✅ *{len(tasks)}* task(s) found — last *{sess.days_back}* day(s).\n"
+        f"{filter_line}"
+        f"_(HQ: {hq_raw} → {hq_kept} | County: {c_raw} → {c_kept})_",
         parse_mode="Markdown",
     )
-    return FT.COUNTY_TEXT
-
-
-async def recv_ft_county_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text     = update.message.text.strip().lower()
-    sess     = _get_ft_sess(ctx)
-    filtered = [
-        t for t in sess.tasks
-        if text in t.get("county", "").lower() or text in t.get("registry", "").lower()
-    ]
-    if not filtered:
-        await update.message.reply_text(
-            f"ℹ️ No tasks match `{text}` — showing all *{len(sess.tasks)}* result(s).",
-            parse_mode="Markdown",
-        )
-        filtered = sess.tasks
-
-    await _ft_show_results(update.message, filtered)
+    await _ft_show_results(message, tasks)
     return ConversationHandler.END
 
 
@@ -3841,10 +3875,10 @@ def main():
                 CallbackQueryHandler(recv_ft_days_callback, pattern=r"^ft_days:"),
                 MessageHandler(not_cancel, recv_ft_days_text),
             ],
-            FT.COUNTY_FILTER: [CallbackQueryHandler(recv_ft_county_filter, pattern=r"^ft_county:")],
-            FT.COUNTY_TEXT:   [MessageHandler(not_cancel, recv_ft_county_text)],
-            FT.AMOUNT_FILTER: [CallbackQueryHandler(recv_ft_amount_filter, pattern=r"^ft_amount:")],
-            FT.AMOUNT_TEXT:   [MessageHandler(not_cancel, recv_ft_amount_text)],
+            FT.COUNTY_FILTER:   [CallbackQueryHandler(recv_ft_county_filter,   pattern=r"^ft_county:")],
+            FT.REGISTRY_FILTER: [CallbackQueryHandler(recv_ft_registry_filter, pattern=r"^ft_registry:")],
+            FT.AMOUNT_FILTER:   [CallbackQueryHandler(recv_ft_amount_filter,   pattern=r"^ft_amount:")],
+            FT.AMOUNT_TEXT:     [MessageHandler(not_cancel, recv_ft_amount_text)],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
