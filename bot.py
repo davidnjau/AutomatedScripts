@@ -3209,19 +3209,28 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
     hq_kept = stats.get("hq_kept",    0)
     c_kept  = stats.get("county_kept", 0)
 
-    # County filter
+    # County filter (partial, case-insensitive)
     if sess.county_filter:
-        tasks = [t for t in tasks if sess.county_filter in (t.get("county") or "").lower()]
+        tasks = [
+            t for t in tasks
+            if sess.county_filter in (t.get("county") or "").strip().lower()
+        ]
 
-    # Registry filter
+    # Registry filter (partial, case-insensitive)
     if sess.registry_filter:
-        tasks = [t for t in tasks if sess.registry_filter in (t.get("registry") or "").lower()]
+        tasks = [
+            t for t in tasks
+            if sess.registry_filter in (t.get("registry") or "").strip().lower()
+        ]
 
-    # Amount filter
+    # Amount filter — strip commas/spaces so "1,500,000.00" parses correctly
     if sess.amount_min is not None or sess.amount_max is not None:
         def _in_range(t):
+            raw = t.get("consideration")
+            if raw is None:
+                return False
             try:
-                val = float(t.get("consideration") or 0)
+                val = float(str(raw).replace(",", "").strip())
             except (ValueError, TypeError):
                 return False
             if sess.amount_min is not None and val < sess.amount_min:
@@ -3281,9 +3290,10 @@ async def _ft_show_results(message, tasks: List[Dict]):
         date   = (t.get("date_created") or "")[:10]
         parcel = t.get("parcel_number") or "—"
         try:
-            cons = f"KES {int(float(t['consideration'])):,}" if t.get("consideration") else "—"
+            raw_cons = t.get("consideration")
+            cons = f"KES {int(float(str(raw_cons).replace(',', '').strip())):,}" if raw_cons else "—"
         except (ValueError, TypeError):
-            cons = t.get("consideration") or "—"
+            cons = str(t.get("consideration") or "—")
         officers_str = ", ".join(
             f"{o['name']} ({o['role']})" for o in t.get("officers", []) if o.get("name")
         ) or "none"
