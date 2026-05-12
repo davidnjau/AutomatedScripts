@@ -184,12 +184,19 @@ _api_sess = _api_session()
 def _try_refresh_token(
     access_token:  str,
     jwt_token:     str,
-    refresh_token: str,
+    refresh_token: str = "",
 ) -> Optional[Tuple[str, str, str]]:
     """
-    POST /auth/refresh-token.
+    POST /auth/refresh-token using current valid auth headers.
+    Sends refresh_token in the body if one is available, but also works
+    without it — the server will issue new tokens while the current ones
+    are still valid (called 10 min before expiry).
     Returns (new_access_token, new_jwt, new_refresh_token) or None.
     """
+    body = {}
+    if refresh_token:
+        body["refresh_token"] = refresh_token
+
     try:
         resp = _api_sess.post(
             f"{AUTH_BASE_URL}/refresh-token",
@@ -197,7 +204,7 @@ def _try_refresh_token(
                 "Authorization": f"Bearer {access_token}",
                 "JWTAUTH":       f"Bearer {jwt_token}",
             },
-            json={"refresh_token": refresh_token},
+            json=body,
             timeout=30,
         )
         if resp.status_code not in (200, 201):
@@ -278,13 +285,15 @@ def _refresh_job(cred_type: str) -> None:
     jwt_token     = entry.get("jwt", "")
     refresh_token = entry.get("refresh_token", "")
 
+    if not access_token or not jwt_token:
+        logger.warning("[%s] No tokens in cache — skipping.", cred_type)
+        return
+
     if not refresh_token:
-        logger.warning(
-            "[%s] No refresh_token stored — cannot refresh. "
-            "Re-authenticate via the bot to save a refresh_token.",
+        logger.info(
+            "[%s] No refresh_token stored — attempting refresh with current auth headers only.",
             cred_type,
         )
-        return
 
     result = _try_refresh_token(access_token, jwt_token, refresh_token)
     if result:
