@@ -5,3 +5,4 @@ urllib3==2.2.3
 pytesseract>=0.3.13
 Pillow>=10.0.0
 anthropic>=0.87.0
+apscheduler>=3.10.0

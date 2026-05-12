@@ -3,7 +3,7 @@
 token_refresh_daemon.py
 =======================
 Always-on daemon that monitors data/saved_tokens.json and automatically
-refreshes every credential profile 5–10 minutes before its token expires.
+refreshes every credential profile before its token expires.
 
 Refresh strategy:
   POST /acl/api/v1/auth/refresh-token
@@ -11,18 +11,22 @@ Refresh strategy:
       JWTAUTH:       Bearer <jwt>
       Body:          {"refresh_token": "<refresh_token>"}
 
-  The daemon only refreshes credentials that were previously authenticated
-  (i.e. saved_tokens.json has a refresh_token entry for that profile).
-  It never triggers OTP prompts — OTP is handled exclusively by the bot
-  flows (assign / receive / fetch / auth-refresh).  Once those flows save
-  tokens via persist_tokens(), the daemon picks them up and keeps them fresh.
+  For each credential found in saved_tokens.json the daemon schedules an
+  APScheduler one-shot job to fire REFRESH_BEFORE seconds before expiry.
+  After a successful refresh the job reschedules itself for the new expiry.
+  A periodic scan runs every SCAN_INTERVAL seconds to pick up credentials
+  that were added or re-authenticated by the bot after startup.
+
+  The daemon never triggers OTP prompts — OTP is handled exclusively by the
+  bot flows (assign / receive / fetch).  Once those flows save tokens via
+  persist_tokens(), the daemon picks them up and keeps them fresh.
 
 Usage:
     python token_refresh_daemon.py              # foreground
     nohup python token_refresh_daemon.py &      # background
 
 Environment variables (read from .env):
-    TELEGRAM_BOT_TOKEN       — required
+    TELEGRAM_BOT_TOKEN       — required for Telegram status messages
     ALLOWED_TELEGRAM_IDS     — comma-separated Telegram chat IDs
 """
 
@@ -37,16 +41,15 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import requests
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from ardhisasa_auth import (
     AUTH_BASE_URL,
-    PUBLIC_CREDENTIALS,
-    STAFF_CREDENTIALS_ICT,
-    STAFF_CREDENTIALS_SUPPORT,
-    STAFF_CREDENTIALS_VALUER,
     build_session,
 )
 
@@ -60,11 +63,13 @@ CACHE_FILE = os.path.join(_BASE_DIR, "data", "saved_tokens.json")
 PID_FILE   = os.path.join(_BASE_DIR, "data", "daemon.pid")
 LOG_FILE   = os.path.join(_BASE_DIR, "data", "daemon.log")
 
-REFRESH_BEFORE = 10 * 60   # act when token expires within this many seconds
-POLL_INTERVAL  = 60        # seconds between token checks
+# Refresh this many seconds before expiry
+REFRESH_BEFORE  = 10 * 60   # 10 minutes
+# How often to scan cache for new / changed credentials
+SCAN_INTERVAL   = 5 * 60    # 5 minutes
 
-TELEGRAM_API   = "https://api.telegram.org"
-BOT_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_API = "https://api.telegram.org"
+BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_IDS: List[int] = [
     int(x.strip())
     for x in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",")
@@ -79,7 +84,7 @@ CRED_LABELS = {
 }
 
 # ──────────────────────────────────────────────────────────
-# Logging — stdout + rotating file
+# Logging — stdout + file
 # ──────────────────────────────────────────────────────────
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -120,8 +125,10 @@ def _load_cache() -> Dict:
 
 def _save_cache(cache: Dict) -> None:
     os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-    with open(CACHE_FILE, "w") as f:
+    tmp = CACHE_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(cache, f, indent=2)
+    os.replace(tmp, CACHE_FILE)
 
 
 def _decode_exp(token: str) -> Optional[float]:
@@ -137,12 +144,22 @@ def _fmt_ts(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _run_at(ts: float) -> datetime:
+    """Convert a UNIX timestamp to a timezone-aware datetime for APScheduler."""
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+
 # ──────────────────────────────────────────────────────────
-# Telegram helper (send only — no getUpdates)
+# Telegram helper
 # ──────────────────────────────────────────────────────────
-def _tg_send(tg: requests.Session, chat_id: int, text: str) -> None:
+_tg_sess = _tg_session()
+
+
+def _tg_send(chat_id: int, text: str) -> None:
+    if not BOT_TOKEN:
+        return
     try:
-        resp = tg.post(
+        resp = _tg_sess.post(
             f"{TELEGRAM_API}/bot{BOT_TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
             timeout=15,
@@ -153,29 +170,28 @@ def _tg_send(tg: requests.Session, chat_id: int, text: str) -> None:
         logger.warning("Telegram error for %s: %s", chat_id, e)
 
 
-def _tg_broadcast(tg: requests.Session, text: str) -> None:
-    if not BOT_TOKEN:
-        logger.warning("TELEGRAM_BOT_TOKEN not set — cannot send Telegram message.")
-        return
+def _tg_broadcast(text: str) -> None:
     for chat_id in ALLOWED_IDS:
-        _tg_send(tg, chat_id, text)
+        _tg_send(chat_id, text)
 
 
 # ──────────────────────────────────────────────────────────
-# Refresh-token call
+# Refresh-token API call
 # ──────────────────────────────────────────────────────────
+_api_sess = _api_session()
+
+
 def _try_refresh_token(
-    api:           requests.Session,
     access_token:  str,
     jwt_token:     str,
     refresh_token: str,
 ) -> Optional[Tuple[str, str, str]]:
     """
-    POST /auth/refresh-token with the stored refresh_token.
-    Returns (new_access_token, new_jwt, new_refresh_token) on success, else None.
+    POST /auth/refresh-token.
+    Returns (new_access_token, new_jwt, new_refresh_token) or None.
     """
     try:
-        resp = api.post(
+        resp = _api_sess.post(
             f"{AUTH_BASE_URL}/refresh-token",
             headers={
                 "Authorization": f"Bearer {access_token}",
@@ -187,11 +203,11 @@ def _try_refresh_token(
         if resp.status_code not in (200, 201):
             logger.debug("refresh-token HTTP %d: %s", resp.status_code, resp.text[:200])
             return None
-        data = resp.json()
-        details   = data.get("details", data)   # handle both nested and flat responses
-        new_at    = details.get("access_token")
-        new_jwt   = details.get("jwt")
-        new_rt    = details.get("refresh_token") or refresh_token  # keep old if not rotated
+        data    = resp.json()
+        details = data.get("details", data)
+        new_at  = details.get("access_token")
+        new_jwt = details.get("jwt")
+        new_rt  = details.get("refresh_token") or refresh_token
         if new_at and new_jwt:
             return new_at, new_jwt, new_rt
         logger.debug("refresh-token response missing tokens. Keys: %s", list(data.keys()))
@@ -201,10 +217,148 @@ def _try_refresh_token(
 
 
 # ──────────────────────────────────────────────────────────
+# Scheduler and job tracking
+# ──────────────────────────────────────────────────────────
+scheduler = BackgroundScheduler(timezone="UTC")
+
+# Track which (cred_type, expiry_bucket) pairs already have a scheduled job
+# so we don't double-schedule for the same expiry window.
+_scheduled: Dict[str, int] = {}   # cred_type → expiry_bucket (int(exp // 60))
+
+
+def _schedule_refresh(cred_type: str, exp: float) -> None:
+    """Schedule a one-shot refresh job to run REFRESH_BEFORE seconds before exp."""
+    bucket      = int(exp // 60)
+    secs_left   = exp - time.time()
+    fire_in     = secs_left - REFRESH_BEFORE
+
+    if _scheduled.get(cred_type) == bucket:
+        return  # already scheduled for this expiry window
+
+    job_id = f"refresh_{cred_type}"
+
+    if fire_in <= 0:
+        # Token already within the refresh window (or expired) — run immediately.
+        logger.info("[%s] Token expires in %ds — scheduling immediate refresh.", cred_type, int(secs_left))
+        fire_time = datetime.now(tz=timezone.utc)
+    else:
+        fire_time = _run_at(exp - REFRESH_BEFORE)
+        logger.info(
+            "[%s] Token expires %s — refresh scheduled at %s (%dm from now).",
+            cred_type, _fmt_ts(exp), _fmt_ts(exp - REFRESH_BEFORE), int(fire_in // 60),
+        )
+
+    # Remove any existing job for this credential first
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+
+    scheduler.add_job(
+        _refresh_job,
+        trigger=DateTrigger(run_date=fire_time),
+        id=job_id,
+        args=[cred_type],
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+    _scheduled[cred_type] = bucket
+
+
+def _refresh_job(cred_type: str) -> None:
+    """APScheduler job: attempt token refresh and reschedule on success."""
+    label = CRED_LABELS.get(cred_type, cred_type)
+    logger.info("[%s] Refresh job fired.", cred_type)
+
+    cache = _load_cache()
+    entry = cache.get(cred_type)
+    if not entry:
+        logger.warning("[%s] No token entry in cache — skipping.", cred_type)
+        return
+
+    access_token  = entry.get("access_token", "")
+    jwt_token     = entry.get("jwt", "")
+    refresh_token = entry.get("refresh_token", "")
+
+    if not refresh_token:
+        logger.warning(
+            "[%s] No refresh_token stored — cannot refresh. "
+            "Re-authenticate via the bot to save a refresh_token.",
+            cred_type,
+        )
+        return
+
+    result = _try_refresh_token(access_token, jwt_token, refresh_token)
+    if result:
+        new_access, new_jwt, new_rt = result
+        new_exp = _decode_exp(new_jwt) or (time.time() + 3600)
+
+        cache[cred_type] = {
+            "access_token":  new_access,
+            "jwt":           new_jwt,
+            "refresh_token": new_rt,
+            "expires_at":    new_exp,
+        }
+        _save_cache(cache)
+
+        # Clear the old scheduled bucket so the new expiry will be scheduled
+        _scheduled.pop(cred_type, None)
+
+        logger.info("[%s] ✅ Token refreshed. New expiry: %s", cred_type, _fmt_ts(new_exp))
+        _tg_broadcast(
+            f"✅ *Token auto-refreshed*\n\n"
+            f"*Profile:* {label}\n"
+            f"*New expiry:* {_fmt_ts(new_exp)}"
+        )
+
+        # Schedule next refresh for the new expiry
+        _schedule_refresh(cred_type, new_exp)
+    else:
+        logger.warning("[%s] ❌ Refresh failed. Will retry at next scan.", cred_type)
+        _tg_broadcast(
+            f"⚠️ *Token refresh failed*\n\n"
+            f"*Profile:* {label}\n"
+            "Will retry at next scan interval."
+        )
+        # Clear scheduled so the scan will retry
+        _scheduled.pop(cred_type, None)
+
+
+def _scan_cache() -> None:
+    """Periodic job: check cache for credentials that need a scheduled refresh."""
+    cache = _load_cache()
+    if not cache:
+        return
+
+    now = time.time()
+    for cred_type, entry in cache.items():
+        jwt_token = entry.get("jwt", "")
+        exp       = entry.get("expires_at") or _decode_exp(jwt_token)
+
+        if not exp:
+            logger.warning("[%s] Cannot decode expiry — skipping.", cred_type)
+            continue
+
+        secs_left = exp - now
+        bucket    = int(exp // 60)
+
+        if secs_left <= 0:
+            logger.info("[%s] Token already expired — triggering immediate refresh.", cred_type)
+            # Clear so _schedule_refresh will reschedule
+            _scheduled.pop(cred_type, None)
+            _schedule_refresh(cred_type, exp)
+        elif _scheduled.get(cred_type) != bucket:
+            # New or changed expiry — schedule a refresh job
+            _schedule_refresh(cred_type, exp)
+        else:
+            logger.debug(
+                "[%s] Refresh already scheduled — expires in %dm.",
+                cred_type, int(secs_left // 60),
+            )
+
+
+# ──────────────────────────────────────────────────────────
 # Process management
 # ──────────────────────────────────────────────────────────
 def _kill_previous_instance() -> None:
-    """Kill any previously running daemon instance recorded in the PID file."""
     try:
         with open(PID_FILE) as f:
             old_pid = int(f.read().strip())
@@ -219,13 +373,13 @@ def _kill_previous_instance() -> None:
         logger.info("Sent SIGTERM to previous daemon instance (PID %d).", old_pid)
         time.sleep(1)
     except ProcessLookupError:
-        pass   # already gone
+        pass
     except Exception as e:
         logger.warning("Could not stop previous daemon (PID %d): %s", old_pid, e)
 
 
 # ──────────────────────────────────────────────────────────
-# Main loop
+# Main
 # ──────────────────────────────────────────────────────────
 _stop = False
 
@@ -237,6 +391,8 @@ def _handle_signal(sig, _frame):
 
 
 def run() -> None:
+    global _stop
+
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT,  _handle_signal)
 
@@ -246,111 +402,35 @@ def run() -> None:
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
-    api_sess = _api_session()
-    tg_sess  = _tg_session()
-
-    # alerted: {cred_type: expiry_bucket} — prevents repeated refresh attempts per expiry window
-    alerted: Dict[str, int] = {}
-
     logger.info("=" * 60)
     logger.info("Token refresh daemon started  (PID %d)", os.getpid())
     logger.info("Cache   : %s", CACHE_FILE)
     logger.info("Refresh : %d min before expiry", REFRESH_BEFORE // 60)
-    logger.info("Poll    : every %d s", POLL_INTERVAL)
-    logger.info("Mode    : refresh-token only — no OTP prompts")
+    logger.info("Scan    : every %d min", SCAN_INTERVAL // 60)
+    logger.info("Mode    : APScheduler date-based — no polling loop")
     logger.info("=" * 60)
 
-    last_token_check = 0.0
+    scheduler.start()
 
+    # Periodic cache scan to pick up newly authenticated credentials
+    scheduler.add_job(
+        _scan_cache,
+        trigger=IntervalTrigger(seconds=SCAN_INTERVAL),
+        id="scan_cache",
+        replace_existing=True,
+    )
+
+    # Run an immediate scan on startup
+    _scan_cache()
+
+    # Main thread just waits for stop signal
     while not _stop:
-        now = time.time()
+        time.sleep(1)
 
-        if now - last_token_check >= POLL_INTERVAL:
-            last_token_check = now
-            cache         = _load_cache()
-            cache_changed = False
-
-            for cred_type, entry in list(cache.items()):
-                access_token  = entry.get("access_token", "")
-                jwt_token     = entry.get("jwt", "")
-                refresh_token = entry.get("refresh_token", "")
-                exp           = entry.get("expires_at") or _decode_exp(jwt_token)
-                label         = CRED_LABELS.get(cred_type, cred_type)
-
-                if not exp:
-                    logger.warning("[%s] Cannot decode expiry — skipping.", cred_type)
-                    continue
-
-                secs_left = exp - now
-                bucket    = int(exp // 60)
-
-                if secs_left > REFRESH_BEFORE:
-                    logger.debug(
-                        "[%s] OK — expires in %dm %ds (%s).",
-                        cred_type, int(secs_left // 60), int(secs_left % 60), _fmt_ts(exp),
-                    )
-                    continue
-
-                # Already handled this expiry window
-                if alerted.get(cred_type) == bucket:
-                    continue
-
-                if secs_left <= 0:
-                    log_msg = f"already expired ({_fmt_ts(exp)})"
-                else:
-                    mins_left = max(int(secs_left // 60), 0)
-                    log_msg   = f"expiring in {mins_left}m ({_fmt_ts(exp)})"
-
-                logger.info("[%s] Token %s — attempting refresh…", cred_type, log_msg)
-
-                if not refresh_token:
-                    logger.warning(
-                        "[%s] No refresh_token stored — cannot refresh. "
-                        "Authenticate via the bot to save a refresh_token.",
-                        cred_type,
-                    )
-                    alerted[cred_type] = bucket
-                    continue
-
-                result = _try_refresh_token(api_sess, access_token, jwt_token, refresh_token)
-                if result:
-                    new_access, new_jwt, new_rt = result
-                    new_exp = _decode_exp(new_jwt) or (now + 3600)
-                    cache[cred_type] = {
-                        "access_token":  new_access,
-                        "jwt":           new_jwt,
-                        "refresh_token": new_rt,
-                        "expires_at":    new_exp,
-                    }
-                    cache_changed      = True
-                    alerted[cred_type] = int(new_exp // 60)
-                    logger.info(
-                        "[%s] ✅ Token refreshed. New expiry: %s", cred_type, _fmt_ts(new_exp)
-                    )
-                    _tg_broadcast(
-                        tg_sess,
-                        f"✅ *Token auto-refreshed*\n\n"
-                        f"*Profile:* {label}\n"
-                        f"*New expiry:* {_fmt_ts(new_exp)}",
-                    )
-                else:
-                    logger.warning(
-                        "[%s] ❌ refresh-token call failed. Will retry next cycle.", cred_type
-                    )
-                    alerted[cred_type] = bucket
-
-            if cache_changed:
-                _save_cache(cache)
-
-        # Sleep between checks
-        elapsed   = time.time() - last_token_check
-        sleep_for = max(1, POLL_INTERVAL - elapsed)
-        for _ in range(int(sleep_for)):
-            if _stop:
-                break
-            time.sleep(1)
-
+    logger.info("Shutting down scheduler…")
+    scheduler.shutdown(wait=False)
     logger.info("Token refresh daemon stopped.")
+
     try:
         os.remove(PID_FILE)
     except FileNotFoundError:
