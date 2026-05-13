@@ -398,7 +398,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_DLV_BATCH)}|{re.escape(BTN_AUTH)}"
     f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_DAEMON)}"
     f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
-    f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_DLV_TASKS)}"
+    f"|{re.escape(BTN_FETCH_TASKS)}"
     f"|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -408,7 +408,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton(BTN_ASSIGN),      KeyboardButton(BTN_DLV_BATCH)],
-            [KeyboardButton(BTN_FETCH_TASKS),  KeyboardButton(BTN_DLV_TASKS)],
+            [KeyboardButton(BTN_FETCH_TASKS)],
             [KeyboardButton(BTN_AUTH),        KeyboardButton(BTN_TOKEN_STATUS)],
             [KeyboardButton(BTN_DAEMON)],
             [KeyboardButton(BTN_VALUERS),     KeyboardButton(BTN_DELETE)],
