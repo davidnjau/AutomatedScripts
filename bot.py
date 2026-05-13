@@ -101,6 +101,7 @@ SAVED_TOKENS_FILE       = os.path.join(DATA_DIR, "saved_tokens.json")
 SAVED_ASSIGNMENTS_FILE  = os.path.join(DATA_DIR, "saved_assignments.json")
 SAVED_TASK_BATCHES_FILE = os.path.join(DATA_DIR, "saved_task_batches.json")
 SAVED_SCHEDULES_FILE    = os.path.join(DATA_DIR, "saved_schedules.json")
+SAVED_DLV_BATCH_FILE    = os.path.join(DATA_DIR, "saved_dlv_batch.json")
 
 # base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
 CPARAMS_DLV          = base64.b64encode(b'{"active_role":"DLV"}').decode()
@@ -290,6 +291,26 @@ class RTSession:
 
 
 # ──────────────────────────────────────────────────────────
+# States — DLV Batch conversation
+# ──────────────────────────────────────────────────────────
+class DB(Enum):
+    INPUT_BATCH   = auto()   # waiting for batch text
+    CONFIRM_BATCH = auto()   # waiting for confirm/cancel
+
+
+@dataclass
+class DBSession:
+    groups: List[Dict] = field(default_factory=list)
+    # groups: [{refs, valuer_name, valuer_uid, valuer_acct, status}]
+
+
+def _get_db_sess(ctx: ContextTypes.DEFAULT_TYPE) -> DBSession:
+    if "db_session" not in ctx.user_data:
+        ctx.user_data["db_session"] = DBSession()
+    return ctx.user_data["db_session"]
+
+
+# ──────────────────────────────────────────────────────────
 # States — Refresh Auth conversation
 # ──────────────────────────────────────────────────────────
 class AS(Enum):
@@ -361,7 +382,7 @@ CRED_LABELS = {
 # Main menu button labels & keyboard
 # ──────────────────────────────────────────────────────────
 BTN_ASSIGN        = "📋 New Assignment"
-BTN_RECEIVE       = "📥 Receive Tasks"
+BTN_DLV_BATCH     = "📥 DLV Batch"
 BTN_AUTH          = "🔑 Refresh Auth"
 BTN_TOKEN_STATUS  = "🔒 Token Status"
 BTN_DAEMON        = "🔄 Token Daemon"
@@ -374,7 +395,7 @@ BTN_CANCEL        = "🛑 Cancel"
 
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
-    f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_RECEIVE)}|{re.escape(BTN_AUTH)}"
+    f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_DLV_BATCH)}|{re.escape(BTN_AUTH)}"
     f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_DAEMON)}"
     f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
     f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_DLV_TASKS)}"
@@ -386,7 +407,7 @@ _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
 def _main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton(BTN_ASSIGN),      KeyboardButton(BTN_RECEIVE)],
+            [KeyboardButton(BTN_ASSIGN),      KeyboardButton(BTN_DLV_BATCH)],
             [KeyboardButton(BTN_FETCH_TASKS),  KeyboardButton(BTN_DLV_TASKS)],
             [KeyboardButton(BTN_AUTH),        KeyboardButton(BTN_TOKEN_STATUS)],
             [KeyboardButton(BTN_DAEMON)],
@@ -2516,6 +2537,201 @@ async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
+# DLV Batch — persistent queue helpers
+# ──────────────────────────────────────────────────────────
+
+def load_dlv_batch() -> List[Dict]:
+    try:
+        with open(SAVED_DLV_BATCH_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_dlv_batch(items: List[Dict]) -> None:
+    _ensure_data_dir()
+    with open(SAVED_DLV_BATCH_FILE, "w") as f:
+        json.dump(items, f, indent=2)
+
+
+def clear_dlv_batch() -> None:
+    save_dlv_batch([])
+
+
+def _parse_batch_input(text: str) -> List[Dict]:
+    """
+    Parse lines of format:  "REF1, REF2 : Valuer Name"
+    Returns [{refs: [...], valuer_name_raw: "..."}]
+    """
+    groups = []
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        ref_part, valuer_part = line.rsplit(":", 1)
+        refs = [r.strip().upper() for r in ref_part.split(",") if r.strip()]
+        valuer_name_raw = valuer_part.strip()
+        if refs and valuer_name_raw:
+            groups.append({"refs": refs, "valuer_name_raw": valuer_name_raw})
+    return groups
+
+
+def _resolve_valuer_from_saved(name: str) -> Optional[Dict]:
+    """Case-insensitive substring match against saved valuers."""
+    name_lower = name.lower()
+    for v in load_saved_valuers():
+        if name_lower in v["name"].lower():
+            return v
+    return None
+
+
+def _search_valuer_api(name: str, tokens: AuthTokens) -> List[Dict]:
+    http_sess = build_session()
+    resp = http_sess.get(
+        f"{BASE_URL}/acl/api/v1/accounts/list-user-accounts",
+        headers={"Authorization": f"Bearer {tokens.access_token}", "JWTAUTH": f"Bearer {tokens.jwt}"},
+        params={"account_type": "STAFF", "filter_type": "ACTIVE", "page": 1, "search": name},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json().get("results", [])
+
+
+def _search_ref_dlv(tokens: AuthTokens, ref: str) -> Optional[Dict]:
+    """Search for a reference number via DLV endpoint. Returns the task dict or None."""
+    http_sess = build_session()
+    resp = http_sess.get(
+        f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
+        headers={
+            "Authorization": f"Bearer {tokens.access_token}",
+            "JWTAUTH":       f"Bearer {tokens.jwt}",
+            "cparams":       CPARAMS_DLV,
+        },
+        params={
+            "filter": "Pending", "role": "DLV", "request_type": "STAMP_DUTY",
+            "search": ref, "page": 1,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    for task in resp.json().get("results", []):
+        if task.get("reference_number") == ref:
+            return task
+    return None
+
+
+def _fetch_ref_detail_dlv(tokens: AuthTokens, request_id: str) -> Optional[Dict]:
+    """Fetch the detail view for a DLV application."""
+    http_sess = build_session()
+    resp = http_sess.get(
+        f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view",
+        headers={
+            "Authorization": f"Bearer {tokens.access_token}",
+            "JWTAUTH":       f"Bearer {tokens.jwt}",
+            "cparams":       CPARAMS_DLV,
+        },
+        params={"request_id": request_id},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _process_dlv_batch_items(tokens: AuthTokens) -> str:
+    """
+    Load the batch queue, process each ref, clear the queue.
+    Returns a report string, or "" if the queue was empty.
+    """
+    items = load_dlv_batch()
+    if not items:
+        return ""
+
+    http_sess = build_session()
+    assign_url = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/fix_application_details"
+    auth_headers = {
+        "Authorization": f"Bearer {tokens.access_token}",
+        "JWTAUTH":       f"Bearer {tokens.jwt}",
+    }
+
+    lines = []
+    for group in items:
+        refs        = group.get("refs", [])
+        valuer_uid  = group.get("valuer_uid", "")
+        valuer_name = group.get("valuer_name", "")
+        lines.append(f"\n👤 *{valuer_name}*")
+
+        for ref in refs:
+            try:
+                task = _search_ref_dlv(tokens, ref)
+                if not task:
+                    lines.append(f"  ⚠️ `{ref}` — not found")
+                    continue
+
+                detail = _fetch_ref_detail_dlv(tokens, task["id"])
+                if not detail:
+                    lines.append(f"  ⚠️ `{ref}` — detail fetch failed")
+                    continue
+
+                node = detail.get("node", "")
+
+                if node == "VALUATION_STAMP_DUTY_CREATED":
+                    r = http_sess.post(
+                        assign_url, headers=auth_headers,
+                        json={
+                            "reference_number":  ref,
+                            "valuation_officer": valuer_uid,
+                            "node":              "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                        },
+                        timeout=30,
+                    )
+                    r.raise_for_status()
+                    lines.append(f"  ✅ `{ref}` — assigned to *{valuer_name}*")
+                    persist_assignment(ref, valuer_name, valuer_uid)
+
+                elif node == "VALUATION_STAMP_DUTY_VALUER_REPORT":
+                    actors = detail.get("actors", [])
+                    if actors:
+                        actor_name = actors[0].get("user_details", {}).get("names", "Unknown")
+                        lines.append(f"  📋 `{ref}` — already with *{actor_name}*")
+                    else:
+                        lines.append(f"  📋 `{ref}` — at VALUER_REPORT stage, no actor listed")
+
+                else:
+                    lines.append(f"  ❓ `{ref}` — unexpected node: `{node}`")
+
+            except Exception as e:
+                lines.append(f"  ❌ `{ref}` — {e}")
+
+    clear_dlv_batch()
+    return "\n".join(lines)
+
+
+async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """PTB repeating job: every 5 minutes, process the DLV batch queue if non-empty."""
+    items = load_dlv_batch()
+    if not items:
+        return
+
+    tokens = _any_valid_tokens()
+    if not tokens:
+        for chat_id in ALLOWED_IDS:
+            await context.bot.send_message(
+                chat_id,
+                "⚠️ DLV Batch: no valid tokens — please re-authenticate.",
+            )
+        return
+
+    report = _process_dlv_batch_items(tokens)
+    if report:
+        msg = f"📋 *DLV Batch (scheduled)*\n{report}"
+        if len(msg) > 4000:
+            msg = msg[:4000] + "\n…_(truncated)_"
+        for chat_id in ALLOWED_IDS:
+            await context.bot.send_message(chat_id, msg, parse_mode="Markdown")
+
+
+# ──────────────────────────────────────────────────────────
 # Implementor Tasks & DLV Tasks — view-only checklist
 # ──────────────────────────────────────────────────────────
 
@@ -3419,6 +3635,158 @@ async def recv_dlv_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────
+# DLV Batch — conversation handlers
+# ──────────────────────────────────────────────────────────
+
+async def cmd_dlv_batch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    ctx.user_data["db_session"] = DBSession()
+    await update.message.reply_text(
+        "📥 *DLV Batch Assignment*\n\n"
+        "Send your batch — one group per line:\n"
+        "`REF1, REF2, REF3 : Valuer Name`\n\n"
+        "*Example:*\n"
+        "`REG/TSFR/5A0B3E1VLS, REG/TSFR/5A0B3E1VLQ : Byron`\n"
+        "`REG/TSFR/XXXXXXXX : John Kamau`\n\n"
+        "Multiple lines are processed together.",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return DB.INPUT_BATCH
+
+
+async def recv_db_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text   = update.message.text.strip()
+    groups = _parse_batch_input(text)
+
+    if not groups:
+        await update.message.reply_text(
+            "⚠️ Could not parse any entries. Use format:\n`REF1, REF2 : Valuer Name`",
+            parse_mode="Markdown",
+        )
+        return DB.INPUT_BATCH
+
+    await update.message.reply_text("🔍 Resolving valuers…")
+    tokens  = _any_valid_tokens()
+    sess    = _get_db_sess(ctx)
+    resolved = []
+
+    for group in groups:
+        name_raw = group["valuer_name_raw"]
+        refs     = group["refs"]
+
+        # 1. Check saved valuers
+        saved = _resolve_valuer_from_saved(name_raw)
+        if saved:
+            resolved.append({
+                "refs":        refs,
+                "valuer_name": saved["name"],
+                "valuer_uid":  saved["uid"],
+                "valuer_acct": saved["account_number"],
+                "status":      "resolved",
+            })
+            continue
+
+        # 2. Search API
+        if tokens:
+            try:
+                results = _search_valuer_api(name_raw, tokens)
+                if results:
+                    v    = results[0]
+                    sd   = v.get("staff_details", {})
+                    name = " ".join(filter(None, [sd.get("firstname"), sd.get("middlename"), sd.get("lastname")]))
+                    resolved.append({
+                        "refs":        refs,
+                        "valuer_name": name,
+                        "valuer_uid":  str(v.get("id", "")),
+                        "valuer_acct": str(v.get("account_number", "")),
+                        "status":      "resolved",
+                    })
+                    continue
+            except Exception as e:
+                logger.warning("Valuer search error for %s: %s", name_raw, e)
+
+        # 3. Unresolvable
+        resolved.append({
+            "refs":        refs,
+            "valuer_name": name_raw,
+            "valuer_uid":  "",
+            "valuer_acct": "",
+            "status":      "unresolved",
+        })
+
+    sess.groups = resolved
+
+    # Build confirmation summary
+    lines = ["📋 *Batch Summary — please confirm:*\n"]
+    has_unresolved = False
+    for g in resolved:
+        refs_str = ", ".join(f"`{r}`" for r in g["refs"])
+        if g["status"] == "resolved":
+            lines.append(f"✅ {refs_str}\n   → *{g['valuer_name']}*")
+        else:
+            lines.append(f"⚠️ {refs_str}\n   → _{g['valuer_name']}_ (NOT FOUND — will be skipped)")
+            has_unresolved = True
+
+    if has_unresolved:
+        lines.append("\n_Unresolved valuers will be skipped._")
+
+    msg = "\n".join(lines)
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n…_(truncated)_"
+
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Confirm & Run", callback_data="db:confirm"),
+            InlineKeyboardButton("❌ Cancel",        callback_data="db:cancel"),
+        ]]),
+    )
+    return DB.CONFIRM_BATCH
+
+
+async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "db:cancel":
+        await query.edit_message_text("❌ DLV Batch cancelled.")
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    sess    = _get_db_sess(ctx)
+    to_save = [g for g in sess.groups if g["status"] == "resolved"]
+
+    if not to_save:
+        await query.edit_message_text("⚠️ No resolved valuers — nothing to process.")
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    save_dlv_batch(to_save)
+    await query.edit_message_text(
+        f"✅ *{len(to_save)} group(s)* queued. Processing now…",
+        parse_mode="Markdown",
+    )
+
+    tokens = _any_valid_tokens()
+    if not tokens:
+        await query.message.reply_text(
+            "⚠️ No valid tokens — authenticate first.\n"
+            "Batch saved; will retry on the next 5-minute cycle.",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
+    report = _process_dlv_batch_items(tokens)
+    msg    = f"📋 *DLV Batch Report*\n{report}" if report else "ℹ️ Batch was already empty."
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n…_(truncated)_"
+    await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=_main_menu())
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────────────────
 # Task-assign sub-flow (valuer picker + assignment execution)
 # ──────────────────────────────────────────────────────────
 
@@ -3819,24 +4187,14 @@ def main():
         per_message=False,
     )
 
-    recv_conv = ConversationHandler(
+    db_conv = ConversationHandler(
         entry_points=[
-            CommandHandler("receive", cmd_receive),
-            MessageHandler(filters.Regex(f"^{re.escape(BTN_RECEIVE)}$"), cmd_receive),
+            CommandHandler("dlvbatch", cmd_dlv_batch),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_BATCH)}$"), cmd_dlv_batch),
         ],
         states={
-            RS.STAFF_NAME:        [MessageHandler(not_cancel, recv_rt_staff_name)],
-            RS.PICK_STAFF_SOURCE: [CallbackQueryHandler(recv_rt_pick_source, pattern=r"^rt_src:")],
-            RS.SELECT_STAFF:      [CallbackQueryHandler(recv_rt_select_staff, pattern=r"^rt_staff:")],
-            RS.CHOOSE_CRED:       [CallbackQueryHandler(recv_rt_cred_choice, pattern=r"^cred:")],
-            RS.WAIT_OTP:          [MessageHandler(not_cancel, recv_rt_otp)],
-            RS.TASK_TYPE:         [CallbackQueryHandler(recv_rt_task_type, pattern=r"^rt_type:")],
-            RS.TASK_COUNT:        [MessageHandler(not_cancel, recv_rt_task_count)],
-            RS.AMOUNT_RANGE:      [CallbackQueryHandler(recv_rt_amount_choice, pattern=r"^rt_amount:")],
-            RS.AMOUNT_TEXT:       [MessageHandler(not_cancel, recv_rt_amount_range)],
-            RS.SCHEDULE_CHOICE:   [CallbackQueryHandler(recv_rt_schedule_choice, pattern=r"^rt_sched:")],
-            RS.SCHEDULE_INTERVAL: [MessageHandler(not_cancel, recv_rt_schedule_interval)],
-            RS.RT_CONFIRM:        [CallbackQueryHandler(recv_rt_confirm, pattern=r"^rt_confirm:")],
+            DB.INPUT_BATCH:   [MessageHandler(not_cancel, recv_db_input)],
+            DB.CONFIRM_BATCH: [CallbackQueryHandler(recv_db_confirm, pattern=r"^db:")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
@@ -3900,9 +4258,12 @@ def main():
     )
 
     app.add_handler(conv)
-    app.add_handler(recv_conv)
+    app.add_handler(db_conv)
     app.add_handler(auth_conv)
     app.add_handler(fetch_conv)
+
+    # DLV Batch: process queue every 5 minutes
+    app.job_queue.run_repeating(_dlv_batch_job, interval=300, first=300)
 
     # Button handlers outside an active conversation
     app.add_handler(CallbackQueryHandler(recv_delete_valuer,  pattern=r"^del:"))
