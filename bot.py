@@ -407,14 +407,16 @@ _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
 def _main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton(BTN_ASSIGN),      KeyboardButton(BTN_DLV_BATCH)],
-            [KeyboardButton(BTN_FETCH_TASKS)],
-            [KeyboardButton(BTN_AUTH),        KeyboardButton(BTN_TOKEN_STATUS)],
+            [KeyboardButton(BTN_ASSIGN)],
+            [KeyboardButton(BTN_FETCH_TASKS),  KeyboardButton(BTN_DLV_BATCH)],
             [KeyboardButton(BTN_DAEMON)],
-            [KeyboardButton(BTN_VALUERS),     KeyboardButton(BTN_DELETE)],
-            [KeyboardButton(BTN_HELP),        KeyboardButton(BTN_CANCEL)],
+            [KeyboardButton(BTN_AUTH),         KeyboardButton(BTN_TOKEN_STATUS)],
+            [KeyboardButton(BTN_HELP)],
+            [KeyboardButton(BTN_VALUERS),      KeyboardButton(BTN_DELETE)],
+            [KeyboardButton(BTN_CANCEL)],
         ],
         resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -2532,7 +2534,8 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────
 async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤔 I didn't understand that. Follow the steps above, or tap 🛑 Cancel to abort."
+        "🤔 I didn't understand that. Follow the steps above, or tap 🛑 Cancel to abort.",
+        reply_markup=_main_menu(),
     )
 
 
