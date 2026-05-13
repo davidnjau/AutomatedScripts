@@ -232,6 +232,9 @@ scheduler = BackgroundScheduler(timezone="UTC")
 # so we don't double-schedule for the same expiry window.
 _scheduled: Dict[str, int] = {}   # cred_type → expiry_bucket (int(exp // 60))
 
+# Credentials that failed to refresh — never retried until new tokens are saved by the bot.
+_failed: set = set()
+
 
 def _schedule_refresh(cred_type: str, exp: float) -> None:
     """Schedule a one-shot refresh job to run REFRESH_BEFORE seconds before exp."""
@@ -308,26 +311,15 @@ def _refresh_job(cred_type: str) -> None:
         }
         _save_cache(cache)
 
-        # Clear the old scheduled bucket so the new expiry will be scheduled
         _scheduled.pop(cred_type, None)
-
+        _failed.discard(cred_type)   # clear any previous failure flag
         logger.info("[%s] ✅ Token refreshed. New expiry: %s", cred_type, _fmt_ts(new_exp))
-        _tg_broadcast(
-            f"✅ *Token auto-refreshed*\n\n"
-            f"*Profile:* {label}\n"
-            f"*New expiry:* {_fmt_ts(new_exp)}"
-        )
 
         # Schedule next refresh for the new expiry
         _schedule_refresh(cred_type, new_exp)
     else:
-        logger.warning("[%s] ❌ Refresh failed. Will retry at next scan.", cred_type)
-        _tg_broadcast(
-            f"⚠️ *Token refresh failed*\n\n"
-            f"*Profile:* {label}\n"
-            "Will retry at next scan interval."
-        )
-        # Clear scheduled so the scan will retry
+        logger.warning("[%s] ❌ Refresh failed — will not retry until new tokens are saved.", cred_type)
+        _failed.add(cred_type)
         _scheduled.pop(cred_type, None)
 
 
@@ -349,13 +341,22 @@ def _scan_cache() -> None:
         secs_left = exp - now
         bucket    = int(exp // 60)
 
+        # If a previous refresh failed, only retry if the bot has saved fresh tokens
+        # (detected by the expiry bucket changing — meaning new tokens were written).
+        if cred_type in _failed:
+            if _scheduled.get(cred_type) == bucket:
+                logger.debug("[%s] Refresh previously failed — waiting for new tokens.", cred_type)
+                continue
+            else:
+                # New token saved by the bot — clear the failure flag and reschedule
+                logger.info("[%s] New tokens detected — clearing failure flag.", cred_type)
+                _failed.discard(cred_type)
+
         if secs_left <= 0:
-            logger.info("[%s] Token already expired — triggering immediate refresh.", cred_type)
-            # Clear so _schedule_refresh will reschedule
+            logger.info("[%s] Token already expired — scheduling immediate refresh.", cred_type)
             _scheduled.pop(cred_type, None)
             _schedule_refresh(cred_type, exp)
         elif _scheduled.get(cred_type) != bucket:
-            # New or changed expiry — schedule a refresh job
             _schedule_refresh(cred_type, exp)
         else:
             logger.debug(
