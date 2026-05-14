@@ -3484,22 +3484,26 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
 
     if not tasks:
         await message.reply_text(
-            f"ℹ️ No qualifying tasks in the last *{sess.days_back}* day(s).\n"
+            f"ℹ️ No qualifying tasks in the last {sess.days_back} day(s).\n"
             f"{filter_line}"
-            f"_(HQ: {hq_raw} seen → {hq_kept} matched | "
-            f"County: {c_raw} seen → {c_kept} matched)_",
-            parse_mode="Markdown",
+            f"(HQ: {hq_raw} seen → {hq_kept} matched | "
+            f"County: {c_raw} seen → {c_kept} matched)",
             reply_markup=_main_menu(),
         )
         return ConversationHandler.END
 
     await message.reply_text(
-        f"✅ *{len(tasks)}* task(s) found — last *{sess.days_back}* day(s).\n"
+        f"✅ {len(tasks)} task(s) found — last {sess.days_back} day(s).\n"
         f"{filter_line}"
-        f"_(HQ: {hq_raw} → {hq_kept} | County: {c_raw} → {c_kept})_",
-        parse_mode="Markdown",
+        f"(HQ: {hq_raw} → {hq_kept} | County: {c_raw} → {c_kept})",
     )
-    await _ft_show_results(message, tasks)
+    try:
+        await _ft_show_results(message, tasks)
+    except Exception as e:
+        logger.error("_ft_show_results error: %s", e)
+        await message.reply_text(
+            f"❌ Failed to display results: {e}", reply_markup=_main_menu()
+        )
     return ConversationHandler.END
 
 
@@ -3527,27 +3531,38 @@ async def _ft_show_results(message, tasks: List[Dict]):
         ) or "none"
 
         lines.append(
-            f"{i}. [{src}] *{ref}*\n"
-            f"   📍 {cnty} / {reg} | 📅 {date}\n"
-            f"   💰 {cons} | 🏠 {parcel}\n"
-            f"   👤 {officers_str}"
+            f"{i}. [{src}] {ref}\n"
+            f"   {cnty} / {reg} | {date}\n"
+            f"   {cons} | {parcel}\n"
+            f"   {officers_str}"
         )
 
+    chunks = []
     chunk = ""
     for line in lines:
         candidate = (chunk + "\n\n" + line).strip()
         if len(candidate) > 4000:
-            await message.reply_text(chunk, parse_mode="Markdown")
+            chunks.append(chunk)
             chunk = line
         else:
             chunk = candidate
-
     if chunk:
-        await message.reply_text(
-            chunk + f"\n\n_Total: {len(tasks)} task(s)_",
-            parse_mode="Markdown",
-            reply_markup=_main_menu(),
-        )
+        chunks.append(chunk)
+
+    for i, c in enumerate(chunks):
+        is_last = (i == len(chunks) - 1)
+        text = c + (f"\n\nTotal: {len(tasks)} task(s)" if is_last else "")
+        try:
+            await message.reply_text(
+                text,
+                reply_markup=_main_menu() if is_last else None,
+            )
+        except Exception as e:
+            logger.warning("_ft_show_results send failed: %s", e)
+            await message.reply_text(
+                text[:4000],
+                reply_markup=_main_menu() if is_last else None,
+            )
 
 
 async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
