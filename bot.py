@@ -2652,8 +2652,9 @@ def _fetch_ref_detail_dlv(tokens: AuthTokens, request_id: str) -> Optional[Dict]
 
 def _process_dlv_batch_items(tokens: AuthTokens) -> str:
     """
-    Load the batch queue, process each ref, clear the queue.
-    Returns a report string, or "" if the queue was empty.
+    Process the flat batch queue (list of {ref, valuer_name, valuer_uid, valuer_acct}).
+    Refs not found in DLV are kept in the queue for the next 5-minute retry cycle.
+    Returns a report string of completed items only, or "" if nothing was processed.
     """
     items = load_dlv_batch()
     if not items:
@@ -2661,62 +2662,72 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> str:
 
     http_sess = build_session()
     assign_url = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/fix_application_details"
-    auth_headers = {
+    auth_hdrs = {
         "Authorization": f"Bearer {tokens.access_token}",
         "JWTAUTH":       f"Bearer {tokens.jwt}",
     }
 
-    lines = []
-    for group in items:
-        refs        = group.get("refs", [])
-        valuer_uid  = group.get("valuer_uid", "")
-        valuer_name = group.get("valuer_name", "")
-        lines.append(f"\n👤 *{valuer_name}*")
+    completed_lines: List[str] = []
+    remaining:       List[Dict] = []
 
-        for ref in refs:
-            try:
-                task = _search_ref_dlv(tokens, ref)
-                if not task:
-                    lines.append(f"  ⚠️ `{ref}` — not found")
-                    continue
+    for item in items:
+        ref         = item.get("ref", "")
+        valuer_name = item.get("valuer_name", "")
+        valuer_uid  = item.get("valuer_uid", "")
 
-                detail = _fetch_ref_detail_dlv(tokens, task["id"])
-                if not detail:
-                    lines.append(f"  ⚠️ `{ref}` — detail fetch failed")
-                    continue
+        try:
+            task = _search_ref_dlv(tokens, ref)
+            if not task:
+                # Not in DLV yet — keep for retry
+                remaining.append(item)
+                continue
 
-                node = detail.get("node", "")
+            detail = _fetch_ref_detail_dlv(tokens, task["id"])
+            if not detail:
+                # Transient failure — keep for retry
+                remaining.append(item)
+                continue
 
-                if node == "VALUATION_STAMP_DUTY_CREATED":
-                    r = http_sess.post(
-                        assign_url, headers=auth_headers,
-                        json={
-                            "reference_number":  ref,
-                            "valuation_officer": valuer_uid,
-                            "node":              "VALUATION_STAMP_DUTY_VALUER_REPORT",
-                        },
-                        timeout=30,
-                    )
-                    r.raise_for_status()
-                    lines.append(f"  ✅ `{ref}` — assigned to *{valuer_name}*")
-                    persist_assignment(ref, valuer_name, valuer_uid)
+            node = detail.get("node", "")
 
-                elif node == "VALUATION_STAMP_DUTY_VALUER_REPORT":
-                    actors = detail.get("actors", [])
-                    if actors:
-                        actor_name = actors[0].get("user_details", {}).get("names", "Unknown")
-                        lines.append(f"  📋 `{ref}` — already with *{actor_name}*")
-                    else:
-                        lines.append(f"  📋 `{ref}` — at VALUER_REPORT stage, no actor listed")
+            if node == "VALUATION_STAMP_DUTY_CREATED":
+                r = http_sess.post(
+                    assign_url, headers=auth_hdrs,
+                    json={
+                        "reference_number":  ref,
+                        "valuation_officer": valuer_uid,
+                        "node":              "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                    },
+                    timeout=30,
+                )
+                r.raise_for_status()
+                completed_lines.append(f"✅ `{ref}` — assigned to *{valuer_name}*")
+                persist_assignment(ref, valuer_name, valuer_uid)
 
+            elif node == "VALUATION_STAMP_DUTY_VALUER_REPORT":
+                actors = detail.get("actors", [])
+                if actors:
+                    actor_name = actors[0].get("user_details", {}).get("names", "Unknown")
+                    completed_lines.append(f"📋 `{ref}` — already with *{actor_name}*")
                 else:
-                    lines.append(f"  ❓ `{ref}` — unexpected node: `{node}`")
+                    completed_lines.append(f"📋 `{ref}` — at VALUER_REPORT stage, no actor listed")
 
-            except Exception as e:
-                lines.append(f"  ❌ `{ref}` — {e}")
+            else:
+                completed_lines.append(f"❓ `{ref}` — unexpected node: `{node}`")
 
-    clear_dlv_batch()
-    return "\n".join(lines)
+        except Exception as e:
+            # Keep for retry on error
+            remaining.append(item)
+            logger.warning("DLV batch error for %s: %s", ref, e)
+
+    # Save only refs that still need processing
+    save_dlv_batch(remaining)
+
+    if remaining:
+        pending_refs = ", ".join(f"`{i['ref']}`" for i in remaining)
+        completed_lines.append(f"\n⏳ Still pending (retry in 5 min): {pending_refs}")
+
+    return "\n".join(completed_lines)
 
 
 async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2727,20 +2738,23 @@ async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     tokens = _any_valid_tokens()
     if not tokens:
-        for chat_id in ALLOWED_IDS:
-            await context.bot.send_message(
-                chat_id,
-                "⚠️ DLV Batch: no valid tokens — please re-authenticate.",
-            )
+        logger.warning("DLV batch job: no valid tokens — skipping cycle.")
         return
 
+    before_count = len(items)
     report = _process_dlv_batch_items(tokens)
-    if report:
-        msg = f"📋 *DLV Batch (scheduled)*\n{report}"
+    after_count  = len(load_dlv_batch())
+
+    # Only notify if something was actually completed (queue shrank)
+    if report and after_count < before_count:
+        msg = f"📋 *DLV Batch (auto)*\n{report}"
         if len(msg) > 4000:
             msg = msg[:4000] + "\n…_(truncated)_"
         for chat_id in ALLOWED_IDS:
-            await context.bot.send_message(chat_id, msg, parse_mode="Markdown")
+            try:
+                await context.bot.send_message(chat_id, msg, parse_mode="Markdown")
+            except Exception as e:
+                logger.warning("DLV batch job notify error for %s: %s", chat_id, e)
 
 
 # ──────────────────────────────────────────────────────────
@@ -3790,9 +3804,19 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Main menu:", reply_markup=_main_menu())
         return ConversationHandler.END
 
-    save_dlv_batch(to_save)
+    # Flatten groups to individual ref+valuer items for per-ref retry tracking
+    flat_items = []
+    for g in to_save:
+        for ref in g["refs"]:
+            flat_items.append({
+                "ref":        ref,
+                "valuer_name": g["valuer_name"],
+                "valuer_uid":  g["valuer_uid"],
+                "valuer_acct": g["valuer_acct"],
+            })
+    save_dlv_batch(flat_items)
     await query.edit_message_text(
-        f"✅ *{len(to_save)} group(s)* queued. Processing now…",
+        f"✅ *{len(flat_items)} ref(s)* queued. Processing now…",
         parse_mode="Markdown",
     )
 
