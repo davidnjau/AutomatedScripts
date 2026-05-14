@@ -202,7 +202,7 @@ def persist_tokens(cred_type: str, access_token: str, jwt: str, refresh_token: s
     tokens[cred_type] = entry
     with open(SAVED_TOKENS_FILE, "w") as f:
         json.dump(tokens, f, indent=2)
-    logger.info("Cached tokens for cred_type=%s (exp=%s)", cred_type, exp)
+    logger.info("Cached tokens for cred_type=%s (exp=%s) → %s", cred_type, exp, SAVED_TOKENS_FILE)
 
 
 
@@ -2466,35 +2466,35 @@ async def cmd_token_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     raw   = _load_tokens_raw()
     now   = time.time()
-    lines = []
+    lines = [f"Token file: {SAVED_TOKENS_FILE}", f"Entries: {list(raw.keys()) or 'none'}\n"]
 
     for cred_type, label in CRED_LABELS.items():
         entry = raw.get(cred_type)
         if not entry:
-            lines.append(f"{label}\n  ⚫ No token cached")
+            lines.append(f"{label}\n  No token cached")
             continue
 
         exp = entry.get("expires_at") or _jwt_exp(entry.get("jwt", ""))
         if not exp:
-            lines.append(f"{label}\n  ⚠️ Expiry unreadable")
+            lines.append(f"{label}\n  Expiry unreadable")
             continue
 
         secs_left = exp - now
         exp_str   = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
         if secs_left <= 0:
-            lines.append(f"{label}\n  🔴 Expired — {exp_str}")
+            lines.append(f"{label}\n  Expired — {exp_str}")
         elif secs_left < 10 * 60:
             mins = int(secs_left // 60)
-            lines.append(f"{label}\n  🟡 Expires in {mins}m — {exp_str}")
+            lines.append(f"{label}\n  Expires in {mins}m — {exp_str}")
         else:
             hrs  = int(secs_left // 3600)
             mins = int((secs_left % 3600) // 60)
             time_str = f"{hrs}h {mins}m" if hrs else f"{mins}m"
-            lines.append(f"{label}\n  🟢 Valid — expires in {time_str} ({exp_str})")
+            lines.append(f"{label}\n  Valid — expires in {time_str} ({exp_str})")
 
-    text = "🔒 *Token Status*\n\n" + "\n\n".join(lines)
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu())
+    text = "Token Status\n\n" + "\n\n".join(lines)
+    await update.message.reply_text(text, reply_markup=_main_menu())
 
 
 async def recv_daemon_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
