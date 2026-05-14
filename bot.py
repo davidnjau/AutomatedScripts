@@ -391,6 +391,7 @@ BTN_DELETE        = "🗑 Delete Valuer"
 BTN_FETCH_TASKS   = "📊 Fetch Tasks"
 BTN_DLV_TASKS     = "📋 DLV Tasks"
 BTN_HELP          = "❓ Help"
+BTN_RESTART       = "🔁 Restart Bot"
 BTN_CANCEL        = "🛑 Cancel"
 
 # Filter that matches any of the persistent menu button texts
@@ -398,7 +399,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_DLV_BATCH)}|{re.escape(BTN_AUTH)}"
     f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_DAEMON)}"
     f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
-    f"|{re.escape(BTN_FETCH_TASKS)}"
+    f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_RESTART)}"
     f"|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -409,7 +410,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton(BTN_ASSIGN)],
             [KeyboardButton(BTN_FETCH_TASKS),  KeyboardButton(BTN_DLV_BATCH)],
-            [KeyboardButton(BTN_DAEMON)],
+            [KeyboardButton(BTN_DAEMON),       KeyboardButton(BTN_RESTART)],
             [KeyboardButton(BTN_AUTH),         KeyboardButton(BTN_TOKEN_STATUS)],
             [KeyboardButton(BTN_HELP)],
             [KeyboardButton(BTN_VALUERS),      KeyboardButton(BTN_DELETE)],
@@ -2529,6 +2530,13 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    await update.message.reply_text("🔁 Restarting bot… back in a moment.")
+    # Replace the current process with a fresh one — preserves nohup/background context
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 # ──────────────────────────────────────────────────────────
 # Fallback (unexpected input during conversation)
 # ──────────────────────────────────────────────────────────
@@ -4274,6 +4282,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_AUTH)}$"),         cmd_auth))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_TOKEN_STATUS)}$"), cmd_token_status))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DAEMON)}$"),       cmd_daemon))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_RESTART)}$"),     cmd_restart))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"),        cmd_help))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_VALUERS)}$"),     cmd_valuers))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DELETE)}$"),      cmd_delete_valuer))
