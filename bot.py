@@ -25,6 +25,7 @@ import base64
 import io
 import json
 import logging
+import asyncio
 import os
 import re
 import signal
@@ -2533,7 +2534,7 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     await update.message.reply_text("🔁 Restarting bot… back in a moment.")
-    # Replace the current process with a fresh one — preserves nohup/background context
+    await asyncio.sleep(2)   # let the message deliver before replacing the process
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
