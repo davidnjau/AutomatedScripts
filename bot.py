@@ -3955,18 +3955,22 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     # Flatten groups to individual ref+valuer items for per-ref retry tracking
-    flat_items = []
+    existing     = load_dlv_batch()
+    existing_refs = {item["ref"] for item in existing}
+    new_items = []
     for g in to_save:
         for ref in g["refs"]:
-            flat_items.append({
-                "ref":        ref,
-                "valuer_name": g["valuer_name"],
-                "valuer_uid":  g["valuer_uid"],
-                "valuer_acct": g["valuer_acct"],
-            })
+            if ref not in existing_refs:
+                new_items.append({
+                    "ref":         ref,
+                    "valuer_name": g["valuer_name"],
+                    "valuer_uid":  g["valuer_uid"],
+                    "valuer_acct": g["valuer_acct"],
+                })
+    flat_items = existing + new_items
     save_dlv_batch(flat_items)
     await query.edit_message_text(
-        f"✅ *{len(flat_items)} ref(s)* queued. Processing now…",
+        f"✅ *{len(new_items)} new ref(s)* added to queue ({len(flat_items)} total). Processing now…",
         parse_mode="Markdown",
     )
 
