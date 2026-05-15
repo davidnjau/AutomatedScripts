@@ -384,6 +384,7 @@ CRED_LABELS = {
 # ──────────────────────────────────────────────────────────
 BTN_ASSIGN        = "📋 New Assignment"
 BTN_DLV_BATCH     = "📥 DLV Batch"
+BTN_DLV_QUEUE     = "🔍 DLV Queue"
 BTN_AUTH          = "🔑 Refresh Auth"
 BTN_TOKEN_STATUS  = "🔒 Token Status"
 BTN_DAEMON        = "🔄 Token Daemon"
@@ -397,7 +398,7 @@ BTN_CANCEL        = "🛑 Cancel"
 
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
-    f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_DLV_BATCH)}|{re.escape(BTN_AUTH)}"
+    f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_DLV_BATCH)}|{re.escape(BTN_DLV_QUEUE)}|{re.escape(BTN_AUTH)}"
     f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_DAEMON)}"
     f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
     f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_RESTART)}"
@@ -411,6 +412,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton(BTN_ASSIGN)],
             [KeyboardButton(BTN_FETCH_TASKS),  KeyboardButton(BTN_DLV_BATCH)],
+            [KeyboardButton(BTN_DLV_QUEUE)],
             [KeyboardButton(BTN_DAEMON),       KeyboardButton(BTN_RESTART)],
             [KeyboardButton(BTN_AUTH),         KeyboardButton(BTN_TOKEN_STATUS)],
             [KeyboardButton(BTN_HELP)],
@@ -2679,12 +2681,14 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> str:
             task = _search_ref_dlv(tokens, ref)
             if not task:
                 # Not in DLV yet — keep for retry
+                item["last_error"] = "Not found in DLV endpoint"
                 remaining.append(item)
                 continue
 
             detail = _fetch_ref_detail_dlv(tokens, task["id"])
             if not detail:
                 # Transient failure — keep for retry
+                item["last_error"] = "Detail fetch returned empty response"
                 remaining.append(item)
                 continue
 
@@ -2717,6 +2721,7 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> str:
 
         except Exception as e:
             # Keep for retry on error
+            item["last_error"] = str(e)[:120]
             remaining.append(item)
             logger.warning("DLV batch error for %s: %s", ref, e)
 
@@ -2755,6 +2760,136 @@ async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(chat_id, msg, parse_mode="Markdown")
             except Exception as e:
                 logger.warning("DLV batch job notify error for %s: %s", chat_id, e)
+
+
+# ──────────────────────────────────────────────────────────
+# DLV Queue viewer
+# ──────────────────────────────────────────────────────────
+
+# Current DLV batch job interval in seconds (default 5 min); updated by user choice
+_dlv_batch_interval: int = 300
+
+
+def _dlv_queue_keyboard(current_interval: int) -> InlineKeyboardMarkup:
+    options = [
+        ("1 min",       60),
+        ("2 min",       120),
+        ("3 min",       180),
+        ("Default (5 min)", 300),
+    ]
+    interval_row = [
+        InlineKeyboardButton(
+            f"{'✅ ' if current_interval == secs else ''}{label}",
+            callback_data=f"dlvq:interval:{secs}",
+        )
+        for label, secs in options
+    ]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Query Now", callback_data="dlvq:now")],
+        interval_row,
+        [InlineKeyboardButton("❌ Cancel",   callback_data="dlvq:cancel")],
+    ])
+
+
+async def cmd_dlv_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+
+    items = load_dlv_batch()
+    if not items:
+        await update.message.reply_text(
+            "✅ DLV Queue is empty — no pending assignments.",
+            reply_markup=_main_menu(),
+        )
+        return
+
+    lines = [f"🔍 *DLV Queue* — {len(items)} pending ref(s)\n"]
+    for item in items:
+        ref         = item.get("ref", "?")
+        valuer_name = item.get("valuer_name", "?")
+        last_error  = item.get("last_error", "")
+        line = f"• `{ref}` → *{valuer_name}*"
+        if last_error:
+            line += f"\n  ⚠️ _{last_error}_"
+        lines.append(line)
+
+    interval_label = {60: "1 min", 120: "2 min", 180: "3 min", 300: "5 min"}.get(
+        _dlv_batch_interval, f"{_dlv_batch_interval}s"
+    )
+    lines.append(f"\n_Current check interval: {interval_label}_")
+
+    msg = "\n".join(lines)
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n…_(truncated)_"
+
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=_dlv_queue_keyboard(_dlv_batch_interval),
+    )
+
+
+async def recv_dlv_queue_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global _dlv_batch_interval
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # "dlvq:now" | "dlvq:interval:N" | "dlvq:cancel"
+
+    if data == "dlvq:cancel":
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+
+    if data == "dlvq:now":
+        tokens = _any_valid_tokens()
+        if not tokens:
+            await query.edit_message_text(
+                "⚠️ No valid tokens — please authenticate first.",
+            )
+            return
+        items_before = load_dlv_batch()
+        if not items_before:
+            await query.edit_message_text("✅ Queue is empty — nothing to process.")
+            return
+        report = _process_dlv_batch_items(tokens)
+        remaining = load_dlv_batch()
+        msg = f"📋 *DLV Queue — Query Result*\n{report}" if report else "ℹ️ Nothing processed."
+        if remaining:
+            msg += f"\n\n⏳ *{len(remaining)} ref(s) still pending*"
+        if len(msg) > 4000:
+            msg = msg[:4000] + "\n…_(truncated)_"
+        await query.edit_message_text(msg, parse_mode="Markdown")
+        return
+
+    if data.startswith("dlvq:interval:"):
+        try:
+            new_interval = int(data.split(":")[-1])
+        except ValueError:
+            return
+        _dlv_batch_interval = new_interval
+
+        # Reschedule the repeating job with the new interval
+        job_queue = ctx.job_queue
+        if job_queue:
+            existing = job_queue.get_jobs_by_name("dlv_batch_job")
+            for job in existing:
+                job.schedule_removal()
+            job_queue.run_repeating(
+                _dlv_batch_job,
+                interval=new_interval,
+                first=new_interval,
+                name="dlv_batch_job",
+            )
+
+        label = {60: "1 min", 120: "2 min", 180: "3 min", 300: "5 min"}.get(
+            new_interval, f"{new_interval}s"
+        )
+        await query.edit_message_reply_markup(
+            reply_markup=_dlv_queue_keyboard(_dlv_batch_interval),
+        )
+        await query.message.reply_text(
+            f"✅ DLV check interval set to *{label}*.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu(),
+        )
 
 
 # ──────────────────────────────────────────────────────────
@@ -4314,7 +4449,7 @@ def main():
     app.add_handler(fetch_conv)
 
     # DLV Batch: process queue every 5 minutes
-    app.job_queue.run_repeating(_dlv_batch_job, interval=300, first=300)
+    app.job_queue.run_repeating(_dlv_batch_job, interval=300, first=300, name="dlv_batch_job")
 
     # Button handlers outside an active conversation
     app.add_handler(CallbackQueryHandler(recv_delete_valuer,  pattern=r"^del:"))
@@ -4327,8 +4462,10 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_VALUERS)}$"),     cmd_valuers))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DELETE)}$"),      cmd_delete_valuer))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_TASKS)}$"),   cmd_dlv_tasks))
-    app.add_handler(CallbackQueryHandler(recv_dlv_check,  pattern=r"^dlv_ck:"))
-    app.add_handler(CallbackQueryHandler(recv_ta_valuer,  pattern=r"^ta:"))
+    app.add_handler(CallbackQueryHandler(recv_dlv_check,       pattern=r"^dlv_ck:"))
+    app.add_handler(CallbackQueryHandler(recv_dlv_queue_action, pattern=r"^dlvq:"))
+    app.add_handler(CallbackQueryHandler(recv_ta_valuer,        pattern=r"^ta:"))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_QUEUE)}$"), cmd_dlv_queue))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_CANCEL)}$"),      cmd_cancel))
     # Lowest-priority: catch valuer name text input during task-assign search
     app.add_handler(
