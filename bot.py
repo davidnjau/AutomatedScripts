@@ -3641,8 +3641,23 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
         )
         return ConversationHandler.END
 
+    # Remove tasks already queued in the DLV batch
+    queued_refs = {item.get("ref", "") for item in load_dlv_batch()}
+    tasks_before = len(tasks)
+    tasks = [t for t in tasks if t.get("reference_number", "") not in queued_refs]
+    queued_removed = tasks_before - len(tasks)
+
+    queued_note = f" ({queued_removed} already in DLV queue — excluded)" if queued_removed else ""
+
+    if not tasks:
+        await message.reply_text(
+            f"ℹ️ All {tasks_before} task(s) are already in the DLV queue.",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
     await message.reply_text(
-        f"✅ {len(tasks)} task(s) found — last {sess.days_back} day(s).\n"
+        f"✅ {len(tasks)} task(s) found — last {sess.days_back} day(s).{queued_note}\n"
         f"{filter_line}"
         f"(HQ: {hq_raw} → {hq_kept} | County: {c_raw} → {c_kept})",
     )
