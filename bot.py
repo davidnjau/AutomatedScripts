@@ -103,6 +103,7 @@ SAVED_ASSIGNMENTS_FILE  = os.path.join(DATA_DIR, "saved_assignments.json")
 SAVED_TASK_BATCHES_FILE = os.path.join(DATA_DIR, "saved_task_batches.json")
 SAVED_SCHEDULES_FILE    = os.path.join(DATA_DIR, "saved_schedules.json")
 SAVED_DLV_BATCH_FILE    = os.path.join(DATA_DIR, "saved_dlv_batch.json")
+SAVED_AUTO_FETCH_FILE   = os.path.join(DATA_DIR, "saved_auto_fetch.json")
 
 # base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
 CPARAMS_DLV          = base64.b64encode(b'{"active_role":"DLV"}').decode()
@@ -292,6 +293,14 @@ class RTSession:
 
 
 # ──────────────────────────────────────────────────────────
+# States — Auto Fetch schedule conversation
+# ──────────────────────────────────────────────────────────
+class AF(Enum):
+    INTERVAL = auto()   # choose how often to run
+    AMOUNT   = auto()   # enter amount range
+
+
+# ──────────────────────────────────────────────────────────
 # States — DLV Batch conversation
 # ──────────────────────────────────────────────────────────
 class DB(Enum):
@@ -385,6 +394,7 @@ CRED_LABELS = {
 BTN_ASSIGN        = "📋 New Assignment"
 BTN_DLV_BATCH     = "📥 DLV Batch"
 BTN_DLV_QUEUE     = "🔍 DLV Queue"
+BTN_AUTO_FETCH    = "⏰ Auto Fetch"
 BTN_AUTH          = "🔑 Refresh Auth"
 BTN_TOKEN_STATUS  = "🔒 Token Status"
 BTN_DAEMON        = "🔄 Token Daemon"
@@ -398,7 +408,8 @@ BTN_CANCEL        = "🛑 Cancel"
 
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
-    f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_DLV_BATCH)}|{re.escape(BTN_DLV_QUEUE)}|{re.escape(BTN_AUTH)}"
+    f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_DLV_BATCH)}|{re.escape(BTN_DLV_QUEUE)}"
+    f"|{re.escape(BTN_AUTO_FETCH)}|{re.escape(BTN_AUTH)}"
     f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_DAEMON)}"
     f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
     f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_RESTART)}"
@@ -412,7 +423,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton(BTN_ASSIGN)],
             [KeyboardButton(BTN_FETCH_TASKS),  KeyboardButton(BTN_DLV_BATCH)],
-            [KeyboardButton(BTN_DLV_QUEUE)],
+            [KeyboardButton(BTN_DLV_QUEUE),    KeyboardButton(BTN_AUTO_FETCH)],
             [KeyboardButton(BTN_DAEMON),       KeyboardButton(BTN_RESTART)],
             [KeyboardButton(BTN_AUTH),         KeyboardButton(BTN_TOKEN_STATUS)],
             [KeyboardButton(BTN_HELP)],
@@ -2763,6 +2774,261 @@ async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ──────────────────────────────────────────────────────────
+# Auto Fetch — scheduled periodic fetch + notify
+# ──────────────────────────────────────────────────────────
+
+_AF_INTERVALS = [
+    ("15 min",  15),
+    ("30 min",  30),
+    ("1 hr",    60),
+    ("2 hr",   120),
+    ("4 hr",   240),
+    ("6 hr",   360),
+    ("12 hr",  720),
+    ("24 hr", 1440),
+]
+
+
+def load_auto_fetch_schedule() -> Optional[Dict]:
+    try:
+        with open(SAVED_AUTO_FETCH_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_auto_fetch_schedule(cfg: Dict) -> None:
+    _ensure_data_dir()
+    with open(SAVED_AUTO_FETCH_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def clear_auto_fetch_schedule() -> None:
+    try:
+        os.remove(SAVED_AUTO_FETCH_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def _af_interval_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    row  = []
+    for label, mins in _AF_INTERVALS:
+        row.append(InlineKeyboardButton(label, callback_data=f"af:interval:{mins}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("❌ Cancel / Stop schedule", callback_data="af:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_auto_fetch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+
+    cfg = load_auto_fetch_schedule()
+    if cfg:
+        mins = cfg.get("interval_minutes", 0)
+        lo   = cfg.get("amount_min")
+        hi   = cfg.get("amount_max")
+        lo_s = f"KES {int(lo):,}" if lo is not None else "0"
+        hi_s = f"KES {int(hi):,}" if hi is not None else "∞"
+        status = (
+            f"⏰ *Auto Fetch is active*\n"
+            f"Interval: every {mins} min\n"
+            f"Amount range: {lo_s} – {hi_s}\n\n"
+            f"Choose a new interval to update, or cancel to stop."
+        )
+    else:
+        status = (
+            "⏰ *Auto Fetch*\n\n"
+            "Periodically fetches tasks and sends results here.\n"
+            "Choose how often to run:"
+        )
+
+    await update.message.reply_text(
+        status,
+        parse_mode="Markdown",
+        reply_markup=_af_interval_keyboard(),
+    )
+    return AF.INTERVAL
+
+
+async def recv_af_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "af:cancel":
+        # Stop the schedule
+        for job in ctx.job_queue.get_jobs_by_name("auto_fetch_job"):
+            job.schedule_removal()
+        clear_auto_fetch_schedule()
+        await query.edit_message_text("🛑 Auto Fetch schedule cancelled.")
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    try:
+        interval_minutes = int(query.data.split(":")[-1])
+    except ValueError:
+        return AF.INTERVAL
+
+    ctx.user_data["af_interval_minutes"] = interval_minutes
+    await query.edit_message_text(
+        f"✅ Interval set to *{interval_minutes} min*.\n\n"
+        f"Now enter the *amount range* (min max), e.g.:\n"
+        f"`500000 5000000`\n\n"
+        f"Or send `skip` to fetch all amounts.",
+        parse_mode="Markdown",
+    )
+    return AF.AMOUNT
+
+
+async def recv_af_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text     = update.message.text.strip().lower()
+    interval = ctx.user_data.get("af_interval_minutes", 60)
+
+    amount_min: Optional[float] = None
+    amount_max: Optional[float] = None
+
+    if text != "skip":
+        parts = text.split()
+        try:
+            if len(parts) == 2:
+                amount_min = float(parts[0].replace(",", ""))
+                amount_max = float(parts[1].replace(",", ""))
+            elif len(parts) == 1:
+                amount_max = float(parts[0].replace(",", ""))
+            else:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Could not parse. Enter two numbers e.g. `500000 5000000`, or `skip`.",
+                parse_mode="Markdown",
+            )
+            return AF.AMOUNT
+
+    cfg = {
+        "interval_minutes": interval,
+        "amount_min":       amount_min,
+        "amount_max":       amount_max,
+        "days_back":        2,
+    }
+    save_auto_fetch_schedule(cfg)
+
+    # Cancel any existing job and start a new one
+    for job in ctx.job_queue.get_jobs_by_name("auto_fetch_job"):
+        job.schedule_removal()
+    ctx.job_queue.run_repeating(
+        _auto_fetch_job,
+        interval=interval * 60,
+        first=interval * 60,
+        name="auto_fetch_job",
+    )
+
+    lo_s = f"KES {int(amount_min):,}" if amount_min is not None else "0"
+    hi_s = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
+    await update.message.reply_text(
+        f"✅ *Auto Fetch scheduled*\n"
+        f"Every *{interval} min* | Amount: {lo_s} – {hi_s}\n"
+        f"First run in {interval} min.",
+        parse_mode="Markdown",
+        reply_markup=_main_menu(),
+    )
+    return ConversationHandler.END
+
+
+async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Background job: fetch tasks with saved schedule settings and notify."""
+    cfg = load_auto_fetch_schedule()
+    if not cfg:
+        return
+
+    tokens = _any_valid_tokens()
+    if not tokens:
+        logger.warning("Auto Fetch job: no valid tokens — skipping cycle.")
+        return
+
+    days_back  = cfg.get("days_back", 2)
+    amount_min = cfg.get("amount_min")
+    amount_max = cfg.get("amount_max")
+
+    try:
+        tasks, stats = _load_fetch_tasks(tokens, days_back)
+    except Exception as e:
+        logger.warning("Auto Fetch job: fetch failed: %s", e)
+        return
+
+    # Amount filter
+    if amount_min is not None or amount_max is not None:
+        def _in_range(t):
+            raw = t.get("consideration")
+            if raw is None:
+                return False
+            try:
+                val = float(str(raw).replace(",", "").strip())
+            except (ValueError, TypeError):
+                return False
+            if amount_min is not None and val < amount_min:
+                return False
+            if amount_max is not None and val > amount_max:
+                return False
+            return True
+        tasks = [t for t in tasks if _in_range(t)]
+
+    # Exclude already-queued refs
+    queued_refs = {item.get("ref", "") for item in load_dlv_batch()}
+    tasks = [t for t in tasks if t.get("reference_number", "") not in queued_refs]
+
+    if not tasks:
+        logger.info("Auto Fetch job: no new tasks after filters.")
+        return
+
+    lo_s = f"KES {int(amount_min):,}" if amount_min is not None else "0"
+    hi_s = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
+    header = f"⏰ *Auto Fetch — {len(tasks)} task(s)* | Amount: {lo_s}–{hi_s}\n\n"
+
+    lines = []
+    for i, t in enumerate(tasks, 1):
+        src    = t.get("source", "")
+        ref    = t.get("reference_number", "—")
+        cnty   = (t.get("county") or "—").upper()
+        reg    = (t.get("registry") or "—").upper()
+        date   = (t.get("date_created") or "")[:10]
+        parcel = t.get("parcel_number") or "—"
+        try:
+            raw_cons = t.get("consideration")
+            cons = f"KES {int(float(str(raw_cons).replace(',','').strip())):,}" if raw_cons else "—"
+        except (ValueError, TypeError):
+            cons = str(t.get("consideration") or "—")
+        lines.append(
+            f"{i}. [{src}] {ref}\n"
+            f"   {cnty} / {reg} | {date}\n"
+            f"   {cons} | {parcel}"
+        )
+
+    # Split into chunks
+    chunks = []
+    chunk  = header
+    for line in lines:
+        candidate = (chunk + "\n\n" + line).strip()
+        if len(candidate) > 4000:
+            chunks.append(chunk)
+            chunk = line
+        else:
+            chunk = candidate
+    if chunk:
+        chunks.append(chunk)
+
+    for chat_id in ALLOWED_IDS:
+        for c in chunks:
+            try:
+                await context.bot.send_message(chat_id, c, parse_mode="Markdown")
+            except Exception as e:
+                logger.warning("Auto Fetch notify error for %s: %s", chat_id, e)
+
+
+# ──────────────────────────────────────────────────────────
 # DLV Queue viewer
 # ──────────────────────────────────────────────────────────
 
@@ -4462,13 +4728,44 @@ def main():
         per_message=False,
     )
 
+    af_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("autofetch", cmd_auto_fetch),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_AUTO_FETCH)}$"), cmd_auto_fetch),
+        ],
+        states={
+            AF.INTERVAL: [CallbackQueryHandler(recv_af_interval, pattern=r"^af:")],
+            AF.AMOUNT:   [MessageHandler(not_cancel, recv_af_amount)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(_CANCEL_FILTER, cmd_cancel),
+            MessageHandler(filters.TEXT, fallback),
+        ],
+        allow_reentry=True,
+        per_message=False,
+    )
+
     app.add_handler(conv)
     app.add_handler(db_conv)
     app.add_handler(auth_conv)
     app.add_handler(fetch_conv)
+    app.add_handler(af_conv)
 
     # DLV Batch: process queue every 5 minutes
     app.job_queue.run_repeating(_dlv_batch_job, interval=300, first=300, name="dlv_batch_job")
+
+    # Auto Fetch: restore saved schedule on startup
+    cfg = load_auto_fetch_schedule()
+    if cfg:
+        interval_secs = cfg.get("interval_minutes", 60) * 60
+        app.job_queue.run_repeating(
+            _auto_fetch_job,
+            interval=interval_secs,
+            first=interval_secs,
+            name="auto_fetch_job",
+        )
+        logger.info("Auto Fetch schedule restored: every %d min", cfg.get("interval_minutes"))
 
     # Button handlers outside an active conversation
     app.add_handler(CallbackQueryHandler(recv_delete_valuer,  pattern=r"^del:"))
