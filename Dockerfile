@@ -6,8 +6,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source files from src/
-COPY src/ .
+# Copy source files from assign/
+COPY assign/ .
 
 # Non-root user for safety
 RUN useradd -m botuser && mkdir -p /app/data && chown botuser:botuser /app/data

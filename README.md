@@ -21,7 +21,7 @@ A Telegram bot that automates valuation officer assignment in the [Ardhisasa](ht
 
 ```
 assign_v/
-├── src/
+├── assign/
 │   ├── bot.py                   # Main Telegram bot — all conversation flows and handlers
 │   ├── ardhisasa_auth.py        # Authentication layer — OTP login, token management, sessions
 │   └── token_refresh_daemon.py  # Background daemon — auto-refreshes tokens before expiry
@@ -57,13 +57,13 @@ docker compose logs -f ardhisasa-bot
 
 ```bash
 pip install -r requirements.txt
-python src/bot.py
+python assign/bot.py
 ```
 
 ### Token refresh daemon (optional — runs alongside the bot)
 
 ```bash
-python src/token_refresh_daemon.py
+python assign/token_refresh_daemon.py
 ```
 
 ---
@@ -82,7 +82,7 @@ ANTHROPIC_API_KEY=         # Optional — used for Claude Vision OCR fallback on
 
 ## Credential Profiles
 
-Four hardcoded credential profiles are defined in `src/ardhisasa_auth.py`:
+Four hardcoded credential profiles are defined in `assign/ardhisasa_auth.py`:
 
 | Key             | Label            | Role used for                     |
 |-----------------|------------------|-----------------------------------|
@@ -91,7 +91,7 @@ Four hardcoded credential profiles are defined in `src/ardhisasa_auth.py`:
 | `staff2`        | Support Reg      | Support registry access           |
 | `staff_valuer`  | Staff Valuer     | Valuer assignment (DLV endpoint)  |
 
-Credentials are hardcoded — do not move them to `.env` without updating `CRED_MAP` / `CRED_LABELS` in `src/bot.py`.
+Credentials are hardcoded — do not move them to `.env` without updating `CRED_MAP` / `CRED_LABELS` in `assign/bot.py`.
 
 ---
 
