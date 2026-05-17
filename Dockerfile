@@ -6,10 +6,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source
-COPY ardhisasa_auth.py .
-COPY bot.py .
-COPY token_refresh_daemon.py .
+# Copy source files from src/
+COPY src/ .
 
 # Non-root user for safety
 RUN useradd -m botuser && mkdir -p /app/data && chown botuser:botuser /app/data
