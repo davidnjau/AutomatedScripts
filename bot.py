@@ -2976,6 +2976,9 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             return True
         tasks = [t for t in tasks if _in_range(t)]
 
+    # Exclude sectional properties (parcel number has 4+ slash-separated parts)
+    tasks = [t for t in tasks if str(t.get("parcel_number") or "").count("/") < 3]
+
     # Exclude already-queued refs
     queued_refs = {item.get("ref", "") for item in load_dlv_batch()}
     tasks = [t for t in tasks if t.get("reference_number", "") not in queued_refs]
@@ -3906,6 +3909,9 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
             reply_markup=_main_menu(),
         )
         return ConversationHandler.END
+
+    # Remove sectional properties (parcel number has 4+ slash-separated parts)
+    tasks = [t for t in tasks if str(t.get("parcel_number") or "").count("/") < 3]
 
     # Remove tasks already queued in the DLV batch
     queued_refs = {item.get("ref", "") for item in load_dlv_batch()}
