@@ -395,6 +395,7 @@ BTN_ASSIGN        = "📋 New Assignment"
 BTN_DLV_BATCH     = "📥 DLV Batch"
 BTN_DLV_QUEUE     = "🔍 DLV Queue"
 BTN_AUTO_FETCH    = "⏰ Auto Fetch"
+BTN_ASSIGNMENTS   = "📜 Assignments"
 BTN_AUTH          = "🔑 Refresh Auth"
 BTN_TOKEN_STATUS  = "🔒 Token Status"
 BTN_DAEMON        = "🔄 Token Daemon"
@@ -409,7 +410,7 @@ BTN_CANCEL        = "🛑 Cancel"
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
     f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_DLV_BATCH)}|{re.escape(BTN_DLV_QUEUE)}"
-    f"|{re.escape(BTN_AUTO_FETCH)}|{re.escape(BTN_AUTH)}"
+    f"|{re.escape(BTN_AUTO_FETCH)}|{re.escape(BTN_ASSIGNMENTS)}|{re.escape(BTN_AUTH)}"
     f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_DAEMON)}"
     f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
     f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_RESTART)}"
@@ -424,6 +425,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(BTN_ASSIGN)],
             [KeyboardButton(BTN_FETCH_TASKS),  KeyboardButton(BTN_DLV_BATCH)],
             [KeyboardButton(BTN_DLV_QUEUE),    KeyboardButton(BTN_AUTO_FETCH)],
+            [KeyboardButton(BTN_ASSIGNMENTS)],
             [KeyboardButton(BTN_DAEMON),       KeyboardButton(BTN_RESTART)],
             [KeyboardButton(BTN_AUTH),         KeyboardButton(BTN_TOKEN_STATUS)],
             [KeyboardButton(BTN_HELP)],
@@ -599,6 +601,50 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────
 # /valuers  /delete_valuer — manage saved valuers
 # ──────────────────────────────────────────────────────────
+async def cmd_assignments(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    assignments = load_saved_assignments()
+    if not assignments:
+        await update.message.reply_text(
+            "📭 No assignments recorded yet.",
+            reply_markup=_main_menu(),
+        )
+        return
+
+    # Sort newest first
+    sorted_items = sorted(
+        assignments.items(),
+        key=lambda kv: kv[1].get("assigned_at", ""),
+        reverse=True,
+    )
+
+    lines = []
+    for ref, info in sorted_items:
+        valuer = info.get("valuer_name", "Unknown")
+        when   = info.get("assigned_at", "—")
+        lines.append(f"• `{ref}`\n  👤 {valuer} | 🕐 {when}")
+
+    header = f"📜 *Assignments ({len(lines)} total)*\n\n"
+    chunks = []
+    chunk  = header
+    for line in lines:
+        candidate = (chunk + line + "\n\n").strip()
+        if len(candidate) > 4000:
+            chunks.append(chunk)
+            chunk = line + "\n\n"
+        else:
+            chunk = candidate + "\n"
+    if chunk.strip():
+        chunks.append(chunk)
+
+    for i, c in enumerate(chunks):
+        await update.message.reply_text(
+            c,
+            parse_mode="Markdown",
+            reply_markup=_main_menu() if i == len(chunks) - 1 else None,
+        )
+
+
 async def cmd_valuers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     valuers = load_saved_valuers()
@@ -4787,7 +4833,8 @@ def main():
     app.add_handler(CallbackQueryHandler(recv_dlv_check,       pattern=r"^dlv_ck:"))
     app.add_handler(CallbackQueryHandler(recv_dlv_queue_action, pattern=r"^dlvq:"))
     app.add_handler(CallbackQueryHandler(recv_ta_valuer,        pattern=r"^ta:"))
-    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_QUEUE)}$"), cmd_dlv_queue))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_QUEUE)}$"),    cmd_dlv_queue))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ASSIGNMENTS)}$"), cmd_assignments))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_CANCEL)}$"),      cmd_cancel))
     # Lowest-priority: catch valuer name text input during task-assign search
     app.add_handler(
