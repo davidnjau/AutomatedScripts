@@ -10,7 +10,7 @@ read -p "New server username:   " TARGET_USER
 read -s -p "New server password:   " TARGET_PASS
 echo ""
 
-BOT_DIR="/opt/ardhisasa-bot"
+BOT_DIR="/opt/ardhisasa-bot/assign"
 BACKUP_FILE="/tmp/bot_data.tar.gz"
 
 echo ""
