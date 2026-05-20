@@ -29,10 +29,13 @@ import asyncio
 import os
 import re
 import signal
+import smtplib
 import subprocess
 import sys
 import time
 import uuid
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_completed
@@ -83,13 +86,19 @@ logger = logging.getLogger("ardhisasa.bot")
 
 load_dotenv()
 
-BOT_TOKEN        = os.environ["TELEGRAM_BOT_TOKEN"]
+BOT_TOKEN         = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ALLOWED_IDS = set(
     int(x.strip())
     for x in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",")
     if x.strip()
 )
+
+# SMTP config for Auto Fetch email notifications (all optional)
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
 
 BASE_URL = "https://ardhisasa-api.lands.go.ke"
 
@@ -296,8 +305,14 @@ class RTSession:
 # States — Auto Fetch schedule conversation
 # ──────────────────────────────────────────────────────────
 class AF(Enum):
-    INTERVAL = auto()   # choose how often to run
-    AMOUNT   = auto()   # enter amount range
+    INTERVAL    = auto()   # choose how often to run
+    DAYS_BACK   = auto()   # choose days back
+    COUNTY      = auto()   # county filter
+    REGISTRY    = auto()   # registry filter
+    AMOUNT      = auto()   # pick amount range button
+    AMOUNT_TEXT = auto()   # custom amount text entry
+    SECTIONAL   = auto()   # exclude / only / all sectional
+    EMAIL       = auto()   # optional recipient email address
 
 
 # ──────────────────────────────────────────────────────────
@@ -352,6 +367,7 @@ class FT(Enum):
     REGISTRY_FILTER  = auto()   # registry button picker
     AMOUNT_FILTER    = auto()   # 4-button amount range picker
     AMOUNT_TEXT      = auto()   # free-text custom min/max amount
+    SECTIONAL_FILTER = auto()   # exclude / only / all sectional
 
 
 @dataclass
@@ -364,8 +380,9 @@ class FTSession:
     stats:           Dict = field(default_factory=dict)
     county_filter:   str = ""           # "nairobi" or "" (all)
     registry_filter: str = ""           # "central", "nairobi", or "" (all)
-    amount_min:      Optional[float] = None
-    amount_max:      Optional[float] = None
+    amount_min:       Optional[float] = None
+    amount_max:       Optional[float] = None
+    sectional_filter: str = "exclude"   # "exclude" | "only" | "all"
 
 
 def _get_ft_sess(ctx: ContextTypes.DEFAULT_TYPE) -> FTSession:
@@ -2875,15 +2892,23 @@ async def cmd_auto_fetch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     cfg = load_auto_fetch_schedule()
     if cfg:
-        mins = cfg.get("interval_minutes", 0)
-        lo   = cfg.get("amount_min")
-        hi   = cfg.get("amount_max")
-        lo_s = f"KES {int(lo):,}" if lo is not None else "0"
-        hi_s = f"KES {int(hi):,}" if hi is not None else "∞"
-        status = (
+        mins    = cfg.get("interval_minutes", 0)
+        lo      = cfg.get("amount_min")
+        hi      = cfg.get("amount_max")
+        lo_s    = f"KES {int(lo):,}" if lo is not None else "0"
+        hi_s    = f"KES {int(hi):,}" if hi is not None else "∞"
+        county    = cfg.get("county_filter", "") or "All"
+        reg       = cfg.get("registry_filter", "") or "All"
+        days      = cfg.get("days_back", 2)
+        sec       = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(
+                        cfg.get("sectional_filter", "exclude"), "Exclude Sectional")
+        email_s   = cfg.get("email") or "Telegram only"
+        status  = (
             f"⏰ *Auto Fetch is active*\n"
-            f"Interval: every {mins} min\n"
-            f"Amount range: {lo_s} – {hi_s}\n\n"
+            f"Interval: every {mins} min | Days back: {days}\n"
+            f"County: {county.title()} | Registry: {reg.title()}\n"
+            f"Amount: {lo_s} – {hi_s} | Sectional: {sec}\n"
+            f"Email: {email_s}\n\n"
             f"Choose a new interval to update, or cancel to stop."
         )
     else:
@@ -2906,7 +2931,6 @@ async def recv_af_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "af:cancel":
-        # Stop the schedule
         for job in ctx.job_queue.get_jobs_by_name("auto_fetch_job"):
             job.schedule_removal()
         clear_auto_fetch_schedule()
@@ -2921,48 +2945,185 @@ async def recv_af_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ctx.user_data["af_interval_minutes"] = interval_minutes
     await query.edit_message_text(
-        f"✅ Interval set to *{interval_minutes} min*.\n\n"
-        f"Now enter the *amount range* (min max), e.g.:\n"
-        f"`500000 5000000`\n\n"
-        f"Or send `skip` to fetch all amounts.",
+        f"✅ Interval: *{interval_minutes} min*\n\nHow many days back to fetch?",
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("1 day",  callback_data="af_days:1"),
+                InlineKeyboardButton("2 days", callback_data="af_days:2"),
+                InlineKeyboardButton("3 days", callback_data="af_days:3"),
+            ],
+            [
+                InlineKeyboardButton("5 days",  callback_data="af_days:5"),
+                InlineKeyboardButton("7 days",  callback_data="af_days:7"),
+                InlineKeyboardButton("10 days", callback_data="af_days:10"),
+            ],
+        ]),
+    )
+    return AF.DAYS_BACK
+
+
+async def recv_af_days(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ctx.user_data["af_days_back"] = int(query.data.split(":")[-1])
+    await query.edit_message_text(
+        f"✅ Days back: *{ctx.user_data['af_days_back']}*\n\nFilter by county?",
+        parse_mode="Markdown",
+        reply_markup=_ft_county_keyboard(),
+    )
+    return AF.COUNTY
+
+
+async def recv_af_county(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ctx.user_data["af_county"] = "" if query.data == "ft_county:all" else query.data.split(":")[1]
+    label = ctx.user_data["af_county"].title() or "All Counties"
+    await query.edit_message_text(
+        f"✅ County: *{label}*\n\nFilter by registry?",
+        parse_mode="Markdown",
+        reply_markup=_ft_registry_keyboard(),
+    )
+    return AF.REGISTRY
+
+
+async def recv_af_registry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ctx.user_data["af_registry"] = "" if query.data == "ft_registry:all" else query.data.split(":")[1]
+    reg_label    = ctx.user_data["af_registry"].title() or "All Registries"
+    county_label = ctx.user_data.get("af_county", "").title() or "All Counties"
+    await query.edit_message_text(
+        f"✅ County: *{county_label}* | Registry: *{reg_label}*\n\nFilter by amount?",
+        parse_mode="Markdown",
+        reply_markup=_ft_amount_keyboard(),
     )
     return AF.AMOUNT
 
 
 async def recv_af_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text     = update.message.text.strip().lower()
-    interval = ctx.user_data.get("af_interval_minutes", 60)
+    """Callback handler — user picked an amount preset or Custom."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data  # e.g. "ft_amount:1m_5m" or "ft_amount:custom"
 
-    amount_min: Optional[float] = None
-    amount_max: Optional[float] = None
+    if choice == "ft_amount:custom":
+        await query.edit_message_text(
+            "✏️ Enter custom amount range as *min max* (e.g. `500000 5000000`).\n"
+            "Or send just one number as max.",
+            parse_mode="Markdown",
+        )
+        return AF.AMOUNT_TEXT
 
-    if text != "skip":
-        parts = text.split()
-        try:
-            if len(parts) == 2:
-                amount_min = float(parts[0].replace(",", ""))
-                amount_max = float(parts[1].replace(",", ""))
-            elif len(parts) == 1:
-                amount_max = float(parts[0].replace(",", ""))
-            else:
-                raise ValueError
-        except ValueError:
+    ranges = {
+        "ft_amount:0_1m":    (0.0,           1_000_000.0),
+        "ft_amount:1m_5m":   (1_000_000.0,   5_000_000.0),
+        "ft_amount:5m_10m":  (5_000_000.0,  10_000_000.0),
+        "ft_amount:20m_50m": (20_000_000.0, 50_000_000.0),
+        "ft_amount:50m_100m":(50_000_000.0,100_000_000.0),
+        "ft_amount:80m_300m":(80_000_000.0,300_000_000.0),
+        "ft_amount:80m_3b":  (80_000_000.0,  3_000_000_000.0),
+        "ft_amount:all":     (None,           None),
+    }
+    amount_min, amount_max = ranges.get(choice, (None, None))
+    ctx.user_data["af_amount_min"] = amount_min
+    ctx.user_data["af_amount_max"] = amount_max
+
+    await query.edit_message_text(
+        "Include sectional properties?\n_(Sectional: parcel has 4 parts e.g. Nairobi/Block12/345/888)_",
+        parse_mode="Markdown",
+        reply_markup=_sectional_keyboard(),
+    )
+    return AF.SECTIONAL
+
+
+async def recv_af_amount_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Text handler for custom amount entry in Auto Fetch."""
+    text = update.message.text.strip()
+    parts = text.split()
+    try:
+        if len(parts) == 2:
+            amount_min = float(parts[0].replace(",", ""))
+            amount_max = float(parts[1].replace(",", ""))
+        elif len(parts) == 1:
+            amount_min = None
+            amount_max = float(parts[0].replace(",", ""))
+        else:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Could not parse. Enter two numbers e.g. `500000 5000000`, or one number as max.",
+            parse_mode="Markdown",
+        )
+        return AF.AMOUNT_TEXT
+
+    ctx.user_data["af_amount_min"] = amount_min
+    ctx.user_data["af_amount_max"] = amount_max
+    await update.message.reply_text(
+        "Include sectional properties?\n_(Sectional: parcel has 4 parts e.g. Nairobi/Block12/345/888)_",
+        parse_mode="Markdown",
+        reply_markup=_sectional_keyboard(),
+    )
+    return AF.SECTIONAL
+
+
+async def recv_af_sectional(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    ctx.user_data["af_sectional"] = query.data.split(":")[1]  # "exclude" | "only" | "all"
+
+    existing_email = ""
+    cfg = load_auto_fetch_schedule()
+    if cfg:
+        existing_email = cfg.get("email", "")
+
+    hint = f"Current: `{existing_email}`\n\n" if existing_email else ""
+    await query.edit_message_text(
+        f"📧 *Send results to email?*\n\n"
+        f"{hint}"
+        f"Enter an email address, or send `skip` to notify via Telegram only.",
+        parse_mode="Markdown",
+    )
+    return AF.EMAIL
+
+
+async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text.lower() == "skip":
+        email = ""
+    else:
+        # Basic email validation
+        if "@" not in text or "." not in text.split("@")[-1]:
             await update.message.reply_text(
-                "❌ Could not parse. Enter two numbers e.g. `500000 5000000`, or `skip`.",
+                "❌ Invalid email address. Enter a valid email or send `skip`.",
                 parse_mode="Markdown",
             )
-            return AF.AMOUNT
+            return AF.EMAIL
+        email = text
+
+    interval   = ctx.user_data.get("af_interval_minutes", 60)
+    days       = ctx.user_data.get("af_days_back", 2)
+    county     = ctx.user_data.get("af_county", "")
+    registry   = ctx.user_data.get("af_registry", "")
+    amount_min = ctx.user_data.get("af_amount_min")
+    amount_max = ctx.user_data.get("af_amount_max")
+    sectional  = ctx.user_data.get("af_sectional", "exclude")
 
     cfg = {
         "interval_minutes": interval,
+        "days_back":        days,
+        "county_filter":    county,
+        "registry_filter":  registry,
         "amount_min":       amount_min,
         "amount_max":       amount_max,
-        "days_back":        2,
+        "sectional_filter": sectional,
+        "email":            email,
     }
     save_auto_fetch_schedule(cfg)
 
-    # Cancel any existing job and start a new one
     for job in ctx.job_queue.get_jobs_by_name("auto_fetch_job"):
         job.schedule_removal()
     ctx.job_queue.run_repeating(
@@ -2972,16 +3133,47 @@ async def recv_af_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         name="auto_fetch_job",
     )
 
-    lo_s = f"KES {int(amount_min):,}" if amount_min is not None else "0"
-    hi_s = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
+    lo_s      = f"KES {int(amount_min):,}" if amount_min is not None else "0"
+    hi_s      = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
+    co_label  = county.title() or "All"
+    re_label  = registry.title() or "All"
+    sec_label = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(sectional, sectional)
+    email_label = email or "Telegram only"
     await update.message.reply_text(
         f"✅ *Auto Fetch scheduled*\n"
-        f"Every *{interval} min* | Amount: {lo_s} – {hi_s}\n"
+        f"Every *{interval} min* | Days back: *{days}*\n"
+        f"County: *{co_label}* | Registry: *{re_label}*\n"
+        f"Amount: {lo_s} – {hi_s} | Sectional: *{sec_label}*\n"
+        f"Email: *{email_label}*\n"
         f"First run in {interval} min.",
         parse_mode="Markdown",
         reply_markup=_main_menu(),
     )
     return ConversationHandler.END
+
+
+def _send_auto_fetch_email(to_email: str, subject: str, body: str) -> None:
+    """Send Auto Fetch results via SMTP. Raises on failure."""
+    if not SMTP_USER or not SMTP_PASS:
+        raise RuntimeError("SMTP_USER / SMTP_PASS not configured in .env")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = SMTP_USER
+    msg["To"]      = to_email
+
+    # Plain text part
+    msg.attach(MIMEText(body, "plain"))
+
+    # Simple HTML version
+    html_body = "<pre style='font-family:monospace'>" + body.replace("&", "&amp;").replace("<", "&lt;") + "</pre>"
+    msg.attach(MIMEText(html_body, "html"))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, to_email, msg.as_string())
 
 
 async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2995,15 +3187,25 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("Auto Fetch job: no valid tokens — skipping cycle.")
         return
 
-    days_back  = cfg.get("days_back", 2)
-    amount_min = cfg.get("amount_min")
-    amount_max = cfg.get("amount_max")
+    days_back       = cfg.get("days_back", 2)
+    county_filter   = cfg.get("county_filter", "")
+    registry_filter = cfg.get("registry_filter", "")
+    amount_min      = cfg.get("amount_min")
+    amount_max      = cfg.get("amount_max")
 
     try:
         tasks, stats = _load_fetch_tasks(tokens, days_back)
     except Exception as e:
         logger.warning("Auto Fetch job: fetch failed: %s", e)
         return
+
+    # County filter
+    if county_filter:
+        tasks = [t for t in tasks if county_filter in (t.get("county") or "").strip().lower()]
+
+    # Registry filter
+    if registry_filter:
+        tasks = [t for t in tasks if registry_filter in (t.get("registry") or "").strip().lower()]
 
     # Amount filter
     if amount_min is not None or amount_max is not None:
@@ -3022,8 +3224,13 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             return True
         tasks = [t for t in tasks if _in_range(t)]
 
-    # Exclude sectional properties (parcel number has 4+ slash-separated parts)
-    tasks = [t for t in tasks if str(t.get("parcel_number") or "").count("/") < 3]
+    # Sectional filter
+    sf = cfg.get("sectional_filter", "exclude")
+    if sf == "exclude":
+        tasks = [t for t in tasks if str(t.get("parcel_number") or "").count("/") < 3]
+    elif sf == "only":
+        tasks = [t for t in tasks if str(t.get("parcel_number") or "").count("/") >= 3]
+    # "all" → no filter
 
     # Exclude already-queued refs
     queued_refs = {item.get("ref", "") for item in load_dlv_batch()}
@@ -3033,9 +3240,15 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Auto Fetch job: no new tasks after filters.")
         return
 
-    lo_s = f"KES {int(amount_min):,}" if amount_min is not None else "0"
-    hi_s = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
-    header = f"⏰ *Auto Fetch — {len(tasks)} task(s)* | Amount: {lo_s}–{hi_s}\n\n"
+    lo_s     = f"KES {int(amount_min):,}" if amount_min is not None else "0"
+    hi_s     = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
+    co_label  = county_filter.title() or "All"
+    re_label  = registry_filter.title() or "All"
+    sec_label = {"exclude": "No Sectional", "only": "Sectional Only", "all": "All"}.get(sf, sf)
+    header    = (
+        f"⏰ *Auto Fetch — {len(tasks)} task(s)*\n"
+        f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | {sec_label}\n\n"
+    )
 
     lines = []
     for i, t in enumerate(tasks, 1):
@@ -3075,6 +3288,41 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(chat_id, c, parse_mode="Markdown")
             except Exception as e:
                 logger.warning("Auto Fetch notify error for %s: %s", chat_id, e)
+
+    # Email notification
+    email = cfg.get("email", "")
+    if email:
+        # Build plain-text body (strip Markdown asterisks)
+        plain_header = (
+            f"Auto Fetch — {len(tasks)} task(s)\n"
+            f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | {sec_label}\n"
+            + "─" * 60 + "\n\n"
+        )
+        plain_lines = []
+        for i, t in enumerate(tasks, 1):
+            src    = t.get("source", "")
+            ref    = t.get("reference_number", "—")
+            cnty   = (t.get("county") or "—").upper()
+            reg    = (t.get("registry") or "—").upper()
+            date   = (t.get("date_created") or "")[:10]
+            parcel = t.get("parcel_number") or "—"
+            try:
+                raw_cons = t.get("consideration")
+                cons = f"KES {int(float(str(raw_cons).replace(',','').strip())):,}" if raw_cons else "—"
+            except (ValueError, TypeError):
+                cons = str(t.get("consideration") or "—")
+            plain_lines.append(
+                f"{i}. [{src}] {ref}\n"
+                f"   {cnty} / {reg} | {date}\n"
+                f"   {cons} | {parcel}"
+            )
+        plain_body   = plain_header + "\n\n".join(plain_lines)
+        email_subject = f"Auto Fetch — {len(tasks)} task(s) found"
+        try:
+            _send_auto_fetch_email(email, email_subject, plain_body)
+            logger.info("Auto Fetch email sent to %s", email)
+        except Exception as e:
+            logger.warning("Auto Fetch email failed: %s", e)
 
 
 # ──────────────────────────────────────────────────────────
@@ -3787,17 +4035,33 @@ def _ft_registry_keyboard() -> InlineKeyboardMarkup:
 def _ft_amount_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("0 – 1M",       callback_data="ft_amount:0_1m"),
-            InlineKeyboardButton("1M – 5M",      callback_data="ft_amount:1m_5m"),
+            InlineKeyboardButton("0 – 1M",        callback_data="ft_amount:0_1m"),
+            InlineKeyboardButton("1M – 5M",        callback_data="ft_amount:1m_5m"),
         ],
         [
-            InlineKeyboardButton("5M – 10M",     callback_data="ft_amount:5m_10m"),
-            InlineKeyboardButton("✏️ Custom",     callback_data="ft_amount:custom"),
+            InlineKeyboardButton("5M – 10M",       callback_data="ft_amount:5m_10m"),
+            InlineKeyboardButton("20M – 50M",      callback_data="ft_amount:20m_50m"),
         ],
         [
-            InlineKeyboardButton("📋 No filter", callback_data="ft_amount:all"),
+            InlineKeyboardButton("50M – 100M",     callback_data="ft_amount:50m_100m"),
+            InlineKeyboardButton("80M – 300M",     callback_data="ft_amount:80m_300m"),
+        ],
+        [
+            InlineKeyboardButton("80M – 3B",       callback_data="ft_amount:80m_3b"),
+            InlineKeyboardButton("✏️ Custom",       callback_data="ft_amount:custom"),
+        ],
+        [
+            InlineKeyboardButton("📋 No filter",   callback_data="ft_amount:all"),
         ],
     ])
+
+
+def _sectional_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🚫 Exclude Sectional", callback_data="ft_sectional:exclude"),
+        InlineKeyboardButton("🏢 Sectional Only",    callback_data="ft_sectional:only"),
+        InlineKeyboardButton("📋 All",               callback_data="ft_sectional:all"),
+    ]])
 
 
 async def recv_ft_county_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3847,17 +4111,22 @@ async def recv_ft_amount_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return FT.AMOUNT_TEXT
 
     ranges = {
-        "ft_amount:0_1m":   (0.0,         1_000_000.0),
-        "ft_amount:1m_5m":  (1_000_000.0, 5_000_000.0),
-        "ft_amount:5m_10m": (5_000_000.0, 10_000_000.0),
-        "ft_amount:all":    (None,         None),
+        "ft_amount:0_1m":    (0.0,           1_000_000.0),
+        "ft_amount:1m_5m":   (1_000_000.0,   5_000_000.0),
+        "ft_amount:5m_10m":  (5_000_000.0,  10_000_000.0),
+        "ft_amount:20m_50m": (20_000_000.0, 50_000_000.0),
+        "ft_amount:50m_100m":(50_000_000.0,100_000_000.0),
+        "ft_amount:80m_300m":(80_000_000.0,300_000_000.0),
+        "ft_amount:80m_3b":  (80_000_000.0,  3_000_000_000.0),
+        "ft_amount:all":     (None,           None),
     }
     sess.amount_min, sess.amount_max = ranges.get(choice, (None, None))
     await query.edit_message_text(
-        f"⏳ Fetching tasks from the last *{sess.days_back}* day(s)…",
+        "Include sectional properties?\n_(Sectional: parcel has 4 parts e.g. Nairobi/Block12/345/888)_",
         parse_mode="Markdown",
+        reply_markup=_sectional_keyboard(),
     )
-    return await _ft_do_fetch(query.message, ctx, sess)
+    return FT.SECTIONAL_FILTER
 
 
 async def recv_ft_amount_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3879,10 +4148,23 @@ async def recv_ft_amount_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return FT.AMOUNT_TEXT
 
     await update.message.reply_text(
+        "Include sectional properties?\n_(Sectional: parcel has 4 parts e.g. Nairobi/Block12/345/888)_",
+        parse_mode="Markdown",
+        reply_markup=_sectional_keyboard(),
+    )
+    return FT.SECTIONAL_FILTER
+
+
+async def recv_ft_sectional_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    sess = _get_ft_sess(ctx)
+    sess.sectional_filter = query.data.split(":")[1]  # "exclude" | "only" | "all"
+    await query.edit_message_text(
         f"⏳ Fetching tasks from the last *{sess.days_back}* day(s)…",
         parse_mode="Markdown",
     )
-    return await _ft_do_fetch(update.message, ctx, sess)
+    return await _ft_do_fetch(query.message, ctx, sess)
 
 
 async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession):
@@ -3956,8 +4238,13 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
         )
         return ConversationHandler.END
 
-    # Remove sectional properties (parcel number has 4+ slash-separated parts)
-    tasks = [t for t in tasks if str(t.get("parcel_number") or "").count("/") < 3]
+    # Sectional filter (parcel with 4+ parts = sectional)
+    sf = sess.sectional_filter
+    if sf == "exclude":
+        tasks = [t for t in tasks if str(t.get("parcel_number") or "").count("/") < 3]
+    elif sf == "only":
+        tasks = [t for t in tasks if str(t.get("parcel_number") or "").count("/") >= 3]
+    # "all" → no filter
 
     # Remove tasks already queued in the DLV batch
     queued_refs = {item.get("ref", "") for item in load_dlv_batch()}
@@ -4768,8 +5055,9 @@ def main():
             ],
             FT.COUNTY_FILTER:   [CallbackQueryHandler(recv_ft_county_filter,   pattern=r"^ft_county:")],
             FT.REGISTRY_FILTER: [CallbackQueryHandler(recv_ft_registry_filter, pattern=r"^ft_registry:")],
-            FT.AMOUNT_FILTER:   [CallbackQueryHandler(recv_ft_amount_filter,   pattern=r"^ft_amount:")],
-            FT.AMOUNT_TEXT:     [MessageHandler(not_cancel, recv_ft_amount_text)],
+            FT.AMOUNT_FILTER:    [CallbackQueryHandler(recv_ft_amount_filter,    pattern=r"^ft_amount:")],
+            FT.AMOUNT_TEXT:      [MessageHandler(not_cancel, recv_ft_amount_text)],
+            FT.SECTIONAL_FILTER: [CallbackQueryHandler(recv_ft_sectional_filter, pattern=r"^ft_sectional:")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
@@ -4786,8 +5074,14 @@ def main():
             MessageHandler(filters.Regex(f"^{re.escape(BTN_AUTO_FETCH)}$"), cmd_auto_fetch),
         ],
         states={
-            AF.INTERVAL: [CallbackQueryHandler(recv_af_interval, pattern=r"^af:")],
-            AF.AMOUNT:   [MessageHandler(not_cancel, recv_af_amount)],
+            AF.INTERVAL:    [CallbackQueryHandler(recv_af_interval,     pattern=r"^af:")],
+            AF.DAYS_BACK:   [CallbackQueryHandler(recv_af_days,         pattern=r"^af_days:")],
+            AF.COUNTY:      [CallbackQueryHandler(recv_af_county,       pattern=r"^ft_county:")],
+            AF.REGISTRY:    [CallbackQueryHandler(recv_af_registry,     pattern=r"^ft_registry:")],
+            AF.AMOUNT:      [CallbackQueryHandler(recv_af_amount,       pattern=r"^ft_amount:")],
+            AF.AMOUNT_TEXT: [MessageHandler(not_cancel, recv_af_amount_text)],
+            AF.SECTIONAL:   [CallbackQueryHandler(recv_af_sectional,    pattern=r"^ft_sectional:")],
+            AF.EMAIL:       [MessageHandler(not_cancel, recv_af_email)],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),

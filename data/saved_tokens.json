@@ -1,7 +1,0 @@
-{
-  "publicuser": {
-    "access_token": "uw70PQ60AyqEX9Lbdxr9BpvAtWxncq",
-    "jwt": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyIjoiZjJiZDZmZDAtYzdlMS00NGJiLWI4MzEtOTBiZmYyYjc5OTNkIiwic2VydmljZV9jb25zdW1lciI6ZmFsc2UsImZpcnN0bmFtZSI6IkRBVklEIiwibWlkZGxlbmFtZSI6Ik1BSU5BIiwibGFzdG5hbWUiOiJOSkFVIiwib3JnYW5pemF0aW9uIjp7fSwicm9sZXMiOlt7Imdyb3VwbmFtZSI6IlBVQkxJQyIsImlzX3ByaW1hcnlfcm9sZSI6ZmFsc2UsImlzX2Rldm9sdmVkIjpudWxsfV0sImFyZGhpcGF5X3JvbGVzIjpbXSwiZXhwIjoxNzc0OTkyODI3LCJpYXQiOjE3NzQ5ODkyMjd9.9n5DhycuVbTk427S5exZi_5E1wpmtQLA2bajA3rQinQ",
-    "expires_at": 1774992827.0
-  }
-}

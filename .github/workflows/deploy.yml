@@ -2,7 +2,7 @@ name: Deploy to VM
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   workflow_dispatch:
 
 jobs:
@@ -29,7 +29,7 @@ jobs:
           username: ${{ secrets.VM_USER }}
           password: ${{ secrets.VM_PASSWORD }}
           script: |
-            cd /opt/ardhisasa-bot
+            cd /opt/ardhisasa-bot/assign
             docker compose down --remove-orphans
             docker compose build --no-cache
             docker compose up -d
