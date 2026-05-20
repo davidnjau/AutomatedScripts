@@ -2,57 +2,99 @@
 """
 ardhisasa_auth.py
 =================
-Shared authentication module for Ardhisasa API scripts.
+Shared authentication module for Ardhisasa API scripts — entries codebase.
 
-Provides login + OTP verification for both credential profiles:
-  - STAFF      (registration/enumeration/conversion)
-  - PUBLIC USER (valuation/stamp-duty)
+Credentials are loaded from environment variables (.env) rather than being
+hardcoded. Call load_credentials(profile) to get a credential dict at runtime.
 
 Usage:
-    from ardhisasa_auth import authenticate, STAFF_CREDENTIALS_ICT, PUBLIC_CREDENTIALS
+    from ardhisasa_auth import AUTH_BASE_URL, AuthTokens, build_session, load_credentials, auth_headers
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 
 import requests
+from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+load_dotenv()
+
 # ---------------------------------------------------------------------------
-# Credentials
+# Credential profiles — populated from environment variables
 # ---------------------------------------------------------------------------
 
-STAFF_CREDENTIALS_SUPPORT = {
-    "username": "SE0E20RF0F",
-    "password": "Ardh1s@s@",
-    "usertype": "staff",
+# Human-readable labels shown in Telegram menus.
+# Keys must match the profile names accepted by load_credentials().
+CRED_LABELS = {
+    "publicuser":   "👤 Public User",
+    "staff":        "🏢 ICT",
+    "staff2":       "🏢 Support Reg",
+    "staff_valuer": "🏢 Staff Valuer",
 }
 
-STAFF_CREDENTIALS_ICT = {
-    "username": "20210439855",
-    "password": "ItaSabaQefin10222/()/",
-    "usertype": "staff",
-}
 
-STAFF_CREDENTIALS_VALUER = {
-    "username": "2015001311",
-    "password": "Marcel(2025)",
-    "usertype": "staff",
-}
+def load_credentials(profile: str) -> dict:
+    """
+    Build a credential dict for the given profile from environment variables.
 
-PUBLIC_CREDENTIALS = {
-    "username": "33745057",
-    "password": "Sc281-6736/2014",
-    "usertype": "publicuser",
-}
+    Profiles and their required env vars:
+        publicuser   → PUBLIC_USERNAME, PUBLIC_PASSWORD
+        staff        → STAFF_ICT_USERNAME, STAFF_ICT_PASSWORD
+        staff2       → STAFF_SUPPORT_USERNAME, STAFF_SUPPORT_PASSWORD
+        staff_valuer → STAFF_VALUER_USERNAME, STAFF_VALUER_PASSWORD
+
+    Raises:
+        ValueError: If the profile is unknown or required env vars are missing.
+    """
+    _profiles = {
+        "publicuser": {
+            "username": os.getenv("PUBLIC_USERNAME"),
+            "password": os.getenv("PUBLIC_PASSWORD"),
+            "usertype": "publicuser",
+        },
+        "staff": {
+            "username": os.getenv("STAFF_ICT_USERNAME"),
+            "password": os.getenv("STAFF_ICT_PASSWORD"),
+            "usertype": "staff",
+        },
+        "staff2": {
+            "username": os.getenv("STAFF_SUPPORT_USERNAME"),
+            "password": os.getenv("STAFF_SUPPORT_PASSWORD"),
+            "usertype": "staff",
+        },
+        "staff_valuer": {
+            "username": os.getenv("STAFF_VALUER_USERNAME"),
+            "password": os.getenv("STAFF_VALUER_PASSWORD"),
+            "usertype": "staff",
+        },
+    }
+
+    if profile not in _profiles:
+        raise ValueError(
+            f"Unknown credential profile '{profile}'. "
+            f"Valid profiles: {list(_profiles)}"
+        )
+
+    creds   = _profiles[profile]
+    missing = [k for k in ("username", "password") if not creds[k]]
+    if missing:
+        raise ValueError(
+            f"Missing env vars for profile '{profile}': {missing}. "
+            "Check your .env file."
+        )
+
+    return creds
+
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-AUTH_BASE_URL = "https://ardhisasa-api.lands.go.ke/acl/api/v1/auth"
+AUTH_BASE_URL   = "https://ardhisasa-api.lands.go.ke/acl/api/v1/auth"
 REQUEST_TIMEOUT = 30  # seconds
 
 logger = logging.getLogger("ardhisasa.auth")
@@ -73,21 +115,12 @@ class AuthTokens:
 # ---------------------------------------------------------------------------
 
 def build_session(max_retries: int = 3, backoff_factor: int = 2) -> requests.Session:
-    """
-    Create a requests.Session with retry logic for transient HTTP errors.
-
-    Args:
-        max_retries:    Maximum retry attempts.
-        backoff_factor: Exponential backoff multiplier between retries.
-
-    Returns:
-        Configured requests.Session instance.
-    """
+    """Return a requests.Session with retry logic and browser-like headers."""
     session = requests.Session()
     retry_strategy = Retry(
         total=max_retries,
         connect=max_retries,
-        read=False,           # never retry reads at urllib3 level — callers handle this
+        read=False,
         backoff_factor=backoff_factor,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "POST"],
@@ -97,24 +130,23 @@ def build_session(max_retries: int = 3, backoff_factor: int = 2) -> requests.Ses
     session.mount("https://", adapter)
     session.mount("http://", adapter)
 
-    # Set common browser-like headers
     session.headers.update({
-        "Accept":           "application/json, text/plain, */*",
-        "Accept-Language":  "en-GB,en-US;q=0.9,en;q=0.8",
-        "Connection":       "keep-alive",
-        "Content-Type":     "application/json",
-        "Origin":           "https://ardhisasa.lands.go.ke",
-        "Referer":          "https://ardhisasa.lands.go.ke/",
-        "Sec-Fetch-Dest":   "empty",
-        "Sec-Fetch-Mode":   "cors",
-        "Sec-Fetch-Site":   "same-site",
-        "User-Agent":       (
+        "Accept":            "application/json, text/plain, */*",
+        "Accept-Language":   "en-GB,en-US;q=0.9,en;q=0.8",
+        "Connection":        "keep-alive",
+        "Content-Type":      "application/json",
+        "Origin":            "https://ardhisasa.lands.go.ke",
+        "Referer":           "https://ardhisasa.lands.go.ke/",
+        "Sec-Fetch-Dest":    "empty",
+        "Sec-Fetch-Mode":    "cors",
+        "Sec-Fetch-Site":    "same-site",
+        "User-Agent":        (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/136.0.0.0 Safari/537.36"
         ),
-        "sec-ch-ua":         '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
-        "sec-ch-ua-mobile":  "?0",
+        "sec-ch-ua":          '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        "sec-ch-ua-mobile":   "?0",
         "sec-ch-ua-platform": '"macOS"',
     })
 
@@ -122,124 +154,11 @@ def build_session(max_retries: int = 3, backoff_factor: int = 2) -> requests.Ses
 
 
 # ---------------------------------------------------------------------------
-# Auth Steps
+# Auth helpers
 # ---------------------------------------------------------------------------
 
-def login(session: requests.Session, credentials: dict) -> None:
-    """
-    Perform initial login to trigger OTP generation.
-
-    Args:
-        session:     Active requests session.
-        credentials: Dict with keys: username, password, usertype.
-
-    Raises:
-        RuntimeError: If the server returns a login error.
-    """
-    url = f"{AUTH_BASE_URL}/login"
-    payload = {
-        "username": credentials["username"],
-        "password": credentials["password"],
-        "usertype": credentials["usertype"],
-        "otpcode":  "",
-    }
-
-    logger.info("Initiating login for user: %s (usertype=%s)",
-                credentials["username"], credentials["usertype"])
-
-    response = session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    data = response.json()
-
-    if not data.get("success", True) and "error" in data:
-        raise RuntimeError(f"Login failed: {data.get('error') or data.get('message')}")
-
-    logger.info("Login successful — OTP dispatched to registered device.")
-
-
-def verify_otp(session: requests.Session, credentials: dict, otp_code: str) -> AuthTokens:
-    """
-    Verify OTP and retrieve authentication tokens.
-
-    Args:
-        session:     Active requests session.
-        credentials: Dict with keys: username, password.
-        otp_code:    OTP entered by the user.
-
-    Returns:
-        AuthTokens instance containing access_token and jwt.
-
-    Raises:
-        RuntimeError: If OTP verification fails or tokens are absent.
-    """
-    url = f"{AUTH_BASE_URL}/otpverify"
-    payload = {
-        "username": credentials["username"],
-        "password": credentials["password"],
-        "otpcode":  otp_code.strip(),
-    }
-
-    logger.info("Verifying OTP...")
-    response = session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    data = response.json()
-
-    access_token = data.get("details", {}).get("access_token")
-    jwt          = data.get("details", {}).get("jwt")
-
-    if not access_token or not jwt:
-        logger.error("OTP verify response keys: %s", list(data.keys()))
-        raise RuntimeError(
-            "OTP verification succeeded but tokens were not found in response. "
-            f"Available keys: {list(data.keys())}"
-        )
-
-    logger.info("OTP verified successfully. Tokens acquired.")
-    return AuthTokens(access_token=access_token, jwt=jwt)
-
-
-def authenticate(
-    session: requests.Session,
-    credentials: Optional[dict] = None,
-    otp_prompt: str = "\n>>> Enter the OTP code received on your registered device: ",
-) -> AuthTokens:
-    """
-    Full authentication flow: login → prompt OTP → verify → return tokens.
-
-    Args:
-        session:     Active requests session.
-        credentials: Credential dict to use. Defaults to STAFF_CREDENTIALS_ICT.
-        otp_prompt:  Custom prompt string shown to the user.
-
-    Returns:
-        AuthTokens with access_token and jwt.
-
-    Raises:
-        ValueError:   If OTP input is empty.
-        RuntimeError: If any auth step fails.
-    """
-    if credentials is None:
-        credentials = STAFF_CREDENTIALS_ICT
-
-    login(session, credentials)
-
-    otp_code = input(otp_prompt).strip()
-    if not otp_code:
-        raise ValueError("OTP code cannot be empty.")
-
-    return verify_otp(session, credentials, otp_code)
-
-
 def auth_headers(tokens: AuthTokens) -> dict:
-    """
-    Build the Authorization / JWTAUTH header dict required for protected endpoints.
-
-    Args:
-        tokens: AuthTokens returned by authenticate().
-
-    Returns:
-        Dict with Authorization and JWTAUTH header entries.
-    """
+    """Return the Authorization / JWTAUTH header dict for protected endpoints."""
     return {
         "Authorization": f"Bearer {tokens.access_token}",
         "JWTAUTH":       f"Bearer {tokens.jwt}",
