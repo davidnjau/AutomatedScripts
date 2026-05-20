@@ -2,17 +2,15 @@
 """
 ardhisasa_auth.py
 =================
-Shared authentication module for Ardhisasa API scripts — entries codebase.
+Authentication module for the entries codebase.
 
-Credentials are loaded from environment variables (.env) rather than being
-hardcoded. Call load_credentials(profile) to get a credential dict at runtime.
-
-Usage:
-    from ardhisasa_auth import AUTH_BASE_URL, AuthTokens, build_session, load_credentials, auth_headers
+A single credential set is used, stored in .env as USER_LOGIN / USER_PASSWORD.
+Call get_credentials() to read them and save_credentials() to update them.
 """
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -24,80 +22,70 @@ from urllib3.util.retry import Retry
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Credential profiles — populated from environment variables
-# ---------------------------------------------------------------------------
-
-# Human-readable labels shown in Telegram menus.
-# Keys must match the profile names accepted by load_credentials().
-CRED_LABELS = {
-    "publicuser":   "👤 Public User",
-    "staff":        "🏢 ICT",
-    "staff2":       "🏢 Support Reg",
-    "staff_valuer": "🏢 Staff Valuer",
-}
-
-
-def load_credentials(profile: str) -> dict:
-    """
-    Build a credential dict for the given profile from environment variables.
-
-    Profiles and their required env vars:
-        publicuser   → PUBLIC_USERNAME, PUBLIC_PASSWORD
-        staff        → STAFF_ICT_USERNAME, STAFF_ICT_PASSWORD
-        staff2       → STAFF_SUPPORT_USERNAME, STAFF_SUPPORT_PASSWORD
-        staff_valuer → STAFF_VALUER_USERNAME, STAFF_VALUER_PASSWORD
-
-    Raises:
-        ValueError: If the profile is unknown or required env vars are missing.
-    """
-    _profiles = {
-        "publicuser": {
-            "username": os.getenv("PUBLIC_USERNAME"),
-            "password": os.getenv("PUBLIC_PASSWORD"),
-            "usertype": "publicuser",
-        },
-        "staff": {
-            "username": os.getenv("STAFF_ICT_USERNAME"),
-            "password": os.getenv("STAFF_ICT_PASSWORD"),
-            "usertype": "staff",
-        },
-        "staff2": {
-            "username": os.getenv("STAFF_SUPPORT_USERNAME"),
-            "password": os.getenv("STAFF_SUPPORT_PASSWORD"),
-            "usertype": "staff",
-        },
-        "staff_valuer": {
-            "username": os.getenv("STAFF_VALUER_USERNAME"),
-            "password": os.getenv("STAFF_VALUER_PASSWORD"),
-            "usertype": "staff",
-        },
-    }
-
-    if profile not in _profiles:
-        raise ValueError(
-            f"Unknown credential profile '{profile}'. "
-            f"Valid profiles: {list(_profiles)}"
-        )
-
-    creds   = _profiles[profile]
-    missing = [k for k in ("username", "password") if not creds[k]]
-    if missing:
-        raise ValueError(
-            f"Missing env vars for profile '{profile}': {missing}. "
-            "Check your .env file."
-        )
-
-    return creds
-
-
-# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 AUTH_BASE_URL   = "https://ardhisasa-api.lands.go.ke/acl/api/v1/auth"
 REQUEST_TIMEOUT = 30  # seconds
 
+_ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
+
 logger = logging.getLogger("ardhisasa.auth")
+
+# ---------------------------------------------------------------------------
+# Credential helpers
+# ---------------------------------------------------------------------------
+
+def get_credentials() -> dict:
+    """
+    Read USER_LOGIN, USER_PASSWORD, USER_TYPE from the environment.
+
+    Returns a dict with keys: username, password, usertype.
+    Values are empty strings when the env vars are not set.
+    """
+    return {
+        "username": os.getenv("USER_LOGIN", ""),
+        "password": os.getenv("USER_PASSWORD", ""),
+        "usertype": os.getenv("USER_TYPE", "staff"),
+    }
+
+
+def save_credentials(username: str, password: str) -> None:
+    """
+    Persist USER_LOGIN and USER_PASSWORD back to the .env file and reload
+    the environment so the running process picks them up immediately.
+
+    Existing lines are updated in-place; missing vars are appended.
+    """
+    lines: list[str] = []
+    if os.path.exists(_ENV_FILE):
+        with open(_ENV_FILE) as f:
+            lines = f.readlines()
+
+    def _set(key: str, value: str, src: list[str]) -> list[str]:
+        pattern = re.compile(rf"^{re.escape(key)}\s*=.*", re.MULTILINE)
+        replaced = False
+        result = []
+        for line in src:
+            if pattern.match(line):
+                result.append(f"{key}={value}\n")
+                replaced = True
+            else:
+                result.append(line)
+        if not replaced:
+            result.append(f"{key}={value}\n")
+        return result
+
+    lines = _set("USER_LOGIN",    username, lines)
+    lines = _set("USER_PASSWORD", password, lines)
+
+    with open(_ENV_FILE, "w") as f:
+        f.writelines(lines)
+
+    # Reload so os.getenv() returns the new values in the same process
+    load_dotenv(_ENV_FILE, override=True)
+    logger.info("Credentials saved to .env (username=%s)", username)
+
 
 # ---------------------------------------------------------------------------
 # Data Structures

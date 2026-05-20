@@ -8,11 +8,11 @@ Workflow (entries.MD):
   POST /registerservice/api/v1/ingestion/encumbrance-change
   Fields: parcel_number, nature_of_title, entry_number, section, entry_status
 
-Auth / daemon infrastructure mirrors the assign bot:
-  - 🔑 Refresh Auth  — login + OTP flow, tokens cached to data/saved_tokens.json
-  - 🔒 Token Status  — show expiry for each cached credential profile
-  - 🔄 Token Daemon  — start / stop the background token-refresh daemon
-  - 🔁 Restart Bot   — hot-restart the process
+Auth uses a single credential set (USER_LOGIN / USER_PASSWORD) stored in .env:
+  - If both are present → ask user whether to use saved credentials or enter new ones.
+  - If either is missing → ask user to enter them; they are saved to .env for next time.
+
+Daemon / token-cache infrastructure mirrors the assign bot.
 """
 
 import asyncio
@@ -50,10 +50,10 @@ from telegram.ext import (
 
 from ardhisasa_auth import (
     AUTH_BASE_URL,
-    CRED_LABELS,
     AuthTokens,
     build_session,
-    load_credentials,
+    get_credentials,
+    save_credentials,
 )
 
 # ──────────────────────────────────────────────────────────
@@ -75,8 +75,11 @@ ALLOWED_IDS = set(
     if x.strip()
 )
 
-BASE_URL          = "https://ardhisasa-api.lands.go.ke"
-ENTRIES_ENDPOINT  = f"{BASE_URL}/registerservice/api/v1/ingestion/encumbrance-change"
+BASE_URL         = "https://ardhisasa-api.lands.go.ke"
+ENTRIES_ENDPOINT = f"{BASE_URL}/registerservice/api/v1/ingestion/encumbrance-change"
+
+# Single token-cache key (one credential, one slot)
+CRED_KEY = "user"
 
 # ──────────────────────────────────────────────────────────
 # Persistent storage
@@ -96,12 +99,10 @@ def _ensure_data_dir():
 # ── Token helpers ─────────────────────────────────────────
 
 def _jwt_exp(token: str) -> Optional[float]:
-    """Decode JWT payload and return the `exp` claim, or None on failure."""
     try:
         payload = token.split(".")[1]
         payload += "=" * (4 - len(payload) % 4)
-        data = json.loads(base64.urlsafe_b64decode(payload))
-        return float(data["exp"])
+        return float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
     except Exception:
         return None
 
@@ -114,56 +115,31 @@ def _load_tokens_raw() -> Dict:
         return {}
 
 
-def persist_tokens(cred_type: str, access_token: str, jwt: str, refresh_token: str = ""):
+def persist_tokens(access_token: str, jwt: str, refresh_token: str = ""):
     _ensure_data_dir()
     tokens = _load_tokens_raw()
     exp    = _jwt_exp(jwt) or (time.time() + 3600)
     entry: Dict = {"access_token": access_token, "jwt": jwt, "expires_at": exp}
     if refresh_token:
         entry["refresh_token"] = refresh_token
-    elif tokens.get(cred_type, {}).get("refresh_token"):
-        entry["refresh_token"] = tokens[cred_type]["refresh_token"]
-    tokens[cred_type] = entry
+    elif tokens.get(CRED_KEY, {}).get("refresh_token"):
+        entry["refresh_token"] = tokens[CRED_KEY]["refresh_token"]
+    tokens[CRED_KEY] = entry
     with open(SAVED_TOKENS_FILE, "w") as f:
         json.dump(tokens, f, indent=2)
-    logger.info("Cached tokens for cred_type=%s (exp=%s)", cred_type, exp)
+    logger.info("Tokens cached (exp=%s)", exp)
 
 
-def get_valid_tokens(cred_type: str) -> Optional[AuthTokens]:
+def get_valid_tokens() -> Optional[AuthTokens]:
     """Return cached AuthTokens if still valid (5 min buffer), else None."""
-    entry = _load_tokens_raw().get(cred_type)
+    entry = _load_tokens_raw().get(CRED_KEY)
     if not entry:
         return None
     if entry.get("expires_at", 0) < time.time() + 300:
-        logger.info("Cached tokens for %s are expired.", cred_type)
+        logger.info("Cached tokens are expired.")
         return None
     return AuthTokens(access_token=entry["access_token"], jwt=entry["jwt"])
 
-
-def _first_valid_tokens() -> Optional[AuthTokens]:
-    """Return the first cached AuthTokens that are still valid, or None."""
-    for profile in CRED_LABELS:
-        t = get_valid_tokens(profile)
-        if t:
-            return t
-    return None
-
-
-# ──────────────────────────────────────────────────────────
-# Credential map (built at runtime from .env)
-# ──────────────────────────────────────────────────────────
-
-def _build_cred_map() -> Dict[str, dict]:
-    cred_map = {}
-    for profile in CRED_LABELS:
-        try:
-            cred_map[profile] = load_credentials(profile)
-        except ValueError:
-            pass
-    return cred_map
-
-
-CRED_MAP: Dict[str, dict] = _build_cred_map()
 
 # ──────────────────────────────────────────────────────────
 # Auth guard
@@ -180,7 +156,7 @@ async def deny(update: Update):
 
 
 # ──────────────────────────────────────────────────────────
-# Daemon helpers  (identical pattern to assign bot)
+# Daemon helpers
 # ──────────────────────────────────────────────────────────
 
 def _daemon_read_pid() -> Optional[int]:
@@ -250,7 +226,7 @@ def _daemon_status_text() -> str:
     if running:
         return f"🟢 *Running* (PID {pid})"
     elif pid:
-        return "🔴 *Not running* (stale PID file — process died)"
+        return "🔴 *Not running* (stale PID — process died)"
     else:
         return "🔴 *Not running*"
 
@@ -299,16 +275,6 @@ def _main_menu() -> ReplyKeyboardMarkup:
     )
 
 
-def _auth_cred_keyboard() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(label, callback_data=f"auth_cred:{profile}")]
-        for profile, label in CRED_LABELS.items()
-        if profile in CRED_MAP
-    ]
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="auth_cred:cancel")])
-    return InlineKeyboardMarkup(rows)
-
-
 # ──────────────────────────────────────────────────────────
 # /start  /help
 # ──────────────────────────────────────────────────────────
@@ -327,8 +293,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🏛 *Ardhisasa Entries Bot — Help*\n\n"
         f"{BTN_UPDATE_ENTRY} — update a land registry entry\n"
-        f"{BTN_AUTH} — authenticate a credential profile (login + OTP)\n"
-        f"{BTN_TOKEN_STATUS} — view cached token expiry per profile\n"
+        f"{BTN_AUTH} — log in (uses saved credentials or prompts for new ones)\n"
+        f"{BTN_TOKEN_STATUS} — view cached token expiry\n"
         f"{BTN_DAEMON} — start / stop the background token refresh daemon\n"
         f"{BTN_RESTART} — restart the bot process\n"
         f"{BTN_CANCEL} — cancel any active flow\n",
@@ -344,40 +310,31 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_token_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
 
-    raw   = _load_tokens_raw()
-    now   = time.time()
-    lines = []
+    entry = _load_tokens_raw().get(CRED_KEY)
+    creds = get_credentials()
 
-    for cred_type, label in CRED_LABELS.items():
-        if cred_type not in CRED_MAP:
-            lines.append(f"{label}\n  ⚫ Not configured in .env")
-            continue
-        entry = raw.get(cred_type)
-        if not entry:
-            lines.append(f"{label}\n  ⚫ No token cached")
-            continue
-        exp = entry.get("expires_at") or _jwt_exp(entry.get("jwt", ""))
+    if not entry:
+        text = "🔒 *Token Status*\n\n⚫ No token cached."
+    else:
+        exp       = entry.get("expires_at") or _jwt_exp(entry.get("jwt", ""))
+        now       = time.time()
+        username  = creds.get("username") or "—"
         if not exp:
-            lines.append(f"{label}\n  ⚠️ Expiry unreadable")
-            continue
-        secs_left = exp - now
-        exp_str   = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        if secs_left <= 0:
-            lines.append(f"{label}\n  🔴 Expired — {exp_str}")
-        elif secs_left < 10 * 60:
-            mins = int(secs_left // 60)
-            lines.append(f"{label}\n  🟡 Expires in {mins}m — {exp_str}")
+            text = f"🔒 *Token Status*\n\n⚠️ Expiry unreadable\nUser: `{username}`"
         else:
-            hrs  = int(secs_left // 3600)
-            mins = int((secs_left % 3600) // 60)
-            time_str = f"{hrs}h {mins}m" if hrs else f"{mins}m"
-            lines.append(f"{label}\n  🟢 Valid — expires in {time_str} ({exp_str})")
+            secs_left = exp - now
+            exp_str   = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            if secs_left <= 0:
+                status = f"🔴 Expired — {exp_str}"
+            elif secs_left < 10 * 60:
+                status = f"🟡 Expires in {int(secs_left // 60)}m — {exp_str}"
+            else:
+                hrs  = int(secs_left // 3600)
+                mins = int((secs_left % 3600) // 60)
+                status = f"🟢 Valid — expires in {hrs}h {mins}m ({exp_str})"
+            text = f"🔒 *Token Status*\n\nUser: `{username}`\n{status}"
 
-    await update.message.reply_text(
-        "🔒 *Token Status*\n\n" + "\n\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=_main_menu(),
-    )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu())
 
 
 # ──────────────────────────────────────────────────────────
@@ -390,7 +347,7 @@ async def cmd_daemon(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🔄 *Token Refresh Daemon*\n\n"
         f"Status: {_daemon_status_text()}\n\n"
         "The daemon watches the token cache and silently refreshes "
-        "each token *5 minutes before it expires*.\n"
+        "the token *5 minutes before it expires*.\n"
         "Logs are written to `data/daemon.log`.",
         parse_mode="Markdown",
         reply_markup=_daemon_keyboard(),
@@ -417,18 +374,28 @@ async def recv_daemon_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────
-# Refresh Auth — login + OTP conversation  (same as assign)
+# Refresh Auth conversation
+#
+# States:
+#   CHOOSE_ACTION  — only entered when saved creds exist;
+#                    user picks "Use Saved" or "Enter New"
+#   ENTER_USERNAME — prompt for username
+#   ENTER_PASSWORD — prompt for password (saved to .env)
+#   WAIT_OTP       — OTP received from user, verified against API
 # ──────────────────────────────────────────────────────────
 
 class AS(Enum):
-    CHOOSE_CRED   = auto()
-    FORCE_CONFIRM = auto()
-    WAIT_OTP      = auto()
+    CHOOSE_ACTION  = auto()
+    ENTER_USERNAME = auto()
+    ENTER_PASSWORD = auto()
+    WAIT_OTP       = auto()
 
 
 @dataclass
 class AuthSession:
-    cred_type:    str = ""
+    username:     str = ""
+    password:     str = ""
+    usertype:     str = "staff"
     http_session: Optional[object] = None
 
 
@@ -438,80 +405,114 @@ def _get_auth_sess(ctx: ContextTypes.DEFAULT_TYPE) -> AuthSession:
     return ctx.user_data["auth_session"]
 
 
+def _saved_creds_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Use saved credentials", callback_data="auth_use:saved")],
+        [InlineKeyboardButton("✏️ Enter new credentials", callback_data="auth_use:new")],
+    ])
+
+
 async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
+
     ctx.user_data["auth_session"] = AuthSession()
-    await update.message.reply_text(
-        "🔑 *Refresh Auth*\n\nSelect a credential profile to authenticate:",
-        parse_mode="Markdown",
-        reply_markup=_auth_cred_keyboard(),
-    )
-    return AS.CHOOSE_CRED
+    creds = get_credentials()
 
-
-async def recv_auth_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    cred_type = query.data.split(":")[1]
-
-    if cred_type == "cancel":
-        await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
-        return ConversationHandler.END
-
-    auth_sess           = _get_auth_sess(ctx)
-    auth_sess.cred_type = cred_type
-
-    cached = get_valid_tokens(cred_type)
-    if cached:
-        entry   = _load_tokens_raw().get(cred_type, {})
-        exp_ts  = entry.get("expires_at", 0)
-        exp_str = (
-            datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            if exp_ts else "unknown"
-        )
-        await query.edit_message_text(
-            f"✅ *{CRED_LABELS[cred_type]}* already has valid cached tokens.\n"
-            f"*Expires:* {exp_str}\n\nForce a fresh login anyway?",
+    if creds["username"] and creds["password"]:
+        # Saved credentials exist — ask what to do
+        await update.message.reply_text(
+            f"🔑 *Refresh Auth*\n\n"
+            f"Saved login found: `{creds['username']}`\n\n"
+            "Use the saved credentials or enter new ones?",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Yes, re-authenticate", callback_data="auth_force:yes")],
-                [InlineKeyboardButton("✅ No, keep current",     callback_data="auth_force:no")],
-            ]),
+            reply_markup=_saved_creds_keyboard(),
         )
-        return AS.FORCE_CONFIRM
-
-    return await _auth_trigger_login(query, auth_sess)
-
-
-async def recv_auth_force(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    auth_sess = _get_auth_sess(ctx)
-    if query.data.split(":")[1] == "no":
-        await query.edit_message_text(
-            f"✅ Keeping existing tokens for *{CRED_LABELS[auth_sess.cred_type]}*.",
+        return AS.CHOOSE_ACTION
+    else:
+        # No saved credentials — go straight to entry
+        await update.message.reply_text(
+            "🔑 *Refresh Auth*\n\n"
+            "No credentials saved. Please enter your *username*:",
             parse_mode="Markdown",
         )
-        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
-        return ConversationHandler.END
-    return await _auth_trigger_login(query, auth_sess)
+        return AS.ENTER_USERNAME
 
 
-async def _auth_trigger_login(query, auth_sess: AuthSession) -> int:
-    creds = CRED_MAP[auth_sess.cred_type]
-    auth_sess.http_session = build_session()
+async def recv_auth_choose(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":")[1]
+
+    if choice == "saved":
+        creds    = get_credentials()
+        auth_sess = _get_auth_sess(ctx)
+        auth_sess.username = creds["username"]
+        auth_sess.password = creds["password"]
+        auth_sess.usertype = creds["usertype"]
+        return await _trigger_login(query, auth_sess)
+
+    # "new" — ask for username
     await query.edit_message_text(
-        f"🔐 Sending login request for *{CRED_LABELS[auth_sess.cred_type]}*…",
+        "✏️ Enter your *username* (login ID):",
         parse_mode="Markdown",
     )
+    return AS.ENTER_USERNAME
+
+
+async def recv_auth_username(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    auth_sess          = _get_auth_sess(ctx)
+    auth_sess.username = update.message.text.strip()
+    await update.message.reply_text(
+        f"Username: `{auth_sess.username}`\n\nNow enter your *password*:\n"
+        "_(your message will not be stored in Telegram history after this)_",
+        parse_mode="Markdown",
+    )
+    return AS.ENTER_PASSWORD
+
+
+async def recv_auth_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    auth_sess          = _get_auth_sess(ctx)
+    auth_sess.password = update.message.text.strip()
+    auth_sess.usertype = get_credentials()["usertype"]  # keep USER_TYPE from .env
+
+    # Save to .env so they persist for next time
+    save_credentials(auth_sess.username, auth_sess.password)
+
+    # Try to delete the password message from chat for safety
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    await update.message.reply_text(
+        "✅ Credentials saved.\n\n🔐 Sending login request…",
+        parse_mode="Markdown",
+    )
+
+    # Fake a query-like call using a regular message path
+    return await _trigger_login_from_message(update.message, auth_sess)
+
+
+async def _trigger_login(query, auth_sess: AuthSession) -> int:
+    """Send login request after choosing saved credentials (callback_query path)."""
+    await query.edit_message_text("🔐 Sending login request…")
+    return await _do_login(query.message, auth_sess)
+
+
+async def _trigger_login_from_message(message, auth_sess: AuthSession) -> int:
+    """Send login request after entering new credentials (message path)."""
+    return await _do_login(message, auth_sess)
+
+
+async def _do_login(message, auth_sess: AuthSession) -> int:
+    auth_sess.http_session = build_session()
     try:
         resp = auth_sess.http_session.post(
             f"{AUTH_BASE_URL}/login",
             json={
-                "username": creds["username"],
-                "password": creds["password"],
-                "usertype": creds["usertype"],
+                "username": auth_sess.username,
+                "password": auth_sess.password,
+                "usertype": auth_sess.usertype,
                 "otpcode":  "",
             },
             timeout=30,
@@ -521,14 +522,14 @@ async def _auth_trigger_login(query, auth_sess: AuthSession) -> int:
         if data.get("success") is False and "error" in data:
             raise RuntimeError(data.get("error") or data.get("message"))
     except Exception as e:
-        await query.message.reply_text(
+        await message.reply_text(
             f"❌ Login failed: `{e}`\n\nUse the menu to retry.",
             parse_mode="Markdown",
             reply_markup=_main_menu(),
         )
         return ConversationHandler.END
 
-    await query.message.reply_text(
+    await message.reply_text(
         "📲 OTP sent to the registered device.\n\nPlease *reply with the OTP code*:",
         parse_mode="Markdown",
     )
@@ -538,13 +539,16 @@ async def _auth_trigger_login(query, auth_sess: AuthSession) -> int:
 async def recv_auth_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     auth_sess = _get_auth_sess(ctx)
     otp       = update.message.text.strip()
-    creds     = CRED_MAP[auth_sess.cred_type]
 
     await update.message.reply_text("🔄 Verifying OTP…")
     try:
         resp = auth_sess.http_session.post(
             f"{AUTH_BASE_URL}/otpverify",
-            json={"username": creds["username"], "password": creds["password"], "otpcode": otp},
+            json={
+                "username": auth_sess.username,
+                "password": auth_sess.password,
+                "otpcode":  otp,
+            },
             timeout=30,
         )
         resp.raise_for_status()
@@ -555,7 +559,9 @@ async def recv_auth_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         refresh_token = details.get("refresh_token", "")
         if not access_token or not jwt:
             raise RuntimeError(f"Tokens missing. Keys: {list(data.keys())}")
-        persist_tokens(auth_sess.cred_type, access_token, jwt, refresh_token)
+
+        persist_tokens(access_token, jwt, refresh_token)
+
         exp_ts  = _jwt_exp(jwt)
         exp_str = (
             datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -570,7 +576,7 @@ async def recv_auth_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"✅ *Authenticated successfully!*\n\n"
-        f"*Profile:* {CRED_LABELS[auth_sess.cred_type]}\n"
+        f"*User:* `{auth_sess.username}`\n"
         f"*Token expires:* {exp_str}",
         parse_mode="Markdown",
         reply_markup=_main_menu(),
@@ -641,8 +647,7 @@ def _confirm_keyboard() -> InlineKeyboardMarkup:
 async def cmd_update_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
 
-    # Require valid cached tokens before starting
-    tokens = _first_valid_tokens()
+    tokens = get_valid_tokens()
     if not tokens:
         await update.message.reply_text(
             "⚠️ No valid tokens found.\n\nPlease tap *🔑 Refresh Auth* first to log in.",
@@ -750,19 +755,17 @@ async def recv_ue_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text("⏳ Submitting entry update…")
 
-    payload = {
-        "parcel_number":   ue.parcel_number,
-        "nature_of_title": ue.nature_of_title,
-        "entry_number":    ue.entry_number,
-        "section":         ue.section,
-        "entry_status":    ue.entry_status,
-    }
-
     try:
         sess = build_session()
         resp = sess.post(
             ENTRIES_ENDPOINT,
-            json=payload,
+            json={
+                "parcel_number":   ue.parcel_number,
+                "nature_of_title": ue.nature_of_title,
+                "entry_number":    ue.entry_number,
+                "section":         ue.section,
+                "entry_status":    ue.entry_status,
+            },
             headers={
                 "Authorization": f"Bearer {ue.tokens.access_token}",
                 "jwtauth":       f"Bearer {ue.tokens.jwt}",
@@ -792,10 +795,7 @@ async def recv_ue_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         msg = f"❓ Unexpected response ({status_code}): `{data}`"
 
-    logger.info(
-        "Update entry %s → HTTP %s: %s",
-        ue.parcel_number, status_code, data,
-    )
+    logger.info("Update entry %s → HTTP %s: %s", ue.parcel_number, status_code, data)
     await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=_main_menu())
     return ConversationHandler.END
 
@@ -830,26 +830,20 @@ async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────
 
 def main():
-    if not CRED_MAP:
-        raise RuntimeError(
-            "No credential profiles are configured. "
-            "Add at least one set of credentials to .env."
-        )
-
     app = Application.builder().token(BOT_TOKEN).build()
 
     not_cancel = filters.TEXT & ~filters.COMMAND & ~_CANCEL_FILTER
 
-    # Refresh Auth conversation
     auth_conv = ConversationHandler(
         entry_points=[
             CommandHandler("auth", cmd_auth),
             MessageHandler(filters.Regex(f"^{re.escape(BTN_AUTH)}$"), cmd_auth),
         ],
         states={
-            AS.CHOOSE_CRED:   [CallbackQueryHandler(recv_auth_cred,  pattern=r"^auth_cred:")],
-            AS.FORCE_CONFIRM: [CallbackQueryHandler(recv_auth_force, pattern=r"^auth_force:")],
-            AS.WAIT_OTP:      [MessageHandler(not_cancel, recv_auth_otp)],
+            AS.CHOOSE_ACTION:  [CallbackQueryHandler(recv_auth_choose,   pattern=r"^auth_use:")],
+            AS.ENTER_USERNAME: [MessageHandler(not_cancel, recv_auth_username)],
+            AS.ENTER_PASSWORD: [MessageHandler(not_cancel, recv_auth_password)],
+            AS.WAIT_OTP:       [MessageHandler(not_cancel, recv_auth_otp)],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
@@ -860,7 +854,6 @@ def main():
         per_message=False,
     )
 
-    # Update Entry conversation
     entry_conv = ConversationHandler(
         entry_points=[
             CommandHandler("entry", cmd_update_entry),
@@ -868,11 +861,11 @@ def main():
         ],
         states={
             UE.PARCEL_NUMBER:   [MessageHandler(not_cancel, recv_ue_parcel)],
-            UE.NATURE_OF_TITLE: [CallbackQueryHandler(recv_ue_nature,       pattern=r"^ue_nature:")],
+            UE.NATURE_OF_TITLE: [CallbackQueryHandler(recv_ue_nature,        pattern=r"^ue_nature:")],
             UE.ENTRY_NUMBER:    [MessageHandler(not_cancel, recv_ue_entry_number)],
-            UE.SECTION:         [CallbackQueryHandler(recv_ue_section,      pattern=r"^ue_section:")],
-            UE.ENTRY_STATUS:    [CallbackQueryHandler(recv_ue_status,       pattern=r"^ue_status:")],
-            UE.CONFIRM:         [CallbackQueryHandler(recv_ue_confirm,      pattern=r"^ue_confirm:")],
+            UE.SECTION:         [CallbackQueryHandler(recv_ue_section,       pattern=r"^ue_section:")],
+            UE.ENTRY_STATUS:    [CallbackQueryHandler(recv_ue_status,        pattern=r"^ue_status:")],
+            UE.CONFIRM:         [CallbackQueryHandler(recv_ue_confirm,       pattern=r"^ue_confirm:")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
