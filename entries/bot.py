@@ -623,7 +623,7 @@ def _nature_keyboard() -> InlineKeyboardMarkup:
 
 
 def _section_keyboard() -> InlineKeyboardMarkup:
-    sections = ["PROPRIETORSHIP", "ENCUMBRANCE", "EASEMENT", "CAUTION", "INHIBITION"]
+    sections = ["PROPRIETORSHIP", "ENCUMBRANCE"]
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(s, callback_data=f"ue_section:{s}")]
         for s in sections
