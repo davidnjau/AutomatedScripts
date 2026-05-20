@@ -296,8 +296,11 @@ class RTSession:
 # States — Auto Fetch schedule conversation
 # ──────────────────────────────────────────────────────────
 class AF(Enum):
-    INTERVAL = auto()   # choose how often to run
-    AMOUNT   = auto()   # enter amount range
+    INTERVAL  = auto()   # choose how often to run
+    DAYS_BACK = auto()   # choose days back
+    COUNTY    = auto()   # county filter
+    REGISTRY  = auto()   # registry filter
+    AMOUNT    = auto()   # enter amount range
 
 
 # ──────────────────────────────────────────────────────────
@@ -2875,15 +2878,19 @@ async def cmd_auto_fetch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     cfg = load_auto_fetch_schedule()
     if cfg:
-        mins = cfg.get("interval_minutes", 0)
-        lo   = cfg.get("amount_min")
-        hi   = cfg.get("amount_max")
-        lo_s = f"KES {int(lo):,}" if lo is not None else "0"
-        hi_s = f"KES {int(hi):,}" if hi is not None else "∞"
-        status = (
+        mins    = cfg.get("interval_minutes", 0)
+        lo      = cfg.get("amount_min")
+        hi      = cfg.get("amount_max")
+        lo_s    = f"KES {int(lo):,}" if lo is not None else "0"
+        hi_s    = f"KES {int(hi):,}" if hi is not None else "∞"
+        county  = cfg.get("county_filter", "") or "All"
+        reg     = cfg.get("registry_filter", "") or "All"
+        days    = cfg.get("days_back", 2)
+        status  = (
             f"⏰ *Auto Fetch is active*\n"
-            f"Interval: every {mins} min\n"
-            f"Amount range: {lo_s} – {hi_s}\n\n"
+            f"Interval: every {mins} min | Days back: {days}\n"
+            f"County: {county.title()} | Registry: {reg.title()}\n"
+            f"Amount: {lo_s} – {hi_s}\n\n"
             f"Choose a new interval to update, or cancel to stop."
         )
     else:
@@ -2906,7 +2913,6 @@ async def recv_af_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "af:cancel":
-        # Stop the schedule
         for job in ctx.job_queue.get_jobs_by_name("auto_fetch_job"):
             job.schedule_removal()
         clear_auto_fetch_schedule()
@@ -2921,10 +2927,59 @@ async def recv_af_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ctx.user_data["af_interval_minutes"] = interval_minutes
     await query.edit_message_text(
-        f"✅ Interval set to *{interval_minutes} min*.\n\n"
-        f"Now enter the *amount range* (min max), e.g.:\n"
-        f"`500000 5000000`\n\n"
-        f"Or send `skip` to fetch all amounts.",
+        f"✅ Interval: *{interval_minutes} min*\n\nHow many days back to fetch?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("1 day",  callback_data="af_days:1"),
+                InlineKeyboardButton("2 days", callback_data="af_days:2"),
+                InlineKeyboardButton("3 days", callback_data="af_days:3"),
+            ],
+            [
+                InlineKeyboardButton("5 days",  callback_data="af_days:5"),
+                InlineKeyboardButton("7 days",  callback_data="af_days:7"),
+                InlineKeyboardButton("10 days", callback_data="af_days:10"),
+            ],
+        ]),
+    )
+    return AF.DAYS_BACK
+
+
+async def recv_af_days(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ctx.user_data["af_days_back"] = int(query.data.split(":")[-1])
+    await query.edit_message_text(
+        f"✅ Days back: *{ctx.user_data['af_days_back']}*\n\nFilter by county?",
+        parse_mode="Markdown",
+        reply_markup=_ft_county_keyboard(),
+    )
+    return AF.COUNTY
+
+
+async def recv_af_county(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ctx.user_data["af_county"] = "" if query.data == "ft_county:all" else query.data.split(":")[1]
+    label = ctx.user_data["af_county"].title() or "All Counties"
+    await query.edit_message_text(
+        f"✅ County: *{label}*\n\nFilter by registry?",
+        parse_mode="Markdown",
+        reply_markup=_ft_registry_keyboard(),
+    )
+    return AF.REGISTRY
+
+
+async def recv_af_registry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ctx.user_data["af_registry"] = "" if query.data == "ft_registry:all" else query.data.split(":")[1]
+    reg_label    = ctx.user_data["af_registry"].title() or "All Registries"
+    county_label = ctx.user_data.get("af_county", "").title() or "All Counties"
+    await query.edit_message_text(
+        f"✅ County: *{county_label}* | Registry: *{reg_label}*\n\n"
+        f"Enter *amount range* (min max), e.g. `500000 5000000`\n"
+        f"Or send `skip` for all amounts.",
         parse_mode="Markdown",
     )
     return AF.AMOUNT
@@ -2933,6 +2988,9 @@ async def recv_af_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def recv_af_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text     = update.message.text.strip().lower()
     interval = ctx.user_data.get("af_interval_minutes", 60)
+    days     = ctx.user_data.get("af_days_back", 2)
+    county   = ctx.user_data.get("af_county", "")
+    registry = ctx.user_data.get("af_registry", "")
 
     amount_min: Optional[float] = None
     amount_max: Optional[float] = None
@@ -2956,13 +3014,14 @@ async def recv_af_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     cfg = {
         "interval_minutes": interval,
+        "days_back":        days,
+        "county_filter":    county,
+        "registry_filter":  registry,
         "amount_min":       amount_min,
         "amount_max":       amount_max,
-        "days_back":        2,
     }
     save_auto_fetch_schedule(cfg)
 
-    # Cancel any existing job and start a new one
     for job in ctx.job_queue.get_jobs_by_name("auto_fetch_job"):
         job.schedule_removal()
     ctx.job_queue.run_repeating(
@@ -2972,11 +3031,15 @@ async def recv_af_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         name="auto_fetch_job",
     )
 
-    lo_s = f"KES {int(amount_min):,}" if amount_min is not None else "0"
-    hi_s = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
+    lo_s     = f"KES {int(amount_min):,}" if amount_min is not None else "0"
+    hi_s     = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
+    co_label = county.title() or "All"
+    re_label = registry.title() or "All"
     await update.message.reply_text(
         f"✅ *Auto Fetch scheduled*\n"
-        f"Every *{interval} min* | Amount: {lo_s} – {hi_s}\n"
+        f"Every *{interval} min* | Days back: *{days}*\n"
+        f"County: *{co_label}* | Registry: *{re_label}*\n"
+        f"Amount: {lo_s} – {hi_s}\n"
         f"First run in {interval} min.",
         parse_mode="Markdown",
         reply_markup=_main_menu(),
@@ -2995,15 +3058,25 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("Auto Fetch job: no valid tokens — skipping cycle.")
         return
 
-    days_back  = cfg.get("days_back", 2)
-    amount_min = cfg.get("amount_min")
-    amount_max = cfg.get("amount_max")
+    days_back       = cfg.get("days_back", 2)
+    county_filter   = cfg.get("county_filter", "")
+    registry_filter = cfg.get("registry_filter", "")
+    amount_min      = cfg.get("amount_min")
+    amount_max      = cfg.get("amount_max")
 
     try:
         tasks, stats = _load_fetch_tasks(tokens, days_back)
     except Exception as e:
         logger.warning("Auto Fetch job: fetch failed: %s", e)
         return
+
+    # County filter
+    if county_filter:
+        tasks = [t for t in tasks if county_filter in (t.get("county") or "").strip().lower()]
+
+    # Registry filter
+    if registry_filter:
+        tasks = [t for t in tasks if registry_filter in (t.get("registry") or "").strip().lower()]
 
     # Amount filter
     if amount_min is not None or amount_max is not None:
@@ -3033,9 +3106,14 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Auto Fetch job: no new tasks after filters.")
         return
 
-    lo_s = f"KES {int(amount_min):,}" if amount_min is not None else "0"
-    hi_s = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
-    header = f"⏰ *Auto Fetch — {len(tasks)} task(s)* | Amount: {lo_s}–{hi_s}\n\n"
+    lo_s     = f"KES {int(amount_min):,}" if amount_min is not None else "0"
+    hi_s     = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
+    co_label = county_filter.title() or "All"
+    re_label = registry_filter.title() or "All"
+    header   = (
+        f"⏰ *Auto Fetch — {len(tasks)} task(s)*\n"
+        f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s}\n\n"
+    )
 
     lines = []
     for i, t in enumerate(tasks, 1):
@@ -4786,8 +4864,11 @@ def main():
             MessageHandler(filters.Regex(f"^{re.escape(BTN_AUTO_FETCH)}$"), cmd_auto_fetch),
         ],
         states={
-            AF.INTERVAL: [CallbackQueryHandler(recv_af_interval, pattern=r"^af:")],
-            AF.AMOUNT:   [MessageHandler(not_cancel, recv_af_amount)],
+            AF.INTERVAL:  [CallbackQueryHandler(recv_af_interval, pattern=r"^af:")],
+            AF.DAYS_BACK: [CallbackQueryHandler(recv_af_days,     pattern=r"^af_days:")],
+            AF.COUNTY:    [CallbackQueryHandler(recv_af_county,   pattern=r"^ft_county:")],
+            AF.REGISTRY:  [CallbackQueryHandler(recv_af_registry, pattern=r"^ft_registry:")],
+            AF.AMOUNT:    [MessageHandler(not_cancel, recv_af_amount)],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
