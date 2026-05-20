@@ -305,13 +305,14 @@ class RTSession:
 # States — Auto Fetch schedule conversation
 # ──────────────────────────────────────────────────────────
 class AF(Enum):
-    INTERVAL  = auto()   # choose how often to run
-    DAYS_BACK = auto()   # choose days back
-    COUNTY    = auto()   # county filter
-    REGISTRY  = auto()   # registry filter
-    AMOUNT    = auto()   # enter amount range
-    SECTIONAL = auto()   # exclude / only / all sectional
-    EMAIL     = auto()   # optional recipient email address
+    INTERVAL    = auto()   # choose how often to run
+    DAYS_BACK   = auto()   # choose days back
+    COUNTY      = auto()   # county filter
+    REGISTRY    = auto()   # registry filter
+    AMOUNT      = auto()   # pick amount range button
+    AMOUNT_TEXT = auto()   # custom amount text entry
+    SECTIONAL   = auto()   # exclude / only / all sectional
+    EMAIL       = auto()   # optional recipient email address
 
 
 # ──────────────────────────────────────────────────────────
@@ -2994,42 +2995,69 @@ async def recv_af_registry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reg_label    = ctx.user_data["af_registry"].title() or "All Registries"
     county_label = ctx.user_data.get("af_county", "").title() or "All Counties"
     await query.edit_message_text(
-        f"✅ County: *{county_label}* | Registry: *{reg_label}*\n\n"
-        f"Enter *amount range* (min max), e.g. `500000 5000000`\n"
-        f"Or send `skip` for all amounts.",
+        f"✅ County: *{county_label}* | Registry: *{reg_label}*\n\nFilter by amount?",
         parse_mode="Markdown",
+        reply_markup=_ft_amount_keyboard(),
     )
     return AF.AMOUNT
 
 
 async def recv_af_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text     = update.message.text.strip().lower()
-    interval = ctx.user_data.get("af_interval_minutes", 60)
-    days     = ctx.user_data.get("af_days_back", 2)
-    county   = ctx.user_data.get("af_county", "")
-    registry = ctx.user_data.get("af_registry", "")
+    """Callback handler — user picked an amount preset or Custom."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data  # e.g. "ft_amount:1m_5m" or "ft_amount:custom"
 
-    amount_min: Optional[float] = None
-    amount_max: Optional[float] = None
+    if choice == "ft_amount:custom":
+        await query.edit_message_text(
+            "✏️ Enter custom amount range as *min max* (e.g. `500000 5000000`).\n"
+            "Or send just one number as max.",
+            parse_mode="Markdown",
+        )
+        return AF.AMOUNT_TEXT
 
-    if text != "skip":
-        parts = text.split()
-        try:
-            if len(parts) == 2:
-                amount_min = float(parts[0].replace(",", ""))
-                amount_max = float(parts[1].replace(",", ""))
-            elif len(parts) == 1:
-                amount_max = float(parts[0].replace(",", ""))
-            else:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Could not parse. Enter two numbers e.g. `500000 5000000`, or `skip`.",
-                parse_mode="Markdown",
-            )
-            return AF.AMOUNT
+    ranges = {
+        "ft_amount:0_1m":    (0.0,           1_000_000.0),
+        "ft_amount:1m_5m":   (1_000_000.0,   5_000_000.0),
+        "ft_amount:5m_10m":  (5_000_000.0,  10_000_000.0),
+        "ft_amount:20m_50m": (20_000_000.0, 50_000_000.0),
+        "ft_amount:50m_100m":(50_000_000.0,100_000_000.0),
+        "ft_amount:80m_300m":(80_000_000.0,300_000_000.0),
+        "ft_amount:80m_3b":  (80_000_000.0,  3_000_000_000.0),
+        "ft_amount:all":     (None,           None),
+    }
+    amount_min, amount_max = ranges.get(choice, (None, None))
+    ctx.user_data["af_amount_min"] = amount_min
+    ctx.user_data["af_amount_max"] = amount_max
 
-    # Stash settings; wait for sectional choice before saving
+    await query.edit_message_text(
+        "Include sectional properties?\n_(Sectional: parcel has 4 parts e.g. Nairobi/Block12/345/888)_",
+        parse_mode="Markdown",
+        reply_markup=_sectional_keyboard(),
+    )
+    return AF.SECTIONAL
+
+
+async def recv_af_amount_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Text handler for custom amount entry in Auto Fetch."""
+    text = update.message.text.strip()
+    parts = text.split()
+    try:
+        if len(parts) == 2:
+            amount_min = float(parts[0].replace(",", ""))
+            amount_max = float(parts[1].replace(",", ""))
+        elif len(parts) == 1:
+            amount_min = None
+            amount_max = float(parts[0].replace(",", ""))
+        else:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Could not parse. Enter two numbers e.g. `500000 5000000`, or one number as max.",
+            parse_mode="Markdown",
+        )
+        return AF.AMOUNT_TEXT
+
     ctx.user_data["af_amount_min"] = amount_min
     ctx.user_data["af_amount_max"] = amount_max
     await update.message.reply_text(
@@ -5046,13 +5074,14 @@ def main():
             MessageHandler(filters.Regex(f"^{re.escape(BTN_AUTO_FETCH)}$"), cmd_auto_fetch),
         ],
         states={
-            AF.INTERVAL:  [CallbackQueryHandler(recv_af_interval,  pattern=r"^af:")],
-            AF.DAYS_BACK: [CallbackQueryHandler(recv_af_days,      pattern=r"^af_days:")],
-            AF.COUNTY:    [CallbackQueryHandler(recv_af_county,    pattern=r"^ft_county:")],
-            AF.REGISTRY:  [CallbackQueryHandler(recv_af_registry,  pattern=r"^ft_registry:")],
-            AF.AMOUNT:    [MessageHandler(not_cancel, recv_af_amount)],
-            AF.SECTIONAL: [CallbackQueryHandler(recv_af_sectional, pattern=r"^ft_sectional:")],
-            AF.EMAIL:     [MessageHandler(not_cancel, recv_af_email)],
+            AF.INTERVAL:    [CallbackQueryHandler(recv_af_interval,     pattern=r"^af:")],
+            AF.DAYS_BACK:   [CallbackQueryHandler(recv_af_days,         pattern=r"^af_days:")],
+            AF.COUNTY:      [CallbackQueryHandler(recv_af_county,       pattern=r"^ft_county:")],
+            AF.REGISTRY:    [CallbackQueryHandler(recv_af_registry,     pattern=r"^ft_registry:")],
+            AF.AMOUNT:      [CallbackQueryHandler(recv_af_amount,       pattern=r"^ft_amount:")],
+            AF.AMOUNT_TEXT: [MessageHandler(not_cancel, recv_af_amount_text)],
+            AF.SECTIONAL:   [CallbackQueryHandler(recv_af_sectional,    pattern=r"^ft_sectional:")],
+            AF.EMAIL:       [MessageHandler(not_cancel, recv_af_email)],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
