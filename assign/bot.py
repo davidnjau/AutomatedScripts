@@ -29,10 +29,13 @@ import asyncio
 import os
 import re
 import signal
+import smtplib
 import subprocess
 import sys
 import time
 import uuid
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_completed
@@ -83,13 +86,19 @@ logger = logging.getLogger("ardhisasa.bot")
 
 load_dotenv()
 
-BOT_TOKEN        = os.environ["TELEGRAM_BOT_TOKEN"]
+BOT_TOKEN         = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ALLOWED_IDS = set(
     int(x.strip())
     for x in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",")
     if x.strip()
 )
+
+# SMTP config for Auto Fetch email notifications (all optional)
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
 
 BASE_URL = "https://ardhisasa-api.lands.go.ke"
 
@@ -302,6 +311,7 @@ class AF(Enum):
     REGISTRY  = auto()   # registry filter
     AMOUNT    = auto()   # enter amount range
     SECTIONAL = auto()   # exclude / only / all sectional
+    EMAIL     = auto()   # optional recipient email address
 
 
 # ──────────────────────────────────────────────────────────
@@ -2891,11 +2901,13 @@ async def cmd_auto_fetch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         days      = cfg.get("days_back", 2)
         sec       = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(
                         cfg.get("sectional_filter", "exclude"), "Exclude Sectional")
+        email_s   = cfg.get("email") or "Telegram only"
         status  = (
             f"⏰ *Auto Fetch is active*\n"
             f"Interval: every {mins} min | Days back: {days}\n"
             f"County: {county.title()} | Registry: {reg.title()}\n"
-            f"Amount: {lo_s} – {hi_s} | Sectional: {sec}\n\n"
+            f"Amount: {lo_s} – {hi_s} | Sectional: {sec}\n"
+            f"Email: {email_s}\n\n"
             f"Choose a new interval to update, or cancel to stop."
         )
     else:
@@ -3032,13 +3044,45 @@ async def recv_af_sectional(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    sectional = query.data.split(":")[1]  # "exclude" | "only" | "all"
+    ctx.user_data["af_sectional"] = query.data.split(":")[1]  # "exclude" | "only" | "all"
+
+    existing_email = ""
+    cfg = load_auto_fetch_schedule()
+    if cfg:
+        existing_email = cfg.get("email", "")
+
+    hint = f"Current: `{existing_email}`\n\n" if existing_email else ""
+    await query.edit_message_text(
+        f"📧 *Send results to email?*\n\n"
+        f"{hint}"
+        f"Enter an email address, or send `skip` to notify via Telegram only.",
+        parse_mode="Markdown",
+    )
+    return AF.EMAIL
+
+
+async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text.lower() == "skip":
+        email = ""
+    else:
+        # Basic email validation
+        if "@" not in text or "." not in text.split("@")[-1]:
+            await update.message.reply_text(
+                "❌ Invalid email address. Enter a valid email or send `skip`.",
+                parse_mode="Markdown",
+            )
+            return AF.EMAIL
+        email = text
+
     interval   = ctx.user_data.get("af_interval_minutes", 60)
     days       = ctx.user_data.get("af_days_back", 2)
     county     = ctx.user_data.get("af_county", "")
     registry   = ctx.user_data.get("af_registry", "")
     amount_min = ctx.user_data.get("af_amount_min")
     amount_max = ctx.user_data.get("af_amount_max")
+    sectional  = ctx.user_data.get("af_sectional", "exclude")
 
     cfg = {
         "interval_minutes": interval,
@@ -3048,6 +3092,7 @@ async def recv_af_sectional(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "amount_min":       amount_min,
         "amount_max":       amount_max,
         "sectional_filter": sectional,
+        "email":            email,
     }
     save_auto_fetch_schedule(cfg)
 
@@ -3060,21 +3105,47 @@ async def recv_af_sectional(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         name="auto_fetch_job",
     )
 
-    lo_s     = f"KES {int(amount_min):,}" if amount_min is not None else "0"
-    hi_s     = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
-    co_label = county.title() or "All"
-    re_label = registry.title() or "All"
+    lo_s      = f"KES {int(amount_min):,}" if amount_min is not None else "0"
+    hi_s      = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
+    co_label  = county.title() or "All"
+    re_label  = registry.title() or "All"
     sec_label = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(sectional, sectional)
-    await query.edit_message_text(
+    email_label = email or "Telegram only"
+    await update.message.reply_text(
         f"✅ *Auto Fetch scheduled*\n"
         f"Every *{interval} min* | Days back: *{days}*\n"
         f"County: *{co_label}* | Registry: *{re_label}*\n"
         f"Amount: {lo_s} – {hi_s} | Sectional: *{sec_label}*\n"
+        f"Email: *{email_label}*\n"
         f"First run in {interval} min.",
         parse_mode="Markdown",
+        reply_markup=_main_menu(),
     )
-    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
     return ConversationHandler.END
+
+
+def _send_auto_fetch_email(to_email: str, subject: str, body: str) -> None:
+    """Send Auto Fetch results via SMTP. Raises on failure."""
+    if not SMTP_USER or not SMTP_PASS:
+        raise RuntimeError("SMTP_USER / SMTP_PASS not configured in .env")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = SMTP_USER
+    msg["To"]      = to_email
+
+    # Plain text part
+    msg.attach(MIMEText(body, "plain"))
+
+    # Simple HTML version
+    html_body = "<pre style='font-family:monospace'>" + body.replace("&", "&amp;").replace("<", "&lt;") + "</pre>"
+    msg.attach(MIMEText(html_body, "html"))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, to_email, msg.as_string())
 
 
 async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3189,6 +3260,41 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(chat_id, c, parse_mode="Markdown")
             except Exception as e:
                 logger.warning("Auto Fetch notify error for %s: %s", chat_id, e)
+
+    # Email notification
+    email = cfg.get("email", "")
+    if email:
+        # Build plain-text body (strip Markdown asterisks)
+        plain_header = (
+            f"Auto Fetch — {len(tasks)} task(s)\n"
+            f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | {sec_label}\n"
+            + "─" * 60 + "\n\n"
+        )
+        plain_lines = []
+        for i, t in enumerate(tasks, 1):
+            src    = t.get("source", "")
+            ref    = t.get("reference_number", "—")
+            cnty   = (t.get("county") or "—").upper()
+            reg    = (t.get("registry") or "—").upper()
+            date   = (t.get("date_created") or "")[:10]
+            parcel = t.get("parcel_number") or "—"
+            try:
+                raw_cons = t.get("consideration")
+                cons = f"KES {int(float(str(raw_cons).replace(',','').strip())):,}" if raw_cons else "—"
+            except (ValueError, TypeError):
+                cons = str(t.get("consideration") or "—")
+            plain_lines.append(
+                f"{i}. [{src}] {ref}\n"
+                f"   {cnty} / {reg} | {date}\n"
+                f"   {cons} | {parcel}"
+            )
+        plain_body   = plain_header + "\n\n".join(plain_lines)
+        email_subject = f"Auto Fetch — {len(tasks)} task(s) found"
+        try:
+            _send_auto_fetch_email(email, email_subject, plain_body)
+            logger.info("Auto Fetch email sent to %s", email)
+        except Exception as e:
+            logger.warning("Auto Fetch email failed: %s", e)
 
 
 # ──────────────────────────────────────────────────────────
@@ -4934,6 +5040,7 @@ def main():
             AF.REGISTRY:  [CallbackQueryHandler(recv_af_registry,  pattern=r"^ft_registry:")],
             AF.AMOUNT:    [MessageHandler(not_cancel, recv_af_amount)],
             AF.SECTIONAL: [CallbackQueryHandler(recv_af_sectional, pattern=r"^ft_sectional:")],
+            AF.EMAIL:     [MessageHandler(not_cancel, recv_af_email)],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
