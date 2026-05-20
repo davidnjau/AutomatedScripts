@@ -10,6 +10,9 @@ read -p "New server username:   " TARGET_USER
 read -s -p "New server password:   " TARGET_PASS
 echo ""
 
+# Directory where this script lives (i.e. the assign/ folder in the cloned repo)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Where the bot will live on both current and target server
 BOT_DIR="/opt/ardhisasa-bot/assign"
 BACKUP_FILE="/tmp/bot_data.tar.gz"
 
@@ -41,7 +44,7 @@ echo "      Done — saved to ${BACKUP_FILE}"
 # ── Step 2: Copy files to new server ─────────────────────
 echo "[2/5] Copying bot files to new server..."
 $SSH "mkdir -p ${BOT_DIR}"
-$SCP -r ${BOT_DIR}/. ${TARGET_USER}@${TARGET_HOST}:${BOT_DIR}/
+$SCP -r ${SCRIPT_DIR}/. ${TARGET_USER}@${TARGET_HOST}:${BOT_DIR}/
 echo "      Done"
 
 echo "[3/5] Copying data backup to new server..."
@@ -77,7 +80,7 @@ echo "      Done"
 
 # ── Step 4: Stop bot on current server ───────────────────
 echo "[5/5] Stopping bot on current server..."
-cd ${BOT_DIR}
+cd ${SCRIPT_DIR}
 docker compose down
 echo "      Done"
 
