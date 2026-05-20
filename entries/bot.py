@@ -615,8 +615,10 @@ def _get_ue_sess(ctx: ContextTypes.DEFAULT_TYPE) -> UESession:
 
 def _nature_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("FREEHOLD",  callback_data="ue_nature:FREEHOLD")],
-        [InlineKeyboardButton("LEASEHOLD", callback_data="ue_nature:LEASEHOLD")],
+        [InlineKeyboardButton("FREEHOLD",           callback_data="ue_nature:FREEHOLD")],
+        [InlineKeyboardButton("LEASEHOLD",          callback_data="ue_nature:LEASEHOLD")],
+        [InlineKeyboardButton("SECTIONAL_PROPERTY", callback_data="ue_nature:SECTIONAL_PROPERTY")],
+        [InlineKeyboardButton("LONG_TERM_LEASE",    callback_data="ue_nature:LONG_TERM_LEASE")],
     ])
 
 

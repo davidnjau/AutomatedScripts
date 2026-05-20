@@ -8,7 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py .
 COPY ardhisasa_auth.py .
 
-RUN useradd -m botuser && mkdir -p /app/data && chown botuser:botuser /app/data
+RUN useradd -m botuser && mkdir -p /app/data && chown -R botuser:botuser /app
 USER botuser
 
 CMD ["python", "-u", "bot.py"]
