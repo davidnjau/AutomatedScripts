@@ -4007,15 +4007,23 @@ def _ft_registry_keyboard() -> InlineKeyboardMarkup:
 def _ft_amount_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("0 – 1M",       callback_data="ft_amount:0_1m"),
-            InlineKeyboardButton("1M – 5M",      callback_data="ft_amount:1m_5m"),
+            InlineKeyboardButton("0 – 1M",        callback_data="ft_amount:0_1m"),
+            InlineKeyboardButton("1M – 5M",        callback_data="ft_amount:1m_5m"),
         ],
         [
-            InlineKeyboardButton("5M – 10M",     callback_data="ft_amount:5m_10m"),
-            InlineKeyboardButton("✏️ Custom",     callback_data="ft_amount:custom"),
+            InlineKeyboardButton("5M – 10M",       callback_data="ft_amount:5m_10m"),
+            InlineKeyboardButton("20M – 50M",      callback_data="ft_amount:20m_50m"),
         ],
         [
-            InlineKeyboardButton("📋 No filter", callback_data="ft_amount:all"),
+            InlineKeyboardButton("50M – 100M",     callback_data="ft_amount:50m_100m"),
+            InlineKeyboardButton("80M – 300M",     callback_data="ft_amount:80m_300m"),
+        ],
+        [
+            InlineKeyboardButton("80M – 3B",       callback_data="ft_amount:80m_3b"),
+            InlineKeyboardButton("✏️ Custom",       callback_data="ft_amount:custom"),
+        ],
+        [
+            InlineKeyboardButton("📋 No filter",   callback_data="ft_amount:all"),
         ],
     ])
 
@@ -4075,10 +4083,14 @@ async def recv_ft_amount_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return FT.AMOUNT_TEXT
 
     ranges = {
-        "ft_amount:0_1m":   (0.0,         1_000_000.0),
-        "ft_amount:1m_5m":  (1_000_000.0, 5_000_000.0),
-        "ft_amount:5m_10m": (5_000_000.0, 10_000_000.0),
-        "ft_amount:all":    (None,         None),
+        "ft_amount:0_1m":    (0.0,           1_000_000.0),
+        "ft_amount:1m_5m":   (1_000_000.0,   5_000_000.0),
+        "ft_amount:5m_10m":  (5_000_000.0,  10_000_000.0),
+        "ft_amount:20m_50m": (20_000_000.0, 50_000_000.0),
+        "ft_amount:50m_100m":(50_000_000.0,100_000_000.0),
+        "ft_amount:80m_300m":(80_000_000.0,300_000_000.0),
+        "ft_amount:80m_3b":  (80_000_000.0,  3_000_000_000.0),
+        "ft_amount:all":     (None,           None),
     }
     sess.amount_min, sess.amount_max = ranges.get(choice, (None, None))
     await query.edit_message_text(
