@@ -113,6 +113,7 @@ SAVED_TASK_BATCHES_FILE = os.path.join(DATA_DIR, "saved_task_batches.json")
 SAVED_SCHEDULES_FILE    = os.path.join(DATA_DIR, "saved_schedules.json")
 SAVED_DLV_BATCH_FILE    = os.path.join(DATA_DIR, "saved_dlv_batch.json")
 SAVED_AUTO_FETCH_FILE   = os.path.join(DATA_DIR, "saved_auto_fetch.json")
+SAVED_AF_RESULTS_FILE   = os.path.join(DATA_DIR, "saved_af_results.json")
 
 # base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
 CPARAMS_DLV          = base64.b64encode(b'{"active_role":"DLV"}').decode()
@@ -420,6 +421,7 @@ BTN_VALUERS       = "👥 Saved Valuers"
 BTN_DELETE        = "🗑 Delete Valuer"
 BTN_FETCH_TASKS   = "📊 Fetch Tasks"
 BTN_DLV_TASKS     = "📋 DLV Tasks"
+BTN_AF_RESULTS    = "🗂 AF Results"
 BTN_HELP          = "❓ Help"
 BTN_RESTART       = "🔁 Restart Bot"
 BTN_CANCEL        = "🛑 Cancel"
@@ -430,7 +432,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_AUTO_FETCH)}|{re.escape(BTN_ASSIGNMENTS)}|{re.escape(BTN_AUTH)}"
     f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_DAEMON)}"
     f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
-    f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_RESTART)}"
+    f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_AF_RESULTS)}|{re.escape(BTN_RESTART)}"
     f"|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -442,7 +444,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(BTN_ASSIGN)],
             [KeyboardButton(BTN_FETCH_TASKS),  KeyboardButton(BTN_DLV_BATCH)],
             [KeyboardButton(BTN_DLV_QUEUE),    KeyboardButton(BTN_AUTO_FETCH)],
-            [KeyboardButton(BTN_ASSIGNMENTS)],
+            [KeyboardButton(BTN_AF_RESULTS),   KeyboardButton(BTN_ASSIGNMENTS)],
             [KeyboardButton(BTN_DAEMON),       KeyboardButton(BTN_RESTART)],
             [KeyboardButton(BTN_AUTH),         KeyboardButton(BTN_TOKEN_STATUS)],
             [KeyboardButton(BTN_HELP)],
@@ -2431,6 +2433,109 @@ async def cmd_task_batches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────
+# AF Results — view auto fetch run history
+# ──────────────────────────────────────────────────────────
+
+async def cmd_af_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    results = load_af_results()
+    if not results:
+        await update.message.reply_text(
+            "📭 No Auto Fetch runs recorded yet. The history is saved once the Auto Fetch schedule runs.",
+            reply_markup=_main_menu(),
+        )
+        return
+
+    # Show last 10 runs as inline buttons (newest first)
+    rows = []
+    for r in reversed(results[-10:]):
+        label = f"{r['run_at']}  ({r['count']} task{'s' if r['count'] != 1 else ''})"
+        rows.append([InlineKeyboardButton(label, callback_data=f"af_result:{r['run_id']}")])
+
+    await update.message.reply_text(
+        "🗂 *Auto Fetch History* (last 10 runs)\n\nTap a run to see its tasks:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def recv_af_result_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show tasks for a specific AF run, marking already-assigned refs."""
+    query = update.callback_query
+    await query.answer()
+    run_id = query.data.split(":", 1)[1]
+
+    results  = load_af_results()
+    run      = next((r for r in results if r["run_id"] == run_id), None)
+    if not run:
+        await query.edit_message_text("❌ Run not found (may have been pruned).")
+        return
+
+    assigned = load_saved_assignments()   # {ref: {valuer_name, ...}}
+    tasks    = run["tasks"]
+    f        = run["filters"]
+
+    lo_s  = f"KES {int(f['amount_min']):,}" if f.get("amount_min") is not None else "0"
+    hi_s  = f"KES {int(f['amount_max']):,}" if f.get("amount_max") is not None else "∞"
+    sec_label = {"exclude": "No Sectional", "only": "Sectional Only", "all": "All"}.get(
+        f.get("sectional_filter", "exclude"), f.get("sectional_filter", "exclude")
+    )
+    header = (
+        f"🗂 *AF Run — {run['run_at']}*\n"
+        f"Tasks found: *{run['count']}*\n"
+        f"Filters: County={f.get('county','All') or 'All'} | Registry={f.get('registry','All') or 'All'}\n"
+        f"Amount: {lo_s}–{hi_s} | {sec_label}\n\n"
+    )
+
+    if not tasks:
+        await query.edit_message_text(header + "_No tasks found in this run._", parse_mode="Markdown")
+        return
+
+    lines = []
+    pending = 0
+    for i, t in enumerate(tasks, 1):
+        ref    = t.get("ref", "—")
+        parcel = t.get("parcel", "—")
+        cnty   = (t.get("county") or "—").upper()
+        reg    = (t.get("registry") or "—").upper()
+        date   = t.get("date_created", "")
+        try:
+            raw = t.get("consideration")
+            cons = f"KES {int(float(str(raw).replace(',','').strip())):,}" if raw else "—"
+        except (ValueError, TypeError):
+            cons = str(t.get("consideration") or "—")
+
+        if ref in assigned:
+            status = f"✅ assigned to {assigned[ref].get('valuer_name', '?')}"
+        else:
+            status = "⏳ pending"
+            pending += 1
+
+        lines.append(
+            f"{i}. `{ref}` — {status}\n"
+            f"   {cnty}/{reg} | {date} | {cons}\n"
+            f"   {parcel}"
+        )
+
+    summary_line = f"*Pending: {pending}  |  Assigned: {len(tasks) - pending}*\n\n"
+
+    # Split into chunks if needed
+    chunks, chunk = [], header + summary_line
+    for line in lines:
+        candidate = chunk + "\n\n" + line
+        if len(candidate) > 4000:
+            chunks.append(chunk)
+            chunk = line
+        else:
+            chunk = candidate
+    if chunk:
+        chunks.append(chunk)
+
+    for c in chunks:
+        await query.message.reply_text(c, parse_mode="Markdown")
+
+
+# ──────────────────────────────────────────────────────────
 # Token refresh daemon — process management
 # ──────────────────────────────────────────────────────────
 
@@ -2879,6 +2984,53 @@ def clear_auto_fetch_schedule() -> None:
         pass
 
 
+# ── Auto Fetch result history ──────────────────────────────
+_AF_RESULTS_KEEP = 20   # keep last N runs
+
+
+def load_af_results() -> List[Dict]:
+    try:
+        with open(SAVED_AF_RESULTS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def persist_af_result(run_id: str, run_at: str, tasks: List[Dict], cfg: Dict) -> None:
+    _ensure_data_dir()
+    results = load_af_results()
+    results.append({
+        "run_id":   run_id,
+        "run_at":   run_at,
+        "count":    len(tasks),
+        "filters": {
+            "county":           cfg.get("county_filter", ""),
+            "registry":         cfg.get("registry_filter", ""),
+            "amount_min":       cfg.get("amount_min"),
+            "amount_max":       cfg.get("amount_max"),
+            "days_back":        cfg.get("days_back", 2),
+            "sectional_filter": cfg.get("sectional_filter", "exclude"),
+        },
+        "tasks": [
+            {
+                "ref":          t.get("reference_number", ""),
+                "parcel":       t.get("parcel_number", ""),
+                "county":       t.get("county", ""),
+                "registry":     t.get("registry", ""),
+                "consideration": t.get("consideration"),
+                "date_created": (t.get("date_created") or "")[:10],
+                "source":       t.get("source", ""),
+            }
+            for t in tasks
+        ],
+    })
+    # Trim to keep only the most recent runs
+    if len(results) > _AF_RESULTS_KEEP:
+        results = results[-_AF_RESULTS_KEEP:]
+    with open(SAVED_AF_RESULTS_FILE, "w") as f:
+        json.dump(results, f, indent=2)
+
+
 def _af_interval_keyboard() -> InlineKeyboardMarkup:
     rows = []
     row  = []
@@ -3241,6 +3393,11 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Exclude already-queued refs
     queued_refs = {item.get("ref", "") for item in load_dlv_batch()}
     tasks = [t for t in tasks if t.get("reference_number", "") not in queued_refs]
+
+    # Persist result history (record even if empty so the run appears in AF Results)
+    _af_run_id = str(uuid.uuid4())[:8]
+    _af_run_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    persist_af_result(_af_run_id, _af_run_at, tasks, cfg)
 
     if not tasks:
         logger.info("Auto Fetch job: no new tasks after filters.")
@@ -5163,6 +5320,8 @@ def main():
     app.add_handler(CallbackQueryHandler(recv_ta_valuer,        pattern=r"^ta:"))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_QUEUE)}$"),    cmd_dlv_queue))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ASSIGNMENTS)}$"), cmd_assignments))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_AF_RESULTS)}$"), cmd_af_results))
+    app.add_handler(CallbackQueryHandler(recv_af_result_detail, pattern=r"^af_result:"))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_CANCEL)}$"),      cmd_cancel))
     # Lowest-priority: catch valuer name text input during task-assign search
     app.add_handler(
