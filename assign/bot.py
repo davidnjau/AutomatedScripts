@@ -2203,67 +2203,73 @@ async def recv_rt_task_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     rt.task_count = count
     await update.message.reply_text(
-        f"✅ *{count} task(s)* requested.\n\n"
-        "Step 4 — Would you like to filter by consideration amount?",
+        f"✅ *{count} task(s)* requested.\n\nStep 4 — Filter by consideration amount?",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💰 Enter Amount Range", callback_data="rt_amount:enter")],
-            [InlineKeyboardButton("⏭ Skip",               callback_data="rt_amount:skip")],
-        ]),
+        reply_markup=_ft_amount_keyboard(),
     )
     return RS.AMOUNT_RANGE
 
 
 async def recv_rt_amount_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handles the Enter / Skip button on the amount range step."""
+    """Handles amount preset button on the amount range step."""
     query  = update.callback_query
     await query.answer()
     rt     = _get_rt(ctx)
-    choice = query.data.split(":")[1]
+    choice = query.data  # e.g. "ft_amount:1m_5m" or "ft_amount:custom"
 
-    if choice == "skip":
-        rt.amount_min = rt.amount_max = None
+    if choice == "ft_amount:custom":
         await query.edit_message_text(
-            "⏭ No amount filter applied.\n\n"
-            "Step 5 — Run now or set up a recurring schedule?",
+            "✏️ Enter custom amount range as *min max* (e.g. `500000 5000000`).\n"
+            "Or send just one number as max.",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("▶️ Run Now",              callback_data="rt_sched:now")],
-                [InlineKeyboardButton("⏰ Schedule (repeating)", callback_data="rt_sched:schedule")],
-            ]),
         )
-        return RS.SCHEDULE_CHOICE
+        return RS.AMOUNT_TEXT
 
-    # "enter" — ask for the range as text
+    ranges = {
+        "ft_amount:0_1m":    (0.0,           1_000_000.0),
+        "ft_amount:1m_5m":   (1_000_000.0,   5_000_000.0),
+        "ft_amount:5m_10m":  (5_000_000.0,  10_000_000.0),
+        "ft_amount:20m_50m": (20_000_000.0, 50_000_000.0),
+        "ft_amount:50m_100m":(50_000_000.0,100_000_000.0),
+        "ft_amount:80m_300m":(80_000_000.0,300_000_000.0),
+        "ft_amount:80m_3b":  (80_000_000.0,  3_000_000_000.0),
+        "ft_amount:all":     (None,           None),
+    }
+    rt.amount_min, rt.amount_max = ranges.get(choice, (None, None))
+
     await query.edit_message_text(
-        "💰 Enter the *consideration amount range*:\n"
-        "_Format:_ `min-max`  _(e.g._ `100000-500000`_)_",
+        "Step 5 — Run now or set up a recurring schedule?",
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ Run Now",              callback_data="rt_sched:now")],
+            [InlineKeyboardButton("⏰ Schedule (repeating)", callback_data="rt_sched:schedule")],
+        ]),
     )
-    return RS.AMOUNT_TEXT
+    return RS.SCHEDULE_CHOICE
 
 
 async def recv_rt_amount_range(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handles the typed min-max range after the user chose 'Enter Amount Range'."""
-    rt   = _get_rt(ctx)
-    text = update.message.text.strip()
-
+    """Handles the typed custom amount range."""
+    rt    = _get_rt(ctx)
+    text  = update.message.text.strip()
+    parts = text.split()
     try:
-        parts = re.split(r"[-–]", text, maxsplit=1)
-        if len(parts) != 2:
+        if len(parts) == 2:
+            rt.amount_min = float(parts[0].replace(",", ""))
+            rt.amount_max = float(parts[1].replace(",", ""))
+        elif len(parts) == 1:
+            rt.amount_min = None
+            rt.amount_max = float(parts[0].replace(",", ""))
+        else:
             raise ValueError
-        lo = float(parts[0].strip().replace(",", ""))
-        hi = float(parts[1].strip().replace(",", ""))
-        rt.amount_min, rt.amount_max = (lo, hi) if lo <= hi else (hi, lo)
     except ValueError:
         await update.message.reply_text(
-            "⚠️ Invalid format. Use `min-max` e.g. `100000-500000`.",
+            "❌ Could not parse. Enter two numbers e.g. `500000 5000000`, or one number as max.",
             parse_mode="Markdown",
         )
         return RS.AMOUNT_TEXT
 
     await update.message.reply_text(
-        f"✅ Amount range: *KES {rt.amount_min:,.0f} – KES {rt.amount_max:,.0f}*\n\n"
         "Step 5 — Run now or set up a recurring schedule?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
@@ -5092,11 +5098,39 @@ def main():
         per_message=False,
     )
 
+    rs_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("receive", cmd_receive),
+        ],
+        states={
+            RS.PICK_STAFF_SOURCE: [CallbackQueryHandler(recv_rt_pick_source,   pattern=r"^rt_src:")],
+            RS.STAFF_NAME:        [MessageHandler(not_cancel, recv_rt_staff_name)],
+            RS.SELECT_STAFF:      [CallbackQueryHandler(recv_rt_select_staff,  pattern=r"^rt_staff:")],
+            RS.CHOOSE_CRED:       [CallbackQueryHandler(recv_rt_cred_choice,   pattern=r"^cred:")],
+            RS.WAIT_OTP:          [MessageHandler(not_cancel, recv_rt_otp)],
+            RS.TASK_TYPE:         [CallbackQueryHandler(recv_rt_task_type,     pattern=r"^rt_type:")],
+            RS.TASK_COUNT:        [MessageHandler(not_cancel, recv_rt_task_count)],
+            RS.AMOUNT_RANGE:      [CallbackQueryHandler(recv_rt_amount_choice, pattern=r"^ft_amount:")],
+            RS.AMOUNT_TEXT:       [MessageHandler(not_cancel, recv_rt_amount_range)],
+            RS.SCHEDULE_CHOICE:   [CallbackQueryHandler(recv_rt_schedule_choice, pattern=r"^rt_sched:")],
+            RS.SCHEDULE_INTERVAL: [MessageHandler(not_cancel, recv_rt_schedule_interval)],
+            RS.RT_CONFIRM:        [CallbackQueryHandler(recv_rt_confirm,       pattern=r"^rt_confirm:")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(_CANCEL_FILTER, cmd_cancel),
+            MessageHandler(filters.TEXT, fallback),
+        ],
+        allow_reentry=True,
+        per_message=False,
+    )
+
     app.add_handler(conv)
     app.add_handler(db_conv)
     app.add_handler(auth_conv)
     app.add_handler(fetch_conv)
     app.add_handler(af_conv)
+    app.add_handler(rs_conv)
 
     # DLV Batch: process queue every 5 minutes
     app.job_queue.run_repeating(_dlv_batch_job, interval=300, first=300, name="dlv_batch_job")
