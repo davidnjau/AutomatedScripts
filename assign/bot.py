@@ -36,6 +36,8 @@ import time
 import uuid
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders as _email_encoders
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_completed
@@ -43,6 +45,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import anthropic
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 import pytesseract
 import requests
 from dotenv import load_dotenv
@@ -392,6 +397,25 @@ def _get_ft_sess(ctx: ContextTypes.DEFAULT_TYPE) -> FTSession:
     return ctx.user_data["ft_session"]
 
 
+# ──────────────────────────────────────────────────────────
+# States — Bulk Export conversation
+# ──────────────────────────────────────────────────────────
+class BE(Enum):
+    EMAIL   = auto()   # ask for recipient email address
+    CONFIRM = auto()   # confirm → kick off background export
+
+
+@dataclass
+class BESession:
+    email: str = ""
+
+
+def _get_be_sess(ctx: ContextTypes.DEFAULT_TYPE) -> BESession:
+    if "be_session" not in ctx.user_data:
+        ctx.user_data["be_session"] = BESession()
+    return ctx.user_data["be_session"]
+
+
 CRED_MAP = {
     "publicuser":   PUBLIC_CREDENTIALS,
     "staff":        STAFF_CREDENTIALS_ICT,
@@ -422,6 +446,7 @@ BTN_DELETE        = "🗑 Delete Valuer"
 BTN_FETCH_TASKS   = "📊 Fetch Tasks"
 BTN_DLV_TASKS     = "📋 DLV Tasks"
 BTN_AF_RESULTS    = "🗂 AF Results"
+BTN_BULK_EXPORT   = "📤 Bulk Export"
 BTN_HELP          = "❓ Help"
 BTN_RESTART       = "🔁 Restart Bot"
 BTN_CANCEL        = "🛑 Cancel"
@@ -432,8 +457,8 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_AUTO_FETCH)}|{re.escape(BTN_ASSIGNMENTS)}|{re.escape(BTN_AUTH)}"
     f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_DAEMON)}"
     f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
-    f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_AF_RESULTS)}|{re.escape(BTN_RESTART)}"
-    f"|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
+    f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_AF_RESULTS)}|{re.escape(BTN_BULK_EXPORT)}"
+    f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
 
@@ -445,6 +470,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(BTN_FETCH_TASKS),  KeyboardButton(BTN_AUTO_FETCH)],
             [KeyboardButton(BTN_DLV_BATCH)],
             [KeyboardButton(BTN_AF_RESULTS),   KeyboardButton(BTN_ASSIGNMENTS)],
+            [KeyboardButton(BTN_BULK_EXPORT)],
             [KeyboardButton(BTN_DAEMON)],
             [KeyboardButton(BTN_AUTH),         KeyboardButton(BTN_TOKEN_STATUS)],
             [KeyboardButton(BTN_RESTART)],
@@ -5118,6 +5144,403 @@ async def recv_auth_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────
+# Bulk Export — NAIROBI Completed stamp-duty applications
+# ──────────────────────────────────────────────────────────
+
+_BE_LIST_URL   = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application"
+_BE_DETAIL_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view"
+_BE_PAGE_SIZE  = 10   # API default
+_BE_LIST_WORKERS   = 15
+_BE_DETAIL_WORKERS = 30
+_BE_MAX_RETRIES    = 3
+
+_EXCEL_COLUMNS = [
+    "Filter",
+    "Reference Number",
+    "Parcel Number",
+    "Registry",
+    "County",
+    "Valuation Request Type",
+    "Application Status",
+    "Application Date Created",
+    "Valuation Officer",
+    "Date of Valuation",
+    "Valuer Total Land Value (KES)",
+    "Harmonized Total Land Value (KES)",
+    "Document URL",
+    "Enrich Error",
+]
+
+
+def _be_headers(tokens: AuthTokens) -> dict:
+    return {
+        "Authorization": f"Bearer {tokens.access_token}",
+        "JWTAUTH":       f"Bearer {tokens.jwt}",
+        "cparams":       CPARAMS_DLV,
+    }
+
+
+def _be_fetch_page(sess: requests.Session, headers: dict, page: int) -> dict:
+    """Fetch one list page. Returns the parsed JSON dict."""
+    params = {
+        "filter":       "Completed",
+        "role":         "DLV",
+        "request_type": "STAMP_DUTY",
+        "search":       "",
+        "page":         page,
+        "registry":     "NAIROBI",
+    }
+    resp = sess.get(_BE_LIST_URL, headers=headers, params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _be_fetch_detail(sess: requests.Session, headers: dict, app_id: str) -> dict:
+    """Fetch detail view for one application ID with exponential back-off retry."""
+    delay = 1.0
+    last_exc: Exception = RuntimeError("unknown")
+    for attempt in range(_BE_MAX_RETRIES):
+        try:
+            resp = sess.get(_BE_DETAIL_URL, headers=headers, params={"request_id": app_id}, timeout=30)
+            if resp.status_code in (429, 502, 503, 504):
+                raise requests.HTTPError(response=resp)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _BE_MAX_RETRIES - 1:
+                time.sleep(delay)
+                delay *= 2
+    raise last_exc
+
+
+def _be_extract_row(detail: dict) -> dict:
+    """Extract the target columns from a detail-view response dict."""
+    # Valuation Officer from actors[]
+    vo_name = ""
+    vo_date = ""
+    for actor in (detail.get("actors") or []):
+        role = (actor.get("role") or "").upper()
+        if role in ("VALUATION OFFICER", "VO"):
+            vo_name = (actor.get("user_details") or {}).get("names", "")
+            vo_date = actor.get("date_assigned", "")
+            if role == "VALUATION OFFICER":
+                break   # prefer exact match
+
+    # Consideration amount from external_process_details
+    ext = detail.get("external_process_details") or {}
+    land_value = ext.get("consideration_amount", "")
+
+    # Document URL: prefer VALUATION CERTIFICATE in process_documents
+    doc_url = ""
+    for pdoc in (detail.get("process_documents") or []):
+        if (pdoc.get("document_name") or "").upper() == "VALUATION CERTIFICATE":
+            doc_url = pdoc.get("document", "")
+            break
+    if not doc_url:
+        app_docs = detail.get("application_documents") or []
+        if app_docs:
+            doc_url = app_docs[0].get("document", "")
+
+    return {
+        "Filter":                          "Completed",
+        "Reference Number":                detail.get("reference_number", ""),
+        "Parcel Number":                   detail.get("parcel_number", ""),
+        "Registry":                        detail.get("registry", ""),
+        "County":                          detail.get("county", ""),
+        "Valuation Request Type":          detail.get("valuation_request_type", ""),
+        "Application Status":              detail.get("application_status", ""),
+        "Application Date Created":        detail.get("date_created", ""),
+        "Valuation Officer":               vo_name,
+        "Date of Valuation":               vo_date,
+        "Valuer Total Land Value (KES)":   land_value,
+        "Harmonized Total Land Value (KES)": detail.get("harmonized_total_land_value", ""),
+        "Document URL":                    doc_url,
+        "Enrich Error":                    "",
+    }
+
+
+def _be_build_excel(rows: List[dict]) -> bytes:
+    """Build the formatted Excel workbook and return the raw bytes."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Stamp Duty Valuations"
+
+    header_font  = Font(bold=True)
+    header_fill  = PatternFill("solid", fgColor="BDD7EE")
+    date_fmt     = "YYYY-MM-DD HH:MM:SS"
+    number_fmt   = "#,##0"
+    date_cols    = {"Application Date Created", "Date of Valuation"}
+    number_cols  = {"Valuer Total Land Value (KES)", "Harmonized Total Land Value (KES)"}
+
+    # Write header
+    ws.append(_EXCEL_COLUMNS)
+    for col_idx, col_name in enumerate(_EXCEL_COLUMNS, start=1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font  = header_font
+        cell.fill  = header_fill
+
+    ws.auto_filter.ref = ws.dimensions
+    ws.freeze_panes    = "A2"
+
+    # Write data rows
+    for row_data in rows:
+        row_vals = [row_data.get(col, "") for col in _EXCEL_COLUMNS]
+        ws.append(row_vals)
+        row_idx = ws.max_row
+        for col_idx, col_name in enumerate(_EXCEL_COLUMNS, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            if col_name in date_cols and cell.value:
+                cell.number_format = date_fmt
+            elif col_name in number_cols and cell.value not in ("", None, "FETCH_ERROR"):
+                try:
+                    cell.value         = float(str(cell.value).replace(",", "").strip())
+                    cell.number_format = number_fmt
+                except (ValueError, TypeError):
+                    pass
+
+    # Auto-fit column widths (min 15, max 50)
+    for col_idx, col_name in enumerate(_EXCEL_COLUMNS, start=1):
+        col_letter = get_column_letter(col_idx)
+        max_len    = len(col_name)
+        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx, min_row=2):
+            val = str(row[0].value or "")
+            if len(val) > max_len:
+                max_len = len(val)
+        ws.column_dimensions[col_letter].width = max(15, min(50, max_len + 2))
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _send_bulk_export_email(to_email: str, filename: str, xlsx_bytes: bytes) -> None:
+    """Send the Excel file as an email attachment. Raises on failure."""
+    if not SMTP_USER or not SMTP_PASS:
+        raise RuntimeError("SMTP_USER / SMTP_PASS not configured in .env")
+
+    msg            = MIMEMultipart()
+    msg["Subject"] = f"Ardhisasa Bulk Export — {filename}"
+    msg["From"]    = SMTP_USER
+    msg["To"]      = to_email
+
+    body = (
+        f"Please find attached the Ardhisasa stamp-duty bulk export.\n\n"
+        f"File: {filename}\n"
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    )
+    msg.attach(MIMEText(body, "plain"))
+
+    part = MIMEBase("application", "octet-stream")
+    part.set_payload(xlsx_bytes)
+    _email_encoders.encode_base64(part)
+    part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+    msg.attach(part)
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, to_email, msg.as_string())
+
+
+def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop) -> None:
+    """
+    Full synchronous export worker — runs in a background thread.
+    Sends progress messages and the final file to the Telegram chat.
+    """
+    def _tg(text: str):
+        """Fire-and-forget Telegram message from this thread."""
+        asyncio.run_coroutine_threadsafe(
+            bot.send_message(chat_id, text, parse_mode="Markdown"),
+            loop,
+        ).result(timeout=15)
+
+    sess    = build_session()
+    headers = _be_headers(tokens)
+
+    try:
+        # ── Step 1: fetch page 1 to learn total count ──────────────
+        _tg("⏳ *Step 1/3* — Fetching list (page 1)…")
+        first_page = _be_fetch_page(sess, headers, 1)
+        total      = first_page.get("count", 0)
+        results    = list(first_page.get("results") or [])
+        page_size  = len(results) if results else _BE_PAGE_SIZE
+        if page_size == 0:
+            page_size = _BE_PAGE_SIZE
+        total_pages = max(1, -(-total // page_size))   # ceil division
+
+        logger.info("Bulk export: count=%d, page_size=%d, total_pages=%d", total, page_size, total_pages)
+
+        # ── Fetch remaining pages in parallel ──────────────────────
+        if total_pages > 1:
+            _tg(f"⏳ Fetching {total_pages - 1} more page(s) in parallel…")
+            with ThreadPoolExecutor(max_workers=_BE_LIST_WORKERS) as pool:
+                futures = {pool.submit(_be_fetch_page, sess, headers, p): p
+                           for p in range(2, total_pages + 1)}
+                for fut in _futures_as_completed(futures):
+                    page_data = fut.result()   # raises on error
+                    results.extend(page_data.get("results") or [])
+
+        # ── Client-side NAIROBI filter ─────────────────────────────
+        nairobi_records = [
+            r for r in results
+            if (r.get("registry") or "").upper() == "NAIROBI"
+            or (r.get("county")   or "").upper() == "NAIROBI"
+        ]
+        id_list = [r["id"] for r in nairobi_records if r.get("id")]
+
+        _tg(
+            f"✅ *Step 1 done* — {total:,} total records fetched, "
+            f"*{len(id_list):,}* NAIROBI records to enrich."
+        )
+
+        if not id_list:
+            _tg("ℹ️ No NAIROBI records found. Export complete with 0 rows.")
+            return
+
+        # ── Step 2: parallel detail fetch ─────────────────────────
+        _tg(f"⏳ *Step 2/3* — Fetching detail for {len(id_list):,} record(s)…")
+        rows: List[dict] = []
+        errors: List[str] = []
+
+        with ThreadPoolExecutor(max_workers=_BE_DETAIL_WORKERS) as pool:
+            futures = {pool.submit(_be_fetch_detail, sess, headers, app_id): app_id
+                       for app_id in id_list}
+            done = 0
+            for fut in _futures_as_completed(futures):
+                app_id = futures[fut]
+                done  += 1
+                try:
+                    detail = fut.result()
+                    rows.append(_be_extract_row(detail))
+                except Exception as exc:
+                    logger.warning("Bulk export detail failed id=%s: %s", app_id, exc)
+                    errors.append(app_id)
+                    err_row = {col: "FETCH_ERROR" for col in _EXCEL_COLUMNS}
+                    err_row["Reference Number"] = app_id
+                    err_row["Enrich Error"]     = str(exc)
+                    err_row["Filter"]           = "Completed"
+                    rows.append(err_row)
+
+                if done % 200 == 0:
+                    _tg(f"⏳ Detail fetch: {done}/{len(id_list)} done…")
+
+        _tg(
+            f"✅ *Step 2 done* — {len(rows):,} rows collected"
+            + (f", {len(errors)} error(s)." if errors else ".")
+        )
+
+        # ── Step 3: build Excel and send ───────────────────────────
+        _tg("⏳ *Step 3/3* — Building Excel workbook…")
+        filename   = f"Ardhisasa_Valuation_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        xlsx_bytes = _be_build_excel(rows)
+
+        # Send file to Telegram
+        asyncio.run_coroutine_threadsafe(
+            bot.send_document(
+                chat_id,
+                document=io.BytesIO(xlsx_bytes),
+                filename=filename,
+                caption=f"📊 Bulk export complete — {len(rows):,} rows",
+            ),
+            loop,
+        ).result(timeout=60)
+
+        # Send via email if provided
+        if email:
+            try:
+                _send_bulk_export_email(email, filename, xlsx_bytes)
+                _tg(f"📧 File also sent to *{email}*.")
+            except Exception as exc:
+                logger.warning("Bulk export email failed: %s", exc)
+                _tg(f"⚠️ Email delivery failed: `{exc}`")
+
+    except Exception as exc:
+        logger.error("Bulk export worker crashed: %s", exc, exc_info=True)
+        _tg(f"❌ Export failed: `{exc}`")
+
+
+# ── Bulk Export conversation handlers ─────────────────────
+
+async def cmd_bulk_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    sess = _get_be_sess(ctx)
+    sess.email = ""
+    await update.message.reply_text(
+        "📤 *Bulk Export — NAIROBI Completed Applications*\n\n"
+        "This will fetch all _Completed_ stamp-duty applications for the NAIROBI registry, "
+        "enrich each with the detail view, and export to Excel.\n\n"
+        "📧 Enter the email address to receive the file, or send `skip` to get it only via Telegram:",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return BE.EMAIL
+
+
+async def recv_be_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    text = (update.message.text or "").strip()
+    sess = _get_be_sess(ctx)
+
+    if text.lower() == "skip":
+        sess.email = ""
+    else:
+        if "@" not in text or "." not in text.split("@")[-1]:
+            await update.message.reply_text(
+                "❌ Invalid email. Enter a valid address or send `skip`.",
+                parse_mode="Markdown",
+            )
+            return BE.EMAIL
+        sess.email = text
+
+    email_label = sess.email or "Telegram only"
+    await update.message.reply_text(
+        f"✅ Ready to export.\n\n"
+        f"• Filter: *Completed* / NAIROBI registry\n"
+        f"• Destination: *{email_label}*\n\n"
+        "Tap *Run Export* to start (may take several minutes).",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("▶️ Run Export", callback_data="be:yes"),
+            InlineKeyboardButton("❌ Cancel",     callback_data="be:no"),
+        ]]),
+    )
+    return BE.CONFIRM
+
+
+async def recv_be_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "be:no":
+        await query.edit_message_text("❌ Export cancelled.")
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    sess   = _get_be_sess(ctx)
+    tokens = _any_valid_tokens()
+    if not tokens:
+        await query.edit_message_text(
+            "❌ No valid cached tokens. Use *🔑 Refresh Auth* first.",
+            parse_mode="Markdown",
+        )
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    chat_id = query.message.chat_id
+    await query.edit_message_text("⏳ Export started — progress updates will appear below.")
+    await ctx.bot.send_message(chat_id, "Returning to menu.", reply_markup=_main_menu())
+
+    loop = asyncio.get_event_loop()
+    asyncio.ensure_future(
+        asyncio.to_thread(_bulk_export_run, tokens, chat_id, sess.email, ctx.bot, loop)
+    )
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────
 async def _post_init(app) -> None:
@@ -5282,12 +5705,31 @@ def main():
         per_message=False,
     )
 
+    be_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("bulkexport", cmd_bulk_export),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_BULK_EXPORT)}$"), cmd_bulk_export),
+        ],
+        states={
+            BE.EMAIL:   [MessageHandler(not_cancel, recv_be_email)],
+            BE.CONFIRM: [CallbackQueryHandler(recv_be_confirm, pattern=r"^be:")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(_CANCEL_FILTER, cmd_cancel),
+            MessageHandler(filters.TEXT, fallback),
+        ],
+        allow_reentry=True,
+        per_message=False,
+    )
+
     app.add_handler(conv)
     app.add_handler(db_conv)
     app.add_handler(auth_conv)
     app.add_handler(fetch_conv)
     app.add_handler(af_conv)
     app.add_handler(rs_conv)
+    app.add_handler(be_conv)
 
     # DLV Batch: process queue every 5 minutes
     app.job_queue.run_repeating(_dlv_batch_job, interval=300, first=300, name="dlv_batch_job")
