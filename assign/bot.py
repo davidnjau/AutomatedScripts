@@ -5150,8 +5150,8 @@ async def recv_auth_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 _BE_LIST_URL   = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application"
 _BE_DETAIL_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view"
 _BE_PAGE_SIZE  = 10   # API default
-_BE_LIST_WORKERS   = 15
-_BE_DETAIL_WORKERS = 30
+_BE_LIST_WORKERS   = 5
+_BE_DETAIL_WORKERS = 5
 _BE_MAX_RETRIES    = 3
 
 _EXCEL_COLUMNS = [
@@ -5356,12 +5356,19 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop) ->
             loop,
         ).result(timeout=15)
 
-    sess    = build_session()
+    sess = build_session()
+    # Expand the connection pool to match worker count so connections aren't discarded
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=_BE_DETAIL_WORKERS,
+        pool_maxsize=_BE_DETAIL_WORKERS,
+        max_retries=0,
+    )
+    sess.mount("https://", adapter)
+    sess.mount("http://",  adapter)
     headers = _be_headers(tokens)
 
     try:
         # ── Step 1: fetch page 1 to learn total count ──────────────
-        _tg("⏳ *Step 1/3* — Fetching list (page 1)…")
         first_page = _be_fetch_page(sess, headers, 1)
         total      = first_page.get("count", 0)
         results    = list(first_page.get("results") or [])
@@ -5374,7 +5381,6 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop) ->
 
         # ── Fetch remaining pages in parallel ──────────────────────
         if total_pages > 1:
-            _tg(f"⏳ Fetching {total_pages - 1} more page(s) in parallel…")
             with ThreadPoolExecutor(max_workers=_BE_LIST_WORKERS) as pool:
                 futures = {pool.submit(_be_fetch_page, sess, headers, p): p
                            for p in range(2, total_pages + 1)}
@@ -5390,27 +5396,19 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop) ->
         ]
         id_list = [r["id"] for r in nairobi_records if r.get("id")]
 
-        _tg(
-            f"✅ *Step 1 done* — {total:,} total records fetched, "
-            f"*{len(id_list):,}* NAIROBI records to enrich."
-        )
-
         if not id_list:
-            _tg("ℹ️ No NAIROBI records found. Export complete with 0 rows.")
+            _tg("ℹ️ Bulk export complete — no NAIROBI records found.")
             return
 
         # ── Step 2: parallel detail fetch ─────────────────────────
-        _tg(f"⏳ *Step 2/3* — Fetching detail for {len(id_list):,} record(s)…")
         rows: List[dict] = []
         errors: List[str] = []
 
         with ThreadPoolExecutor(max_workers=_BE_DETAIL_WORKERS) as pool:
             futures = {pool.submit(_be_fetch_detail, sess, headers, app_id): app_id
                        for app_id in id_list}
-            done = 0
             for fut in _futures_as_completed(futures):
                 app_id = futures[fut]
-                done  += 1
                 try:
                     detail = fut.result()
                     rows.append(_be_extract_row(detail))
@@ -5423,16 +5421,7 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop) ->
                     err_row["Filter"]           = "Completed"
                     rows.append(err_row)
 
-                if done % 200 == 0:
-                    _tg(f"⏳ Detail fetch: {done}/{len(id_list)} done…")
-
-        _tg(
-            f"✅ *Step 2 done* — {len(rows):,} rows collected"
-            + (f", {len(errors)} error(s)." if errors else ".")
-        )
-
         # ── Step 3: build Excel and send ───────────────────────────
-        _tg("⏳ *Step 3/3* — Building Excel workbook…")
         filename   = f"Ardhisasa_Valuation_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         xlsx_bytes = _be_build_excel(rows)
 
@@ -5530,7 +5519,7 @@ async def recv_be_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     chat_id = query.message.chat_id
-    await query.edit_message_text("⏳ Export started — progress updates will appear below.")
+    await query.edit_message_text("⏳ Export running in background — you will be notified when done.")
     await ctx.bot.send_message(chat_id, "Returning to menu.", reply_markup=_main_menu())
 
     loop = asyncio.get_event_loop()
