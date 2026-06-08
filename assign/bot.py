@@ -401,13 +401,32 @@ def _get_ft_sess(ctx: ContextTypes.DEFAULT_TYPE) -> FTSession:
 # States — Bulk Export conversation
 # ──────────────────────────────────────────────────────────
 class BE(Enum):
+    COUNTY  = auto()   # pick county
     EMAIL   = auto()   # ask for recipient email address
     CONFIRM = auto()   # confirm → kick off background export
 
 
+# County → list of registry names as they appear in the API response
+_BE_COUNTY_REGISTRIES: Dict[str, List[str]] = {
+    "NAIROBI":  ["NAIROBI", "CENTRAL"],
+    "KIAMBU":   ["KIAMBU", "LIMURU", "THIKA", "RUIRU", "GITHUNGURI"],
+    "MURANGA":  ["MURANGA", "KANDARA", "MARAGUA", "KANGEMA"],
+    "MOMBASA":  ["MOMBASA", "COAST"],
+}
+
+_BE_COUNTY_LABELS: Dict[str, str] = {
+    "NAIROBI": "🌆 Nairobi",
+    "KIAMBU":  "🏙 Kiambu",
+    "MURANGA": "🏡 Murang'a",
+    "MOMBASA": "🌊 Mombasa",
+}
+
+
 @dataclass
 class BESession:
-    email: str = ""
+    county:     str = ""
+    registries: List[str] = field(default_factory=list)
+    email:      str = ""
 
 
 def _get_be_sess(ctx: ContextTypes.DEFAULT_TYPE) -> BESession:
@@ -446,7 +465,7 @@ BTN_DELETE        = "🗑 Delete Valuer"
 BTN_FETCH_TASKS   = "📊 Fetch Tasks"
 BTN_DLV_TASKS     = "📋 DLV Tasks"
 BTN_AF_RESULTS    = "🗂 AF Results"
-BTN_BULK_EXPORT   = "📤 Bulk Export"
+BTN_BULK_EXPORT   = "📤 Export Valuation Report"
 BTN_HELP          = "❓ Help"
 BTN_RESTART       = "🔁 Restart Bot"
 BTN_CANCEL        = "🛑 Cancel"
@@ -5180,6 +5199,13 @@ def _be_headers(tokens: AuthTokens) -> dict:
     }
 
 
+def _be_county_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=f"be_county:{key}")]
+        for key, label in _BE_COUNTY_LABELS.items()
+    ])
+
+
 def _be_fetch_page(sess: requests.Session, headers: dict, page: int) -> dict:
     """Fetch one list page. Returns the parsed JSON dict."""
     params = {
@@ -5188,7 +5214,6 @@ def _be_fetch_page(sess: requests.Session, headers: dict, page: int) -> dict:
         "request_type": "STAMP_DUTY",
         "search":       "",
         "page":         page,
-        "registry":     "NAIROBI",
     }
     resp = sess.get(_BE_LIST_URL, headers=headers, params=params, timeout=30)
     resp.raise_for_status()
@@ -5320,7 +5345,7 @@ def _send_bulk_export_email(to_email: str, filename: str, xlsx_bytes: bytes) -> 
         raise RuntimeError("SMTP_USER / SMTP_PASS not configured in .env")
 
     msg            = MIMEMultipart()
-    msg["Subject"] = f"Ardhisasa Bulk Export — {filename}"
+    msg["Subject"] = f"Ardhisasa Export Valuation Report — {filename}"
     msg["From"]    = SMTP_USER
     msg["To"]      = to_email
 
@@ -5344,7 +5369,7 @@ def _send_bulk_export_email(to_email: str, filename: str, xlsx_bytes: bytes) -> 
         server.sendmail(SMTP_USER, to_email, msg.as_string())
 
 
-def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop) -> None:
+def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, registries: List[str] = None) -> None:
     """
     Full synchronous export worker — runs in a background thread.
     Sends progress messages and the final file to the Telegram chat.
@@ -5388,13 +5413,13 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop) ->
                     page_data = fut.result()   # raises on error
                     results.extend(page_data.get("results") or [])
 
-        # ── Client-side NAIROBI filter ─────────────────────────────
-        nairobi_records = [
-            r for r in results
-            if (r.get("registry") or "").upper() == "NAIROBI"
-            or (r.get("county")   or "").upper() == "NAIROBI"
-        ]
-        id_list = [r["id"] for r in nairobi_records if r.get("id")]
+        # ── Client-side registry filter ────────────────────────────
+        reg_set = {r.upper() for r in (registries or [])}
+        if reg_set:
+            filtered = [r for r in results if (r.get("registry") or "").upper() in reg_set]
+        else:
+            filtered = results
+        id_list = [r["id"] for r in filtered if r.get("id")]
 
         if not id_list:
             _tg("ℹ️ Bulk export complete — no NAIROBI records found.")
@@ -5455,14 +5480,31 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop) ->
 async def cmd_bulk_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     sess = _get_be_sess(ctx)
-    sess.email = ""
+    sess.county     = ""
+    sess.registries = []
+    sess.email      = ""
     await update.message.reply_text(
-        "📤 *Bulk Export — NAIROBI Completed Applications*\n\n"
-        "This will fetch all _Completed_ stamp-duty applications for the NAIROBI registry, "
-        "enrich each with the detail view, and export to Excel.\n\n"
+        "📤 *Export Valuation Report*\n\nSelect the county to export:",
+        parse_mode="Markdown",
+        reply_markup=_be_county_keyboard(),
+    )
+    return BE.COUNTY
+
+
+async def recv_be_county(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    county = query.data.split(":")[1]
+    sess   = _get_be_sess(ctx)
+    sess.county     = county
+    sess.registries = _BE_COUNTY_REGISTRIES.get(county, [county])
+    label           = _BE_COUNTY_LABELS.get(county, county.title())
+    reg_list        = ", ".join(sess.registries)
+    await query.edit_message_text(
+        f"✅ County: *{label}*\nRegistries: `{reg_list}`\n\n"
         "📧 Enter the email address to receive the file, or send `skip` to get it only via Telegram:",
         parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
     )
     return BE.EMAIL
 
@@ -5484,9 +5526,13 @@ async def recv_be_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sess.email = text
 
     email_label = sess.email or "Telegram only"
+    county_label = _BE_COUNTY_LABELS.get(sess.county, sess.county.title())
+    reg_list     = ", ".join(sess.registries)
     await update.message.reply_text(
         f"✅ Ready to export.\n\n"
-        f"• Filter: *Completed* / NAIROBI registry\n"
+        f"• County: *{county_label}*\n"
+        f"• Registries: `{reg_list}`\n"
+        f"• Filter: *Completed*\n"
         f"• Destination: *{email_label}*\n\n"
         "Tap *Run Export* to start (may take several minutes).",
         parse_mode="Markdown",
@@ -5524,7 +5570,7 @@ async def recv_be_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     loop = asyncio.get_event_loop()
     asyncio.ensure_future(
-        asyncio.to_thread(_bulk_export_run, tokens, chat_id, sess.email, ctx.bot, loop)
+        asyncio.to_thread(_bulk_export_run, tokens, chat_id, sess.email, ctx.bot, loop, sess.registries)
     )
     return ConversationHandler.END
 
@@ -5700,6 +5746,7 @@ def main():
             MessageHandler(filters.Regex(f"^{re.escape(BTN_BULK_EXPORT)}$"), cmd_bulk_export),
         ],
         states={
+            BE.COUNTY:  [CallbackQueryHandler(recv_be_county, pattern=r"^be_county:")],
             BE.EMAIL:   [MessageHandler(not_cancel, recv_be_email)],
             BE.CONFIRM: [CallbackQueryHandler(recv_be_confirm, pattern=r"^be:")],
         },
