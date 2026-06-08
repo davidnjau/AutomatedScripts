@@ -5334,6 +5334,121 @@ def _be_build_excel(rows: List[dict]) -> bytes:
                 max_len = len(val)
         ws.column_dimensions[col_letter].width = max(15, min(50, max_len + 2))
 
+    # ── Summary sheet ─────────────────────────────────────────
+    ws2 = wb.create_sheet("Summary")
+
+    def _write_section_header(ws, row: int, text: str):
+        cell = ws.cell(row=row, column=1, value=text)
+        cell.font = Font(bold=True, size=12)
+        cell.fill = PatternFill("solid", fgColor="BDD7EE")
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+
+    def _write_col_headers(ws, row: int, *headers):
+        for col, h in enumerate(headers, start=1):
+            c = ws.cell(row=row, column=col, value=h)
+            c.font = header_font
+            c.fill = PatternFill("solid", fgColor="D9E1F2")
+
+    # ── Collect stats from rows ───────────────────────────────
+    from collections import defaultdict
+
+    monthly: dict  = defaultdict(int)    # "YYYY-MM" → count
+    yearly:  dict  = defaultdict(int)    # "YYYY"    → count
+    vo_tasks: dict = defaultdict(int)    # officer name → count
+    total_land_value = 0.0
+    total_harmonized = 0.0
+
+    for r in rows:
+        # Date of Valuation — monthly/yearly distribution
+        dov = str(r.get("Date of Valuation") or "")
+        if len(dov) >= 7:
+            monthly[dov[:7]] += 1
+        if len(dov) >= 4:
+            yearly[dov[:4]] += 1
+
+        # Valuation Officer task count
+        vo = (r.get("Valuation Officer") or "").strip()
+        if vo and vo != "FETCH_ERROR":
+            vo_tasks[vo] += 1
+
+        # Sum land values
+        for key, target in (
+            ("Valuer Total Land Value (KES)", "land"),
+            ("Harmonized Total Land Value (KES)", "harm"),
+        ):
+            raw = r.get(key, "")
+            if raw not in ("", None, "FETCH_ERROR"):
+                try:
+                    val = float(str(raw).replace(",", "").strip())
+                    if key == "Valuer Total Land Value (KES)":
+                        total_land_value += val
+                    else:
+                        total_harmonized += val
+                except (ValueError, TypeError):
+                    pass
+
+    cur_row = 1
+
+    # ── Section 1: Totals ─────────────────────────────────────
+    _write_section_header(ws2, cur_row, "Overall Totals")
+    cur_row += 1
+    for label, value in (
+        ("Total Records",                        len(rows)),
+        ("Valuer Total Land Value (KES)",        total_land_value),
+        ("Harmonized Total Land Value (KES)",    total_harmonized),
+    ):
+        ws2.cell(row=cur_row, column=1, value=label).font = Font(bold=True)
+        c = ws2.cell(row=cur_row, column=2, value=value)
+        if isinstance(value, float):
+            c.number_format = number_fmt
+        cur_row += 1
+
+    cur_row += 1  # blank row
+
+    # ── Section 2: Monthly distribution ──────────────────────
+    _write_section_header(ws2, cur_row, "Monthly Distribution (Date of Valuation)")
+    cur_row += 1
+    _write_col_headers(ws2, cur_row, "Month (YYYY-MM)", "Count")
+    cur_row += 1
+    for month in sorted(monthly):
+        ws2.cell(row=cur_row, column=1, value=month)
+        ws2.cell(row=cur_row, column=2, value=monthly[month])
+        cur_row += 1
+
+    cur_row += 1  # blank row
+
+    # ── Section 3: Yearly distribution ───────────────────────
+    _write_section_header(ws2, cur_row, "Yearly Distribution (Date of Valuation)")
+    cur_row += 1
+    _write_col_headers(ws2, cur_row, "Year", "Count")
+    cur_row += 1
+    for year in sorted(yearly):
+        ws2.cell(row=cur_row, column=1, value=year)
+        ws2.cell(row=cur_row, column=2, value=yearly[year])
+        cur_row += 1
+
+    cur_row += 1  # blank row
+
+    # ── Section 4: Valuation Officer task counts ──────────────
+    _write_section_header(ws2, cur_row, "Tasks per Valuation Officer")
+    cur_row += 1
+    _write_col_headers(ws2, cur_row, "Valuation Officer", "Tasks")
+    cur_row += 1
+    for officer, count in sorted(vo_tasks.items(), key=lambda x: -x[1]):
+        ws2.cell(row=cur_row, column=1, value=officer)
+        ws2.cell(row=cur_row, column=2, value=count)
+        cur_row += 1
+
+    # Auto-fit Summary sheet columns
+    for col_idx in (1, 2):
+        col_letter = get_column_letter(col_idx)
+        max_len = 20
+        for row in ws2.iter_rows(min_col=col_idx, max_col=col_idx):
+            val = str(row[0].value or "")
+            if len(val) > max_len:
+                max_len = len(val)
+        ws2.column_dimensions[col_letter].width = max(20, min(50, max_len + 2))
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
