@@ -116,7 +116,8 @@ SAVED_TOKENS_FILE       = os.path.join(DATA_DIR, "saved_tokens.json")
 SAVED_ASSIGNMENTS_FILE  = os.path.join(DATA_DIR, "saved_assignments.json")
 SAVED_TASK_BATCHES_FILE = os.path.join(DATA_DIR, "saved_task_batches.json")
 SAVED_SCHEDULES_FILE    = os.path.join(DATA_DIR, "saved_schedules.json")
-SAVED_DLV_BATCH_FILE    = os.path.join(DATA_DIR, "saved_dlv_batch.json")
+SAVED_DLV_BATCH_FILE          = os.path.join(DATA_DIR, "saved_dlv_batch.json")
+SAVED_BULK_EXPORT_SCHED_FILE  = os.path.join(DATA_DIR, "saved_bulk_export_schedule.json")
 SAVED_AUTO_FETCH_FILE   = os.path.join(DATA_DIR, "saved_auto_fetch.json")
 SAVED_AF_RESULTS_FILE   = os.path.join(DATA_DIR, "saved_af_results.json")
 
@@ -401,9 +402,10 @@ def _get_ft_sess(ctx: ContextTypes.DEFAULT_TYPE) -> FTSession:
 # States — Bulk Export conversation
 # ──────────────────────────────────────────────────────────
 class BE(Enum):
-    COUNTY  = auto()   # pick county
-    EMAIL   = auto()   # ask for recipient email address
-    CONFIRM = auto()   # confirm → kick off background export
+    COUNTY   = auto()   # pick county
+    EMAIL    = auto()   # ask for recipient email address
+    SCHEDULE = auto()   # pick repeat interval
+    CONFIRM  = auto()   # confirm → kick off background export
 
 
 # County → list of registry names as they appear in the API response
@@ -422,11 +424,22 @@ _BE_COUNTY_LABELS: Dict[str, str] = {
 }
 
 
+_BE_SCHEDULE_OPTIONS: List[tuple] = [
+    ("Every Day",      86_400),
+    ("Every Week",     604_800),
+    ("Bi-Monthly",     1_209_600),   # every 2 weeks
+    ("Monthly",        2_592_000),   # 30 days
+    ("Every 2 Months", 5_184_000),   # 60 days
+    ("Run Once",       0),
+]
+
+
 @dataclass
 class BESession:
-    county:     str = ""
-    registries: List[str] = field(default_factory=list)
-    email:      str = ""
+    county:           str = ""
+    registries:       List[str] = field(default_factory=list)
+    email:            str = ""
+    schedule_seconds: int = 0   # 0 = run once
 
 
 def _get_be_sess(ctx: ContextTypes.DEFAULT_TYPE) -> BESession:
@@ -5199,6 +5212,34 @@ def _be_headers(tokens: AuthTokens) -> dict:
     }
 
 
+def load_be_schedule() -> Optional[Dict]:
+    try:
+        with open(SAVED_BULK_EXPORT_SCHED_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_be_schedule(cfg: Dict) -> None:
+    _ensure_data_dir()
+    with open(SAVED_BULK_EXPORT_SCHED_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def clear_be_schedule() -> None:
+    try:
+        os.remove(SAVED_BULK_EXPORT_SCHED_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def _be_schedule_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for label, secs in _BE_SCHEDULE_OPTIONS:
+        rows.append([InlineKeyboardButton(label, callback_data=f"be_sched:{secs}")])
+    return InlineKeyboardMarkup(rows)
+
+
 def _be_county_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(label, callback_data=f"be_county:{key}")]
@@ -5592,6 +5633,24 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
 
 # ── Bulk Export conversation handlers ─────────────────────
 
+async def _bulk_export_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """APScheduler job: run bulk export with saved schedule config."""
+    cfg = load_be_schedule()
+    if not cfg:
+        return
+    tokens = _any_valid_tokens()
+    if not tokens:
+        logger.warning("Bulk export job: no valid tokens — skipping.")
+        return
+    chat_id    = cfg["chat_id"]
+    email      = cfg.get("email", "")
+    registries = cfg.get("registries", [])
+    loop       = asyncio.get_event_loop()
+    asyncio.ensure_future(
+        asyncio.to_thread(_bulk_export_run, tokens, chat_id, email, context.bot, loop, registries)
+    )
+
+
 async def cmd_bulk_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     sess = _get_be_sess(ctx)
@@ -5640,16 +5699,36 @@ async def recv_be_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return BE.EMAIL
         sess.email = text
 
-    email_label = sess.email or "Telegram only"
+    await update.message.reply_text(
+        "🔁 *How often should this report run?*",
+        parse_mode="Markdown",
+        reply_markup=_be_schedule_keyboard(),
+    )
+    return BE.SCHEDULE
+
+
+async def recv_be_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    secs = int(query.data.split(":")[1])
+    sess = _get_be_sess(ctx)
+    sess.schedule_seconds = secs
+
+    label        = next((l for l, s in _BE_SCHEDULE_OPTIONS if s == secs), "Run Once")
+    email_label  = sess.email or "Telegram only"
     county_label = _BE_COUNTY_LABELS.get(sess.county, sess.county.title())
     reg_list     = ", ".join(sess.registries)
-    await update.message.reply_text(
+    sched_label  = label if secs == 0 else f"{label} (repeating)"
+
+    await query.edit_message_text(
         f"✅ Ready to export.\n\n"
         f"• County: *{county_label}*\n"
         f"• Registries: `{reg_list}`\n"
         f"• Filter: *Completed*\n"
+        f"• Schedule: *{sched_label}*\n"
         f"• Destination: *{email_label}*\n\n"
-        "Tap *Run Export* to start (may take several minutes).",
+        "Tap *Run Export* to start.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("▶️ Run Export", callback_data="be:yes"),
@@ -5680,13 +5759,42 @@ async def recv_be_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     chat_id = query.message.chat_id
-    await query.edit_message_text("⏳ Export running in background — you will be notified when done.")
-    await ctx.bot.send_message(chat_id, "Returning to menu.", reply_markup=_main_menu())
+    secs    = sess.schedule_seconds
 
-    loop = asyncio.get_event_loop()
-    asyncio.ensure_future(
-        asyncio.to_thread(_bulk_export_run, tokens, chat_id, sess.email, ctx.bot, loop, sess.registries)
-    )
+    if secs > 0:
+        # Save schedule and register repeating job
+        cfg = {
+            "chat_id":          chat_id,
+            "county":           sess.county,
+            "registries":       sess.registries,
+            "email":            sess.email,
+            "interval_seconds": secs,
+        }
+        save_be_schedule(cfg)
+        # Remove any existing job before adding a new one
+        current_jobs = ctx.application.job_queue.get_jobs_by_name("bulk_export_job")
+        for job in current_jobs:
+            job.schedule_removal()
+        ctx.application.job_queue.run_repeating(
+            _bulk_export_job,
+            interval=secs,
+            first=0,   # run immediately then repeat
+            name="bulk_export_job",
+        )
+        label = next((l for l, s in _BE_SCHEDULE_OPTIONS if s == secs), "repeating")
+        await query.edit_message_text(
+            f"⏳ Export started and scheduled to repeat *{label}*.\n"
+            "You will be notified each time it completes.",
+            parse_mode="Markdown",
+        )
+    else:
+        await query.edit_message_text("⏳ Export running in background — you will be notified when done.")
+        loop = asyncio.get_event_loop()
+        asyncio.ensure_future(
+            asyncio.to_thread(_bulk_export_run, tokens, chat_id, sess.email, ctx.bot, loop, sess.registries)
+        )
+
+    await ctx.bot.send_message(chat_id, "Returning to menu.", reply_markup=_main_menu())
     return ConversationHandler.END
 
 
@@ -5861,9 +5969,10 @@ def main():
             MessageHandler(filters.Regex(f"^{re.escape(BTN_BULK_EXPORT)}$"), cmd_bulk_export),
         ],
         states={
-            BE.COUNTY:  [CallbackQueryHandler(recv_be_county, pattern=r"^be_county:")],
-            BE.EMAIL:   [MessageHandler(not_cancel, recv_be_email)],
-            BE.CONFIRM: [CallbackQueryHandler(recv_be_confirm, pattern=r"^be:")],
+            BE.COUNTY:   [CallbackQueryHandler(recv_be_county,    pattern=r"^be_county:")],
+            BE.EMAIL:    [MessageHandler(not_cancel, recv_be_email)],
+            BE.SCHEDULE: [CallbackQueryHandler(recv_be_schedule,  pattern=r"^be_sched:")],
+            BE.CONFIRM:  [CallbackQueryHandler(recv_be_confirm,   pattern=r"^be:")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
@@ -5884,6 +5993,17 @@ def main():
 
     # DLV Batch: process queue every 5 minutes
     app.job_queue.run_repeating(_dlv_batch_job, interval=300, first=300, name="dlv_batch_job")
+
+    # Bulk Export: restore saved schedule on startup
+    be_cfg = load_be_schedule()
+    if be_cfg and be_cfg.get("interval_seconds", 0) > 0:
+        app.job_queue.run_repeating(
+            _bulk_export_job,
+            interval=be_cfg["interval_seconds"],
+            first=be_cfg["interval_seconds"],
+            name="bulk_export_job",
+        )
+        logger.info("Bulk export schedule restored: every %ds", be_cfg["interval_seconds"])
 
     # Auto Fetch: restore saved schedule on startup
     cfg = load_auto_fetch_schedule()
