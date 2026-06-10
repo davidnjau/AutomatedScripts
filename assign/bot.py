@@ -5211,11 +5211,11 @@ _EXCEL_COLUMNS = [
 ]
 
 
-def _be_headers(tokens: AuthTokens) -> dict:
+def _be_headers(tokens: AuthTokens, cparams: str = CPARAMS_DLV) -> dict:
     return {
         "Authorization": f"Bearer {tokens.access_token}",
         "JWTAUTH":       f"Bearer {tokens.jwt}",
-        "cparams":       CPARAMS_DLV,
+        "cparams":       cparams,
     }
 
 
@@ -5570,7 +5570,8 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
     )
     sess.mount("https://", adapter)
     sess.mount("http://",  adapter)
-    headers = _be_headers(tokens)
+    headers        = _be_headers(tokens)
+    detail_headers = _be_headers(tokens, cparams=CPARAMS_ASSESSOR)
 
     try:
         # ── Step 1: fetch page 1 to learn total count ──────────────
@@ -5614,7 +5615,7 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
         errors: List[str] = []
 
         with ThreadPoolExecutor(max_workers=_BE_DETAIL_WORKERS) as pool:
-            futures = {pool.submit(_be_fetch_detail, sess, headers, app_id): app_id
+            futures = {pool.submit(_be_fetch_detail, sess, detail_headers, app_id): app_id
                        for app_id in id_list}
             for fut in _futures_as_completed(futures):
                 app_id = futures[fut]
