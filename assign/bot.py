@@ -402,10 +402,11 @@ def _get_ft_sess(ctx: ContextTypes.DEFAULT_TYPE) -> FTSession:
 # States — Bulk Export conversation
 # ──────────────────────────────────────────────────────────
 class BE(Enum):
-    COUNTY   = auto()   # pick county
-    EMAIL    = auto()   # ask for recipient email address
-    SCHEDULE = auto()   # pick repeat interval
-    CONFIRM  = auto()   # confirm → kick off background export
+    COUNTY    = auto()   # pick county
+    EMAIL     = auto()   # ask for recipient email address
+    SCHEDULE  = auto()   # pick repeat interval
+    PICK_CRED = auto()   # choose which cached credential to run as
+    CONFIRM   = auto()   # confirm → kick off background export
 
 
 # County → list of registry names as they appear in the API response
@@ -445,6 +446,7 @@ class BESession:
     registries:       List[str] = field(default_factory=list)
     email:            str = ""
     schedule_seconds: int = 0   # 0 = run once
+    cred_type:        str = ""
 
 
 def _get_be_sess(ctx: ContextTypes.DEFAULT_TYPE) -> BESession:
@@ -5253,6 +5255,17 @@ def _be_county_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _be_cred_keyboard() -> Optional[InlineKeyboardMarkup]:
+    """Return an inline keyboard of credential profiles that currently have valid tokens.
+    Returns None if no credentials are valid."""
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"be_cred:{key}")]
+        for key, label in CRED_LABELS.items()
+        if get_valid_tokens(key)
+    ]
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
 def _be_fetch_page(sess: requests.Session, headers: dict, page: int) -> dict:
     """Fetch one list page. Returns the parsed JSON dict."""
     params = {
@@ -5674,9 +5687,11 @@ async def _bulk_export_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = load_be_schedule()
     if not cfg:
         return
-    tokens = _any_valid_tokens()
+    cred_type = cfg.get("cred_type")
+    tokens    = get_valid_tokens(cred_type) if cred_type else _any_valid_tokens()
     if not tokens:
-        logger.warning("Bulk export job: no valid tokens — skipping.")
+        cred_label = CRED_LABELS.get(cred_type, cred_type or "any")
+        logger.warning("Bulk export job: no valid tokens for %s — skipping.", cred_label)
         return
     chat_id    = cfg["chat_id"]
     email      = cfg.get("email", "")
@@ -5693,6 +5708,7 @@ async def cmd_bulk_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess.county     = ""
     sess.registries = []
     sess.email      = ""
+    sess.cred_type  = ""
     await update.message.reply_text(
         "📤 *Export Valuation Report*\n\nSelect the county to export:",
         parse_mode="Markdown",
@@ -5825,11 +5841,38 @@ async def recv_be_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess = _get_be_sess(ctx)
     sess.schedule_seconds = secs
 
-    label        = next((l for l, s in _BE_SCHEDULE_OPTIONS if s == secs), "Run Once")
-    email_label  = sess.email or "Telegram only"
+    kbd = _be_cred_keyboard()
+    if not kbd:
+        await query.edit_message_text(
+            "❌ No valid cached tokens. Use *🔑 Refresh Auth* first.",
+            parse_mode="Markdown",
+        )
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        "👤 *Select the account to run the export as:*",
+        parse_mode="Markdown",
+        reply_markup=kbd,
+    )
+    return BE.PICK_CRED
+
+
+async def recv_be_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    sess           = _get_be_sess(ctx)
+    sess.cred_type = query.data.split(":")[1]
+
+    cred_label   = CRED_LABELS.get(sess.cred_type, sess.cred_type)
     county_label = _BE_COUNTY_LABELS.get(sess.county, sess.county.title())
     reg_list     = ", ".join(sess.registries)
-    sched_label  = label if secs == 0 else f"{label} (repeating)"
+    secs         = sess.schedule_seconds
+    sched_label  = next((l for l, s in _BE_SCHEDULE_OPTIONS if s == secs), "Run Once")
+    if secs > 0:
+        sched_label += " (repeating)"
+    email_label  = sess.email or "Telegram only"
 
     await query.edit_message_text(
         f"✅ Ready to export.\n\n"
@@ -5837,6 +5880,7 @@ async def recv_be_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"• Registries: `{reg_list}`\n"
         f"• Filter: *Completed*\n"
         f"• Schedule: *{sched_label}*\n"
+        f"• Account: *{cred_label}*\n"
         f"• Destination: *{email_label}*\n\n"
         "Tap *Run Export* to start.",
         parse_mode="Markdown",
@@ -5859,10 +5903,11 @@ async def recv_be_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     sess   = _get_be_sess(ctx)
-    tokens = _any_valid_tokens()
+    tokens = get_valid_tokens(sess.cred_type)
     if not tokens:
+        cred_label = CRED_LABELS.get(sess.cred_type, sess.cred_type)
         await query.edit_message_text(
-            "❌ No valid cached tokens. Use *🔑 Refresh Auth* first.",
+            f"❌ Tokens for *{cred_label}* have expired. Use *🔑 Refresh Auth* first.",
             parse_mode="Markdown",
         )
         await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
@@ -5879,6 +5924,7 @@ async def recv_be_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "registries":       sess.registries,
             "email":            sess.email,
             "interval_seconds": secs,
+            "cred_type":        sess.cred_type,
         }
         save_be_schedule(cfg)
         # Remove any existing job before adding a new one
@@ -6079,10 +6125,11 @@ def main():
             MessageHandler(filters.Regex(f"^{re.escape(BTN_BULK_EXPORT)}$"), cmd_bulk_export),
         ],
         states={
-            BE.COUNTY:   [CallbackQueryHandler(recv_be_county,    pattern=r"^be_county:")],
-            BE.EMAIL:    [MessageHandler(not_cancel, recv_be_email)],
-            BE.SCHEDULE: [CallbackQueryHandler(recv_be_schedule,  pattern=r"^be_sched:")],
-            BE.CONFIRM:  [CallbackQueryHandler(recv_be_confirm,   pattern=r"^be:")],
+            BE.COUNTY:    [CallbackQueryHandler(recv_be_county,    pattern=r"^be_county:")],
+            BE.EMAIL:     [MessageHandler(not_cancel, recv_be_email)],
+            BE.SCHEDULE:  [CallbackQueryHandler(recv_be_schedule,  pattern=r"^be_sched:")],
+            BE.PICK_CRED: [CallbackQueryHandler(recv_be_cred,      pattern=r"^be_cred:")],
+            BE.CONFIRM:   [CallbackQueryHandler(recv_be_confirm,   pattern=r"^be:")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
