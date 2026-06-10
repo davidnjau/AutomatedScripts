@@ -433,6 +433,11 @@ _BE_SCHEDULE_OPTIONS: List[tuple] = [
     ("Run Once",       0),
 ]
 
+# Per-chat export status tracker — keyed by chat_id
+# Each entry: {phase, started_at, total, pages_done, total_pages,
+#              details_done, details_total, errors, completed_at, rows, error_msg}
+_BE_STATUS: Dict[int, dict] = {}
+
 
 @dataclass
 class BESession:
@@ -479,6 +484,7 @@ BTN_FETCH_TASKS   = "📊 Fetch Tasks"
 BTN_DLV_TASKS     = "📋 DLV Tasks"
 BTN_AF_RESULTS    = "🗂 AF Results"
 BTN_BULK_EXPORT   = "📤 Export Valuation Report"
+BTN_EXPORT_STATUS = "📊 Export Status"
 BTN_HELP          = "❓ Help"
 BTN_RESTART       = "🔁 Restart Bot"
 BTN_CANCEL        = "🛑 Cancel"
@@ -490,6 +496,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_DAEMON)}"
     f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
     f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_AF_RESULTS)}|{re.escape(BTN_BULK_EXPORT)}"
+    f"|{re.escape(BTN_EXPORT_STATUS)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -502,7 +509,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(BTN_FETCH_TASKS),  KeyboardButton(BTN_AUTO_FETCH)],
             [KeyboardButton(BTN_DLV_BATCH)],
             [KeyboardButton(BTN_AF_RESULTS),   KeyboardButton(BTN_ASSIGNMENTS)],
-            [KeyboardButton(BTN_BULK_EXPORT)],
+            [KeyboardButton(BTN_BULK_EXPORT), KeyboardButton(BTN_EXPORT_STATUS)],
             [KeyboardButton(BTN_DAEMON)],
             [KeyboardButton(BTN_AUTH),         KeyboardButton(BTN_TOKEN_STATUS)],
             [KeyboardButton(BTN_RESTART)],
@@ -5537,6 +5544,23 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
             loop,
         ).result(timeout=15)
 
+    def _set_status(**kwargs):
+        _BE_STATUS.setdefault(chat_id, {}).update(kwargs)
+
+    _BE_STATUS[chat_id] = {
+        "phase":          "fetching pages",
+        "started_at":     datetime.now(),
+        "total":          None,
+        "pages_done":     1,
+        "total_pages":    None,
+        "details_done":   0,
+        "details_total":  None,
+        "errors":         0,
+        "completed_at":   None,
+        "rows":           None,
+        "error_msg":      None,
+    }
+
     sess = build_session()
     # Expand the connection pool to match worker count so connections aren't discarded
     adapter = requests.adapters.HTTPAdapter(
@@ -5559,6 +5583,7 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
         total_pages = max(1, -(-total // page_size))   # ceil division
 
         logger.info("Bulk export: count=%d, page_size=%d, total_pages=%d", total, page_size, total_pages)
+        _set_status(total=total, total_pages=total_pages, pages_done=1)
 
         # ── Fetch remaining pages in parallel ──────────────────────
         if total_pages > 1:
@@ -5568,6 +5593,7 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
                 for fut in _futures_as_completed(futures):
                     page_data = fut.result()   # raises on error
                     results.extend(page_data.get("results") or [])
+                    _set_status(pages_done=_BE_STATUS[chat_id]["pages_done"] + 1)
 
         # ── Client-side registry filter ────────────────────────────
         reg_set = {r.upper() for r in (registries or [])}
@@ -5578,10 +5604,12 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
         id_list = [r["id"] for r in filtered if r.get("id")]
 
         if not id_list:
+            _set_status(phase="done", completed_at=datetime.now(), rows=0)
             _tg("ℹ️ Bulk export complete — no NAIROBI records found.")
             return
 
         # ── Step 2: parallel detail fetch ─────────────────────────
+        _set_status(phase="fetching details", details_total=len(id_list))
         rows: List[dict] = []
         errors: List[str] = []
 
@@ -5593,9 +5621,14 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
                 try:
                     detail = fut.result()
                     rows.append(_be_extract_row(detail))
+                    _set_status(details_done=_BE_STATUS[chat_id]["details_done"] + 1)
                 except Exception as exc:
                     logger.warning("Bulk export detail failed id=%s: %s", app_id, exc)
                     errors.append(app_id)
+                    _set_status(
+                        details_done=_BE_STATUS[chat_id]["details_done"] + 1,
+                        errors=_BE_STATUS[chat_id]["errors"] + 1,
+                    )
                     err_row = {col: "FETCH_ERROR" for col in _EXCEL_COLUMNS}
                     err_row["Reference Number"] = app_id
                     err_row["Enrich Error"]     = str(exc)
@@ -5603,6 +5636,7 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
                     rows.append(err_row)
 
         # ── Step 3: build Excel and send ───────────────────────────
+        _set_status(phase="building excel")
         filename   = f"Ardhisasa_Valuation_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         xlsx_bytes = _be_build_excel(rows)
 
@@ -5617,6 +5651,8 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
             loop,
         ).result(timeout=60)
 
+        _set_status(phase="done", completed_at=datetime.now(), rows=len(rows))
+
         # Send via email if provided
         if email:
             try:
@@ -5628,6 +5664,7 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
 
     except Exception as exc:
         logger.error("Bulk export worker crashed: %s", exc, exc_info=True)
+        _set_status(phase="failed", completed_at=datetime.now(), error_msg=str(exc))
         _tg(f"❌ Export failed: `{exc}`")
 
 
@@ -5663,6 +5700,80 @@ async def cmd_bulk_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=_be_county_keyboard(),
     )
     return BE.COUNTY
+
+
+async def cmd_export_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    chat_id = update.effective_chat.id
+    st = _BE_STATUS.get(chat_id)
+
+    if not st:
+        await update.message.reply_text(
+            "ℹ️ No export has been run in this session.",
+            reply_markup=_main_menu(),
+        )
+        return
+
+    phase        = st.get("phase", "unknown")
+    started_at   = st.get("started_at")
+    completed_at = st.get("completed_at")
+    total        = st.get("total")
+    total_pages  = st.get("total_pages")
+    pages_done   = st.get("pages_done", 0)
+    details_done = st.get("details_done", 0)
+    details_total = st.get("details_total")
+    errors       = st.get("errors", 0)
+    rows         = st.get("rows")
+    error_msg    = st.get("error_msg")
+
+    elapsed = ""
+    if started_at:
+        ref = completed_at or datetime.now()
+        secs = int((ref - started_at).total_seconds())
+        elapsed = f"{secs // 60}m {secs % 60}s"
+
+    phase_icons = {
+        "fetching pages":   "📄",
+        "fetching details": "🔍",
+        "building excel":   "📊",
+        "done":             "✅",
+        "failed":           "❌",
+    }
+    icon = phase_icons.get(phase, "⏳")
+
+    lines = [f"*{icon} Export Status*\n"]
+
+    if started_at:
+        lines.append(f"Started: `{started_at.strftime('%H:%M:%S')}`")
+    if elapsed:
+        lines.append(f"Elapsed: `{elapsed}`")
+
+    lines.append(f"Phase: `{phase}`")
+
+    if total is not None:
+        lines.append(f"Total records (API): `{total:,}`")
+
+    if total_pages is not None:
+        lines.append(f"Pages: `{pages_done}/{total_pages}`")
+
+    if details_total is not None:
+        pct = int(details_done / details_total * 100) if details_total else 0
+        lines.append(f"Details: `{details_done}/{details_total}` ({pct}%)")
+
+    if errors:
+        lines.append(f"⚠️ Fetch errors: `{errors}`")
+
+    if phase == "done" and rows is not None:
+        lines.append(f"Rows exported: `{rows:,}`")
+
+    if phase == "failed" and error_msg:
+        lines.append(f"Error: `{error_msg}`")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=_main_menu(),
+    )
 
 
 async def recv_be_county(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5990,6 +6101,9 @@ def main():
     app.add_handler(af_conv)
     app.add_handler(rs_conv)
     app.add_handler(be_conv)
+    app.add_handler(MessageHandler(
+        filters.Regex(f"^{re.escape(BTN_EXPORT_STATUS)}$"), cmd_export_status
+    ))
 
     # DLV Batch: process queue every 5 minutes
     app.job_queue.run_repeating(_dlv_batch_job, interval=300, first=300, name="dlv_batch_job")
