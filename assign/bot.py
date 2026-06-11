@@ -6011,7 +6011,11 @@ def _jd_build_excel(
         for m in members_sorted:
             uid   = m.get("userid", "")
             tasks = tasks_by_userid.get(uid, [])
-            refs  = ", ".join(t.get("reference_number", t.get("id", "")) for t in tasks)
+            def _fmt_ref(t):
+                ref    = t.get("reference_number", t.get("id", ""))
+                amount = t.get("consideration_amount", "")
+                return f"{ref}({int(amount):,})" if amount != "" else ref
+            refs  = ", ".join(_fmt_ref(t) for t in tasks)
             ws2.append([
                 team.get("team_name", ""),
                 m.get("name", ""),
@@ -6147,11 +6151,13 @@ def _jd_run(tokens: AuthTokens, chat_id: int, bot, loop) -> None:
                     vo     = next((a for a in actors if a.get("role") == "VALUATION OFFICER"), None)
                     if vo:
                         uid = (vo.get("user_details") or {}).get("id", "")
+                        ext = detail.get("external_process_details") or {}
                         tasks_by_userid.setdefault(uid, []).append({
-                            "reference_number": detail.get("reference_number", ""),
-                            "parcel_number":    detail.get("parcel_number", ""),
-                            "registry":         detail.get("registry", ""),
-                            "date_created":     detail.get("date_created", ""),
+                            "reference_number":   detail.get("reference_number", ""),
+                            "parcel_number":      detail.get("parcel_number", ""),
+                            "registry":           detail.get("registry", ""),
+                            "date_created":       detail.get("date_created", ""),
+                            "consideration_amount": ext.get("consideration_amount", ""),
                         })
                     else:
                         unassigned_tasks.append(task_summary)
