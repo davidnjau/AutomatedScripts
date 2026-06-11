@@ -6086,6 +6086,92 @@ def _jd_build_excel(
                 ws3.cell(row=i, column=c).fill = alt_fill
     _autofit(ws3)
 
+    # ── Sheet 4: Team Roster & Cross-Team Members ──────────
+    ws4 = wb.create_sheet("Team Roster")
+
+    # Build userid → list of team names (to detect multi-team members)
+    userid_to_teams: Dict[str, List[str]] = {}
+    for team in teams:
+        for m in members_by_team.get(team["id"], []):
+            uid = m.get("userid", "")
+            userid_to_teams.setdefault(uid, []).append(team.get("team_name", ""))
+
+    multi_team_fill = PatternFill("solid", fgColor="FFF176")   # yellow for multi-team rows
+
+    # ── Section A: per-team roster ─────────────────────────
+    ws4.append(["TEAM ROSTER"])
+    ws4.cell(row=ws4.max_row, column=1).font = Font(bold=True, size=13)
+    ws4.append([])
+
+    current_row = 3
+    for team in teams:
+        # Team header
+        ws4.append([team.get("team_name", ""), f"({len(members_by_team.get(team['id'], []))} members)"])
+        for c in range(1, 3):
+            cell      = ws4.cell(row=ws4.max_row, column=c)
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="BDD7EE")
+        current_row = ws4.max_row + 1
+
+        # Column headers
+        ws4.append(["#", "Name", "Account Number", "Availability", "Registry", "Also In Teams"])
+        for c in range(1, 7):
+            cell      = ws4.cell(row=ws4.max_row, column=c)
+            cell.font = hdr_font
+            cell.fill = PatternFill("solid", fgColor="D9E1F2")
+
+        members = sorted(members_by_team.get(team["id"], []), key=lambda m: m.get("name", ""))
+        for idx, m in enumerate(members, start=1):
+            uid        = m.get("userid", "")
+            other_teams = [t for t in userid_to_teams.get(uid, []) if t != team.get("team_name", "")]
+            also_in    = ", ".join(other_teams) if other_teams else ""
+            ws4.append([
+                idx,
+                m.get("name", ""),
+                m.get("account_number", ""),
+                m.get("availability", ""),
+                m.get("registry", ""),
+                also_in,
+            ])
+            if other_teams:
+                for c in range(1, 7):
+                    ws4.cell(row=ws4.max_row, column=c).fill = multi_team_fill
+
+        ws4.append([])   # blank row between teams
+
+    # ── Section B: members in multiple teams ──────────────
+    ws4.append([])
+    ws4.append(["MEMBERS IN MULTIPLE TEAMS"])
+    ws4.cell(row=ws4.max_row, column=1).font = Font(bold=True, size=13)
+    ws4.cell(row=ws4.max_row, column=1).fill = PatternFill("solid", fgColor="FFF176")
+
+    ws4.append(["Name", "Account Number", "Teams"])
+    for c in range(1, 4):
+        cell      = ws4.cell(row=ws4.max_row, column=c)
+        cell.font = hdr_font
+        cell.fill = PatternFill("solid", fgColor="D9E1F2")
+
+    # collect all members once (avoid duplicates from members_by_team)
+    seen_multi: set = set()
+    for team in teams:
+        for m in members_by_team.get(team["id"], []):
+            uid        = m.get("userid", "")
+            team_names = userid_to_teams.get(uid, [])
+            if len(team_names) > 1 and uid not in seen_multi:
+                seen_multi.add(uid)
+                ws4.append([
+                    m.get("name", ""),
+                    m.get("account_number", ""),
+                    ", ".join(team_names),
+                ])
+                for c in range(1, 4):
+                    ws4.cell(row=ws4.max_row, column=c).fill = multi_team_fill
+
+    if not seen_multi:
+        ws4.append(["No members belong to more than one team."])
+
+    _autofit(ws4)
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
