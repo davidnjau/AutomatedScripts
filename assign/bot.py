@@ -32,6 +32,7 @@ import signal
 import smtplib
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from email.mime.multipart import MIMEMultipart
@@ -117,7 +118,8 @@ SAVED_ASSIGNMENTS_FILE  = os.path.join(DATA_DIR, "saved_assignments.json")
 SAVED_TASK_BATCHES_FILE = os.path.join(DATA_DIR, "saved_task_batches.json")
 SAVED_SCHEDULES_FILE    = os.path.join(DATA_DIR, "saved_schedules.json")
 SAVED_DLV_BATCH_FILE          = os.path.join(DATA_DIR, "saved_dlv_batch.json")
-SAVED_BULK_EXPORT_SCHED_FILE  = os.path.join(DATA_DIR, "saved_bulk_export_schedule.json")
+SAVED_BULK_EXPORT_SCHED_FILE    = os.path.join(DATA_DIR, "saved_bulk_export_schedule.json")
+SAVED_BULK_EXPORT_PARTIAL_FILE  = os.path.join(DATA_DIR, "saved_bulk_export_partial.json")
 SAVED_AUTO_FETCH_FILE   = os.path.join(DATA_DIR, "saved_auto_fetch.json")
 SAVED_AF_RESULTS_FILE   = os.path.join(DATA_DIR, "saved_af_results.json")
 
@@ -5191,9 +5193,47 @@ async def recv_auth_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 _BE_LIST_URL   = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application"
 _BE_DETAIL_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view"
 _BE_PAGE_SIZE  = 10   # API default
-_BE_LIST_WORKERS   = 5
-_BE_DETAIL_WORKERS = 5
-_BE_MAX_RETRIES    = 3
+_BE_LIST_WORKERS        = 5
+_BE_DETAIL_WORKERS      = 5
+_BE_MAX_RETRIES         = 3
+_BE_TOKEN_ROTATE_DELAY  = 10   # seconds to wait before retrying with a new token
+
+
+class _AllTokensExhausted(Exception):
+    pass
+
+
+class _TokenRotator:
+    """Thread-safe token rotator — advances to the next valid credential on 403."""
+
+    def __init__(self, token_pairs: List[tuple]):
+        # token_pairs: [(cred_type, AuthTokens), ...]
+        self._tokens = list(token_pairs)
+        self._idx    = 0
+        self._lock   = threading.Lock()
+
+    def current(self) -> Optional["AuthTokens"]:
+        with self._lock:
+            return self._tokens[self._idx][1] if self._idx < len(self._tokens) else None
+
+    def current_label(self) -> str:
+        with self._lock:
+            if self._idx < len(self._tokens):
+                return CRED_LABELS.get(self._tokens[self._idx][0], self._tokens[self._idx][0])
+            return "none"
+
+    def rotate(self, failed: "AuthTokens") -> Optional["AuthTokens"]:
+        """Advance past `failed` if it is still the current token. Returns new token or None."""
+        with self._lock:
+            if self._idx < len(self._tokens) and self._tokens[self._idx][1] is failed:
+                self._idx += 1
+            return self._tokens[self._idx][1] if self._idx < len(self._tokens) else None
+
+    @property
+    def exhausted(self) -> bool:
+        with self._lock:
+            return self._idx >= len(self._tokens)
+
 
 _EXCEL_COLUMNS = [
     "Filter",
@@ -5241,6 +5281,33 @@ def clear_be_schedule() -> None:
         pass
 
 
+def load_be_partial() -> Optional[Dict]:
+    try:
+        with open(SAVED_BULK_EXPORT_PARTIAL_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_be_partial(county: str, registries: List[str], rows: List[dict], done_ids: List[str]) -> None:
+    _ensure_data_dir()
+    with open(SAVED_BULK_EXPORT_PARTIAL_FILE, "w") as f:
+        json.dump({
+            "saved_at":  datetime.now().isoformat(),
+            "county":    county,
+            "registries": registries,
+            "rows":      rows,
+            "done_ids":  done_ids,
+        }, f)
+
+
+def clear_be_partial() -> None:
+    try:
+        os.remove(SAVED_BULK_EXPORT_PARTIAL_FILE)
+    except FileNotFoundError:
+        pass
+
+
 def _be_schedule_keyboard() -> InlineKeyboardMarkup:
     rows = []
     for label, secs in _BE_SCHEDULE_OPTIONS:
@@ -5280,23 +5347,34 @@ def _be_fetch_page(sess: requests.Session, headers: dict, page: int) -> dict:
     return resp.json()
 
 
-def _be_fetch_detail(sess: requests.Session, headers: dict, app_id: str) -> dict:
-    """Fetch detail view for one application ID with exponential back-off retry."""
-    delay = 1.0
-    last_exc: Exception = RuntimeError("unknown")
-    for attempt in range(_BE_MAX_RETRIES):
+def _be_fetch_detail(sess: requests.Session, rotator: "_TokenRotator", app_id: str) -> dict:
+    """
+    Fetch detail view for one application ID.
+    On 403 rotates to the next valid token (with a short pause).
+    Raises _AllTokensExhausted when no more tokens remain.
+    """
+    while True:
+        tokens = rotator.current()
+        if tokens is None:
+            raise _AllTokensExhausted(f"All tokens exhausted fetching {app_id}")
+        headers = _be_headers(tokens)
         try:
             resp = sess.get(_BE_DETAIL_URL, headers=headers, params={"request_id": app_id}, timeout=30)
+            if resp.status_code == 403:
+                new_tokens = rotator.rotate(tokens)
+                if new_tokens is None:
+                    raise _AllTokensExhausted(f"All tokens exhausted (403) fetching {app_id}")
+                time.sleep(_BE_TOKEN_ROTATE_DELAY)
+                continue
             if resp.status_code in (429, 502, 503, 504):
-                raise requests.HTTPError(response=resp)
+                time.sleep(2)
+                continue
             resp.raise_for_status()
             return resp.json()
+        except _AllTokensExhausted:
+            raise
         except Exception as exc:
-            last_exc = exc
-            if attempt < _BE_MAX_RETRIES - 1:
-                time.sleep(delay)
-                delay *= 2
-    raise last_exc
+            raise exc
 
 
 def _be_extract_row(detail: dict) -> dict:
@@ -5544,13 +5622,19 @@ def _send_bulk_export_email(to_email: str, filename: str, xlsx_bytes: bytes) -> 
         server.sendmail(SMTP_USER, to_email, msg.as_string())
 
 
-def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, registries: List[str] = None) -> None:
+def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop,
+                     registries: List[str] = None, county: str = "") -> None:
     """
     Full synchronous export worker — runs in a background thread.
-    Sends progress messages and the final file to the Telegram chat.
+
+    Behaviour:
+    - Resumes from a saved partial checkpoint when one exists for the same county/registries.
+    - Sorts all records by Application Date Created (ascending) so resume is date-ordered.
+    - Rotates tokens on 403: tries every valid credential before giving up.
+    - On full token exhaustion saves a partial checkpoint and notifies the user.
+    - On success clears the partial checkpoint and sends the Excel file.
     """
     def _tg(text: str):
-        """Fire-and-forget Telegram message from this thread."""
         asyncio.run_coroutine_threadsafe(
             bot.send_message(chat_id, text, parse_mode="Markdown"),
             loop,
@@ -5573,8 +5657,17 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
         "error_msg":      None,
     }
 
+    # ── Build token rotator from all currently-valid credentials ──
+    token_pairs = [
+        (ct, get_valid_tokens(ct))
+        for ct in CRED_MAP
+        if get_valid_tokens(ct)
+    ]
+    # Put the originally-chosen token first
+    token_pairs.sort(key=lambda p: 0 if p[1] is tokens else 1)
+    rotator = _TokenRotator(token_pairs)
+
     sess = build_session()
-    # Expand the connection pool to match worker count so connections aren't discarded
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=_BE_DETAIL_WORKERS,
         pool_maxsize=_BE_DETAIL_WORKERS,
@@ -5582,29 +5675,27 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
     )
     sess.mount("https://", adapter)
     sess.mount("http://",  adapter)
-    headers = _be_headers(tokens)
+    list_headers = _be_headers(tokens)
 
     try:
-        # ── Step 1: fetch page 1 to learn total count ──────────────
-        first_page = _be_fetch_page(sess, headers, 1)
-        total      = first_page.get("count", 0)
-        results    = list(first_page.get("results") or [])
-        page_size  = len(results) if results else _BE_PAGE_SIZE
+        # ── Step 1: fetch list pages ───────────────────────────────
+        first_page  = _be_fetch_page(sess, list_headers, 1)
+        total       = first_page.get("count", 0)
+        results     = list(first_page.get("results") or [])
+        page_size   = len(results) if results else _BE_PAGE_SIZE
         if page_size == 0:
             page_size = _BE_PAGE_SIZE
-        total_pages = max(1, -(-total // page_size))   # ceil division
+        total_pages = max(1, -(-total // page_size))
 
         logger.info("Bulk export: count=%d, page_size=%d, total_pages=%d", total, page_size, total_pages)
         _set_status(total=total, total_pages=total_pages, pages_done=1)
 
-        # ── Fetch remaining pages in parallel ──────────────────────
         if total_pages > 1:
             with ThreadPoolExecutor(max_workers=_BE_LIST_WORKERS) as pool:
-                futures = {pool.submit(_be_fetch_page, sess, headers, p): p
+                futures = {pool.submit(_be_fetch_page, sess, list_headers, p): p
                            for p in range(2, total_pages + 1)}
                 for fut in _futures_as_completed(futures):
-                    page_data = fut.result()   # raises on error
-                    results.extend(page_data.get("results") or [])
+                    results.extend(fut.result().get("results") or [])
                     _set_status(pages_done=_BE_STATUS[chat_id]["pages_done"] + 1)
 
         # ── Client-side registry filter ────────────────────────────
@@ -5613,46 +5704,86 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
             filtered = [r for r in results if (r.get("registry") or "").upper() in reg_set]
         else:
             filtered = results
-        id_list = [r["id"] for r in filtered if r.get("id")]
 
-        if not id_list:
+        # Sort by Application Date Created ascending so resume is date-ordered
+        filtered.sort(key=lambda r: (r.get("date_created") or ""))
+
+        # ── Resume: load partial checkpoint if it matches ──────────
+        partial     = load_be_partial()
+        resume_rows: List[dict] = []
+        done_ids:    set        = set()
+
+        if partial and partial.get("county") == county and \
+                set(partial.get("registries", [])) == set(registries or []):
+            resume_rows = partial.get("rows") or []
+            done_ids    = set(partial.get("done_ids") or [])
+            _tg(
+                f"♻️ Resuming from checkpoint — {len(resume_rows):,} rows already saved, "
+                f"{len(done_ids):,} IDs done."
+            )
+
+        id_list = [r["id"] for r in filtered if r.get("id") and r["id"] not in done_ids]
+
+        if not id_list and not resume_rows:
             _set_status(phase="done", completed_at=datetime.now(), rows=0)
-            _tg("ℹ️ Bulk export complete — no NAIROBI records found.")
+            _tg("ℹ️ Bulk export complete — no records found.")
             return
 
-        # ── Step 2: parallel detail fetch ─────────────────────────
-        _set_status(phase="fetching details", details_total=len(id_list))
-        rows: List[dict] = []
-        errors: List[str] = []
+        if not id_list:
+            # All IDs already done from checkpoint — skip straight to Excel
+            rows = resume_rows
+        else:
+            # ── Step 2: parallel detail fetch with token rotation ──────
+            _set_status(phase="fetching details", details_total=len(id_list))
+            rows: List[dict] = list(resume_rows)
+            current_done_ids = list(done_ids)
+            exhausted_flag   = threading.Event()
 
-        with ThreadPoolExecutor(max_workers=_BE_DETAIL_WORKERS) as pool:
-            futures = {pool.submit(_be_fetch_detail, sess, headers, app_id): app_id
-                       for app_id in id_list}
-            for fut in _futures_as_completed(futures):
-                app_id = futures[fut]
-                try:
-                    detail = fut.result()
-                    rows.append(_be_extract_row(detail))
-                    _set_status(details_done=_BE_STATUS[chat_id]["details_done"] + 1)
-                except Exception as exc:
-                    logger.warning("Bulk export detail failed id=%s: %s", app_id, exc)
-                    errors.append(app_id)
-                    _set_status(
-                        details_done=_BE_STATUS[chat_id]["details_done"] + 1,
-                        errors=_BE_STATUS[chat_id]["errors"] + 1,
-                    )
-                    err_row = {col: "FETCH_ERROR" for col in _EXCEL_COLUMNS}
-                    err_row["Reference Number"] = app_id
-                    err_row["Enrich Error"]     = str(exc)
-                    err_row["Filter"]           = "Completed"
-                    rows.append(err_row)
+            with ThreadPoolExecutor(max_workers=_BE_DETAIL_WORKERS) as pool:
+                futures = {pool.submit(_be_fetch_detail, sess, rotator, app_id): app_id
+                           for app_id in id_list}
+                for fut in _futures_as_completed(futures):
+                    app_id = futures[fut]
+                    try:
+                        if exhausted_flag.is_set():
+                            # Tokens already gone — skip remaining futures
+                            fut.cancel()
+                            continue
+                        detail = fut.result()
+                        rows.append(_be_extract_row(detail))
+                        current_done_ids.append(app_id)
+                        _set_status(details_done=_BE_STATUS[chat_id]["details_done"] + 1)
+                    except _AllTokensExhausted:
+                        exhausted_flag.set()
+                        logger.warning("Bulk export: all tokens exhausted at id=%s", app_id)
+                    except Exception as exc:
+                        logger.warning("Bulk export detail failed id=%s: %s", app_id, exc)
+                        _set_status(
+                            details_done=_BE_STATUS[chat_id]["details_done"] + 1,
+                            errors=_BE_STATUS[chat_id]["errors"] + 1,
+                        )
 
-        # ── Step 3: build Excel and send ───────────────────────────
+            if exhausted_flag.is_set():
+                # Save whatever we managed to fetch and bail out
+                save_be_partial(county, list(registries or []), rows, current_done_ids)
+                remaining = len(id_list) - len(current_done_ids) + len(done_ids)
+                _set_status(phase="paused — tokens exhausted", completed_at=datetime.now(), rows=len(rows))
+                _tg(
+                    f"⚠️ All tokens returned 403 — export paused.\n\n"
+                    f"*Saved so far:* {len(rows):,} rows\n"
+                    f"*Remaining:* ~{remaining:,} records\n\n"
+                    "Refresh your tokens and run the export again to continue from this checkpoint."
+                )
+                return
+
+        # ── Step 3: sort final rows by date, build Excel, send ────
         _set_status(phase="building excel")
+        rows.sort(key=lambda r: (r.get("Application Date Created") or ""))
+
+        clear_be_partial()
         filename   = f"Ardhisasa_Valuation_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         xlsx_bytes = _be_build_excel(rows)
 
-        # Send file to Telegram
         asyncio.run_coroutine_threadsafe(
             bot.send_document(
                 chat_id,
@@ -5665,7 +5796,6 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop, re
 
         _set_status(phase="done", completed_at=datetime.now(), rows=len(rows))
 
-        # Send via email if provided
         if email:
             try:
                 _send_bulk_export_email(email, filename, xlsx_bytes)
@@ -5696,9 +5826,10 @@ async def _bulk_export_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id    = cfg["chat_id"]
     email      = cfg.get("email", "")
     registries = cfg.get("registries", [])
+    county     = cfg.get("county", "")
     loop       = asyncio.get_event_loop()
     asyncio.ensure_future(
-        asyncio.to_thread(_bulk_export_run, tokens, chat_id, email, context.bot, loop, registries)
+        asyncio.to_thread(_bulk_export_run, tokens, chat_id, email, context.bot, loop, registries, county)
     )
 
 
@@ -5947,7 +6078,7 @@ async def recv_be_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⏳ Export running in background — you will be notified when done.")
         loop = asyncio.get_event_loop()
         asyncio.ensure_future(
-            asyncio.to_thread(_bulk_export_run, tokens, chat_id, sess.email, ctx.bot, loop, sess.registries)
+            asyncio.to_thread(_bulk_export_run, tokens, chat_id, sess.email, ctx.bot, loop, sess.registries, sess.county)
         )
 
     await ctx.bot.send_message(chat_id, "Returning to menu.", reply_markup=_main_menu())
