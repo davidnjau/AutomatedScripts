@@ -5997,8 +5997,10 @@ def _jd_build_excel(
     ws2 = wb.create_sheet("Member Distribution")
     _header_row(ws2, [
         "Team", "Name", "Account Number", "Availability",
-        "Registry", "Tasks Assigned", "Reference Numbers",
+        "Registry", "Tasks Assigned", "Reference Numbers", "Analysis",
     ])
+
+    warn_fill = PatternFill("solid", fgColor="FFE0B2")   # amber for out-of-range rows
 
     row_idx = 2
     for team in teams:
@@ -6008,10 +6010,45 @@ def _jd_build_excel(
             members,
             key=lambda m: -len(tasks_by_userid.get(m.get("userid", ""), [])),
         )
+        team_min = float(team.get("min_amount") or 0)
+        team_max = float(team.get("max_amount") or float("inf"))
+
         for m in members_sorted:
             uid   = m.get("userid", "")
             tasks = tasks_by_userid.get(uid, [])
-            refs  = ", ".join(t.get("reference_number", t.get("id", "")) for t in tasks)
+
+            in_range:  List[str] = []
+            out_range: List[str] = []
+
+            for t in tasks:
+                ref    = t.get("reference_number", t.get("id", ""))
+                amount = t.get("consideration_amount", "")
+                if amount == "":
+                    label = ref
+                else:
+                    try:
+                        amt   = float(amount)
+                        label = f"{ref}({int(amt):,})"
+                        if team_min <= amt <= team_max:
+                            in_range.append(label)
+                        else:
+                            out_range.append(label)
+                        continue
+                    except (ValueError, TypeError):
+                        label = ref
+                in_range.append(label)   # no amount → assume in range
+
+            refs = ", ".join(in_range + out_range)
+
+            if out_range:
+                analysis = f"⚠️ Out of range: {', '.join(out_range)}"
+                if in_range:
+                    analysis += f" | ✅ In range: {len(in_range)}"
+            elif in_range:
+                analysis = f"✅ All {len(in_range)} in range"
+            else:
+                analysis = ""
+
             ws2.append([
                 team.get("team_name", ""),
                 m.get("name", ""),
@@ -6020,10 +6057,12 @@ def _jd_build_excel(
                 m.get("registry", ""),
                 len(tasks),
                 refs,
+                analysis,
             ])
-            if row_idx % 2 == 0:
-                for c in range(1, 8):
-                    ws2.cell(row=row_idx, column=c).fill = alt_fill
+            fill = warn_fill if out_range else (alt_fill if row_idx % 2 == 0 else None)
+            if fill:
+                for c in range(1, 9):
+                    ws2.cell(row=row_idx, column=c).fill = fill
             row_idx += 1
     _autofit(ws2)
 
@@ -6147,11 +6186,13 @@ def _jd_run(tokens: AuthTokens, chat_id: int, bot, loop) -> None:
                     vo     = next((a for a in actors if a.get("role") == "VALUATION OFFICER"), None)
                     if vo:
                         uid = (vo.get("user_details") or {}).get("id", "")
+                        ext = detail.get("external_process_details") or {}
                         tasks_by_userid.setdefault(uid, []).append({
-                            "reference_number": detail.get("reference_number", ""),
-                            "parcel_number":    detail.get("parcel_number", ""),
-                            "registry":         detail.get("registry", ""),
-                            "date_created":     detail.get("date_created", ""),
+                            "reference_number":   detail.get("reference_number", ""),
+                            "parcel_number":      detail.get("parcel_number", ""),
+                            "registry":           detail.get("registry", ""),
+                            "date_created":       detail.get("date_created", ""),
+                            "consideration_amount": ext.get("consideration_amount", ""),
                         })
                     else:
                         unassigned_tasks.append(task_summary)
