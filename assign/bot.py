@@ -5204,6 +5204,7 @@ async def recv_auth_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 _BE_LIST_URL   = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application"
 _BE_DETAIL_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view"
+_BE_REPORT_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/office-reports/get-current-office-report"
 _BE_PAGE_SIZE  = 10   # API default
 _BE_LIST_WORKERS        = 5
 _BE_DETAIL_WORKERS      = 5
@@ -5261,6 +5262,7 @@ _EXCEL_COLUMNS = [
     "Valuer Total Land Value (KES)",
     "Harmonized Total Land Value (KES)",
     "Document URL",
+    "Combined Report",
     "Enrich Error",
 ]
 
@@ -5389,6 +5391,44 @@ def _be_fetch_detail(sess: requests.Session, rotator: "_TokenRotator", app_id: s
             raise exc
 
 
+def _be_fetch_office_report(sess: requests.Session, rotator: "_TokenRotator", app_id: str) -> dict:
+    """Fetch the office report for one application. Returns {} on any error (non-critical)."""
+    while True:
+        tokens = rotator.current()
+        if tokens is None:
+            return {}
+        headers = _be_headers(tokens)
+        try:
+            resp = sess.get(_BE_REPORT_URL, headers=headers, params={"request_id": app_id}, timeout=30)
+            if resp.status_code == 403:
+                new_tokens = rotator.rotate(tokens)
+                if new_tokens is None:
+                    return {}
+                time.sleep(_BE_TOKEN_ROTATE_DELAY)
+                continue
+            if resp.status_code in (429, 502, 503, 504):
+                time.sleep(2)
+                continue
+            if resp.status_code == 404:
+                return {}
+            resp.raise_for_status()
+            return resp.json()
+        except _AllTokensExhausted:
+            return {}
+        except Exception:
+            return {}
+
+
+def _be_fetch_full_record(sess: requests.Session, rotator: "_TokenRotator", app_id: str) -> dict:
+    """Fetch detail + office report for one record and return the merged row dict."""
+    detail = _be_fetch_detail(sess, rotator, app_id)   # raises on error
+    report = _be_fetch_office_report(sess, rotator, app_id)
+    row    = _be_extract_row(detail)
+    docs   = report.get("combined_document") or []
+    row["Combined Report"] = docs[0].get("document", "") if docs else ""
+    return row
+
+
 def _be_extract_row(detail: dict) -> dict:
     """Extract the target columns from a detail-view response dict."""
     # Valuation Officer from actors[]
@@ -5431,6 +5471,7 @@ def _be_extract_row(detail: dict) -> dict:
         "Valuer Total Land Value (KES)":   land_value,
         "Harmonized Total Land Value (KES)": detail.get("harmonized_total_land_value", ""),
         "Document URL":                    doc_url,
+        "Combined Report":                 "",
         "Enrich Error":                    "",
     }
 
@@ -5752,17 +5793,16 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop,
             exhausted_flag   = threading.Event()
 
             with ThreadPoolExecutor(max_workers=_BE_DETAIL_WORKERS) as pool:
-                futures = {pool.submit(_be_fetch_detail, sess, rotator, app_id): app_id
+                futures = {pool.submit(_be_fetch_full_record, sess, rotator, app_id): app_id
                            for app_id in id_list}
                 for fut in _futures_as_completed(futures):
                     app_id = futures[fut]
                     try:
                         if exhausted_flag.is_set():
-                            # Tokens already gone — skip remaining futures
                             fut.cancel()
                             continue
-                        detail = fut.result()
-                        rows.append(_be_extract_row(detail))
+                        row = fut.result()
+                        rows.append(row)
                         current_done_ids.append(app_id)
                         _set_status(details_done=_BE_STATUS[chat_id]["details_done"] + 1)
                     except _AllTokensExhausted:
