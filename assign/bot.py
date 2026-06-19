@@ -7153,7 +7153,7 @@ async def recv_vt_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         try:
             fb_resp = http_sess.get(
-                "https://customercare.lands.go.ke/api/v1/ardhisasa/users/filter-staff",
+                f"{BASE_URL}/api/v1/accounts/filter-staff/",
                 headers={"Authorization": f"Bearer {tokens.access_token}", "JWTAUTH": f"Bearer {tokens.jwt}"},
                 params={"employee_number": name, "page": 1},
                 timeout=30,
