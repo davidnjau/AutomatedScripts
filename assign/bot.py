@@ -405,6 +405,7 @@ def _get_ft_sess(ctx: ContextTypes.DEFAULT_TYPE) -> FTSession:
 # ──────────────────────────────────────────────────────────
 class JD(Enum):
     PICK_CRED = auto()   # select account with valid token
+    COUNTY    = auto()   # multi-select county filter
     CONFIRM   = auto()   # confirm → kick off background analysis
 
 
@@ -6073,15 +6074,46 @@ def _post_assignment_report(tokens: AuthTokens, ok_refs: List[str]) -> List[str]
     return messages if messages else [header + "\nNo results returned."]
 
 
+# (key, display label) — key must match the county value returned by the API
+_JD_COUNTIES: List[Tuple[str, str]] = [
+    ("NAIROBI",  "🌆 Nairobi"),
+    ("KIAMBU",   "🏙 Kiambu"),
+    ("MURANGA",  "🏡 Murang'a"),
+    ("MACHAKOS", "🏞 Machakos"),
+    ("MOMBASA",  "🌊 Mombasa"),
+    ("ISIOLO",   "🌿 Isiolo"),
+    ("NAKURU",   "⛰ Nakuru"),
+]
+_JD_COUNTY_KEYS: List[str] = [k for k, _ in _JD_COUNTIES]
+
+
 @dataclass
 class JDSession:
-    cred_type: str = ""
+    cred_type: str       = ""
+    counties:  List[str] = field(default_factory=lambda: list(_JD_COUNTY_KEYS))
 
 
 def _get_jd_sess(ctx: ContextTypes.DEFAULT_TYPE) -> JDSession:
     if "jd_session" not in ctx.user_data:
         ctx.user_data["jd_session"] = JDSession()
     return ctx.user_data["jd_session"]
+
+
+def _jd_county_keyboard(selected: List[str]) -> InlineKeyboardMarkup:
+    """Multi-select county picker. selected is a list of county keys."""
+    rows = []
+    for key, label in _JD_COUNTIES:
+        mark = "✅" if key in selected else "☐"
+        rows.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"jd_county:{key}")])
+    rows.append([
+        InlineKeyboardButton("☑️ All",   callback_data="jd_county:ALL"),
+        InlineKeyboardButton("🔲 None",  callback_data="jd_county:NONE"),
+    ])
+    rows.append([
+        InlineKeyboardButton("▶️ Run Analysis", callback_data="jd_county:done"),
+        InlineKeyboardButton("❌ Cancel",        callback_data="jd_county:cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
 def _jd_headers(tokens: AuthTokens) -> dict:
@@ -6417,7 +6449,7 @@ def _jd_build_excel(
     return buf.getvalue()
 
 
-def _jd_run(tokens: AuthTokens, chat_id: int, bot, loop) -> None:
+def _jd_run(tokens: AuthTokens, chat_id: int, bot, loop, counties: Optional[List[str]] = None) -> None:
     """Background worker: fetch teams + task distribution, build Excel, send."""
     def _tg(text: str):
         asyncio.run_coroutine_threadsafe(
@@ -6490,6 +6522,15 @@ def _jd_run(tokens: AuthTokens, chat_id: int, bot, loop) -> None:
                 for fut in _futures_as_completed(futures):
                     task_list.extend(fut.result().get("results") or [])
 
+        # Apply county filter if specified
+        if counties:
+            counties_upper = {c.upper() for c in counties}
+            task_list = [t for t in task_list if t.get("county", "").upper() in counties_upper]
+            county_labels = ", ".join(
+                label for key, label in _JD_COUNTIES if key in counties_upper
+            )
+            _tg(f"🗺 County filter: *{county_labels}* → *{len(task_list)}* tasks remaining.")
+
         _set_status(phase="fetching task details", tasks_total=len(task_list))
         _tg(f"📄 *{len(task_list)}* ongoing tasks. Fetching assignment details…")
 
@@ -6559,7 +6600,8 @@ def _jd_run(tokens: AuthTokens, chat_id: int, bot, loop) -> None:
                 filename=filename,
                 caption=(
                     f"🏆 Job Distribution Report\n"
-                    f"Teams: {len(teams)} | Members: {total_members} | "
+                    + (f"Counties: {', '.join(counties)}\n" if counties else "")
+                    + f"Teams: {len(teams)} | Members: {total_members} | "
                     f"Assigned: {assigned_count} | Unassigned: {unassigned_count}"
                 ),
             ),
@@ -6606,53 +6648,84 @@ async def recv_jd_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     sess           = _get_jd_sess(ctx)
     sess.cred_type = query.data.split(":")[1]
+    sess.counties  = list(_JD_COUNTY_KEYS)   # reset to all selected
     cred_label     = CRED_LABELS.get(sess.cred_type, sess.cred_type)
 
     await query.edit_message_text(
         f"✅ Account: *{cred_label}*\n\n"
-        "The analysis will:\n"
-        "• Fetch all teams and their members\n"
-        "• Fetch all Ongoing stamp-duty tasks\n"
-        "• Identify the assigned Valuation Officer per task\n"
-        "• Export a 3-sheet Excel: Team Summary, Member Distribution, Unassigned Tasks\n\n"
-        "Tap *Run Analysis* to start.",
+        "🗺 *Select counties to include in the report:*\n"
+        "_(all 7 pre-selected — tap to toggle)_",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("▶️ Run Analysis", callback_data="jd:yes"),
-            InlineKeyboardButton("❌ Cancel",       callback_data="jd:no"),
-        ]]),
+        reply_markup=_jd_county_keyboard(sess.counties),
     )
-    return JD.CONFIRM
+    return JD.COUNTY
 
 
-async def recv_jd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def recv_jd_county(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     query = update.callback_query
-    await query.answer()
+    sess  = _get_jd_sess(ctx)
+    data  = query.data.split(":", 1)[1]
 
-    if query.data == "jd:no":
+    if data == "cancel":
+        await query.answer()
         await query.edit_message_text("❌ Analysis cancelled.")
         await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
         return ConversationHandler.END
 
-    sess   = _get_jd_sess(ctx)
-    tokens = get_valid_tokens(sess.cred_type)
-    if not tokens:
-        cred_label = CRED_LABELS.get(sess.cred_type, sess.cred_type)
+    if data == "done":
+        if not sess.counties:
+            await query.answer("Select at least one county first.", show_alert=True)
+            return JD.COUNTY
+        await query.answer()
+        tokens = get_valid_tokens(sess.cred_type)
+        if not tokens:
+            cred_label = CRED_LABELS.get(sess.cred_type, sess.cred_type)
+            await query.edit_message_text(
+                f"❌ Tokens for *{cred_label}* have expired. Use *🔑 Refresh Auth* first.",
+                parse_mode="Markdown",
+            )
+            await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+            return ConversationHandler.END
+
+        county_labels = ", ".join(
+            label for key, label in _JD_COUNTIES if key in sess.counties
+        )
         await query.edit_message_text(
-            f"❌ Tokens for *{cred_label}* have expired. Use *🔑 Refresh Auth* first.",
+            f"⏳ Analysis running for: *{county_labels}*\n\nYou will be notified when done.",
             parse_mode="Markdown",
         )
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Returning to menu.", reply_markup=_main_menu())
+
+        loop = asyncio.get_event_loop()
+        asyncio.ensure_future(
+            asyncio.to_thread(_jd_run, tokens, query.message.chat_id, ctx.bot, loop, list(sess.counties))
+        )
         return ConversationHandler.END
 
-    await query.edit_message_text("⏳ Analysis running in background — you will be notified when done.")
-    await ctx.bot.send_message(query.message.chat_id, "Returning to menu.", reply_markup=_main_menu())
+    # Toggle logic
+    await query.answer()
+    if data == "ALL":
+        sess.counties = list(_JD_COUNTY_KEYS)
+    elif data == "NONE":
+        sess.counties = []
+    else:
+        if data in sess.counties:
+            sess.counties.remove(data)
+        else:
+            sess.counties.append(data)
 
-    loop = asyncio.get_event_loop()
-    asyncio.ensure_future(
-        asyncio.to_thread(_jd_run, tokens, query.message.chat_id, ctx.bot, loop)
-    )
+    await query.edit_message_reply_markup(reply_markup=_jd_county_keyboard(sess.counties))
+    return JD.COUNTY
+
+
+async def recv_jd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Kept for backward compatibility — not reached in the current flow
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("❌ Cancelled.")
+    await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
     return ConversationHandler.END
 
 
@@ -7241,8 +7314,9 @@ def main():
             MessageHandler(filters.Regex(f"^{re.escape(BTN_JOB_DIST)}$"), cmd_job_distribution),
         ],
         states={
-            JD.PICK_CRED: [CallbackQueryHandler(recv_jd_cred,     pattern=r"^be_cred:")],
-            JD.CONFIRM:   [CallbackQueryHandler(recv_jd_confirm,  pattern=r"^jd:")],
+            JD.PICK_CRED: [CallbackQueryHandler(recv_jd_cred,    pattern=r"^be_cred:")],
+            JD.COUNTY:    [CallbackQueryHandler(recv_jd_county,  pattern=r"^jd_county:")],
+            JD.CONFIRM:   [CallbackQueryHandler(recv_jd_confirm, pattern=r"^jd:")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
