@@ -408,6 +408,13 @@ class JD(Enum):
     CONFIRM   = auto()   # confirm → kick off background analysis
 
 
+# States — Lookup Reference conversation
+# ──────────────────────────────────────────────────────────
+class LU(Enum):
+    PICK_CRED = auto()   # select account with valid token
+    REF_INPUT = auto()   # enter reference number(s)
+
+
 # States — Bulk Export conversation
 # ──────────────────────────────────────────────────────────
 class BE(Enum):
@@ -500,6 +507,7 @@ BTN_AF_RESULTS    = "🗂 AF Results"
 BTN_BULK_EXPORT   = "📤 Export Valuation Report"
 BTN_EXPORT_STATUS = "📊 Export Status"
 BTN_JOB_DIST      = "🏆 Job Distribution"
+BTN_LOOKUP        = "🔎 Lookup Reference"
 BTN_HELP          = "❓ Help"
 BTN_RESTART       = "🔁 Restart Bot"
 BTN_CANCEL        = "🛑 Cancel"
@@ -511,7 +519,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_DAEMON)}"
     f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
     f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_AF_RESULTS)}|{re.escape(BTN_BULK_EXPORT)}"
-    f"|{re.escape(BTN_EXPORT_STATUS)}|{re.escape(BTN_JOB_DIST)}"
+    f"|{re.escape(BTN_EXPORT_STATUS)}|{re.escape(BTN_JOB_DIST)}|{re.escape(BTN_LOOKUP)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -526,6 +534,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(BTN_AF_RESULTS),   KeyboardButton(BTN_ASSIGNMENTS)],
             [KeyboardButton(BTN_BULK_EXPORT), KeyboardButton(BTN_EXPORT_STATUS)],
             [KeyboardButton(BTN_JOB_DIST)],
+            [KeyboardButton(BTN_LOOKUP)],
             [KeyboardButton(BTN_DAEMON)],
             [KeyboardButton(BTN_AUTH),         KeyboardButton(BTN_TOKEN_STATUS)],
             [KeyboardButton(BTN_RESTART)],
@@ -1381,13 +1390,20 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(summary) > 4000:
         summary = summary[:4000] + "\n…_(truncated)_"
 
-    await query.message.reply_text(summary, parse_mode="Markdown", reply_markup=_main_menu())
+    await query.message.reply_text(summary, parse_mode="Markdown")
 
     if fail_refs:
         await query.message.reply_text(
             "⚠️ Some assignments failed. Tap *📋 New Assignment* to retry failed refs.",
             parse_mode="Markdown",
         )
+
+    if ok_refs:
+        await query.message.reply_text("🔍 Fetching post-assignment status…", parse_mode="Markdown")
+        pages = await asyncio.to_thread(_post_assignment_report, sess.tokens, ok_refs)
+        for i, page in enumerate(pages):
+            markup = _main_menu() if i == len(pages) - 1 else None
+            await query.message.reply_text(page, parse_mode="Markdown", reply_markup=markup)
 
     return ConversationHandler.END
 
@@ -4911,7 +4927,16 @@ async def _ta_run_assign(message, ctx: ContextTypes.DEFAULT_TYPE,
     )
     if len(summary) > 4000:
         summary = summary[:4000] + "\n…_(truncated)_"
-    await message.reply_text(summary, parse_mode="Markdown", reply_markup=_main_menu())
+    await message.reply_text(summary, parse_mode="Markdown")
+
+    if ok_refs:
+        await message.reply_text("🔍 Fetching post-assignment status…", parse_mode="Markdown")
+        pages = await asyncio.to_thread(_post_assignment_report, tokens, ok_refs)
+        for i, page in enumerate(pages):
+            markup = _main_menu() if i == len(pages) - 1 else None
+            await message.reply_text(page, parse_mode="Markdown", reply_markup=markup)
+    else:
+        await message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
 
     # Clear pending state
     ctx.user_data.pop("ta_pending", None)
@@ -5874,6 +5899,181 @@ _JD_WORKERS       = 5
 
 
 @dataclass
+class LUSession:
+    cred_type: str = ""
+
+
+def _get_lu_sess(ctx: ContextTypes.DEFAULT_TYPE) -> LUSession:
+    if "lu_session" not in ctx.user_data:
+        ctx.user_data["lu_session"] = LUSession()
+    return ctx.user_data["lu_session"]
+
+
+# Node code → human-readable label
+_NODE_LABELS: Dict[str, str] = {
+    "VALUATION_STAMP_DUTY_CREATED":        "📭 Unassigned (awaiting valuer)",
+    "VALUATION_STAMP_DUTY_VALUER_REPORT":  "✍️ Assigned — valuer report pending",
+    "STAMP_DUTY_PAYMENT_DEFINITION":       "💳 Payment stage",
+}
+
+# (filter, role, cparams) combos to try when searching by reference number.
+# Ordered from most likely to least likely.
+_LU_SEARCH_COMBOS = [
+    ("Ongoing",   "DLV",    CPARAMS_DLV),
+    ("Pending",   "DLV",    CPARAMS_DLV),
+    ("Completed", "DLV",    CPARAMS_DLV),
+    ("Ongoing",   "VALUER", CPARAMS_VALUER_ROLE),
+    ("Pending",   "VALUER", CPARAMS_VALUER_ROLE),
+]
+
+_LU_LIST_URL   = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application"
+_LU_DETAIL_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view"
+
+
+def _lu_search_ref(tokens: AuthTokens, ref: str) -> Optional[Dict]:
+    """Search all filter/role combos for ref. Returns the list-item dict (with 'id') or None."""
+    http_sess = build_session()
+    hdrs = {
+        "Authorization": f"Bearer {tokens.access_token}",
+        "JWTAUTH":       f"Bearer {tokens.jwt}",
+    }
+    for filt, role, cparams in _LU_SEARCH_COMBOS:
+        try:
+            resp = http_sess.get(
+                _LU_LIST_URL,
+                headers={**hdrs, "cparams": cparams},
+                params={
+                    "filter":       filt,
+                    "role":         role,
+                    "request_type": "STAMP_DUTY",
+                    "search":       ref,
+                    "page":         1,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            for item in resp.json().get("results", []):
+                if item.get("reference_number") == ref:
+                    item["_matched_filter"] = filt
+                    return item
+        except Exception as e:
+            logger.warning("LU search combo %s/%s failed: %s", filt, role, e)
+    return None
+
+
+def _lu_fetch_detail(tokens: AuthTokens, app_id: str) -> Optional[Dict]:
+    """Fetch detail-view for a given internal application ID."""
+    http_sess = build_session()
+    try:
+        resp = http_sess.get(
+            _LU_DETAIL_URL,
+            headers={
+                "Authorization": f"Bearer {tokens.access_token}",
+                "JWTAUTH":       f"Bearer {tokens.jwt}",
+                "cparams":       CPARAMS_DLV,
+            },
+            params={"request_id": app_id},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.warning("LU detail fetch failed for id=%s: %s", app_id, e)
+        return None
+
+
+def _lu_format_result(ref: str, item: Dict, detail: Optional[Dict]) -> str:
+    """Build the lookup result message from list-item + detail-view data."""
+    status = (item.get("application_status") or item.get("status") or "—").upper()
+    node_raw = ""
+    valuer_name = "—"
+    consideration = "—"
+    ext: Dict = {}
+
+    if detail:
+        node_raw    = detail.get("node", "")
+        ext         = detail.get("external_process_details") or {}
+        actors      = detail.get("actors") or []
+        vo          = next((a for a in actors if a.get("role") == "VALUATION OFFICER"), None)
+        if vo:
+            valuer_name = (vo.get("user_details") or {}).get("names", "—")
+        consideration_raw = ext.get("consideration_amount", "")
+        if consideration_raw:
+            currency = ext.get("currency_code", "KES")
+            try:
+                consideration = f"{currency} {float(consideration_raw):,.2f}"
+            except (ValueError, TypeError):
+                consideration = str(consideration_raw)
+
+    node_label  = _NODE_LABELS.get(node_raw, node_raw or "—")
+    registry    = (detail or item).get("registry") or item.get("registry") or "—"
+    county      = (detail or item).get("county")   or item.get("county")   or "—"
+    parcel      = (detail or item).get("parcel_number") or item.get("parcel_number") or \
+                  ext.get("parcel_number") or "—"
+    created     = item.get("date_created", "—")
+
+    lines = [
+        f"🔎 *Reference Lookup*\n",
+        f"📌 *Ref:* `{ref}`",
+        f"📊 *Status:* {status}",
+        f"🔄 *Node:* {node_label}",
+        f"👤 *Valuer:* {valuer_name}",
+        f"🏢 *Registry:* {registry}",
+        f"📍 *County:* {county}",
+        f"💰 *Consideration:* {consideration}",
+        f"📋 *Parcel:* {parcel}",
+        f"📅 *Created:* {created}",
+    ]
+    return "\n".join(lines)
+
+
+def _lookup_one_ref(tokens: AuthTokens, ref: str) -> str:
+    """Search + detail-fetch for a single ref. Returns a formatted result string."""
+    item = _lu_search_ref(tokens, ref)
+    if not item:
+        return f"⚠️ `{ref}` — not found in post-assignment lookup"
+    detail = _lu_fetch_detail(tokens, item["id"])
+    return _lu_format_result(ref, item, detail)
+
+
+def _post_assignment_report(tokens: AuthTokens, ok_refs: List[str]) -> List[str]:
+    """
+    Run lookups for all successfully assigned refs in parallel and return a
+    list of message strings (each ≤ 4000 chars) ready to send to Telegram.
+    """
+    results: Dict[str, str] = {}
+    workers = min(len(ok_refs), 10)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        fut_map = {pool.submit(_lookup_one_ref, tokens, ref): ref for ref in ok_refs}
+        for fut in _futures_as_completed(fut_map):
+            ref = fut_map[fut]
+            try:
+                results[ref] = fut.result()
+            except Exception as e:
+                results[ref] = f"⚠️ `{ref}` — lookup error: {e}"
+
+    # Build paginated messages — start each page with the header
+    header    = "📋 *Post-Assignment Verification*\n"
+    divider   = "\n" + "─" * 30 + "\n"
+    messages  = []
+    current   = header
+
+    for ref in ok_refs:
+        block = results.get(ref, f"⚠️ `{ref}` — no result")
+        chunk = divider + block if current != header else "\n" + block
+        if len(current) + len(chunk) > 4000:
+            messages.append(current.rstrip())
+            current = header + "\n" + block
+        else:
+            current += chunk
+
+    if current.strip() and current.strip() != header.strip():
+        messages.append(current.rstrip())
+
+    return messages if messages else [header + "\nNo results returned."]
+
+
+@dataclass
 class JDSession:
     cred_type: str = ""
 
@@ -6456,6 +6656,87 @@ async def recv_jd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ── Lookup Reference conversation handlers ────────────────
+
+async def cmd_lookup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    sess           = _get_lu_sess(ctx)
+    sess.cred_type = ""
+
+    kbd = _be_cred_keyboard()
+    if not kbd:
+        await update.message.reply_text(
+            "❌ No valid cached tokens. Use *🔑 Refresh Auth* first.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "🔎 *Reference Lookup*\n\n"
+        "Find out which valuer holds an application and its current node.\n\n"
+        "👤 *Select the account to search with:*",
+        parse_mode="Markdown",
+        reply_markup=kbd,
+    )
+    return LU.PICK_CRED
+
+
+async def recv_lu_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+
+    sess           = _get_lu_sess(ctx)
+    sess.cred_type = query.data.split(":")[1]
+
+    await query.edit_message_text(
+        f"✅ Account: *{CRED_LABELS.get(sess.cred_type, sess.cred_type)}*\n\n"
+        "Enter a *reference number* to look up\n"
+        "(e.g. `NBI/STAMP/2024/12345`):",
+        parse_mode="Markdown",
+    )
+    return LU.REF_INPUT
+
+
+async def recv_lu_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+
+    sess = _get_lu_sess(ctx)
+    ref  = (update.message.text or "").strip()
+
+    if not ref:
+        await update.message.reply_text("Please enter a reference number.")
+        return LU.REF_INPUT
+
+    tokens = get_valid_tokens(sess.cred_type)
+    if not tokens:
+        await update.message.reply_text(
+            f"❌ Tokens expired. Use *🔑 Refresh Auth* first.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text(f"🔍 Searching for `{ref}`…", parse_mode="Markdown")
+
+    item = await asyncio.to_thread(_lu_search_ref, tokens, ref)
+    if not item:
+        await update.message.reply_text(
+            f"❌ Reference `{ref}` not found across all filters (Ongoing, Pending, Completed).\n\n"
+            "Check the reference number and try again.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
+    detail = await asyncio.to_thread(_lu_fetch_detail, tokens, item["id"])
+    result = _lu_format_result(ref, item, detail)
+
+    await update.message.reply_text(result, parse_mode="Markdown", reply_markup=_main_menu())
+    return ConversationHandler.END
+
+
 # ── Bulk Export conversation handlers ─────────────────────
 
 async def _bulk_export_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6972,6 +7253,24 @@ def main():
         per_message=False,
     )
 
+    lu_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("lookup", cmd_lookup),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_LOOKUP)}$"), cmd_lookup),
+        ],
+        states={
+            LU.PICK_CRED: [CallbackQueryHandler(recv_lu_cred, pattern=r"^be_cred:")],
+            LU.REF_INPUT: [MessageHandler(not_cancel, recv_lu_ref)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(_CANCEL_FILTER, cmd_cancel),
+            MessageHandler(filters.TEXT, fallback),
+        ],
+        allow_reentry=True,
+        per_message=False,
+    )
+
     app.add_handler(conv)
     app.add_handler(db_conv)
     app.add_handler(auth_conv)
@@ -6980,6 +7279,7 @@ def main():
     app.add_handler(rs_conv)
     app.add_handler(be_conv)
     app.add_handler(jd_conv)
+    app.add_handler(lu_conv)
     app.add_handler(MessageHandler(
         filters.Regex(f"^{re.escape(BTN_EXPORT_STATUS)}$"), cmd_export_status
     ))
