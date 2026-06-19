@@ -7,6 +7,9 @@ services:
     # No ports needed — bot uses long-polling, not webhooks
     volumes:
       - bot_data:/app/data
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     logging:
       driver: "json-file"
       options:
