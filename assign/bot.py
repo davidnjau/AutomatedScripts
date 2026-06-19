@@ -7146,11 +7146,45 @@ async def recv_vt_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if not results:
+        # Fallback: try employee-number search
         await update.message.reply_text(
-            f"⚠️ No staff found for *{name}*. Try a different name.",
+            f"🔍 No name match — trying employee number *{name}*…",
             parse_mode="Markdown",
         )
-        return VT.STAFF_NAME
+        try:
+            fb_resp = http_sess.get(
+                f"{BASE_URL}/api/v1/ardhisasa/users/filter-staff",
+                headers={"Authorization": f"Bearer {tokens.access_token}", "JWTAUTH": f"Bearer {tokens.jwt}"},
+                params={"employee_number": name, "page": 1},
+                timeout=30,
+            )
+            fb_resp.raise_for_status()
+            fb_raw = fb_resp.json()
+            # Response may be a list or a dict with 'results'
+            if isinstance(fb_raw, list):
+                fb_list = fb_raw
+            else:
+                fb_list = fb_raw.get("results", fb_raw.get("data", []))
+                if isinstance(fb_list, dict):
+                    fb_list = [fb_list]
+            # Normalize: map 'profile' → 'staff_details' so recv_vt_select works unchanged
+            for item in fb_list:
+                if "profile" in item and "staff_details" not in item:
+                    item["staff_details"] = item["profile"]
+            results = fb_list
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Employee number search failed: `{e}`",
+                parse_mode="Markdown", reply_markup=_main_menu(),
+            )
+            return ConversationHandler.END
+
+        if not results:
+            await update.message.reply_text(
+                f"⚠️ No staff found for *{name}*. Try a different name or employee number.",
+                parse_mode="Markdown",
+            )
+            return VT.STAFF_NAME
 
     ctx.user_data["vt_search_results"] = results
     rows = []
