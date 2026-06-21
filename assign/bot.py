@@ -42,7 +42,7 @@ from email import encoders as _email_encoders
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as _dtime
 from typing import Dict, List, Optional, Tuple
 
 import anthropic
@@ -123,6 +123,9 @@ SAVED_BULK_EXPORT_SCHED_FILE    = os.path.join(DATA_DIR, "saved_bulk_export_sche
 SAVED_BULK_EXPORT_PARTIAL_FILE  = os.path.join(DATA_DIR, "saved_bulk_export_partial.json")
 SAVED_AUTO_FETCH_FILE   = os.path.join(DATA_DIR, "saved_auto_fetch.json")
 SAVED_AF_RESULTS_FILE   = os.path.join(DATA_DIR, "saved_af_results.json")
+SAVED_SLA_CONFIG_FILE       = os.path.join(DATA_DIR, "saved_sla_config.json")
+SAVED_BRIEFING_CONFIG_FILE  = os.path.join(DATA_DIR, "saved_briefing_config.json")
+SAVED_SECTIONAL_CONFIG_FILE = os.path.join(DATA_DIR, "saved_sectional_config.json")
 
 # base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
 CPARAMS_DLV          = base64.b64encode(b'{"active_role":"DLV"}').decode()
@@ -455,19 +458,49 @@ class BE(Enum):
     CONFIRM   = auto()   # confirm → kick off background export
 
 
+# States — SLA Alerts conversation
+class SLA(Enum):
+    THRESHOLD = auto()   # enter aging threshold in days
+    INTERVAL  = auto()   # how often to check (hours)
+
+
+# States — Sectional Properties conversation
+class SC(Enum):
+    ACTION   = auto()   # show current config + action buttons
+    SET_NAME = auto()   # enter specialist name to search
+    SELECT   = auto()   # pick from search results
+    CRED     = auto()   # pick credential to use for auto-assignment
+
+
 # County → list of registry names as they appear in the API response
 _BE_COUNTY_REGISTRIES: Dict[str, List[str]] = {
-    "NAIROBI":  ["NAIROBI", "CENTRAL"],
-    "KIAMBU":   ["KIAMBU", "LIMURU", "THIKA", "RUIRU", "GITHUNGURI"],
-    "MURANGA":  ["MURANGA", "KANDARA", "MARAGUA", "KANGEMA"],
-    "MOMBASA":  ["MOMBASA", "COAST"],
+    "NAIROBI":   ["NAIROBI", "CENTRAL"],
+    "KIAMBU":    ["KIAMBU", "LIMURU", "THIKA", "RUIRU", "GITHUNGURI"],
+    "MURANGA":   ["MURANGA", "KANDARA", "MARAGUA", "KANGEMA"],
+    "MOMBASA":   ["MOMBASA", "COAST"],
+    "NAKURU":    ["NAKURU", "NAIVASHA", "GILGIL", "MOLO"],
+    "KISUMU":    ["KISUMU", "MASENO"],
+    "NYERI":     ["NYERI", "KARATINA", "OTHAYA"],
+    "MACHAKOS":  ["MACHAKOS", "MAVOKO"],
+    "KAJIADO":   ["KAJIADO", "NGONG"],
+    "MERU":      ["MERU"],
+    "LAIKIPIA":  ["LAIKIPIA", "NANYUKI"],
+    "EMBU":      ["EMBU"],
 }
 
 _BE_COUNTY_LABELS: Dict[str, str] = {
-    "NAIROBI": "🌆 Nairobi",
-    "KIAMBU":  "🏙 Kiambu",
-    "MURANGA": "🏡 Murang'a",
-    "MOMBASA": "🌊 Mombasa",
+    "NAIROBI":   "🌆 Nairobi",
+    "KIAMBU":    "🏙 Kiambu",
+    "MURANGA":   "🏡 Murang'a",
+    "MOMBASA":   "🌊 Mombasa",
+    "NAKURU":    "🌿 Nakuru",
+    "KISUMU":    "🐟 Kisumu",
+    "NYERI":     "🏔 Nyeri",
+    "MACHAKOS":  "🦏 Machakos",
+    "KAJIADO":   "🌄 Kajiado",
+    "MERU":      "🌲 Meru",
+    "LAIKIPIA":  "🦁 Laikipia",
+    "EMBU":      "🌱 Embu",
 }
 
 
@@ -542,6 +575,9 @@ BTN_VALUER_TASKS  = "👤 Valuer Tasks"
 BTN_HELP          = "❓ Help"
 BTN_RESTART       = "🔁 Restart Bot"
 BTN_CANCEL        = "🛑 Cancel"
+BTN_SLA           = "⚠️ SLA Alerts"
+BTN_BRIEFING      = "🌅 Morning Briefing"
+BTN_SECTIONAL     = "🔲 Sectional"
 
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
@@ -552,6 +588,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_AF_RESULTS)}|{re.escape(BTN_BULK_EXPORT)}"
     f"|{re.escape(BTN_EXPORT_STATUS)}|{re.escape(BTN_JOB_DIST)}|{re.escape(BTN_LOOKUP)}"
     f"|{re.escape(BTN_VALUER_TASKS)}"
+    f"|{re.escape(BTN_SLA)}|{re.escape(BTN_BRIEFING)}|{re.escape(BTN_SECTIONAL)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -568,6 +605,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(BTN_DLV_BATCH)],
             [KeyboardButton(BTN_BULK_EXPORT),    KeyboardButton(BTN_EXPORT_STATUS)],
             [KeyboardButton(BTN_JOB_DIST),       KeyboardButton(BTN_VALUER_TASKS)],
+            [KeyboardButton(BTN_SLA),            KeyboardButton(BTN_BRIEFING),    KeyboardButton(BTN_SECTIONAL)],
             # ── Lookup ──────────────────────────────────────
             [KeyboardButton(BTN_LOOKUP)],
             [KeyboardButton(BTN_AUTH),           KeyboardButton(BTN_TOKEN_STATUS)],
@@ -3146,6 +3184,55 @@ def clear_auto_fetch_schedule() -> None:
         pass
 
 
+# ── SLA Alerts config ──────────────────────────────────────
+
+def load_sla_config() -> Optional[Dict]:
+    try:
+        with open(SAVED_SLA_CONFIG_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_sla_config(cfg: Dict) -> None:
+    _atomic_json_write(SAVED_SLA_CONFIG_FILE, cfg, indent=2)
+
+
+def clear_sla_config() -> None:
+    try:
+        os.remove(SAVED_SLA_CONFIG_FILE)
+    except FileNotFoundError:
+        pass
+
+
+# ── Morning Briefing config ────────────────────────────────
+
+def load_briefing_config() -> Optional[Dict]:
+    try:
+        with open(SAVED_BRIEFING_CONFIG_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_briefing_config(cfg: Dict) -> None:
+    _atomic_json_write(SAVED_BRIEFING_CONFIG_FILE, cfg, indent=2)
+
+
+# ── Sectional Properties config ────────────────────────────
+
+def load_sectional_config() -> Optional[Dict]:
+    try:
+        with open(SAVED_SECTIONAL_CONFIG_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_sectional_config(cfg: Dict) -> None:
+    _atomic_json_write(SAVED_SECTIONAL_CONFIG_FILE, cfg, indent=2)
+
+
 # ── Auto Fetch result history ──────────────────────────────
 _AF_RESULTS_KEEP = 20   # keep last N runs
 
@@ -3558,6 +3645,58 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     queued_refs = {item.get("ref", "") for item in load_dlv_batch()}
     tasks = [t for t in tasks if t.get("reference_number", "") not in queued_refs]
 
+    # Sectional auto-routing: if a specialist is configured, auto-assign sectional tasks
+    sc_cfg = load_sectional_config()
+    if sc_cfg and sc_cfg.get("auto_route") and sc_cfg.get("specialist") and sc_cfg.get("cred_type"):
+        specialist   = sc_cfg["specialist"]
+        sc_cred_type = sc_cfg["cred_type"]
+        sc_tokens    = get_valid_tokens(sc_cred_type)
+        if sc_tokens:
+            sectional_tasks  = [t for t in tasks if str(t.get("parcel_number") or "").count("/") >= 3]
+            remaining_tasks  = [t for t in tasks if str(t.get("parcel_number") or "").count("/") < 3]
+            if sectional_tasks:
+                assigned_sc = []
+                failed_sc   = []
+                sc_sess     = build_session()
+                sc_hdrs     = {
+                    "Authorization": f"Bearer {sc_tokens.access_token}",
+                    "JWTAUTH":       f"Bearer {sc_tokens.jwt}",
+                    "cparams":       CPARAMS_VALUER_ROLE,
+                }
+                for t in sectional_tasks:
+                    ref = t.get("reference_number", "")
+                    try:
+                        r = sc_sess.put(
+                            f"{BASE_URL}/valuationservice/api/v1/stamp-duty/fix_application_details",
+                            headers=sc_hdrs,
+                            json={"request_id": t.get("id", ""), "valuation_officer": specialist["uid"]},
+                            timeout=30,
+                        )
+                        if r.status_code in (200, 201):
+                            assigned_sc.append(ref)
+                            persist_assignment(ref, specialist["name"], specialist["uid"])
+                        else:
+                            failed_sc.append(ref)
+                    except Exception as e:
+                        logger.warning("Sectional auto-assign failed for %s: %s", ref, e)
+                        failed_sc.append(ref)
+
+                if assigned_sc or failed_sc:
+                    sc_msg = (
+                        f"🔲 *Sectional Auto-Assign* — {specialist['name']}\n"
+                        f"✅ Assigned: {len(assigned_sc)} | ❌ Failed: {len(failed_sc)}\n"
+                    )
+                    if assigned_sc:
+                        sc_msg += "\n".join(f"  ✅ {r}" for r in assigned_sc[:10])
+                    if failed_sc:
+                        sc_msg += "\n" + "\n".join(f"  ❌ {r}" for r in failed_sc[:5])
+                    for chat_id in ALLOWED_IDS:
+                        try:
+                            await context.bot.send_message(chat_id, sc_msg, parse_mode="Markdown")
+                        except Exception as e:
+                            logger.warning("Sectional auto-assign notify error for %s: %s", chat_id, e)
+                tasks = remaining_tasks
+
     # Persist result history (record even if empty so the run appears in AF Results)
     _af_run_id = str(uuid.uuid4())[:8]
     _af_run_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -3650,6 +3789,502 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.info("Auto Fetch email sent to %s", email)
         except Exception as e:
             logger.warning("Auto Fetch email failed: %s", e)
+
+
+# ──────────────────────────────────────────────────────────
+# SLA Alerts background job
+# ──────────────────────────────────────────────────────────
+
+async def _sla_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Background job: check ONGOING tasks for aging and alert if any exceed the threshold."""
+    cfg = load_sla_config()
+    if not cfg or not cfg.get("enabled"):
+        return
+
+    tokens = _any_valid_tokens()
+    if not tokens:
+        logger.warning("SLA job: no valid tokens — skipping.")
+        return
+
+    threshold_days = cfg.get("threshold_days", 7)
+    http_sess = build_session()
+    headers = {
+        "Authorization": f"Bearer {tokens.access_token}",
+        "JWTAUTH":       f"Bearer {tokens.jwt}",
+        "cparams":       CPARAMS_DLV,
+    }
+
+    all_tasks = []
+    page = 1
+    while True:
+        try:
+            resp = http_sess.get(
+                f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
+                headers=headers,
+                params={"filter": "Ongoing", "role": "DLV", "request_type": "STAMP_DUTY", "page": page},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", [])
+            if not results:
+                break
+            all_tasks.extend(results)
+            if len(results) < 100:
+                break
+            page += 1
+        except Exception as e:
+            logger.warning("SLA job: fetch page %d failed: %s", page, e)
+            break
+
+    if not all_tasks:
+        return
+
+    now = datetime.now(tz=timezone.utc)
+    aged = []
+    county_counts: Dict[str, int] = {}
+
+    for t in all_tasks:
+        raw_date = t.get("date_created") or t.get("created_at") or ""
+        try:
+            created = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+            age_days = (now - created).days
+        except (ValueError, TypeError):
+            age_days = 0
+        if age_days >= threshold_days:
+            county = (t.get("county") or "Unknown").upper()
+            county_counts[county] = county_counts.get(county, 0) + 1
+            aged.append({
+                "ref":      t.get("reference_number", "—"),
+                "county":   county,
+                "registry": (t.get("registry") or "—").upper(),
+                "age_days": age_days,
+            })
+
+    if not aged:
+        return
+
+    aged.sort(key=lambda x: x["age_days"], reverse=True)
+    county_lines = "\n".join(
+        f"  • {c}: {n} task(s)" for c, n in sorted(county_counts.items())
+    )
+    top_5 = aged[:5]
+    top_lines = "\n".join(
+        f"  {i+1}. {t['ref']} — {t['age_days']}d ({t['county']}/{t['registry']})"
+        for i, t in enumerate(top_5)
+    )
+    msg = (
+        f"⚠️ *SLA Alert — {len(aged)} aged task(s)*\n"
+        f"Threshold: >{threshold_days} days old | Total ONGOING: {len(all_tasks)}\n\n"
+        f"*By county:*\n{county_lines}\n\n"
+        f"*Oldest tasks:*\n{top_lines}"
+    )
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n…_(truncated)_"
+    for chat_id in ALLOWED_IDS:
+        try:
+            await context.bot.send_message(chat_id, msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("SLA job notify error for %s: %s", chat_id, e)
+
+
+# ──────────────────────────────────────────────────────────
+# Morning Briefing background job
+# ──────────────────────────────────────────────────────────
+
+async def _send_briefing(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    for chat_id in ALLOWED_IDS:
+        try:
+            await context.bot.send_message(chat_id, text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("Morning briefing notify error for %s: %s", chat_id, e)
+
+
+async def _morning_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Daily 8 AM EAT briefing: ONGOING task backlog by county and age."""
+    cfg = load_briefing_config()
+    if not cfg or not cfg.get("enabled"):
+        return
+
+    tokens = _any_valid_tokens()
+    if not tokens:
+        logger.warning("Morning briefing job: no valid tokens — skipping.")
+        return
+
+    http_sess = build_session()
+    headers = {
+        "Authorization": f"Bearer {tokens.access_token}",
+        "JWTAUTH":       f"Bearer {tokens.jwt}",
+        "cparams":       CPARAMS_DLV,
+    }
+
+    all_tasks = []
+    page = 1
+    while True:
+        try:
+            resp = http_sess.get(
+                f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
+                headers=headers,
+                params={"filter": "Ongoing", "role": "DLV", "request_type": "STAMP_DUTY", "page": page},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", [])
+            if not results:
+                break
+            all_tasks.extend(results)
+            if len(results) < 100:
+                break
+            page += 1
+        except Exception as e:
+            logger.warning("Morning briefing job: fetch page %d failed: %s", page, e)
+            break
+
+    if not all_tasks:
+        await _send_briefing(context, "📋 *Morning Briefing*\n\nNo ONGOING tasks found.")
+        return
+
+    now = datetime.now(tz=timezone.utc)
+    buckets = {"0-3 days": 0, "4-7 days": 0, "8-14 days": 0, ">14 days": 0}
+    county_counts: Dict[str, int] = {}
+    oldest_days = 0
+    oldest_ref  = "—"
+
+    for t in all_tasks:
+        raw_date = t.get("date_created") or t.get("created_at") or ""
+        try:
+            created   = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+            age_days  = (now - created).days
+        except (ValueError, TypeError):
+            age_days = 0
+
+        if age_days <= 3:
+            buckets["0-3 days"] += 1
+        elif age_days <= 7:
+            buckets["4-7 days"] += 1
+        elif age_days <= 14:
+            buckets["8-14 days"] += 1
+        else:
+            buckets[">14 days"] += 1
+
+        county = (t.get("county") or "Unknown").upper()
+        county_counts[county] = county_counts.get(county, 0) + 1
+
+        if age_days > oldest_days:
+            oldest_days = age_days
+            oldest_ref  = t.get("reference_number", "—")
+
+    bucket_lines = "\n".join(f"  {label}: {count}" for label, count in buckets.items())
+    county_lines = "\n".join(
+        f"  {c}: {n}" for c, n in sorted(county_counts.items(), key=lambda x: -x[1])[:8]
+    )
+    today = now.strftime("%d %b %Y")
+    msg = (
+        f"🌅 *Morning Briefing — {today}*\n"
+        f"Total ONGOING: *{len(all_tasks)}*\n\n"
+        f"*Age breakdown:*\n{bucket_lines}\n\n"
+        f"*Top counties:*\n{county_lines}\n\n"
+        f"Oldest task: *{oldest_days}d* ({oldest_ref})"
+    )
+    await _send_briefing(context, msg)
+
+
+# ──────────────────────────────────────────────────────────
+# SLA Alerts command handlers
+# ──────────────────────────────────────────────────────────
+
+async def cmd_sla(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    cfg = load_sla_config()
+    if cfg and cfg.get("enabled"):
+        threshold = cfg.get("threshold_days", 7)
+        interval  = cfg.get("interval_hours", 6)
+        status = (
+            f"⚠️ *SLA Alerts are active*\n"
+            f"Threshold: {threshold} days | Check every: {interval} hr\n\n"
+            f"Enter a new threshold (days) to reconfigure, or tap Cancel to disable:"
+        )
+        await update.message.reply_text(
+            status,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🛑 Disable SLA Alerts", callback_data="sla:disable"),
+                InlineKeyboardButton("✏️ Reconfigure", callback_data="sla:reconfigure"),
+            ]]),
+        )
+        return SLA.THRESHOLD
+    await update.message.reply_text(
+        "⚠️ *SLA Alerts*\n\n"
+        "Periodically checks for ONGOING tasks older than a set threshold and sends an alert.\n\n"
+        "Enter the aging threshold in days (e.g. `7`):",
+        parse_mode="Markdown",
+    )
+    return SLA.THRESHOLD
+
+
+async def recv_sla_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        if query.data == "sla:disable":
+            for job in ctx.job_queue.get_jobs_by_name("sla_job"):
+                job.schedule_removal()
+            clear_sla_config()
+            await query.edit_message_text("🛑 SLA Alerts disabled.")
+            await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+            return ConversationHandler.END
+        # reconfigure — ask for threshold
+        await query.edit_message_text(
+            "Enter the aging threshold in days (e.g. `7`):",
+            parse_mode="Markdown",
+        )
+        return SLA.THRESHOLD
+
+    text = update.message.text.strip()
+    try:
+        days = int(text)
+        if days < 1:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Enter a whole number >= 1 (e.g. `7`).", parse_mode="Markdown")
+        return SLA.THRESHOLD
+
+    ctx.user_data["sla_threshold"] = days
+    await update.message.reply_text(
+        f"✅ Threshold: *{days} days*\n\nHow often should the check run?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Every 2 hr",  callback_data="sla_interval:2"),
+                InlineKeyboardButton("Every 4 hr",  callback_data="sla_interval:4"),
+                InlineKeyboardButton("Every 6 hr",  callback_data="sla_interval:6"),
+            ],
+            [
+                InlineKeyboardButton("Every 12 hr", callback_data="sla_interval:12"),
+                InlineKeyboardButton("Every 24 hr", callback_data="sla_interval:24"),
+            ],
+        ]),
+    )
+    return SLA.INTERVAL
+
+
+async def recv_sla_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    hours = int(query.data.split(":")[1])
+    threshold = ctx.user_data.get("sla_threshold", 7)
+
+    cfg = {"enabled": True, "threshold_days": threshold, "interval_hours": hours}
+    save_sla_config(cfg)
+
+    for job in ctx.job_queue.get_jobs_by_name("sla_job"):
+        job.schedule_removal()
+    ctx.job_queue.run_repeating(
+        _sla_job,
+        interval=hours * 3600,
+        first=hours * 3600,
+        name="sla_job",
+    )
+    await query.edit_message_text(
+        f"✅ *SLA Alerts enabled*\n"
+        f"Threshold: *{threshold} days* | Check every *{hours} hr*\n"
+        f"First check in {hours} hr.",
+        parse_mode="Markdown",
+    )
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────────────────
+# Morning Briefing command handler
+# ──────────────────────────────────────────────────────────
+
+async def cmd_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    cfg = load_briefing_config()
+    if cfg and cfg.get("enabled"):
+        save_briefing_config({"enabled": False})
+        for job in ctx.job_queue.get_jobs_by_name("morning_briefing_job"):
+            job.schedule_removal()
+        await update.message.reply_text(
+            "🛑 Morning Briefing disabled.",
+            reply_markup=_main_menu(),
+        )
+    else:
+        save_briefing_config({"enabled": True})
+        ctx.job_queue.run_daily(
+            _morning_briefing_job,
+            time=_dtime(5, 0, tzinfo=timezone.utc),
+            name="morning_briefing_job",
+        )
+        await update.message.reply_text(
+            "🌅 *Morning Briefing enabled*\nRuns daily at 8 AM EAT (05:00 UTC).\n"
+            "Tap again to disable.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu(),
+        )
+
+
+# ──────────────────────────────────────────────────────────
+# Sectional Properties command handlers
+# ──────────────────────────────────────────────────────────
+
+async def cmd_sectional(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    cfg = load_sectional_config()
+    specialist = cfg.get("specialist") if cfg else None
+    auto_route = cfg.get("auto_route", False) if cfg else False
+    cred_type  = cfg.get("cred_type", "") if cfg else ""
+
+    if specialist:
+        status = (
+            f"🔲 *Sectional Properties*\n\n"
+            f"Specialist: *{specialist['name']}*\n"
+            f"Auto-routing: {'✅ On' if auto_route else '❌ Off'}\n"
+            f"Credential: {CRED_LABELS.get(cred_type, cred_type) if cred_type else '—'}\n\n"
+            f"Choose an action:"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "❌ Disable Auto-Route" if auto_route else "✅ Enable Auto-Route",
+                    callback_data="sc:toggle_route",
+                ),
+            ],
+            [InlineKeyboardButton("👤 Change Specialist", callback_data="sc:change")],
+            [InlineKeyboardButton("🗑 Clear Config",       callback_data="sc:clear")],
+        ])
+    else:
+        status = (
+            "🔲 *Sectional Properties*\n\n"
+            "No specialist configured. Set a specialist valuer to enable auto-routing "
+            "of sectional tasks from Auto Fetch.\n\n"
+            "Enter the specialist's name to search:"
+        )
+        keyboard = None
+
+    await update.message.reply_text(status, parse_mode="Markdown", reply_markup=keyboard)
+    return SC.ACTION if specialist else SC.SET_NAME
+
+
+async def recv_sc_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    cfg = load_sectional_config() or {}
+
+    if query.data == "sc:toggle_route":
+        cfg["auto_route"] = not cfg.get("auto_route", False)
+        save_sectional_config(cfg)
+        state = "enabled" if cfg["auto_route"] else "disabled"
+        await query.edit_message_text(f"✅ Auto-routing {state}.", reply_markup=None)
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    if query.data == "sc:clear":
+        save_sectional_config({})
+        await query.edit_message_text("🗑 Sectional config cleared.")
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    # sc:change — ask for new name
+    await query.edit_message_text(
+        "Enter the specialist valuer's name to search:",
+        reply_markup=None,
+    )
+    return SC.SET_NAME
+
+
+async def recv_sc_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("❌ Please enter a name.")
+        return SC.SET_NAME
+
+    tokens = _any_valid_tokens()
+    if not tokens:
+        await update.message.reply_text("❌ No valid tokens. Please refresh auth first.")
+        return ConversationHandler.END
+
+    http_sess = build_session()
+    try:
+        resp = http_sess.get(
+            f"{BASE_URL}/acl/api/v1/accounts/list-user-accounts",
+            headers={"Authorization": f"Bearer {tokens.access_token}", "JWTAUTH": f"Bearer {tokens.jwt}"},
+            params={"account_type": "STAFF", "search": name, "page": 1},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+    except Exception as e:
+        logger.error("Sectional name search failed: %s", e)
+        await update.message.reply_text(f"❌ Search failed: {_safe_err(e)}")
+        return ConversationHandler.END
+
+    if not results:
+        await update.message.reply_text(f"No staff found matching '{name}'. Try again:")
+        return SC.SET_NAME
+
+    ctx.user_data["sc_results"] = results[:10]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{r.get('first_name','')} {r.get('last_name','')} ({r.get('employee_number','')})".strip(),
+            callback_data=f"sc_pick:{i}",
+        )]
+        for i, r in enumerate(results[:10])
+    ])
+    await update.message.reply_text("Select the specialist valuer:", reply_markup=keyboard)
+    return SC.SELECT
+
+
+async def recv_sc_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    idx = int(query.data.split(":")[1])
+    results = ctx.user_data.get("sc_results", [])
+    if idx >= len(results):
+        await query.edit_message_text("❌ Invalid selection.")
+        return ConversationHandler.END
+
+    person = results[idx]
+    uid    = str(person.get("id") or person.get("uid", ""))
+    name   = f"{person.get('first_name','')} {person.get('last_name','')}".strip()
+    acct   = str(person.get("account_number") or person.get("employee_number") or "")
+    ctx.user_data["sc_specialist"] = {"name": name, "uid": uid, "account_number": acct}
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=f"sc_cred:{key}")]
+        for key, label in CRED_LABELS.items()
+    ])
+    await query.edit_message_text(
+        f"Selected: *{name}*\n\nWhich credential to use for auto-assignment?",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+    return SC.CRED
+
+
+async def recv_sc_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    cred_type  = query.data.split(":")[1]
+    specialist = ctx.user_data.get("sc_specialist", {})
+    cfg = load_sectional_config() or {}
+    cfg.update({
+        "specialist": specialist,
+        "cred_type":  cred_type,
+        "auto_route": cfg.get("auto_route", False),
+    })
+    save_sectional_config(cfg)
+    await query.edit_message_text(
+        f"✅ *Sectional specialist set*\n"
+        f"Name: *{specialist.get('name')}*\n"
+        f"Credential: *{CRED_LABELS.get(cred_type, cred_type)}*\n\n"
+        f"Use /sectional to toggle auto-routing.",
+        parse_mode="Markdown",
+    )
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    return ConversationHandler.END
 
 
 # ──────────────────────────────────────────────────────────
@@ -5430,10 +6065,14 @@ def _be_schedule_keyboard() -> InlineKeyboardMarkup:
 
 
 def _be_county_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label, callback_data=f"be_county:{key}")]
-        for key, label in _BE_COUNTY_LABELS.items()
-    ])
+    items = list(_BE_COUNTY_LABELS.items())
+    rows = []
+    for i in range(0, len(items), 2):
+        row = [InlineKeyboardButton(items[i][1], callback_data=f"be_county:{items[i][0]}")]
+        if i + 1 < len(items):
+            row.append(InlineKeyboardButton(items[i+1][1], callback_data=f"be_county:{items[i+1][0]}"))
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
 
 
 def _be_cred_keyboard() -> Optional[InlineKeyboardMarkup]:
@@ -7943,6 +8582,74 @@ def main():
             name="auto_fetch_job",
         )
         logger.info("Auto Fetch schedule restored: every %d min", cfg.get("interval_minutes"))
+
+    # SLA Alerts: restore saved schedule on startup
+    sla_cfg = load_sla_config()
+    if sla_cfg and sla_cfg.get("enabled"):
+        hours = sla_cfg.get("interval_hours", 6)
+        app.job_queue.run_repeating(
+            _sla_job,
+            interval=hours * 3600,
+            first=hours * 3600,
+            name="sla_job",
+        )
+        logger.info("SLA alerts restored: every %d hr", hours)
+
+    # Morning Briefing: restore if enabled
+    briefing_cfg = load_briefing_config()
+    if briefing_cfg and briefing_cfg.get("enabled"):
+        app.job_queue.run_daily(
+            _morning_briefing_job,
+            time=_dtime(5, 0, tzinfo=timezone.utc),
+            name="morning_briefing_job",
+        )
+        logger.info("Morning briefing restored: daily at 05:00 UTC")
+
+    sla_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("sla", cmd_sla),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_SLA)}$"), cmd_sla),
+        ],
+        states={
+            SLA.THRESHOLD: [
+                CallbackQueryHandler(recv_sla_threshold, pattern=r"^sla:"),
+                MessageHandler(not_cancel, recv_sla_threshold),
+            ],
+            SLA.INTERVAL: [CallbackQueryHandler(recv_sla_interval, pattern=r"^sla_interval:")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(_CANCEL_FILTER, cmd_cancel),
+            MessageHandler(filters.TEXT, fallback),
+        ],
+        allow_reentry=True,
+        per_message=False,
+    )
+    app.add_handler(sla_conv)
+
+    sc_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("sectional", cmd_sectional),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_SECTIONAL)}$"), cmd_sectional),
+        ],
+        states={
+            SC.ACTION:   [CallbackQueryHandler(recv_sc_action,  pattern=r"^sc:")],
+            SC.SET_NAME: [MessageHandler(not_cancel, recv_sc_name)],
+            SC.SELECT:   [CallbackQueryHandler(recv_sc_select,  pattern=r"^sc_pick:")],
+            SC.CRED:     [CallbackQueryHandler(recv_sc_cred,    pattern=r"^sc_cred:")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(_CANCEL_FILTER, cmd_cancel),
+            MessageHandler(filters.TEXT, fallback),
+        ],
+        allow_reentry=True,
+        per_message=False,
+    )
+    app.add_handler(sc_conv)
+
+    app.add_handler(CommandHandler("briefing", cmd_briefing))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_BRIEFING)}$"), cmd_briefing))
 
     # Button handlers outside an active conversation
     app.add_handler(CallbackQueryHandler(recv_delete_valuer,  pattern=r"^del:"))
