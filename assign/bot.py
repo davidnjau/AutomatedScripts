@@ -79,6 +79,7 @@ from ardhisasa_auth import (
     STAFF_CREDENTIALS_VALUER,
     AuthTokens,
     build_session,
+    decode_jwt_exp,
 )
 
 # ──────────────────────────────────────────────────────────
@@ -138,6 +139,20 @@ def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
+# Serialises concurrent load-modify-save cycles on the assignments file.
+# persist_assignment() is called from both async handlers and background threads.
+_ASSIGN_LOCK = threading.Lock()
+
+
+def _atomic_json_write(path: str, data, **dump_kwargs) -> None:
+    """Write data as JSON to path atomically (write to .tmp then os.replace)."""
+    _ensure_data_dir()
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, **dump_kwargs)
+    os.replace(tmp, path)
+
+
 # ── Valuers ───────────────────────────────────────────────
 
 def load_saved_valuers() -> List[Dict]:
@@ -154,8 +169,7 @@ def persist_valuer(name: str, uid: str, account_number: str):
     if any(x["uid"] == uid for x in valuers):
         return  # already saved
     valuers.append({"name": name, "uid": uid, "account_number": account_number})
-    with open(SAVED_VALUERS_FILE, "w") as f:
-        json.dump(valuers, f, indent=2)
+    _atomic_json_write(SAVED_VALUERS_FILE, valuers, indent=2)
     logger.info("Saved valuer %s (uid=%s)", name, uid)
 
 
@@ -171,29 +185,23 @@ def load_saved_assignments() -> Dict:
 
 
 def persist_assignment(ref: str, valuer_name: str, valuer_uid: str):
-    _ensure_data_dir()
-    assignments = load_saved_assignments()
-    assignments[ref] = {
-        "valuer_name": valuer_name,
-        "valuer_uid":  valuer_uid,
-        "assigned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    with open(SAVED_ASSIGNMENTS_FILE, "w") as f:
-        json.dump(assignments, f, indent=2)
+    with _ASSIGN_LOCK:
+        assignments = load_saved_assignments()
+        assignments[ref] = {
+            "valuer_name": valuer_name,
+            "valuer_uid":  valuer_uid,
+            "assigned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        # Keep only the most recent 500 assignments to prevent unbounded growth
+        if len(assignments) > 500:
+            assignments = dict(list(assignments.items())[-500:])
+        _atomic_json_write(SAVED_ASSIGNMENTS_FILE, assignments, indent=2)
     logger.info("Saved assignment %s → %s", ref, valuer_name)
 
 
 # ── Tokens ────────────────────────────────────────────────
 
-def _jwt_exp(token: str) -> Optional[float]:
-    """Decode the JWT payload and return the `exp` claim, or None on failure."""
-    try:
-        payload = token.split(".")[1]
-        payload += "=" * (4 - len(payload) % 4)
-        data = json.loads(base64.urlsafe_b64decode(payload))
-        return float(data["exp"])
-    except Exception:
-        return None
+_jwt_exp = decode_jwt_exp  # shared implementation in ardhisasa_auth
 
 
 def _load_tokens_raw() -> Dict:
@@ -219,8 +227,7 @@ def persist_tokens(cred_type: str, access_token: str, jwt: str, refresh_token: s
         # Preserve existing refresh_token if a new one wasn't returned
         entry["refresh_token"] = tokens[cred_type]["refresh_token"]
     tokens[cred_type] = entry
-    with open(SAVED_TOKENS_FILE, "w") as f:
-        json.dump(tokens, f, indent=2)
+    _atomic_json_write(SAVED_TOKENS_FILE, tokens, indent=2)
     logger.info("Cached tokens for cred_type=%s (exp=%s) → %s", cred_type, exp, SAVED_TOKENS_FILE)
 
 
@@ -824,9 +831,7 @@ async def recv_delete_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Valuer not found.")
         return
     removed = valuers.pop(idx)
-    _ensure_data_dir()
-    with open(SAVED_VALUERS_FILE, "w") as f:
-        json.dump(valuers, f, indent=2)
+    _atomic_json_write(SAVED_VALUERS_FILE, valuers, indent=2)
     await query.edit_message_text(
         f"🗑 Removed *{removed['name']}* from saved valuers.", parse_mode="Markdown"
     )
@@ -1111,7 +1116,14 @@ async def recv_valuer_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return S.VALUER_NAME
     else:
         saved = load_saved_valuers()
-        sv = saved[int(data)]
+        idx = int(data)
+        if idx >= len(saved):
+            await query.edit_message_text(
+                "⚠️ That saved valuer no longer exists. Please start over.",
+                reply_markup=_main_menu(),
+            )
+            return ConversationHandler.END
+        sv = saved[idx]
         sess.saved_valuer = sv
         await query.edit_message_text(
             f"✅ Valuer: *{sv['name']}*\n\n"
@@ -1440,8 +1452,10 @@ def persist_task_batch(batch: Dict):
     _ensure_data_dir()
     batches = load_task_batches()
     batches.append(batch)
-    with open(SAVED_TASK_BATCHES_FILE, "w") as f:
-        json.dump(batches, f, indent=2)
+    # Keep only the most recent 100 batches to prevent unbounded growth
+    if len(batches) > 100:
+        batches = batches[-100:]
+    _atomic_json_write(SAVED_TASK_BATCHES_FILE, batches, indent=2)
     logger.info("Saved task batch %s (%d tasks)", batch["batch_id"], len(batch["tasks"]))
 
 
@@ -1454,9 +1468,7 @@ def load_schedules() -> List[Dict]:
 
 
 def _save_schedules(schedules: List[Dict]):
-    _ensure_data_dir()
-    with open(SAVED_SCHEDULES_FILE, "w") as f:
-        json.dump(schedules, f, indent=2)
+    _atomic_json_write(SAVED_SCHEDULES_FILE, schedules, indent=2)
 
 
 def persist_schedule(sched: Dict):
@@ -2107,7 +2119,14 @@ async def recv_rt_pick_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return RS.STAFF_NAME
 
     saved = load_saved_valuers()
-    sv    = saved[int(data)]
+    idx = int(data)
+    if idx >= len(saved):
+        await query.edit_message_text(
+            "⚠️ That saved valuer no longer exists. Please start over.",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+    sv = saved[idx]
     rt.saved_valuer = sv
     rt.staff_name   = sv["name"]
 
@@ -2230,6 +2249,12 @@ async def recv_rt_select_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     rt        = _get_rt(ctx)
     idx       = int(query.data.split(":")[1])
+    if idx >= len(rt.staff_results):
+        await query.edit_message_text(
+            "⚠️ Selection no longer available. Please search again.",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
     list_entry = rt.staff_results[idx]
 
     sd   = list_entry.get("staff_details", {})
@@ -2696,6 +2721,7 @@ def _daemon_start() -> Tuple[bool, str]:
         start_new_session=True,   # detach from bot's process group
         close_fds=True,
     )
+    log_fh.close()   # child has its own fd; parent's copy is no longer needed
     with open(DAEMON_PID_FILE, "w") as f:
         f.write(str(proc.pid))
     logger.info("Token refresh daemon started (PID %d)", proc.pid)
@@ -2834,8 +2860,14 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     await update.message.reply_text("🔁 Restarting bot… back in a moment.")
-    await asyncio.sleep(2)   # let the message deliver before replacing the process
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    # Schedule execv in a daemon thread so the event loop can finish delivering
+    # the reply above before the process image is replaced.  os.execv never
+    # returns, so dropping the thread is intentional.
+    def _do_restart():
+        time.sleep(2)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    t = threading.Thread(target=_do_restart, daemon=True)
+    t.start()
 
 
 # ──────────────────────────────────────────────────────────
@@ -2862,9 +2894,7 @@ def load_dlv_batch() -> List[Dict]:
 
 
 def save_dlv_batch(items: List[Dict]) -> None:
-    _ensure_data_dir()
-    with open(SAVED_DLV_BATCH_FILE, "w") as f:
-        json.dump(items, f, indent=2)
+    _atomic_json_write(SAVED_DLV_BATCH_FILE, items, indent=2)
 
 
 def clear_dlv_batch() -> None:
@@ -3003,8 +3033,13 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> str:
                     timeout=30,
                 )
                 r.raise_for_status()
+                # Persist before reporting success; if disk write fails, log it but
+                # still report the correct outcome — the API assignment did succeed.
+                try:
+                    persist_assignment(ref, valuer_name, valuer_uid)
+                except Exception as _pe:
+                    logger.error("persist_assignment failed for %s: %s", ref, _pe)
                 completed_lines.append(f"✅ `{ref}` — assigned to *{valuer_name}*")
-                persist_assignment(ref, valuer_name, valuer_uid)
 
             elif node == "VALUATION_STAMP_DUTY_VALUER_REPORT":
                 actors = detail.get("actors", [])
@@ -3085,9 +3120,7 @@ def load_auto_fetch_schedule() -> Optional[Dict]:
 
 
 def save_auto_fetch_schedule(cfg: Dict) -> None:
-    _ensure_data_dir()
-    with open(SAVED_AUTO_FETCH_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
+    _atomic_json_write(SAVED_AUTO_FETCH_FILE, cfg, indent=2)
 
 
 def clear_auto_fetch_schedule() -> None:
@@ -3140,8 +3173,7 @@ def persist_af_result(run_id: str, run_at: str, tasks: List[Dict], cfg: Dict) ->
     # Trim to keep only the most recent runs
     if len(results) > _AF_RESULTS_KEEP:
         results = results[-_AF_RESULTS_KEEP:]
-    with open(SAVED_AF_RESULTS_FILE, "w") as f:
-        json.dump(results, f, indent=2)
+    _atomic_json_write(SAVED_AF_RESULTS_FILE, results, indent=2)
 
 
 def _af_interval_keyboard() -> InlineKeyboardMarkup:
@@ -4411,6 +4443,9 @@ async def recv_ft_amount_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = text.replace(",", "").split()
     try:
         if len(parts) == 2:
+            # Python evaluates the full RHS tuple before the assignment, so if
+            # float(parts[1]) raises, neither sess.amount_min nor sess.amount_max
+            # is modified — the session state stays clean.
             sess.amount_min, sess.amount_max = float(parts[0]), float(parts[1])
         elif len(parts) == 1:
             sess.amount_min, sess.amount_max = 0.0, float(parts[0])
@@ -5277,7 +5312,13 @@ class _TokenRotator:
             return "none"
 
     def rotate(self, failed: "AuthTokens") -> Optional["AuthTokens"]:
-        """Advance past `failed` if it is still the current token. Returns new token or None."""
+        """Advance past `failed` if it is still the current token. Returns new token or None.
+
+        The identity (`is`) check is intentional: if two threads both get 403 on the
+        same token and both call rotate(), only the first one advances the index — the
+        second sees the index already moved and simply returns the new current token,
+        avoiding a double-skip.  This is correct thread-safe behaviour, not a bug.
+        """
         with self._lock:
             if self._idx < len(self._tokens) and self._tokens[self._idx][1] is failed:
                 self._idx += 1
@@ -5324,9 +5365,7 @@ def load_be_schedule() -> Optional[Dict]:
 
 
 def save_be_schedule(cfg: Dict) -> None:
-    _ensure_data_dir()
-    with open(SAVED_BULK_EXPORT_SCHED_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
+    _atomic_json_write(SAVED_BULK_EXPORT_SCHED_FILE, cfg, indent=2)
 
 
 def clear_be_schedule() -> None:
@@ -5345,15 +5384,13 @@ def load_be_partial() -> Optional[Dict]:
 
 
 def save_be_partial(county: str, registries: List[str], rows: List[dict], done_ids: List[str]) -> None:
-    _ensure_data_dir()
-    with open(SAVED_BULK_EXPORT_PARTIAL_FILE, "w") as f:
-        json.dump({
-            "saved_at":  datetime.now().isoformat(),
-            "county":    county,
-            "registries": registries,
-            "rows":      rows,
-            "done_ids":  done_ids,
-        }, f)
+    _atomic_json_write(SAVED_BULK_EXPORT_PARTIAL_FILE, {
+        "saved_at":   datetime.now().isoformat(),
+        "county":     county,
+        "registries": registries,
+        "rows":       rows,
+        "done_ids":   done_ids,
+    })
 
 
 def clear_be_partial() -> None:
@@ -5421,6 +5458,10 @@ def _be_fetch_detail(sess: requests.Session, rotator: "_TokenRotator", app_id: s
                     raise _AllTokensExhausted(f"All tokens exhausted (403) fetching {app_id}")
                 time.sleep(_BE_TOKEN_ROTATE_DELAY)
                 continue
+            if resp.status_code == 404:
+                # Record no longer exists — return empty dict so caller marks it cleanly
+                logger.debug("_be_fetch_detail: 404 for app_id=%s — record not found", app_id)
+                return {}
             if resp.status_code in (429, 502, 503, 504):
                 time.sleep(2)
                 continue
@@ -6320,10 +6361,10 @@ def _jd_build_excel(
                             in_range.append(label)
                         else:
                             out_range.append(label)
-                        continue
+                        continue   # already appended above; skip the fallback append below
                     except (ValueError, TypeError):
                         label = ref
-                in_range.append(label)   # no amount → assume in range
+                in_range.append(label)   # reached when: amount is empty OR unparseable → assume in range
 
             refs = ", ".join(in_range + out_range)
 
