@@ -153,6 +153,19 @@ def _atomic_json_write(path: str, data, **dump_kwargs) -> None:
     os.replace(tmp, path)
 
 
+def _safe_err(e: Exception) -> str:
+    """Return a user-facing error string that contains no internal URLs or server detail.
+
+    HTTP errors are reduced to their status code; everything else becomes a
+    generic phrase so that API internals never leak into Telegram messages.
+    The full exception is intentionally NOT included here — callers should
+    log it separately before sending this string to the user.
+    """
+    if isinstance(e, requests.HTTPError) and e.response is not None:
+        return f"server returned HTTP {e.response.status_code}"
+    return "unexpected error — check logs"
+
+
 # ── Valuers ───────────────────────────────────────────────
 
 def load_saved_valuers() -> List[Dict]:
@@ -1399,8 +1412,9 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ok_refs.append(ref)
             result_lines.append(f"✅ `{ref}`")
         except Exception as e:
+            logger.error("Assignment failed for %s: %s", ref, e)
             fail_refs.append(ref)
-            result_lines.append(f"❌ `{ref}` — {e}")
+            result_lines.append(f"❌ `{ref}` — {_safe_err(e)}")
 
     if ok_refs:
         persist_valuer(name, uid, acct)          # auto-save valuer for future assignments
@@ -1688,8 +1702,9 @@ async def _do_assign_tasks(
             result_lines.append(f"✅ `{ref}` — KES {task['consideration_amount']:,.0f}")
             persist_assignment(ref, staff_name, staff_uid)
         except Exception as e:
+            logger.error("Assignment failed for %s: %s", ref, e)
             fail_refs.append(ref)
-            result_lines.append(f"❌ `{ref}` — {e}")
+            result_lines.append(f"❌ `{ref}` — {_safe_err(e)}")
 
     # Persist the batch
     batch = {
@@ -2265,6 +2280,7 @@ async def recv_rt_select_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ok, err_msg, task_type, registry, county = _validate_staff(user_data)
     if not ok:
+        rt.staff_results = []   # clear stale results so old callbacks can't reach them
         await query.edit_message_text(
             f"❌ *Validation failed for {name}:*\n{err_msg}",
             parse_mode="Markdown",
@@ -3244,6 +3260,10 @@ async def recv_af_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         interval_minutes = int(query.data.split(":")[-1])
     except ValueError:
+        await query.edit_message_text(
+            "⚠️ Unexpected selection. Please tap one of the interval buttons below:",
+            reply_markup=_af_interval_keyboard(),
+        )
         return AF.INTERVAL
 
     ctx.user_data["af_interval_minutes"] = interval_minutes
@@ -3398,10 +3418,9 @@ async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text.lower() == "skip":
         email = ""
     else:
-        # Basic email validation
-        if "@" not in text or "." not in text.split("@")[-1]:
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}", text):
             await update.message.reply_text(
-                "❌ Invalid email address. Enter a valid email or send `skip`.",
+                "❌ Invalid email address. Enter a valid email (e.g. `user@example.com`) or send `skip`.",
                 parse_mode="Markdown",
             )
             return AF.EMAIL
@@ -4582,7 +4601,7 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
     except Exception as e:
         logger.error("_ft_show_results error: %s", e)
         await message.reply_text(
-            f"❌ Failed to display results: {e}", reply_markup=_main_menu()
+            "❌ Failed to display results — please try again.", reply_markup=_main_menu()
         )
     return ConversationHandler.END
 
@@ -4702,7 +4721,8 @@ async def recv_dlv_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             tasks, raw_count = _load_dlv_tasks(tokens)
         except Exception as e:
-            await query.edit_message_text(f"❌ Refresh failed: {e}")
+            logger.error("DLV task refresh failed: %s", e)
+            await query.edit_message_text("❌ Refresh failed — please try again.")
             return
         checked = set()
         ctx.user_data["dlv_tasks"]   = tasks
@@ -4963,8 +4983,9 @@ async def _ta_run_assign(message, ctx: ContextTypes.DEFAULT_TYPE,
             result_lines.append(f"✅ `{ref}`")
             persist_assignment(ref, valuer_name, valuer_uid)
         except Exception as e:
+            logger.error("Assignment failed for %s: %s", ref, e)
             fail_refs.append(ref)
-            result_lines.append(f"❌ `{ref}` — {e}")
+            result_lines.append(f"❌ `{ref}` — {_safe_err(e)}")
 
     if ok_refs:
         persist_valuer(valuer_name, valuer_uid, acct)
@@ -5286,6 +5307,7 @@ _BE_LIST_WORKERS        = 5
 _BE_DETAIL_WORKERS      = 5
 _BE_MAX_RETRIES         = 3
 _BE_TOKEN_ROTATE_DELAY  = 10   # seconds to wait before retrying with a new token
+_MAX_FETCH_RETRIES      = 5    # max 429/5xx retries before aborting a fetch loop
 
 
 class _AllTokensExhausted(Exception):
@@ -5445,36 +5467,39 @@ def _be_fetch_detail(sess: requests.Session, rotator: "_TokenRotator", app_id: s
     On 403 rotates to the next valid token (with a short pause).
     Raises _AllTokensExhausted when no more tokens remain.
     """
+    retries = 0
     while True:
         tokens = rotator.current()
         if tokens is None:
             raise _AllTokensExhausted(f"All tokens exhausted fetching {app_id}")
         headers = _be_headers(tokens)
-        try:
-            resp = sess.get(_BE_DETAIL_URL, headers=headers, params={"request_id": app_id}, timeout=30)
-            if resp.status_code == 403:
-                new_tokens = rotator.rotate(tokens)
-                if new_tokens is None:
-                    raise _AllTokensExhausted(f"All tokens exhausted (403) fetching {app_id}")
-                time.sleep(_BE_TOKEN_ROTATE_DELAY)
-                continue
-            if resp.status_code == 404:
-                # Record no longer exists — return empty dict so caller marks it cleanly
-                logger.debug("_be_fetch_detail: 404 for app_id=%s — record not found", app_id)
-                return {}
-            if resp.status_code in (429, 502, 503, 504):
-                time.sleep(2)
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except _AllTokensExhausted:
-            raise
-        except Exception as exc:
-            raise exc
+        resp = sess.get(_BE_DETAIL_URL, headers=headers, params={"request_id": app_id}, timeout=30)
+        if resp.status_code == 403:
+            new_tokens = rotator.rotate(tokens)
+            if new_tokens is None:
+                raise _AllTokensExhausted(f"All tokens exhausted (403) fetching {app_id}")
+            time.sleep(_BE_TOKEN_ROTATE_DELAY)
+            continue
+        if resp.status_code == 404:
+            # Record no longer exists — return empty dict so caller marks it cleanly
+            logger.debug("_be_fetch_detail: 404 for app_id=%s — record not found", app_id)
+            return {}
+        if resp.status_code in (429, 502, 503, 504):
+            retries += 1
+            if retries >= _MAX_FETCH_RETRIES:
+                raise RuntimeError(
+                    f"_be_fetch_detail: too many transient errors (HTTP {resp.status_code}) "
+                    f"for app_id={app_id}"
+                )
+            time.sleep(2)
+            continue
+        resp.raise_for_status()
+        return resp.json()
 
 
 def _be_fetch_office_report(sess: requests.Session, rotator: "_TokenRotator", app_id: str) -> dict:
     """Fetch the office report for one application. Returns {} on any error (non-critical)."""
+    retries = 0
     while True:
         tokens = rotator.current()
         if tokens is None:
@@ -5489,15 +5514,17 @@ def _be_fetch_office_report(sess: requests.Session, rotator: "_TokenRotator", ap
                 time.sleep(_BE_TOKEN_ROTATE_DELAY)
                 continue
             if resp.status_code in (429, 502, 503, 504):
+                retries += 1
+                if retries >= _MAX_FETCH_RETRIES:
+                    logger.warning("_be_fetch_office_report: giving up after %d retries for app_id=%s", retries, app_id)
+                    return {}
                 time.sleep(2)
                 continue
             if resp.status_code == 404:
                 return {}
             resp.raise_for_status()
             return resp.json()
-        except _AllTokensExhausted:
-            return {}
-        except Exception:
+        except (_AllTokensExhausted, Exception):
             return {}
 
 
@@ -6228,28 +6255,30 @@ def _jd_fetch_ongoing_page(sess: requests.Session, headers: dict, page: int) -> 
 
 def _jd_fetch_task_detail(sess: requests.Session, rotator: "_TokenRotator", task_id: str) -> dict:
     """Fetch detail for one task with token rotation on 403."""
+    retries = 0
     while True:
         tokens = rotator.current()
         if tokens is None:
             raise _AllTokensExhausted(f"All tokens exhausted fetching task {task_id}")
         headers = _jd_headers(tokens)
-        try:
-            resp = sess.get(_JD_DETAIL_URL, headers=headers, params={"request_id": task_id}, timeout=30)
-            if resp.status_code == 403:
-                new_tokens = rotator.rotate(tokens)
-                if new_tokens is None:
-                    raise _AllTokensExhausted(f"All tokens exhausted (403) fetching task {task_id}")
-                time.sleep(_BE_TOKEN_ROTATE_DELAY)
-                continue
-            if resp.status_code in (429, 502, 503, 504):
-                time.sleep(2)
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except _AllTokensExhausted:
-            raise
-        except Exception as exc:
-            raise exc
+        resp = sess.get(_JD_DETAIL_URL, headers=headers, params={"request_id": task_id}, timeout=30)
+        if resp.status_code == 403:
+            new_tokens = rotator.rotate(tokens)
+            if new_tokens is None:
+                raise _AllTokensExhausted(f"All tokens exhausted (403) fetching task {task_id}")
+            time.sleep(_BE_TOKEN_ROTATE_DELAY)
+            continue
+        if resp.status_code in (429, 502, 503, 504):
+            retries += 1
+            if retries >= _MAX_FETCH_RETRIES:
+                raise RuntimeError(
+                    f"_jd_fetch_task_detail: too many transient errors (HTTP {resp.status_code}) "
+                    f"for task_id={task_id}"
+                )
+            time.sleep(2)
+            continue
+        resp.raise_for_status()
+        return resp.json()
 
 
 def _jd_build_excel(
