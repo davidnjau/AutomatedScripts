@@ -12,39 +12,45 @@ Usage:
     from ardhisasa_auth import authenticate, STAFF_CREDENTIALS_ICT, PUBLIC_CREDENTIALS
 """
 
+import base64
+import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 
 import requests
+from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+load_dotenv()
+
 # ---------------------------------------------------------------------------
-# Credentials
+# Credentials  (values come from .env — never hardcode secrets in source)
 # ---------------------------------------------------------------------------
 
 STAFF_CREDENTIALS_SUPPORT = {
-    "username": "SE0E20RF0F",
-    "password": "Ardh1s@s@",
+    "username": os.environ["STAFF_SUPPORT_USER"],
+    "password": os.environ["STAFF_SUPPORT_PASS"],
     "usertype": "staff",
 }
 
 STAFF_CREDENTIALS_ICT = {
-    "username": "20210439855",
-    "password": "ItaSabaQefin10222/()/",
+    "username": os.environ["STAFF_ICT_USER"],
+    "password": os.environ["STAFF_ICT_PASS"],
     "usertype": "staff",
 }
 
 STAFF_CREDENTIALS_VALUER = {
-    "username": "2015001311",
-    "password": "Marcel(2025)",
+    "username": os.environ["STAFF_VALUER_USER"],
+    "password": os.environ["STAFF_VALUER_PASS"],
     "usertype": "staff",
 }
 
 PUBLIC_CREDENTIALS = {
-    "username": "33745057",
-    "password": "Sc281-6736/2014",
+    "username": os.environ["PUBLIC_USER"],
+    "password": os.environ["PUBLIC_PASS"],
     "usertype": "publicuser",
 }
 
@@ -144,8 +150,7 @@ def login(session: requests.Session, credentials: dict) -> None:
         "otpcode":  "",
     }
 
-    logger.info("Initiating login for user: %s (usertype=%s)",
-                credentials["username"], credentials["usertype"])
+    logger.info("Initiating login (usertype=%s)", credentials["usertype"])
 
     response = session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
@@ -244,3 +249,23 @@ def auth_headers(tokens: AuthTokens) -> dict:
         "Authorization": f"Bearer {tokens.access_token}",
         "JWTAUTH":       f"Bearer {tokens.jwt}",
     }
+
+
+# ---------------------------------------------------------------------------
+# JWT utilities
+# ---------------------------------------------------------------------------
+
+def decode_jwt_exp(token: str) -> Optional[float]:
+    """
+    Decode the JWT payload (without verification) and return the `exp` claim.
+
+    Returns the expiry as a UNIX timestamp float, or None if the token is
+    malformed or the claim is missing.
+    """
+    try:
+        payload = token.split(".")[1]
+        # Re-pad to a multiple of 4 before decoding
+        payload += "=" * (4 - len(payload) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
+    except Exception:
+        return None

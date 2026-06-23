@@ -42,7 +42,7 @@ from email import encoders as _email_encoders
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as _dtime
 from typing import Dict, List, Optional, Tuple
 
 import anthropic
@@ -79,6 +79,7 @@ from ardhisasa_auth import (
     STAFF_CREDENTIALS_VALUER,
     AuthTokens,
     build_session,
+    decode_jwt_exp,
 )
 
 # ──────────────────────────────────────────────────────────
@@ -122,6 +123,9 @@ SAVED_BULK_EXPORT_SCHED_FILE    = os.path.join(DATA_DIR, "saved_bulk_export_sche
 SAVED_BULK_EXPORT_PARTIAL_FILE  = os.path.join(DATA_DIR, "saved_bulk_export_partial.json")
 SAVED_AUTO_FETCH_FILE   = os.path.join(DATA_DIR, "saved_auto_fetch.json")
 SAVED_AF_RESULTS_FILE   = os.path.join(DATA_DIR, "saved_af_results.json")
+SAVED_SLA_CONFIG_FILE       = os.path.join(DATA_DIR, "saved_sla_config.json")
+SAVED_BRIEFING_CONFIG_FILE  = os.path.join(DATA_DIR, "saved_briefing_config.json")
+SAVED_SECTIONAL_CONFIG_FILE = os.path.join(DATA_DIR, "saved_sectional_config.json")
 
 # base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
 CPARAMS_DLV          = base64.b64encode(b'{"active_role":"DLV"}').decode()
@@ -136,6 +140,33 @@ DAEMON_LOG_FILE = os.path.join(DATA_DIR, "daemon.log")
 
 def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
+
+
+# Serialises concurrent load-modify-save cycles on the assignments file.
+# persist_assignment() is called from both async handlers and background threads.
+_ASSIGN_LOCK = threading.Lock()
+
+
+def _atomic_json_write(path: str, data, **dump_kwargs) -> None:
+    """Write data as JSON to path atomically (write to .tmp then os.replace)."""
+    _ensure_data_dir()
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, **dump_kwargs)
+    os.replace(tmp, path)
+
+
+def _safe_err(e: Exception) -> str:
+    """Return a user-facing error string that contains no internal URLs or server detail.
+
+    HTTP errors are reduced to their status code; everything else becomes a
+    generic phrase so that API internals never leak into Telegram messages.
+    The full exception is intentionally NOT included here — callers should
+    log it separately before sending this string to the user.
+    """
+    if isinstance(e, requests.HTTPError) and e.response is not None:
+        return f"server returned HTTP {e.response.status_code}"
+    return "unexpected error — check logs"
 
 
 # ── Valuers ───────────────────────────────────────────────
@@ -154,8 +185,7 @@ def persist_valuer(name: str, uid: str, account_number: str):
     if any(x["uid"] == uid for x in valuers):
         return  # already saved
     valuers.append({"name": name, "uid": uid, "account_number": account_number})
-    with open(SAVED_VALUERS_FILE, "w") as f:
-        json.dump(valuers, f, indent=2)
+    _atomic_json_write(SAVED_VALUERS_FILE, valuers, indent=2)
     logger.info("Saved valuer %s (uid=%s)", name, uid)
 
 
@@ -171,29 +201,23 @@ def load_saved_assignments() -> Dict:
 
 
 def persist_assignment(ref: str, valuer_name: str, valuer_uid: str):
-    _ensure_data_dir()
-    assignments = load_saved_assignments()
-    assignments[ref] = {
-        "valuer_name": valuer_name,
-        "valuer_uid":  valuer_uid,
-        "assigned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    with open(SAVED_ASSIGNMENTS_FILE, "w") as f:
-        json.dump(assignments, f, indent=2)
+    with _ASSIGN_LOCK:
+        assignments = load_saved_assignments()
+        assignments[ref] = {
+            "valuer_name": valuer_name,
+            "valuer_uid":  valuer_uid,
+            "assigned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        # Keep only the most recent 500 assignments to prevent unbounded growth
+        if len(assignments) > 500:
+            assignments = dict(list(assignments.items())[-500:])
+        _atomic_json_write(SAVED_ASSIGNMENTS_FILE, assignments, indent=2)
     logger.info("Saved assignment %s → %s", ref, valuer_name)
 
 
 # ── Tokens ────────────────────────────────────────────────
 
-def _jwt_exp(token: str) -> Optional[float]:
-    """Decode the JWT payload and return the `exp` claim, or None on failure."""
-    try:
-        payload = token.split(".")[1]
-        payload += "=" * (4 - len(payload) % 4)
-        data = json.loads(base64.urlsafe_b64decode(payload))
-        return float(data["exp"])
-    except Exception:
-        return None
+_jwt_exp = decode_jwt_exp  # shared implementation in ardhisasa_auth
 
 
 def _load_tokens_raw() -> Dict:
@@ -219,8 +243,7 @@ def persist_tokens(cred_type: str, access_token: str, jwt: str, refresh_token: s
         # Preserve existing refresh_token if a new one wasn't returned
         entry["refresh_token"] = tokens[cred_type]["refresh_token"]
     tokens[cred_type] = entry
-    with open(SAVED_TOKENS_FILE, "w") as f:
-        json.dump(tokens, f, indent=2)
+    _atomic_json_write(SAVED_TOKENS_FILE, tokens, indent=2)
     logger.info("Cached tokens for cred_type=%s (exp=%s) → %s", cred_type, exp, SAVED_TOKENS_FILE)
 
 
@@ -435,19 +458,49 @@ class BE(Enum):
     CONFIRM   = auto()   # confirm → kick off background export
 
 
+# States — SLA Alerts conversation
+class SLA(Enum):
+    THRESHOLD = auto()   # enter aging threshold in days
+    INTERVAL  = auto()   # how often to check (hours)
+
+
+# States — Sectional Properties conversation
+class SC(Enum):
+    ACTION   = auto()   # show current config + action buttons
+    SET_NAME = auto()   # enter specialist name to search
+    SELECT   = auto()   # pick from search results
+    CRED     = auto()   # pick credential to use for auto-assignment
+
+
 # County → list of registry names as they appear in the API response
 _BE_COUNTY_REGISTRIES: Dict[str, List[str]] = {
-    "NAIROBI":  ["NAIROBI", "CENTRAL"],
-    "KIAMBU":   ["KIAMBU", "LIMURU", "THIKA", "RUIRU", "GITHUNGURI"],
-    "MURANGA":  ["MURANGA", "KANDARA", "MARAGUA", "KANGEMA"],
-    "MOMBASA":  ["MOMBASA", "COAST"],
+    "NAIROBI":   ["NAIROBI", "CENTRAL"],
+    "KIAMBU":    ["KIAMBU", "LIMURU", "THIKA", "RUIRU", "GITHUNGURI"],
+    "MURANGA":   ["MURANGA", "KANDARA", "MARAGUA", "KANGEMA"],
+    "MOMBASA":   ["MOMBASA", "COAST"],
+    "NAKURU":    ["NAKURU", "NAIVASHA", "GILGIL", "MOLO"],
+    "KISUMU":    ["KISUMU", "MASENO"],
+    "NYERI":     ["NYERI", "KARATINA", "OTHAYA"],
+    "MACHAKOS":  ["MACHAKOS", "MAVOKO"],
+    "KAJIADO":   ["KAJIADO", "NGONG"],
+    "MERU":      ["MERU"],
+    "LAIKIPIA":  ["LAIKIPIA", "NANYUKI"],
+    "EMBU":      ["EMBU"],
 }
 
 _BE_COUNTY_LABELS: Dict[str, str] = {
-    "NAIROBI": "🌆 Nairobi",
-    "KIAMBU":  "🏙 Kiambu",
-    "MURANGA": "🏡 Murang'a",
-    "MOMBASA": "🌊 Mombasa",
+    "NAIROBI":   "🌆 Nairobi",
+    "KIAMBU":    "🏙 Kiambu",
+    "MURANGA":   "🏡 Murang'a",
+    "MOMBASA":   "🌊 Mombasa",
+    "NAKURU":    "🌿 Nakuru",
+    "KISUMU":    "🐟 Kisumu",
+    "NYERI":     "🏔 Nyeri",
+    "MACHAKOS":  "🦏 Machakos",
+    "KAJIADO":   "🌄 Kajiado",
+    "MERU":      "🌲 Meru",
+    "LAIKIPIA":  "🦁 Laikipia",
+    "EMBU":      "🌱 Embu",
 }
 
 
@@ -522,6 +575,9 @@ BTN_VALUER_TASKS  = "👤 Valuer Tasks"
 BTN_HELP          = "❓ Help"
 BTN_RESTART       = "🔁 Restart Bot"
 BTN_CANCEL        = "🛑 Cancel"
+BTN_SLA           = "⚠️ SLA Alerts"
+BTN_BRIEFING      = "🌅 Morning Briefing"
+BTN_SECTIONAL     = "🔲 Sectional"
 
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
@@ -532,6 +588,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_AF_RESULTS)}|{re.escape(BTN_BULK_EXPORT)}"
     f"|{re.escape(BTN_EXPORT_STATUS)}|{re.escape(BTN_JOB_DIST)}|{re.escape(BTN_LOOKUP)}"
     f"|{re.escape(BTN_VALUER_TASKS)}"
+    f"|{re.escape(BTN_SLA)}|{re.escape(BTN_BRIEFING)}|{re.escape(BTN_SECTIONAL)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -548,6 +605,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(BTN_DLV_BATCH)],
             [KeyboardButton(BTN_BULK_EXPORT),    KeyboardButton(BTN_EXPORT_STATUS)],
             [KeyboardButton(BTN_JOB_DIST),       KeyboardButton(BTN_VALUER_TASKS)],
+            [KeyboardButton(BTN_SLA),            KeyboardButton(BTN_BRIEFING),    KeyboardButton(BTN_SECTIONAL)],
             # ── Lookup ──────────────────────────────────────
             [KeyboardButton(BTN_LOOKUP)],
             [KeyboardButton(BTN_AUTH),           KeyboardButton(BTN_TOKEN_STATUS)],
@@ -824,9 +882,7 @@ async def recv_delete_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Valuer not found.")
         return
     removed = valuers.pop(idx)
-    _ensure_data_dir()
-    with open(SAVED_VALUERS_FILE, "w") as f:
-        json.dump(valuers, f, indent=2)
+    _atomic_json_write(SAVED_VALUERS_FILE, valuers, indent=2)
     await query.edit_message_text(
         f"🗑 Removed *{removed['name']}* from saved valuers.", parse_mode="Markdown"
     )
@@ -1111,7 +1167,14 @@ async def recv_valuer_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return S.VALUER_NAME
     else:
         saved = load_saved_valuers()
-        sv = saved[int(data)]
+        idx = int(data)
+        if idx >= len(saved):
+            await query.edit_message_text(
+                "⚠️ That saved valuer no longer exists. Please start over.",
+                reply_markup=_main_menu(),
+            )
+            return ConversationHandler.END
+        sv = saved[idx]
         sess.saved_valuer = sv
         await query.edit_message_text(
             f"✅ Valuer: *{sv['name']}*\n\n"
@@ -1387,8 +1450,9 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ok_refs.append(ref)
             result_lines.append(f"✅ `{ref}`")
         except Exception as e:
+            logger.error("Assignment failed for %s: %s", ref, e)
             fail_refs.append(ref)
-            result_lines.append(f"❌ `{ref}` — {e}")
+            result_lines.append(f"❌ `{ref}` — {_safe_err(e)}")
 
     if ok_refs:
         persist_valuer(name, uid, acct)          # auto-save valuer for future assignments
@@ -1440,8 +1504,10 @@ def persist_task_batch(batch: Dict):
     _ensure_data_dir()
     batches = load_task_batches()
     batches.append(batch)
-    with open(SAVED_TASK_BATCHES_FILE, "w") as f:
-        json.dump(batches, f, indent=2)
+    # Keep only the most recent 100 batches to prevent unbounded growth
+    if len(batches) > 100:
+        batches = batches[-100:]
+    _atomic_json_write(SAVED_TASK_BATCHES_FILE, batches, indent=2)
     logger.info("Saved task batch %s (%d tasks)", batch["batch_id"], len(batch["tasks"]))
 
 
@@ -1454,9 +1520,7 @@ def load_schedules() -> List[Dict]:
 
 
 def _save_schedules(schedules: List[Dict]):
-    _ensure_data_dir()
-    with open(SAVED_SCHEDULES_FILE, "w") as f:
-        json.dump(schedules, f, indent=2)
+    _atomic_json_write(SAVED_SCHEDULES_FILE, schedules, indent=2)
 
 
 def persist_schedule(sched: Dict):
@@ -1676,8 +1740,9 @@ async def _do_assign_tasks(
             result_lines.append(f"✅ `{ref}` — KES {task['consideration_amount']:,.0f}")
             persist_assignment(ref, staff_name, staff_uid)
         except Exception as e:
+            logger.error("Assignment failed for %s: %s", ref, e)
             fail_refs.append(ref)
-            result_lines.append(f"❌ `{ref}` — {e}")
+            result_lines.append(f"❌ `{ref}` — {_safe_err(e)}")
 
     # Persist the batch
     batch = {
@@ -2107,7 +2172,14 @@ async def recv_rt_pick_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return RS.STAFF_NAME
 
     saved = load_saved_valuers()
-    sv    = saved[int(data)]
+    idx = int(data)
+    if idx >= len(saved):
+        await query.edit_message_text(
+            "⚠️ That saved valuer no longer exists. Please start over.",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+    sv = saved[idx]
     rt.saved_valuer = sv
     rt.staff_name   = sv["name"]
 
@@ -2230,6 +2302,12 @@ async def recv_rt_select_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     rt        = _get_rt(ctx)
     idx       = int(query.data.split(":")[1])
+    if idx >= len(rt.staff_results):
+        await query.edit_message_text(
+            "⚠️ Selection no longer available. Please search again.",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
     list_entry = rt.staff_results[idx]
 
     sd   = list_entry.get("staff_details", {})
@@ -2240,6 +2318,7 @@ async def recv_rt_select_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ok, err_msg, task_type, registry, county = _validate_staff(user_data)
     if not ok:
+        rt.staff_results = []   # clear stale results so old callbacks can't reach them
         await query.edit_message_text(
             f"❌ *Validation failed for {name}:*\n{err_msg}",
             parse_mode="Markdown",
@@ -2696,6 +2775,7 @@ def _daemon_start() -> Tuple[bool, str]:
         start_new_session=True,   # detach from bot's process group
         close_fds=True,
     )
+    log_fh.close()   # child has its own fd; parent's copy is no longer needed
     with open(DAEMON_PID_FILE, "w") as f:
         f.write(str(proc.pid))
     logger.info("Token refresh daemon started (PID %d)", proc.pid)
@@ -2834,8 +2914,14 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     await update.message.reply_text("🔁 Restarting bot… back in a moment.")
-    await asyncio.sleep(2)   # let the message deliver before replacing the process
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    # Schedule execv in a daemon thread so the event loop can finish delivering
+    # the reply above before the process image is replaced.  os.execv never
+    # returns, so dropping the thread is intentional.
+    def _do_restart():
+        time.sleep(2)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    t = threading.Thread(target=_do_restart, daemon=True)
+    t.start()
 
 
 # ──────────────────────────────────────────────────────────
@@ -2862,9 +2948,7 @@ def load_dlv_batch() -> List[Dict]:
 
 
 def save_dlv_batch(items: List[Dict]) -> None:
-    _ensure_data_dir()
-    with open(SAVED_DLV_BATCH_FILE, "w") as f:
-        json.dump(items, f, indent=2)
+    _atomic_json_write(SAVED_DLV_BATCH_FILE, items, indent=2)
 
 
 def clear_dlv_batch() -> None:
@@ -3003,8 +3087,13 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> str:
                     timeout=30,
                 )
                 r.raise_for_status()
+                # Persist before reporting success; if disk write fails, log it but
+                # still report the correct outcome — the API assignment did succeed.
+                try:
+                    persist_assignment(ref, valuer_name, valuer_uid)
+                except Exception as _pe:
+                    logger.error("persist_assignment failed for %s: %s", ref, _pe)
                 completed_lines.append(f"✅ `{ref}` — assigned to *{valuer_name}*")
-                persist_assignment(ref, valuer_name, valuer_uid)
 
             elif node == "VALUATION_STAMP_DUTY_VALUER_REPORT":
                 actors = detail.get("actors", [])
@@ -3085,9 +3174,7 @@ def load_auto_fetch_schedule() -> Optional[Dict]:
 
 
 def save_auto_fetch_schedule(cfg: Dict) -> None:
-    _ensure_data_dir()
-    with open(SAVED_AUTO_FETCH_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
+    _atomic_json_write(SAVED_AUTO_FETCH_FILE, cfg, indent=2)
 
 
 def clear_auto_fetch_schedule() -> None:
@@ -3095,6 +3182,55 @@ def clear_auto_fetch_schedule() -> None:
         os.remove(SAVED_AUTO_FETCH_FILE)
     except FileNotFoundError:
         pass
+
+
+# ── SLA Alerts config ──────────────────────────────────────
+
+def load_sla_config() -> Optional[Dict]:
+    try:
+        with open(SAVED_SLA_CONFIG_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_sla_config(cfg: Dict) -> None:
+    _atomic_json_write(SAVED_SLA_CONFIG_FILE, cfg, indent=2)
+
+
+def clear_sla_config() -> None:
+    try:
+        os.remove(SAVED_SLA_CONFIG_FILE)
+    except FileNotFoundError:
+        pass
+
+
+# ── Morning Briefing config ────────────────────────────────
+
+def load_briefing_config() -> Optional[Dict]:
+    try:
+        with open(SAVED_BRIEFING_CONFIG_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_briefing_config(cfg: Dict) -> None:
+    _atomic_json_write(SAVED_BRIEFING_CONFIG_FILE, cfg, indent=2)
+
+
+# ── Sectional Properties config ────────────────────────────
+
+def load_sectional_config() -> Optional[Dict]:
+    try:
+        with open(SAVED_SECTIONAL_CONFIG_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_sectional_config(cfg: Dict) -> None:
+    _atomic_json_write(SAVED_SECTIONAL_CONFIG_FILE, cfg, indent=2)
 
 
 # ── Auto Fetch result history ──────────────────────────────
@@ -3140,8 +3276,7 @@ def persist_af_result(run_id: str, run_at: str, tasks: List[Dict], cfg: Dict) ->
     # Trim to keep only the most recent runs
     if len(results) > _AF_RESULTS_KEEP:
         results = results[-_AF_RESULTS_KEEP:]
-    with open(SAVED_AF_RESULTS_FILE, "w") as f:
-        json.dump(results, f, indent=2)
+    _atomic_json_write(SAVED_AF_RESULTS_FILE, results, indent=2)
 
 
 def _af_interval_keyboard() -> InlineKeyboardMarkup:
@@ -3212,6 +3347,10 @@ async def recv_af_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         interval_minutes = int(query.data.split(":")[-1])
     except ValueError:
+        await query.edit_message_text(
+            "⚠️ Unexpected selection. Please tap one of the interval buttons below:",
+            reply_markup=_af_interval_keyboard(),
+        )
         return AF.INTERVAL
 
     ctx.user_data["af_interval_minutes"] = interval_minutes
@@ -3366,10 +3505,9 @@ async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text.lower() == "skip":
         email = ""
     else:
-        # Basic email validation
-        if "@" not in text or "." not in text.split("@")[-1]:
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}", text):
             await update.message.reply_text(
-                "❌ Invalid email address. Enter a valid email or send `skip`.",
+                "❌ Invalid email address. Enter a valid email (e.g. `user@example.com`) or send `skip`.",
                 parse_mode="Markdown",
             )
             return AF.EMAIL
@@ -3507,6 +3645,58 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     queued_refs = {item.get("ref", "") for item in load_dlv_batch()}
     tasks = [t for t in tasks if t.get("reference_number", "") not in queued_refs]
 
+    # Sectional auto-routing: if a specialist is configured, auto-assign sectional tasks
+    sc_cfg = load_sectional_config()
+    if sc_cfg and sc_cfg.get("auto_route") and sc_cfg.get("specialist") and sc_cfg.get("cred_type"):
+        specialist   = sc_cfg["specialist"]
+        sc_cred_type = sc_cfg["cred_type"]
+        sc_tokens    = get_valid_tokens(sc_cred_type)
+        if sc_tokens:
+            sectional_tasks  = [t for t in tasks if str(t.get("parcel_number") or "").count("/") >= 3]
+            remaining_tasks  = [t for t in tasks if str(t.get("parcel_number") or "").count("/") < 3]
+            if sectional_tasks:
+                assigned_sc = []
+                failed_sc   = []
+                sc_sess     = build_session()
+                sc_hdrs     = {
+                    "Authorization": f"Bearer {sc_tokens.access_token}",
+                    "JWTAUTH":       f"Bearer {sc_tokens.jwt}",
+                    "cparams":       CPARAMS_VALUER_ROLE,
+                }
+                for t in sectional_tasks:
+                    ref = t.get("reference_number", "")
+                    try:
+                        r = sc_sess.put(
+                            f"{BASE_URL}/valuationservice/api/v1/stamp-duty/fix_application_details",
+                            headers=sc_hdrs,
+                            json={"request_id": t.get("id", ""), "valuation_officer": specialist["uid"]},
+                            timeout=30,
+                        )
+                        if r.status_code in (200, 201):
+                            assigned_sc.append(ref)
+                            persist_assignment(ref, specialist["name"], specialist["uid"])
+                        else:
+                            failed_sc.append(ref)
+                    except Exception as e:
+                        logger.warning("Sectional auto-assign failed for %s: %s", ref, e)
+                        failed_sc.append(ref)
+
+                if assigned_sc or failed_sc:
+                    sc_msg = (
+                        f"🔲 *Sectional Auto-Assign* — {specialist['name']}\n"
+                        f"✅ Assigned: {len(assigned_sc)} | ❌ Failed: {len(failed_sc)}\n"
+                    )
+                    if assigned_sc:
+                        sc_msg += "\n".join(f"  ✅ {r}" for r in assigned_sc[:10])
+                    if failed_sc:
+                        sc_msg += "\n" + "\n".join(f"  ❌ {r}" for r in failed_sc[:5])
+                    for chat_id in ALLOWED_IDS:
+                        try:
+                            await context.bot.send_message(chat_id, sc_msg, parse_mode="Markdown")
+                        except Exception as e:
+                            logger.warning("Sectional auto-assign notify error for %s: %s", chat_id, e)
+                tasks = remaining_tasks
+
     # Persist result history (record even if empty so the run appears in AF Results)
     _af_run_id = str(uuid.uuid4())[:8]
     _af_run_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -3599,6 +3789,502 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.info("Auto Fetch email sent to %s", email)
         except Exception as e:
             logger.warning("Auto Fetch email failed: %s", e)
+
+
+# ──────────────────────────────────────────────────────────
+# SLA Alerts background job
+# ──────────────────────────────────────────────────────────
+
+async def _sla_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Background job: check ONGOING tasks for aging and alert if any exceed the threshold."""
+    cfg = load_sla_config()
+    if not cfg or not cfg.get("enabled"):
+        return
+
+    tokens = _any_valid_tokens()
+    if not tokens:
+        logger.warning("SLA job: no valid tokens — skipping.")
+        return
+
+    threshold_days = cfg.get("threshold_days", 7)
+    http_sess = build_session()
+    headers = {
+        "Authorization": f"Bearer {tokens.access_token}",
+        "JWTAUTH":       f"Bearer {tokens.jwt}",
+        "cparams":       CPARAMS_DLV,
+    }
+
+    all_tasks = []
+    page = 1
+    while True:
+        try:
+            resp = http_sess.get(
+                f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
+                headers=headers,
+                params={"filter": "Ongoing", "role": "DLV", "request_type": "STAMP_DUTY", "page": page},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", [])
+            if not results:
+                break
+            all_tasks.extend(results)
+            if len(results) < 100:
+                break
+            page += 1
+        except Exception as e:
+            logger.warning("SLA job: fetch page %d failed: %s", page, e)
+            break
+
+    if not all_tasks:
+        return
+
+    now = datetime.now(tz=timezone.utc)
+    aged = []
+    county_counts: Dict[str, int] = {}
+
+    for t in all_tasks:
+        raw_date = t.get("date_created") or t.get("created_at") or ""
+        try:
+            created = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+            age_days = (now - created).days
+        except (ValueError, TypeError):
+            age_days = 0
+        if age_days >= threshold_days:
+            county = (t.get("county") or "Unknown").upper()
+            county_counts[county] = county_counts.get(county, 0) + 1
+            aged.append({
+                "ref":      t.get("reference_number", "—"),
+                "county":   county,
+                "registry": (t.get("registry") or "—").upper(),
+                "age_days": age_days,
+            })
+
+    if not aged:
+        return
+
+    aged.sort(key=lambda x: x["age_days"], reverse=True)
+    county_lines = "\n".join(
+        f"  • {c}: {n} task(s)" for c, n in sorted(county_counts.items())
+    )
+    top_5 = aged[:5]
+    top_lines = "\n".join(
+        f"  {i+1}. {t['ref']} — {t['age_days']}d ({t['county']}/{t['registry']})"
+        for i, t in enumerate(top_5)
+    )
+    msg = (
+        f"⚠️ *SLA Alert — {len(aged)} aged task(s)*\n"
+        f"Threshold: >{threshold_days} days old | Total ONGOING: {len(all_tasks)}\n\n"
+        f"*By county:*\n{county_lines}\n\n"
+        f"*Oldest tasks:*\n{top_lines}"
+    )
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n…_(truncated)_"
+    for chat_id in ALLOWED_IDS:
+        try:
+            await context.bot.send_message(chat_id, msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("SLA job notify error for %s: %s", chat_id, e)
+
+
+# ──────────────────────────────────────────────────────────
+# Morning Briefing background job
+# ──────────────────────────────────────────────────────────
+
+async def _send_briefing(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    for chat_id in ALLOWED_IDS:
+        try:
+            await context.bot.send_message(chat_id, text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("Morning briefing notify error for %s: %s", chat_id, e)
+
+
+async def _morning_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Daily 8 AM EAT briefing: ONGOING task backlog by county and age."""
+    cfg = load_briefing_config()
+    if not cfg or not cfg.get("enabled"):
+        return
+
+    tokens = _any_valid_tokens()
+    if not tokens:
+        logger.warning("Morning briefing job: no valid tokens — skipping.")
+        return
+
+    http_sess = build_session()
+    headers = {
+        "Authorization": f"Bearer {tokens.access_token}",
+        "JWTAUTH":       f"Bearer {tokens.jwt}",
+        "cparams":       CPARAMS_DLV,
+    }
+
+    all_tasks = []
+    page = 1
+    while True:
+        try:
+            resp = http_sess.get(
+                f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
+                headers=headers,
+                params={"filter": "Ongoing", "role": "DLV", "request_type": "STAMP_DUTY", "page": page},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", [])
+            if not results:
+                break
+            all_tasks.extend(results)
+            if len(results) < 100:
+                break
+            page += 1
+        except Exception as e:
+            logger.warning("Morning briefing job: fetch page %d failed: %s", page, e)
+            break
+
+    if not all_tasks:
+        await _send_briefing(context, "📋 *Morning Briefing*\n\nNo ONGOING tasks found.")
+        return
+
+    now = datetime.now(tz=timezone.utc)
+    buckets = {"0-3 days": 0, "4-7 days": 0, "8-14 days": 0, ">14 days": 0}
+    county_counts: Dict[str, int] = {}
+    oldest_days = 0
+    oldest_ref  = "—"
+
+    for t in all_tasks:
+        raw_date = t.get("date_created") or t.get("created_at") or ""
+        try:
+            created   = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+            age_days  = (now - created).days
+        except (ValueError, TypeError):
+            age_days = 0
+
+        if age_days <= 3:
+            buckets["0-3 days"] += 1
+        elif age_days <= 7:
+            buckets["4-7 days"] += 1
+        elif age_days <= 14:
+            buckets["8-14 days"] += 1
+        else:
+            buckets[">14 days"] += 1
+
+        county = (t.get("county") or "Unknown").upper()
+        county_counts[county] = county_counts.get(county, 0) + 1
+
+        if age_days > oldest_days:
+            oldest_days = age_days
+            oldest_ref  = t.get("reference_number", "—")
+
+    bucket_lines = "\n".join(f"  {label}: {count}" for label, count in buckets.items())
+    county_lines = "\n".join(
+        f"  {c}: {n}" for c, n in sorted(county_counts.items(), key=lambda x: -x[1])[:8]
+    )
+    today = now.strftime("%d %b %Y")
+    msg = (
+        f"🌅 *Morning Briefing — {today}*\n"
+        f"Total ONGOING: *{len(all_tasks)}*\n\n"
+        f"*Age breakdown:*\n{bucket_lines}\n\n"
+        f"*Top counties:*\n{county_lines}\n\n"
+        f"Oldest task: *{oldest_days}d* ({oldest_ref})"
+    )
+    await _send_briefing(context, msg)
+
+
+# ──────────────────────────────────────────────────────────
+# SLA Alerts command handlers
+# ──────────────────────────────────────────────────────────
+
+async def cmd_sla(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    cfg = load_sla_config()
+    if cfg and cfg.get("enabled"):
+        threshold = cfg.get("threshold_days", 7)
+        interval  = cfg.get("interval_hours", 6)
+        status = (
+            f"⚠️ *SLA Alerts are active*\n"
+            f"Threshold: {threshold} days | Check every: {interval} hr\n\n"
+            f"Enter a new threshold (days) to reconfigure, or tap Cancel to disable:"
+        )
+        await update.message.reply_text(
+            status,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🛑 Disable SLA Alerts", callback_data="sla:disable"),
+                InlineKeyboardButton("✏️ Reconfigure", callback_data="sla:reconfigure"),
+            ]]),
+        )
+        return SLA.THRESHOLD
+    await update.message.reply_text(
+        "⚠️ *SLA Alerts*\n\n"
+        "Periodically checks for ONGOING tasks older than a set threshold and sends an alert.\n\n"
+        "Enter the aging threshold in days (e.g. `7`):",
+        parse_mode="Markdown",
+    )
+    return SLA.THRESHOLD
+
+
+async def recv_sla_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        if query.data == "sla:disable":
+            for job in ctx.job_queue.get_jobs_by_name("sla_job"):
+                job.schedule_removal()
+            clear_sla_config()
+            await query.edit_message_text("🛑 SLA Alerts disabled.")
+            await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+            return ConversationHandler.END
+        # reconfigure — ask for threshold
+        await query.edit_message_text(
+            "Enter the aging threshold in days (e.g. `7`):",
+            parse_mode="Markdown",
+        )
+        return SLA.THRESHOLD
+
+    text = update.message.text.strip()
+    try:
+        days = int(text)
+        if days < 1:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Enter a whole number >= 1 (e.g. `7`).", parse_mode="Markdown")
+        return SLA.THRESHOLD
+
+    ctx.user_data["sla_threshold"] = days
+    await update.message.reply_text(
+        f"✅ Threshold: *{days} days*\n\nHow often should the check run?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Every 2 hr",  callback_data="sla_interval:2"),
+                InlineKeyboardButton("Every 4 hr",  callback_data="sla_interval:4"),
+                InlineKeyboardButton("Every 6 hr",  callback_data="sla_interval:6"),
+            ],
+            [
+                InlineKeyboardButton("Every 12 hr", callback_data="sla_interval:12"),
+                InlineKeyboardButton("Every 24 hr", callback_data="sla_interval:24"),
+            ],
+        ]),
+    )
+    return SLA.INTERVAL
+
+
+async def recv_sla_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    hours = int(query.data.split(":")[1])
+    threshold = ctx.user_data.get("sla_threshold", 7)
+
+    cfg = {"enabled": True, "threshold_days": threshold, "interval_hours": hours}
+    save_sla_config(cfg)
+
+    for job in ctx.job_queue.get_jobs_by_name("sla_job"):
+        job.schedule_removal()
+    ctx.job_queue.run_repeating(
+        _sla_job,
+        interval=hours * 3600,
+        first=hours * 3600,
+        name="sla_job",
+    )
+    await query.edit_message_text(
+        f"✅ *SLA Alerts enabled*\n"
+        f"Threshold: *{threshold} days* | Check every *{hours} hr*\n"
+        f"First check in {hours} hr.",
+        parse_mode="Markdown",
+    )
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    return ConversationHandler.END
+
+
+# ──────────────────────────────────────────────────────────
+# Morning Briefing command handler
+# ──────────────────────────────────────────────────────────
+
+async def cmd_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    cfg = load_briefing_config()
+    if cfg and cfg.get("enabled"):
+        save_briefing_config({"enabled": False})
+        for job in ctx.job_queue.get_jobs_by_name("morning_briefing_job"):
+            job.schedule_removal()
+        await update.message.reply_text(
+            "🛑 Morning Briefing disabled.",
+            reply_markup=_main_menu(),
+        )
+    else:
+        save_briefing_config({"enabled": True})
+        ctx.job_queue.run_daily(
+            _morning_briefing_job,
+            time=_dtime(5, 0, tzinfo=timezone.utc),
+            name="morning_briefing_job",
+        )
+        await update.message.reply_text(
+            "🌅 *Morning Briefing enabled*\nRuns daily at 8 AM EAT (05:00 UTC).\n"
+            "Tap again to disable.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu(),
+        )
+
+
+# ──────────────────────────────────────────────────────────
+# Sectional Properties command handlers
+# ──────────────────────────────────────────────────────────
+
+async def cmd_sectional(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    cfg = load_sectional_config()
+    specialist = cfg.get("specialist") if cfg else None
+    auto_route = cfg.get("auto_route", False) if cfg else False
+    cred_type  = cfg.get("cred_type", "") if cfg else ""
+
+    if specialist:
+        status = (
+            f"🔲 *Sectional Properties*\n\n"
+            f"Specialist: *{specialist['name']}*\n"
+            f"Auto-routing: {'✅ On' if auto_route else '❌ Off'}\n"
+            f"Credential: {CRED_LABELS.get(cred_type, cred_type) if cred_type else '—'}\n\n"
+            f"Choose an action:"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "❌ Disable Auto-Route" if auto_route else "✅ Enable Auto-Route",
+                    callback_data="sc:toggle_route",
+                ),
+            ],
+            [InlineKeyboardButton("👤 Change Specialist", callback_data="sc:change")],
+            [InlineKeyboardButton("🗑 Clear Config",       callback_data="sc:clear")],
+        ])
+    else:
+        status = (
+            "🔲 *Sectional Properties*\n\n"
+            "No specialist configured. Set a specialist valuer to enable auto-routing "
+            "of sectional tasks from Auto Fetch.\n\n"
+            "Enter the specialist's name to search:"
+        )
+        keyboard = None
+
+    await update.message.reply_text(status, parse_mode="Markdown", reply_markup=keyboard)
+    return SC.ACTION if specialist else SC.SET_NAME
+
+
+async def recv_sc_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    cfg = load_sectional_config() or {}
+
+    if query.data == "sc:toggle_route":
+        cfg["auto_route"] = not cfg.get("auto_route", False)
+        save_sectional_config(cfg)
+        state = "enabled" if cfg["auto_route"] else "disabled"
+        await query.edit_message_text(f"✅ Auto-routing {state}.", reply_markup=None)
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    if query.data == "sc:clear":
+        save_sectional_config({})
+        await query.edit_message_text("🗑 Sectional config cleared.")
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    # sc:change — ask for new name
+    await query.edit_message_text(
+        "Enter the specialist valuer's name to search:",
+        reply_markup=None,
+    )
+    return SC.SET_NAME
+
+
+async def recv_sc_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("❌ Please enter a name.")
+        return SC.SET_NAME
+
+    tokens = _any_valid_tokens()
+    if not tokens:
+        await update.message.reply_text("❌ No valid tokens. Please refresh auth first.")
+        return ConversationHandler.END
+
+    http_sess = build_session()
+    try:
+        resp = http_sess.get(
+            f"{BASE_URL}/acl/api/v1/accounts/list-user-accounts",
+            headers={"Authorization": f"Bearer {tokens.access_token}", "JWTAUTH": f"Bearer {tokens.jwt}"},
+            params={"account_type": "STAFF", "search": name, "page": 1},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+    except Exception as e:
+        logger.error("Sectional name search failed: %s", e)
+        await update.message.reply_text(f"❌ Search failed: {_safe_err(e)}")
+        return ConversationHandler.END
+
+    if not results:
+        await update.message.reply_text(f"No staff found matching '{name}'. Try again:")
+        return SC.SET_NAME
+
+    ctx.user_data["sc_results"] = results[:10]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"{r.get('first_name','')} {r.get('last_name','')} ({r.get('employee_number','')})".strip(),
+            callback_data=f"sc_pick:{i}",
+        )]
+        for i, r in enumerate(results[:10])
+    ])
+    await update.message.reply_text("Select the specialist valuer:", reply_markup=keyboard)
+    return SC.SELECT
+
+
+async def recv_sc_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    idx = int(query.data.split(":")[1])
+    results = ctx.user_data.get("sc_results", [])
+    if idx >= len(results):
+        await query.edit_message_text("❌ Invalid selection.")
+        return ConversationHandler.END
+
+    person = results[idx]
+    uid    = str(person.get("id") or person.get("uid", ""))
+    name   = f"{person.get('first_name','')} {person.get('last_name','')}".strip()
+    acct   = str(person.get("account_number") or person.get("employee_number") or "")
+    ctx.user_data["sc_specialist"] = {"name": name, "uid": uid, "account_number": acct}
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=f"sc_cred:{key}")]
+        for key, label in CRED_LABELS.items()
+    ])
+    await query.edit_message_text(
+        f"Selected: *{name}*\n\nWhich credential to use for auto-assignment?",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+    return SC.CRED
+
+
+async def recv_sc_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    cred_type  = query.data.split(":")[1]
+    specialist = ctx.user_data.get("sc_specialist", {})
+    cfg = load_sectional_config() or {}
+    cfg.update({
+        "specialist": specialist,
+        "cred_type":  cred_type,
+        "auto_route": cfg.get("auto_route", False),
+    })
+    save_sectional_config(cfg)
+    await query.edit_message_text(
+        f"✅ *Sectional specialist set*\n"
+        f"Name: *{specialist.get('name')}*\n"
+        f"Credential: *{CRED_LABELS.get(cred_type, cred_type)}*\n\n"
+        f"Use /sectional to toggle auto-routing.",
+        parse_mode="Markdown",
+    )
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    return ConversationHandler.END
 
 
 # ──────────────────────────────────────────────────────────
@@ -4411,6 +5097,9 @@ async def recv_ft_amount_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = text.replace(",", "").split()
     try:
         if len(parts) == 2:
+            # Python evaluates the full RHS tuple before the assignment, so if
+            # float(parts[1]) raises, neither sess.amount_min nor sess.amount_max
+            # is modified — the session state stays clean.
             sess.amount_min, sess.amount_max = float(parts[0]), float(parts[1])
         elif len(parts) == 1:
             sess.amount_min, sess.amount_max = 0.0, float(parts[0])
@@ -4547,7 +5236,7 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
     except Exception as e:
         logger.error("_ft_show_results error: %s", e)
         await message.reply_text(
-            f"❌ Failed to display results: {e}", reply_markup=_main_menu()
+            "❌ Failed to display results — please try again.", reply_markup=_main_menu()
         )
     return ConversationHandler.END
 
@@ -4667,7 +5356,8 @@ async def recv_dlv_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             tasks, raw_count = _load_dlv_tasks(tokens)
         except Exception as e:
-            await query.edit_message_text(f"❌ Refresh failed: {e}")
+            logger.error("DLV task refresh failed: %s", e)
+            await query.edit_message_text("❌ Refresh failed — please try again.")
             return
         checked = set()
         ctx.user_data["dlv_tasks"]   = tasks
@@ -4928,8 +5618,9 @@ async def _ta_run_assign(message, ctx: ContextTypes.DEFAULT_TYPE,
             result_lines.append(f"✅ `{ref}`")
             persist_assignment(ref, valuer_name, valuer_uid)
         except Exception as e:
+            logger.error("Assignment failed for %s: %s", ref, e)
             fail_refs.append(ref)
-            result_lines.append(f"❌ `{ref}` — {e}")
+            result_lines.append(f"❌ `{ref}` — {_safe_err(e)}")
 
     if ok_refs:
         persist_valuer(valuer_name, valuer_uid, acct)
@@ -5251,6 +5942,7 @@ _BE_LIST_WORKERS        = 5
 _BE_DETAIL_WORKERS      = 5
 _BE_MAX_RETRIES         = 3
 _BE_TOKEN_ROTATE_DELAY  = 10   # seconds to wait before retrying with a new token
+_MAX_FETCH_RETRIES      = 5    # max 429/5xx retries before aborting a fetch loop
 
 
 class _AllTokensExhausted(Exception):
@@ -5277,7 +5969,13 @@ class _TokenRotator:
             return "none"
 
     def rotate(self, failed: "AuthTokens") -> Optional["AuthTokens"]:
-        """Advance past `failed` if it is still the current token. Returns new token or None."""
+        """Advance past `failed` if it is still the current token. Returns new token or None.
+
+        The identity (`is`) check is intentional: if two threads both get 403 on the
+        same token and both call rotate(), only the first one advances the index — the
+        second sees the index already moved and simply returns the new current token,
+        avoiding a double-skip.  This is correct thread-safe behaviour, not a bug.
+        """
         with self._lock:
             if self._idx < len(self._tokens) and self._tokens[self._idx][1] is failed:
                 self._idx += 1
@@ -5324,9 +6022,7 @@ def load_be_schedule() -> Optional[Dict]:
 
 
 def save_be_schedule(cfg: Dict) -> None:
-    _ensure_data_dir()
-    with open(SAVED_BULK_EXPORT_SCHED_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
+    _atomic_json_write(SAVED_BULK_EXPORT_SCHED_FILE, cfg, indent=2)
 
 
 def clear_be_schedule() -> None:
@@ -5345,15 +6041,13 @@ def load_be_partial() -> Optional[Dict]:
 
 
 def save_be_partial(county: str, registries: List[str], rows: List[dict], done_ids: List[str]) -> None:
-    _ensure_data_dir()
-    with open(SAVED_BULK_EXPORT_PARTIAL_FILE, "w") as f:
-        json.dump({
-            "saved_at":  datetime.now().isoformat(),
-            "county":    county,
-            "registries": registries,
-            "rows":      rows,
-            "done_ids":  done_ids,
-        }, f)
+    _atomic_json_write(SAVED_BULK_EXPORT_PARTIAL_FILE, {
+        "saved_at":   datetime.now().isoformat(),
+        "county":     county,
+        "registries": registries,
+        "rows":       rows,
+        "done_ids":   done_ids,
+    })
 
 
 def clear_be_partial() -> None:
@@ -5371,10 +6065,14 @@ def _be_schedule_keyboard() -> InlineKeyboardMarkup:
 
 
 def _be_county_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label, callback_data=f"be_county:{key}")]
-        for key, label in _BE_COUNTY_LABELS.items()
-    ])
+    items = list(_BE_COUNTY_LABELS.items())
+    rows = []
+    for i in range(0, len(items), 2):
+        row = [InlineKeyboardButton(items[i][1], callback_data=f"be_county:{items[i][0]}")]
+        if i + 1 < len(items):
+            row.append(InlineKeyboardButton(items[i+1][1], callback_data=f"be_county:{items[i+1][0]}"))
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
 
 
 def _be_cred_keyboard() -> Optional[InlineKeyboardMarkup]:
@@ -5408,32 +6106,39 @@ def _be_fetch_detail(sess: requests.Session, rotator: "_TokenRotator", app_id: s
     On 403 rotates to the next valid token (with a short pause).
     Raises _AllTokensExhausted when no more tokens remain.
     """
+    retries = 0
     while True:
         tokens = rotator.current()
         if tokens is None:
             raise _AllTokensExhausted(f"All tokens exhausted fetching {app_id}")
         headers = _be_headers(tokens)
-        try:
-            resp = sess.get(_BE_DETAIL_URL, headers=headers, params={"request_id": app_id}, timeout=30)
-            if resp.status_code == 403:
-                new_tokens = rotator.rotate(tokens)
-                if new_tokens is None:
-                    raise _AllTokensExhausted(f"All tokens exhausted (403) fetching {app_id}")
-                time.sleep(_BE_TOKEN_ROTATE_DELAY)
-                continue
-            if resp.status_code in (429, 502, 503, 504):
-                time.sleep(2)
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except _AllTokensExhausted:
-            raise
-        except Exception as exc:
-            raise exc
+        resp = sess.get(_BE_DETAIL_URL, headers=headers, params={"request_id": app_id}, timeout=30)
+        if resp.status_code == 403:
+            new_tokens = rotator.rotate(tokens)
+            if new_tokens is None:
+                raise _AllTokensExhausted(f"All tokens exhausted (403) fetching {app_id}")
+            time.sleep(_BE_TOKEN_ROTATE_DELAY)
+            continue
+        if resp.status_code == 404:
+            # Record no longer exists — return empty dict so caller marks it cleanly
+            logger.debug("_be_fetch_detail: 404 for app_id=%s — record not found", app_id)
+            return {}
+        if resp.status_code in (429, 502, 503, 504):
+            retries += 1
+            if retries >= _MAX_FETCH_RETRIES:
+                raise RuntimeError(
+                    f"_be_fetch_detail: too many transient errors (HTTP {resp.status_code}) "
+                    f"for app_id={app_id}"
+                )
+            time.sleep(2)
+            continue
+        resp.raise_for_status()
+        return resp.json()
 
 
 def _be_fetch_office_report(sess: requests.Session, rotator: "_TokenRotator", app_id: str) -> dict:
     """Fetch the office report for one application. Returns {} on any error (non-critical)."""
+    retries = 0
     while True:
         tokens = rotator.current()
         if tokens is None:
@@ -5448,15 +6153,17 @@ def _be_fetch_office_report(sess: requests.Session, rotator: "_TokenRotator", ap
                 time.sleep(_BE_TOKEN_ROTATE_DELAY)
                 continue
             if resp.status_code in (429, 502, 503, 504):
+                retries += 1
+                if retries >= _MAX_FETCH_RETRIES:
+                    logger.warning("_be_fetch_office_report: giving up after %d retries for app_id=%s", retries, app_id)
+                    return {}
                 time.sleep(2)
                 continue
             if resp.status_code == 404:
                 return {}
             resp.raise_for_status()
             return resp.json()
-        except _AllTokensExhausted:
-            return {}
-        except Exception:
+        except (_AllTokensExhausted, Exception):
             return {}
 
 
@@ -6187,28 +6894,30 @@ def _jd_fetch_ongoing_page(sess: requests.Session, headers: dict, page: int) -> 
 
 def _jd_fetch_task_detail(sess: requests.Session, rotator: "_TokenRotator", task_id: str) -> dict:
     """Fetch detail for one task with token rotation on 403."""
+    retries = 0
     while True:
         tokens = rotator.current()
         if tokens is None:
             raise _AllTokensExhausted(f"All tokens exhausted fetching task {task_id}")
         headers = _jd_headers(tokens)
-        try:
-            resp = sess.get(_JD_DETAIL_URL, headers=headers, params={"request_id": task_id}, timeout=30)
-            if resp.status_code == 403:
-                new_tokens = rotator.rotate(tokens)
-                if new_tokens is None:
-                    raise _AllTokensExhausted(f"All tokens exhausted (403) fetching task {task_id}")
-                time.sleep(_BE_TOKEN_ROTATE_DELAY)
-                continue
-            if resp.status_code in (429, 502, 503, 504):
-                time.sleep(2)
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except _AllTokensExhausted:
-            raise
-        except Exception as exc:
-            raise exc
+        resp = sess.get(_JD_DETAIL_URL, headers=headers, params={"request_id": task_id}, timeout=30)
+        if resp.status_code == 403:
+            new_tokens = rotator.rotate(tokens)
+            if new_tokens is None:
+                raise _AllTokensExhausted(f"All tokens exhausted (403) fetching task {task_id}")
+            time.sleep(_BE_TOKEN_ROTATE_DELAY)
+            continue
+        if resp.status_code in (429, 502, 503, 504):
+            retries += 1
+            if retries >= _MAX_FETCH_RETRIES:
+                raise RuntimeError(
+                    f"_jd_fetch_task_detail: too many transient errors (HTTP {resp.status_code}) "
+                    f"for task_id={task_id}"
+                )
+            time.sleep(2)
+            continue
+        resp.raise_for_status()
+        return resp.json()
 
 
 def _jd_build_excel(
@@ -6320,10 +7029,10 @@ def _jd_build_excel(
                             in_range.append(label)
                         else:
                             out_range.append(label)
-                        continue
+                        continue   # already appended above; skip the fallback append below
                     except (ValueError, TypeError):
                         label = ref
-                in_range.append(label)   # no amount → assume in range
+                in_range.append(label)   # reached when: amount is empty OR unparseable → assume in range
 
             refs = ", ".join(in_range + out_range)
 
@@ -7873,6 +8582,74 @@ def main():
             name="auto_fetch_job",
         )
         logger.info("Auto Fetch schedule restored: every %d min", cfg.get("interval_minutes"))
+
+    # SLA Alerts: restore saved schedule on startup
+    sla_cfg = load_sla_config()
+    if sla_cfg and sla_cfg.get("enabled"):
+        hours = sla_cfg.get("interval_hours", 6)
+        app.job_queue.run_repeating(
+            _sla_job,
+            interval=hours * 3600,
+            first=hours * 3600,
+            name="sla_job",
+        )
+        logger.info("SLA alerts restored: every %d hr", hours)
+
+    # Morning Briefing: restore if enabled
+    briefing_cfg = load_briefing_config()
+    if briefing_cfg and briefing_cfg.get("enabled"):
+        app.job_queue.run_daily(
+            _morning_briefing_job,
+            time=_dtime(5, 0, tzinfo=timezone.utc),
+            name="morning_briefing_job",
+        )
+        logger.info("Morning briefing restored: daily at 05:00 UTC")
+
+    sla_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("sla", cmd_sla),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_SLA)}$"), cmd_sla),
+        ],
+        states={
+            SLA.THRESHOLD: [
+                CallbackQueryHandler(recv_sla_threshold, pattern=r"^sla:"),
+                MessageHandler(not_cancel, recv_sla_threshold),
+            ],
+            SLA.INTERVAL: [CallbackQueryHandler(recv_sla_interval, pattern=r"^sla_interval:")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(_CANCEL_FILTER, cmd_cancel),
+            MessageHandler(filters.TEXT, fallback),
+        ],
+        allow_reentry=True,
+        per_message=False,
+    )
+    app.add_handler(sla_conv)
+
+    sc_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("sectional", cmd_sectional),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_SECTIONAL)}$"), cmd_sectional),
+        ],
+        states={
+            SC.ACTION:   [CallbackQueryHandler(recv_sc_action,  pattern=r"^sc:")],
+            SC.SET_NAME: [MessageHandler(not_cancel, recv_sc_name)],
+            SC.SELECT:   [CallbackQueryHandler(recv_sc_select,  pattern=r"^sc_pick:")],
+            SC.CRED:     [CallbackQueryHandler(recv_sc_cred,    pattern=r"^sc_cred:")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(_CANCEL_FILTER, cmd_cancel),
+            MessageHandler(filters.TEXT, fallback),
+        ],
+        allow_reentry=True,
+        per_message=False,
+    )
+    app.add_handler(sc_conv)
+
+    app.add_handler(CommandHandler("briefing", cmd_briefing))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_BRIEFING)}$"), cmd_briefing))
 
     # Button handlers outside an active conversation
     app.add_handler(CallbackQueryHandler(recv_delete_valuer,  pattern=r"^del:"))

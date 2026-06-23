@@ -30,7 +30,6 @@ Environment variables (read from .env):
     ALLOWED_TELEGRAM_IDS     — comma-separated Telegram chat IDs
 """
 
-import base64
 import json
 import logging
 import os
@@ -51,6 +50,7 @@ from urllib3.util.retry import Retry
 from ardhisasa_auth import (
     AUTH_BASE_URL,
     build_session,
+    decode_jwt_exp,
 )
 
 load_dotenv()
@@ -131,13 +131,7 @@ def _save_cache(cache: Dict) -> None:
     os.replace(tmp, CACHE_FILE)
 
 
-def _decode_exp(token: str) -> Optional[float]:
-    try:
-        payload = token.split(".")[1]
-        payload += "=" * (4 - len(payload) % 4)
-        return float(json.loads(base64.urlsafe_b64decode(payload))["exp"])
-    except Exception:
-        return None
+_decode_exp = decode_jwt_exp  # shared implementation in ardhisasa_auth
 
 
 def _fmt_ts(ts: float) -> str:
@@ -293,8 +287,9 @@ def _refresh_job(cred_type: str) -> None:
         return
 
     if not refresh_token:
-        logger.info(
-            "[%s] No refresh_token stored — attempting refresh with current auth headers only.",
+        logger.warning(
+            "[%s] No refresh_token stored — attempting header-only refresh. "
+            "If this fails the credential will be skipped until the bot re-authenticates via OTP.",
             cred_type,
         )
 
