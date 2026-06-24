@@ -475,7 +475,7 @@ class SC(Enum):
 
 # County → list of registry names as they appear in the API response
 _BE_COUNTY_REGISTRIES: Dict[str, List[str]] = {
-    "NAIROBI":   ["NAIROBI", "CENTRAL"],
+    "NAIROBI":   ["CENTRAL"],
     "KIAMBU":    ["KIAMBU", "LIMURU", "THIKA", "RUIRU", "GITHUNGURI"],
     "MURANGA":   ["MURANGA", "KANDARA", "MARAGUA", "KANGEMA"],
     "MOMBASA":   ["MOMBASA", "COAST"],
