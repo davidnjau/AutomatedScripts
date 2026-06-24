@@ -451,6 +451,7 @@ class VT(Enum):
 # States — Bulk Export conversation
 # ──────────────────────────────────────────────────────────
 class BE(Enum):
+    REPORT_TYPE = auto()  # pick Ardhisasa or Ardhipay report
     COUNTY    = auto()   # pick county
     EMAIL     = auto()   # ask for recipient email address
     SCHEDULE  = auto()   # pick repeat interval
@@ -524,6 +525,7 @@ _JD_STATUS: Dict[int, dict] = {}
 
 @dataclass
 class BESession:
+    report_type:      str = ""   # "ardhisasa" or "ardhipay"
     county:           str = ""
     registries:       List[str] = field(default_factory=list)
     email:            str = ""
@@ -605,7 +607,8 @@ def _main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(BTN_DLV_BATCH)],
             [KeyboardButton(BTN_BULK_EXPORT),    KeyboardButton(BTN_EXPORT_STATUS)],
             [KeyboardButton(BTN_JOB_DIST),       KeyboardButton(BTN_VALUER_TASKS)],
-            [KeyboardButton(BTN_SLA),            KeyboardButton(BTN_BRIEFING),    KeyboardButton(BTN_SECTIONAL)],
+            [KeyboardButton(BTN_SLA),            KeyboardButton(BTN_SECTIONAL)],
+            [KeyboardButton(BTN_BRIEFING)],
             # ── Lookup ──────────────────────────────────────
             [KeyboardButton(BTN_LOOKUP)],
             [KeyboardButton(BTN_AUTH),           KeyboardButton(BTN_TOKEN_STATUS)],
@@ -5937,6 +5940,9 @@ async def recv_auth_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 _BE_LIST_URL   = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application"
 _BE_DETAIL_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view"
 _BE_REPORT_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/office-reports/get-current-office-report"
+# Ardhisasa report-specific endpoints
+_AR_OFFICE_REPORTS_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/office-reports"
+_AR_REPORT_DETAIL_URL  = f"{BASE_URL}/valuationservice/api/v1/valuation-reports/search/get_report_detail_view"
 _BE_PAGE_SIZE  = 10   # API default
 _BE_LIST_WORKERS        = 5
 _BE_DETAIL_WORKERS      = 5
@@ -6064,6 +6070,13 @@ def _be_schedule_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _be_report_type_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏛 Ardhisasa Report", callback_data="be_rtype:ardhisasa")],
+        [InlineKeyboardButton("💳 Ardhipay Report",  callback_data="be_rtype:ardhipay")],
+    ])
+
+
 def _be_county_keyboard() -> InlineKeyboardMarkup:
     items = list(_BE_COUNTY_LABELS.items())
     rows = []
@@ -6175,6 +6188,126 @@ def _be_fetch_full_record(sess: requests.Session, rotator: "_TokenRotator", app_
     docs   = report.get("combined_document") or []
     row["Combined Report"] = docs[0].get("document", "") if docs else ""
     return row
+
+
+def _ar_fetch_office_reports(sess: requests.Session, rotator: "_TokenRotator", app_id: str) -> dict:
+    """Fetch /stamp-duty/office-reports?request_id=<id>&current_previous=CURRENT. Returns results[0] or {}."""
+    retries = 0
+    while True:
+        tokens = rotator.current()
+        if tokens is None:
+            return {}
+        headers = {**_be_headers(tokens), "cparams": CPARAMS_DLV}
+        try:
+            resp = sess.get(
+                _AR_OFFICE_REPORTS_URL,
+                headers=headers,
+                params={"request_id": app_id, "current_previous": "CURRENT"},
+                timeout=30,
+            )
+            if resp.status_code == 403:
+                new_tokens = rotator.rotate(tokens)
+                if new_tokens is None:
+                    return {}
+                time.sleep(_BE_TOKEN_ROTATE_DELAY)
+                continue
+            if resp.status_code in (429, 502, 503, 504):
+                retries += 1
+                if retries >= _MAX_FETCH_RETRIES:
+                    return {}
+                time.sleep(2)
+                continue
+            if resp.status_code == 404:
+                return {}
+            resp.raise_for_status()
+            results = resp.json().get("results") or []
+            return results[0] if results else {}
+        except Exception:
+            return {}
+
+
+def _ar_fetch_report_detail(sess: requests.Session, rotator: "_TokenRotator", report_id: str) -> dict:
+    """Fetch /valuation-reports/search/get_report_detail_view?id=<report_id>. Returns the report dict or {}."""
+    retries = 0
+    while True:
+        tokens = rotator.current()
+        if tokens is None:
+            return {}
+        headers = {**_be_headers(tokens), "cparams": CPARAMS_DLV}
+        try:
+            resp = sess.get(
+                _AR_REPORT_DETAIL_URL,
+                headers=headers,
+                params={"id": report_id},
+                timeout=30,
+            )
+            if resp.status_code == 403:
+                new_tokens = rotator.rotate(tokens)
+                if new_tokens is None:
+                    return {}
+                time.sleep(_BE_TOKEN_ROTATE_DELAY)
+                continue
+            if resp.status_code in (429, 502, 503, 504):
+                retries += 1
+                if retries >= _MAX_FETCH_RETRIES:
+                    return {}
+                time.sleep(2)
+                continue
+            if resp.status_code == 404:
+                return {}
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            return {}
+
+
+def _ar_extract_row(detail: dict, office_report: dict, report_detail: dict) -> dict:
+    """Extract columns for the Ardhisasa report from detail + office-reports + report-detail responses."""
+    vo_name = ""
+    for actor in (detail.get("actors") or []):
+        if (actor.get("role") or "").upper() == "VALUATION OFFICER":
+            vo_name = (actor.get("user_details") or {}).get("names", "")
+            break
+
+    doc_url = ""
+    for pdoc in (detail.get("process_documents") or []):
+        if (pdoc.get("document_name") or "").upper() == "VALUATION CERTIFICATE":
+            doc_url = pdoc.get("document", "")
+            break
+
+    combined_url = ""
+    for cdoc in (report_detail.get("combined_document") or []):
+        if (cdoc.get("document_name") or "").lower() == "combined report file":
+            combined_url = cdoc.get("document", "")
+            break
+
+    return {
+        "Filter":                            detail.get("application_status", ""),
+        "Reference Number":                  detail.get("reference_number", ""),
+        "Parcel Number":                     detail.get("parcel_number", ""),
+        "Registry":                          detail.get("registry", ""),
+        "County":                            detail.get("county", ""),
+        "Valuation Request Type":            detail.get("valuation_request_type", ""),
+        "Application Status":                detail.get("application_status", ""),
+        "Application Date Created":          detail.get("date_created", ""),
+        "Valuation Officer":                 vo_name,
+        "Date of Valuation":                 office_report.get("date_of_valuation", ""),
+        "Valuer Total Land Value (KES)":     office_report.get("valuer_total_land_value", ""),
+        "Harmonized Total Land Value (KES)": office_report.get("harmonized_total_land_value", ""),
+        "Document URL":                      doc_url,
+        "Combined Report":                   combined_url,
+        "Enrich Error":                      "",
+    }
+
+
+def _ar_fetch_full_record(sess: requests.Session, rotator: "_TokenRotator", app_id: str) -> dict:
+    """Ardhisasa report: detail → office-reports → report-detail → merged row."""
+    detail        = _be_fetch_detail(sess, rotator, app_id)   # raises on error
+    office_report = _ar_fetch_office_reports(sess, rotator, app_id)
+    report_detail: dict = {}
+    if office_report.get("id"):
+        report_detail = _ar_fetch_report_detail(sess, rotator, office_report["id"])
+    return _ar_extract_row(detail, office_report, report_detail)
 
 
 def _be_extract_row(detail: dict) -> dict:
@@ -6424,7 +6557,8 @@ def _send_bulk_export_email(to_email: str, filename: str, xlsx_bytes: bytes) -> 
 
 
 def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop,
-                     registries: List[str] = None, county: str = "") -> None:
+                     registries: List[str] = None, county: str = "",
+                     report_type: str = "ardhipay") -> None:
     """
     Full synchronous export worker — runs in a background thread.
 
@@ -6540,8 +6674,9 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop,
             current_done_ids = list(done_ids)
             exhausted_flag   = threading.Event()
 
+            _fetch_fn = _ar_fetch_full_record if report_type == "ardhisasa" else _be_fetch_full_record
             with ThreadPoolExecutor(max_workers=_BE_DETAIL_WORKERS) as pool:
-                futures = {pool.submit(_be_fetch_full_record, sess, rotator, app_id): app_id
+                futures = {pool.submit(_fetch_fn, sess, rotator, app_id): app_id
                            for app_id in id_list}
                 for fut in _futures_as_completed(futures):
                     app_id = futures[fut]
@@ -6581,7 +6716,8 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop,
         rows.sort(key=lambda r: (r.get("Application Date Created") or ""))
 
         clear_be_partial()
-        filename   = f"Ardhisasa_Valuation_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        rtype_label = "Ardhisasa" if report_type == "ardhisasa" else "Ardhipay"
+        filename   = f"{rtype_label}_Valuation_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         xlsx_bytes = _be_build_excel(rows)
 
         asyncio.run_coroutine_threadsafe(
@@ -7997,29 +8133,32 @@ async def _bulk_export_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         cred_label = CRED_LABELS.get(cred_type, cred_type or "any")
         logger.warning("Bulk export job: no valid tokens for %s — skipping.", cred_label)
         return
-    chat_id    = cfg["chat_id"]
-    email      = cfg.get("email", "")
-    registries = cfg.get("registries", [])
-    county     = cfg.get("county", "")
-    loop       = asyncio.get_event_loop()
+    chat_id     = cfg["chat_id"]
+    email       = cfg.get("email", "")
+    registries  = cfg.get("registries", [])
+    county      = cfg.get("county", "")
+    report_type = cfg.get("report_type", "ardhipay")
+    loop        = asyncio.get_event_loop()
     asyncio.ensure_future(
-        asyncio.to_thread(_bulk_export_run, tokens, chat_id, email, context.bot, loop, registries, county)
+        asyncio.to_thread(_bulk_export_run, tokens, chat_id, email, context.bot, loop,
+                          registries, county, report_type)
     )
 
 
 async def cmd_bulk_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     sess = _get_be_sess(ctx)
-    sess.county     = ""
-    sess.registries = []
-    sess.email      = ""
-    sess.cred_type  = ""
+    sess.report_type = ""
+    sess.county      = ""
+    sess.registries  = []
+    sess.email       = ""
+    sess.cred_type   = ""
     await update.message.reply_text(
-        "📤 *Export Valuation Report*\n\nSelect the county to export:",
+        "📤 *Export Valuation Report*\n\nSelect the report type:",
         parse_mode="Markdown",
-        reply_markup=_be_county_keyboard(),
+        reply_markup=_be_report_type_keyboard(),
     )
-    return BE.COUNTY
+    return BE.REPORT_TYPE
 
 
 async def cmd_export_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -8133,6 +8272,22 @@ async def cmd_export_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def recv_be_report_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    report_type      = query.data.split(":")[1]
+    sess             = _get_be_sess(ctx)
+    sess.report_type = report_type
+    label = "🏛 Ardhisasa Report" if report_type == "ardhisasa" else "💳 Ardhipay Report"
+    await query.edit_message_text(
+        f"✅ Report type: *{label}*\n\nSelect the county to export:",
+        parse_mode="Markdown",
+        reply_markup=_be_county_keyboard(),
+    )
+    return BE.COUNTY
+
+
 async def recv_be_county(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     query = update.callback_query
@@ -8215,9 +8370,11 @@ async def recv_be_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if secs > 0:
         sched_label += " (repeating)"
     email_label  = sess.email or "Telegram only"
+    rtype_label  = "🏛 Ardhisasa Report" if sess.report_type == "ardhisasa" else "💳 Ardhipay Report"
 
     await query.edit_message_text(
         f"✅ Ready to export.\n\n"
+        f"• Report Type: *{rtype_label}*\n"
         f"• County: *{county_label}*\n"
         f"• Registries: `{reg_list}`\n"
         f"• Filter: *Completed*\n"
@@ -8267,6 +8424,7 @@ async def recv_be_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "email":            sess.email,
             "interval_seconds": secs,
             "cred_type":        sess.cred_type,
+            "report_type":      sess.report_type,
         }
         save_be_schedule(cfg)
         # Remove any existing job before adding a new one
@@ -8289,7 +8447,8 @@ async def recv_be_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⏳ Export running in background — you will be notified when done.")
         loop = asyncio.get_event_loop()
         asyncio.ensure_future(
-            asyncio.to_thread(_bulk_export_run, tokens, chat_id, sess.email, ctx.bot, loop, sess.registries, sess.county)
+            asyncio.to_thread(_bulk_export_run, tokens, chat_id, sess.email, ctx.bot, loop,
+                              sess.registries, sess.county, sess.report_type)
         )
 
     await ctx.bot.send_message(chat_id, "Returning to menu.", reply_markup=_main_menu())
@@ -8467,6 +8626,7 @@ def main():
             MessageHandler(filters.Regex(f"^{re.escape(BTN_BULK_EXPORT)}$"), cmd_bulk_export),
         ],
         states={
+            BE.REPORT_TYPE: [CallbackQueryHandler(recv_be_report_type, pattern=r"^be_rtype:")],
             BE.COUNTY:    [CallbackQueryHandler(recv_be_county,    pattern=r"^be_county:")],
             BE.EMAIL:     [MessageHandler(not_cancel, recv_be_email)],
             BE.SCHEDULE:  [CallbackQueryHandler(recv_be_schedule,  pattern=r"^be_sched:")],
