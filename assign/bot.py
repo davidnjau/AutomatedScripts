@@ -475,7 +475,7 @@ class SC(Enum):
 
 # County → list of registry names as they appear in the API response
 _BE_COUNTY_REGISTRIES: Dict[str, List[str]] = {
-    "NAIROBI":   ["NAIROBI", "CENTRAL"],
+    "NAIROBI":   ["CENTRAL"],
     "KIAMBU":    ["KIAMBU", "LIMURU", "THIKA", "RUIRU", "GITHUNGURI"],
     "MURANGA":   ["MURANGA", "KANDARA", "MARAGUA", "KANGEMA"],
     "MOMBASA":   ["MOMBASA", "COAST"],
@@ -502,6 +502,22 @@ _BE_COUNTY_LABELS: Dict[str, str] = {
     "MERU":      "🌲 Meru",
     "LAIKIPIA":  "🦁 Laikipia",
     "EMBU":      "🌱 Embu",
+}
+
+
+# Ardhisasa report — restricted county set with specific registry lists
+_AR_COUNTY_REGISTRIES: Dict[str, List[str]] = {
+    "NAIROBI":  ["NAIROBI"],
+    "MOMBASA":  ["MOMBASA", "COAST"],
+    "ISIOLO":   ["ISIOLO"],
+    "MURANGA":  ["MURANGA", "KANDARA", "MARAGUA", "KANGEMA"],
+}
+
+_AR_COUNTY_LABELS: Dict[str, str] = {
+    "NAIROBI":  "🌆 Nairobi",
+    "MOMBASA":  "🌊 Mombasa",
+    "ISIOLO":   "🌵 Isiolo",
+    "MURANGA":  "🏡 Murang'a",
 }
 
 
@@ -6088,6 +6104,17 @@ def _be_county_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _ar_county_keyboard() -> InlineKeyboardMarkup:
+    items = list(_AR_COUNTY_LABELS.items())
+    rows = []
+    for i in range(0, len(items), 2):
+        row = [InlineKeyboardButton(items[i][1], callback_data=f"be_county:{items[i][0]}")]
+        if i + 1 < len(items):
+            row.append(InlineKeyboardButton(items[i+1][1], callback_data=f"be_county:{items[i+1][0]}"))
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
 def _be_cred_keyboard() -> Optional[InlineKeyboardMarkup]:
     """Return an inline keyboard of credential profiles that currently have valid tokens.
     Returns None if no credentials are valid."""
@@ -8279,11 +8306,12 @@ async def recv_be_report_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     report_type      = query.data.split(":")[1]
     sess             = _get_be_sess(ctx)
     sess.report_type = report_type
-    label = "🏛 Ardhisasa Report" if report_type == "ardhisasa" else "💳 Ardhipay Report"
+    label  = "🏛 Ardhisasa Report" if report_type == "ardhisasa" else "💳 Ardhipay Report"
+    county_kbd = _ar_county_keyboard() if report_type == "ardhisasa" else _be_county_keyboard()
     await query.edit_message_text(
         f"✅ Report type: *{label}*\n\nSelect the county to export:",
         parse_mode="Markdown",
-        reply_markup=_be_county_keyboard(),
+        reply_markup=county_kbd,
     )
     return BE.COUNTY
 
@@ -8295,8 +8323,10 @@ async def recv_be_county(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     county = query.data.split(":")[1]
     sess   = _get_be_sess(ctx)
     sess.county     = county
-    sess.registries = _BE_COUNTY_REGISTRIES.get(county, [county])
-    label           = _BE_COUNTY_LABELS.get(county, county.title())
+    reg_map         = _AR_COUNTY_REGISTRIES if sess.report_type == "ardhisasa" else _BE_COUNTY_REGISTRIES
+    lbl_map         = _AR_COUNTY_LABELS     if sess.report_type == "ardhisasa" else _BE_COUNTY_LABELS
+    sess.registries = reg_map.get(county, [county])
+    label           = lbl_map.get(county, county.title())
     reg_list        = ", ".join(sess.registries)
     await query.edit_message_text(
         f"✅ County: *{label}*\nRegistries: `{reg_list}`\n\n"
