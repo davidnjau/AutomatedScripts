@@ -3809,92 +3809,75 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ──────────────────────────────────────────────────────────
 
 def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
-    """Fetch all ONGOING DLV tasks and enrich with detail. Returns enriched row list."""
+    """Load DLV batch queue and enrich each ref with API data (assessor, date, parcel)."""
+    batch = load_dlv_batch()
+    if not batch:
+        return []
+
     http_sess = build_session()
-    adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
-    http_sess.mount("https://", adapter)
-    http_sess.mount("http://", adapter)
     headers = {
         "Authorization": f"Bearer {tokens.access_token}",
         "JWTAUTH":       f"Bearer {tokens.jwt}",
         "cparams":       CPARAMS_DLV,
     }
 
-    # ── Step 1: paginate the list endpoint ────────────────
-    all_items: List[dict] = []
-    page = 1
-    while True:
+    def _enrich(item: dict) -> dict:
+        ref          = item.get("ref", "")
+        assessor     = ""
+        parcel       = ""
+        registry     = ""
+        county       = ""
+        date_created = item.get("queued_at", "")   # fallback: when queued
+
         try:
             resp = http_sess.get(
                 f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
                 headers=headers,
-                params={
-                    "filter": "Ongoing", "role": "DLV",
-                    "request_type": "STAMP_DUTY", "search": "", "page": page,
-                },
+                params={"filter": "Pending", "role": "DLV",
+                        "request_type": "STAMP_DUTY", "search": ref, "page": 1},
                 timeout=30,
             )
             resp.raise_for_status()
-            data    = resp.json()
-            results = data.get("results") or []
-            all_items.extend(results)
-            if not data.get("next") or not results:
-                break
-            page += 1
-        except Exception as e:
-            logger.warning("DLV Tasks list page %d failed: %s", page, e)
-            break
-
-    if not all_items:
-        return []
-
-    # ── Step 2: enrich each item with detail ──────────────
-    def _enrich(item: dict) -> Optional[dict]:
-        app_id = item.get("id")
-        if not app_id:
-            return None
-        try:
-            dresp = http_sess.get(
-                f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view",
-                headers=headers,
-                params={"request_id": app_id},
-                timeout=30,
+            task = next(
+                (t for t in resp.json().get("results", [])
+                 if t.get("reference_number") == ref),
+                None,
             )
-            dresp.raise_for_status()
-            detail = dresp.json()
-        except Exception:
-            detail = {}
+            if task:
+                parcel       = task.get("parcel_number", "")
+                registry     = (task.get("registry") or "").upper()
+                county       = (task.get("county") or "").upper()
+                date_created = task.get("date_created", date_created)
 
-        valuer_name = ""
-        valuer_uid  = ""
-        for actor in (detail.get("actors") or []):
-            if (actor.get("role") or "").upper() == "VALUATION OFFICER":
-                ud          = actor.get("user_details") or {}
-                valuer_name = ud.get("names", "")
-                valuer_uid  = ud.get("id", "")
-                break
-
-        assessor_ud   = (detail.get("assessor") or {}).get("user_details") or {}
-        assessor_name = assessor_ud.get("names", "")
+                dresp = http_sess.get(
+                    f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view",
+                    headers=headers,
+                    params={"request_id": task["id"]},
+                    timeout=30,
+                )
+                dresp.raise_for_status()
+                detail      = dresp.json()
+                assessor_ud = (detail.get("assessor") or {}).get("user_details") or {}
+                assessor    = assessor_ud.get("names", "")
+        except Exception as e:
+            logger.warning("DLV Tasks enrich failed for %s: %s", ref, e)
 
         return {
-            "ref":          item.get("reference_number", ""),
-            "parcel":       item.get("parcel_number", ""),
-            "registry":     (item.get("registry") or "").upper(),
-            "county":       (item.get("county") or "").upper(),
-            "date_created": item.get("date_created", ""),
-            "valuer_name":  valuer_name,
-            "valuer_uid":   valuer_uid,
-            "assessor":     assessor_name,
+            "ref":          ref,
+            "parcel":       parcel,
+            "registry":     registry,
+            "county":       county,
+            "date_created": date_created,
+            "valuer_name":  item.get("valuer_name", ""),
+            "valuer_uid":   item.get("valuer_uid", ""),
+            "assessor":     assessor,
         }
 
     rows: List[dict] = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        fut_map = {pool.submit(_enrich, item): item for item in all_items}
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        fut_map = {pool.submit(_enrich, item): item for item in batch}
         for fut in _futures_as_completed(fut_map):
-            row = fut.result()
-            if row:
-                rows.append(row)
+            rows.append(fut.result())
 
     return rows
 
@@ -4070,7 +4053,7 @@ async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    msg = await update.message.reply_text("⏳ Fetching ONGOING tasks, please wait…")
+    msg = await update.message.reply_text("⏳ Loading DLV Batch queue and enriching tasks, please wait…")
 
     try:
         rows = await asyncio.to_thread(_dt_fetch_tasks, tokens)
@@ -4081,7 +4064,7 @@ async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if not rows:
-        await msg.edit_text("ℹ️ No ONGOING tasks found.")
+        await msg.edit_text("ℹ️ DLV Batch queue is empty.")
         await ctx.bot.send_message(update.effective_chat.id, "Main menu.", reply_markup=_main_menu())
         return ConversationHandler.END
 
@@ -4103,7 +4086,7 @@ async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess.email         = ""
 
     await msg.edit_text(
-        f"📋 *DLV Tasks* — {len(rows)} ongoing task(s), {len(valuers)} valuer(s)\n\n"
+        f"📋 *DLV Tasks* — {len(rows)} queued task(s), {len(valuers)} valuer(s)\n\n"
         "Tap a valuer to *exclude* their tasks from the report. ✅ = included, ❌ = excluded.",
         parse_mode="Markdown",
         reply_markup=_dt_exclusion_keyboard(valuers, sess.excluded_uids),
@@ -5692,6 +5675,7 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "valuer_name": g["valuer_name"],
                     "valuer_uid":  g["valuer_uid"],
                     "valuer_acct": g["valuer_acct"],
+                    "queued_at":   datetime.now().isoformat(timespec="seconds"),
                 })
     flat_items = existing + new_items
     save_dlv_batch(flat_items)
