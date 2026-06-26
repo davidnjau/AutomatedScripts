@@ -123,7 +123,6 @@ SAVED_BULK_EXPORT_SCHED_FILE    = os.path.join(DATA_DIR, "saved_bulk_export_sche
 SAVED_BULK_EXPORT_PARTIAL_FILE  = os.path.join(DATA_DIR, "saved_bulk_export_partial.json")
 SAVED_AUTO_FETCH_FILE   = os.path.join(DATA_DIR, "saved_auto_fetch.json")
 SAVED_AF_RESULTS_FILE   = os.path.join(DATA_DIR, "saved_af_results.json")
-SAVED_SLA_CONFIG_FILE       = os.path.join(DATA_DIR, "saved_sla_config.json")
 SAVED_BRIEFING_CONFIG_FILE  = os.path.join(DATA_DIR, "saved_briefing_config.json")
 SAVED_SECTIONAL_CONFIG_FILE = os.path.join(DATA_DIR, "saved_sectional_config.json")
 
@@ -459,10 +458,11 @@ class BE(Enum):
     CONFIRM   = auto()   # confirm → kick off background export
 
 
-# States — SLA Alerts conversation
-class SLA(Enum):
-    THRESHOLD = auto()   # enter aging threshold in days
-    INTERVAL  = auto()   # how often to check (hours)
+# States — DLV Tasks conversation
+class DT(Enum):
+    EXCLUDE_VALUERS = auto()   # toggle which valuers to exclude
+    DELIVERY        = auto()   # telegram or email
+    EMAIL_INPUT     = auto()   # enter email address
 
 
 # States — Sectional Properties conversation
@@ -593,7 +593,7 @@ BTN_VALUER_TASKS  = "👤 Valuer Tasks"
 BTN_HELP          = "❓ Help"
 BTN_RESTART       = "🔁 Restart Bot"
 BTN_CANCEL        = "🛑 Cancel"
-BTN_SLA           = "⚠️ SLA Alerts"
+BTN_DLV_TASKS     = "📋 DLV Tasks"
 BTN_BRIEFING      = "🌅 Morning Briefing"
 BTN_SECTIONAL     = "🔲 Sectional"
 
@@ -606,7 +606,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_AF_RESULTS)}|{re.escape(BTN_BULK_EXPORT)}"
     f"|{re.escape(BTN_EXPORT_STATUS)}|{re.escape(BTN_JOB_DIST)}|{re.escape(BTN_LOOKUP)}"
     f"|{re.escape(BTN_VALUER_TASKS)}"
-    f"|{re.escape(BTN_SLA)}|{re.escape(BTN_BRIEFING)}|{re.escape(BTN_SECTIONAL)}"
+    f"|{re.escape(BTN_DLV_TASKS)}|{re.escape(BTN_BRIEFING)}|{re.escape(BTN_SECTIONAL)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -623,7 +623,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(BTN_DLV_BATCH)],
             [KeyboardButton(BTN_BULK_EXPORT),    KeyboardButton(BTN_EXPORT_STATUS)],
             [KeyboardButton(BTN_JOB_DIST),       KeyboardButton(BTN_VALUER_TASKS)],
-            [KeyboardButton(BTN_SLA),            KeyboardButton(BTN_SECTIONAL)],
+            [KeyboardButton(BTN_DLV_TASKS),      KeyboardButton(BTN_SECTIONAL)],
             [KeyboardButton(BTN_BRIEFING)],
             # ── Lookup ──────────────────────────────────────
             [KeyboardButton(BTN_LOOKUP)],
@@ -3203,25 +3203,20 @@ def clear_auto_fetch_schedule() -> None:
         pass
 
 
-# ── SLA Alerts config ──────────────────────────────────────
+# ── DLV Tasks session ──────────────────────────────────────
 
-def load_sla_config() -> Optional[Dict]:
-    try:
-        with open(SAVED_SLA_CONFIG_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
-
-
-def save_sla_config(cfg: Dict) -> None:
-    _atomic_json_write(SAVED_SLA_CONFIG_FILE, cfg, indent=2)
+@dataclass
+class DTSession:
+    tasks:         List[dict] = field(default_factory=list)   # enriched task rows
+    valuers:       List[dict] = field(default_factory=list)   # unique valuers [{uid, name}]
+    excluded_uids: set        = field(default_factory=set)
+    email:         str        = ""
 
 
-def clear_sla_config() -> None:
-    try:
-        os.remove(SAVED_SLA_CONFIG_FILE)
-    except FileNotFoundError:
-        pass
+def _get_dt_sess(ctx: ContextTypes.DEFAULT_TYPE) -> DTSession:
+    if "dt_session" not in ctx.user_data:
+        ctx.user_data["dt_session"] = DTSession()
+    return ctx.user_data["dt_session"]
 
 
 # ── Morning Briefing config ────────────────────────────────
@@ -3810,101 +3805,98 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("Auto Fetch email failed: %s", e)
 
 
+# DLV Tasks — fetch and enrich ongoing tasks
 # ──────────────────────────────────────────────────────────
-# SLA Alerts background job
-# ──────────────────────────────────────────────────────────
 
-async def _sla_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Background job: check ONGOING tasks for aging and alert if any exceed the threshold."""
-    cfg = load_sla_config()
-    if not cfg or not cfg.get("enabled"):
-        return
-
-    tokens = _any_valid_tokens()
-    if not tokens:
-        logger.warning("SLA job: no valid tokens — skipping.")
-        return
-
-    threshold_days = cfg.get("threshold_days", 7)
+def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
+    """Fetch all ONGOING DLV tasks and enrich with detail. Returns enriched row list."""
     http_sess = build_session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0)
+    http_sess.mount("https://", adapter)
+    http_sess.mount("http://", adapter)
     headers = {
         "Authorization": f"Bearer {tokens.access_token}",
         "JWTAUTH":       f"Bearer {tokens.jwt}",
         "cparams":       CPARAMS_DLV,
     }
 
-    all_tasks = []
+    # ── Step 1: paginate the list endpoint ────────────────
+    all_items: List[dict] = []
     page = 1
     while True:
         try:
             resp = http_sess.get(
                 f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
                 headers=headers,
-                params={"filter": "Ongoing", "role": "DLV", "request_type": "STAMP_DUTY", "page": page},
+                params={
+                    "filter": "Ongoing", "role": "DLV",
+                    "request_type": "STAMP_DUTY", "search": "", "page": page,
+                },
                 timeout=30,
             )
             resp.raise_for_status()
-            data = resp.json()
-            results = data.get("results", [])
-            if not results:
-                break
-            all_tasks.extend(results)
-            if len(results) < 100:
+            data    = resp.json()
+            results = data.get("results") or []
+            all_items.extend(results)
+            if not data.get("next") or not results:
                 break
             page += 1
         except Exception as e:
-            logger.warning("SLA job: fetch page %d failed: %s", page, e)
+            logger.warning("DLV Tasks list page %d failed: %s", page, e)
             break
 
-    if not all_tasks:
-        return
+    if not all_items:
+        return []
 
-    now = datetime.now(tz=timezone.utc)
-    aged = []
-    county_counts: Dict[str, int] = {}
-
-    for t in all_tasks:
-        raw_date = t.get("date_created") or t.get("created_at") or ""
+    # ── Step 2: enrich each item with detail ──────────────
+    def _enrich(item: dict) -> Optional[dict]:
+        app_id = item.get("id")
+        if not app_id:
+            return None
         try:
-            created = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
-            age_days = (now - created).days
-        except (ValueError, TypeError):
-            age_days = 0
-        if age_days >= threshold_days:
-            county = (t.get("county") or "Unknown").upper()
-            county_counts[county] = county_counts.get(county, 0) + 1
-            aged.append({
-                "ref":      t.get("reference_number", "—"),
-                "county":   county,
-                "registry": (t.get("registry") or "—").upper(),
-                "age_days": age_days,
-            })
+            dresp = http_sess.get(
+                f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view",
+                headers=headers,
+                params={"request_id": app_id},
+                timeout=30,
+            )
+            dresp.raise_for_status()
+            detail = dresp.json()
+        except Exception:
+            detail = {}
 
-    if not aged:
-        return
+        valuer_name = ""
+        valuer_uid  = ""
+        for actor in (detail.get("actors") or []):
+            if (actor.get("role") or "").upper() == "VALUATION OFFICER":
+                ud          = actor.get("user_details") or {}
+                valuer_name = ud.get("names", "")
+                valuer_uid  = ud.get("id", "")
+                break
 
-    aged.sort(key=lambda x: x["age_days"], reverse=True)
-    county_lines = "\n".join(
-        f"  • {c}: {n} task(s)" for c, n in sorted(county_counts.items())
-    )
-    top_5 = aged[:5]
-    top_lines = "\n".join(
-        f"  {i+1}. {t['ref']} — {t['age_days']}d ({t['county']}/{t['registry']})"
-        for i, t in enumerate(top_5)
-    )
-    msg = (
-        f"⚠️ *SLA Alert — {len(aged)} aged task(s)*\n"
-        f"Threshold: >{threshold_days} days old | Total ONGOING: {len(all_tasks)}\n\n"
-        f"*By county:*\n{county_lines}\n\n"
-        f"*Oldest tasks:*\n{top_lines}"
-    )
-    if len(msg) > 4000:
-        msg = msg[:4000] + "\n…_(truncated)_"
-    for chat_id in ALLOWED_IDS:
-        try:
-            await context.bot.send_message(chat_id, msg, parse_mode="Markdown")
-        except Exception as e:
-            logger.warning("SLA job notify error for %s: %s", chat_id, e)
+        assessor_ud   = (detail.get("assessor") or {}).get("user_details") or {}
+        assessor_name = assessor_ud.get("names", "")
+
+        return {
+            "ref":          item.get("reference_number", ""),
+            "parcel":       item.get("parcel_number", ""),
+            "registry":     (item.get("registry") or "").upper(),
+            "county":       (item.get("county") or "").upper(),
+            "date_created": item.get("date_created", ""),
+            "valuer_name":  valuer_name,
+            "valuer_uid":   valuer_uid,
+            "assessor":     assessor_name,
+        }
+
+    rows: List[dict] = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        fut_map = {pool.submit(_enrich, item): item for item in all_items}
+        for fut in _futures_as_completed(fut_map):
+            row = fut.result()
+            if row:
+                rows.append(row)
+
+    return rows
 
 
 # ──────────────────────────────────────────────────────────
@@ -4009,110 +4001,254 @@ async def _morning_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_briefing(context, msg)
 
 
-# ──────────────────────────────────────────────────────────
-# SLA Alerts command handlers
+# DLV Tasks command handlers
 # ──────────────────────────────────────────────────────────
 
-async def cmd_sla(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+def _dt_exclusion_keyboard(valuers: List[dict], excluded_uids: set) -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(valuers), 2):
+        row = []
+        for v in valuers[i:i+2]:
+            icon = "❌" if v["uid"] in excluded_uids else "✅"
+            row.append(InlineKeyboardButton(
+                f"{icon} {v['name']}", callback_data=f"dt_toggle:{v['uid']}",
+            ))
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("▶️ Confirm", callback_data="dt_confirm"),
+        InlineKeyboardButton("🛑 Cancel",  callback_data="dt_cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _dt_build_excel(rows: List[dict]) -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "DLV Tasks"
+    cols = ["Reference Number", "Parcel Number", "Registry", "County",
+            "Date Added", "Valuer", "Assessor"]
+    header_font = Font(bold=True)
+    header_fill = PatternFill("solid", fgColor="BDD7EE")
+    ws.append(cols)
+    for ci, _ in enumerate(cols, start=1):
+        cell = ws.cell(row=1, column=ci)
+        cell.font = header_font
+        cell.fill = header_fill
+    ws.auto_filter.ref = ws.dimensions
+    ws.freeze_panes    = "A2"
+    for r in rows:
+        ws.append([
+            r.get("ref", ""),
+            r.get("parcel", ""),
+            r.get("registry", ""),
+            r.get("county", ""),
+            r.get("date_created", ""),
+            r.get("valuer_name", ""),
+            r.get("assessor", ""),
+        ])
+    for ci, col_name in enumerate(cols, start=1):
+        col_letter = get_column_letter(ci)
+        max_len = len(col_name)
+        for row in ws.iter_rows(min_col=ci, max_col=ci, min_row=2):
+            val = str(row[0].value or "")
+            if len(val) > max_len:
+                max_len = len(val)
+        ws.column_dimensions[col_letter].width = max(15, min(60, max_len + 2))
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
-    cfg = load_sla_config()
-    if cfg and cfg.get("enabled"):
-        threshold = cfg.get("threshold_days", 7)
-        interval  = cfg.get("interval_hours", 6)
-        status = (
-            f"⚠️ *SLA Alerts are active*\n"
-            f"Threshold: {threshold} days | Check every: {interval} hr\n\n"
-            f"Enter a new threshold (days) to reconfigure, or tap Cancel to disable:"
-        )
+    tokens = _any_valid_tokens()
+    if not tokens:
         await update.message.reply_text(
-            status,
+            "❌ No valid cached tokens. Use *🔑 Refresh Auth* first.",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🛑 Disable SLA Alerts", callback_data="sla:disable"),
-                InlineKeyboardButton("✏️ Reconfigure", callback_data="sla:reconfigure"),
-            ]]),
+            reply_markup=_main_menu(),
         )
-        return SLA.THRESHOLD
-    await update.message.reply_text(
-        "⚠️ *SLA Alerts*\n\n"
-        "Periodically checks for ONGOING tasks older than a set threshold and sends an alert.\n\n"
-        "Enter the aging threshold in days (e.g. `7`):",
-        parse_mode="Markdown",
-    )
-    return SLA.THRESHOLD
+        return ConversationHandler.END
 
+    msg = await update.message.reply_text("⏳ Fetching ONGOING tasks, please wait…")
 
-async def recv_sla_threshold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        if query.data == "sla:disable":
-            for job in ctx.job_queue.get_jobs_by_name("sla_job"):
-                job.schedule_removal()
-            clear_sla_config()
-            await query.edit_message_text("🛑 SLA Alerts disabled.")
-            await query.message.reply_text("Main menu:", reply_markup=_main_menu())
-            return ConversationHandler.END
-        # reconfigure — ask for threshold
-        await query.edit_message_text(
-            "Enter the aging threshold in days (e.g. `7`):",
-            parse_mode="Markdown",
-        )
-        return SLA.THRESHOLD
-
-    text = update.message.text.strip()
     try:
-        days = int(text)
-        if days < 1:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Enter a whole number >= 1 (e.g. `7`).", parse_mode="Markdown")
-        return SLA.THRESHOLD
+        rows = await asyncio.to_thread(_dt_fetch_tasks, tokens)
+    except Exception as exc:
+        logger.error("DLV Tasks fetch failed: %s", exc, exc_info=True)
+        await msg.edit_text(f"❌ Failed to fetch tasks: `{exc}`", parse_mode="Markdown")
+        await ctx.bot.send_message(update.effective_chat.id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
 
-    ctx.user_data["sla_threshold"] = days
-    await update.message.reply_text(
-        f"✅ Threshold: *{days} days*\n\nHow often should the check run?",
+    if not rows:
+        await msg.edit_text("ℹ️ No ONGOING tasks found.")
+        await ctx.bot.send_message(update.effective_chat.id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    # Collect unique valuers (preserve insertion order, dedupe by uid)
+    seen: set = set()
+    valuers: List[dict] = []
+    for r in rows:
+        uid  = r.get("valuer_uid") or ""
+        name = r.get("valuer_name") or "Unassigned"
+        if uid not in seen:
+            seen.add(uid)
+            valuers.append({"uid": uid, "name": name})
+    valuers.sort(key=lambda v: v["name"])
+
+    sess               = _get_dt_sess(ctx)
+    sess.tasks         = rows
+    sess.valuers       = valuers
+    sess.excluded_uids = set()
+    sess.email         = ""
+
+    await msg.edit_text(
+        f"📋 *DLV Tasks* — {len(rows)} ongoing task(s), {len(valuers)} valuer(s)\n\n"
+        "Tap a valuer to *exclude* their tasks from the report. ✅ = included, ❌ = excluded.",
+        parse_mode="Markdown",
+        reply_markup=_dt_exclusion_keyboard(valuers, sess.excluded_uids),
+    )
+    return DT.EXCLUDE_VALUERS
+
+
+async def recv_dt_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    uid  = query.data.split(":")[1]
+    sess = _get_dt_sess(ctx)
+    if uid in sess.excluded_uids:
+        sess.excluded_uids.discard(uid)
+    else:
+        sess.excluded_uids.add(uid)
+    await query.edit_message_reply_markup(
+        reply_markup=_dt_exclusion_keyboard(sess.valuers, sess.excluded_uids),
+    )
+    return DT.EXCLUDE_VALUERS
+
+
+async def recv_dt_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "dt_cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    sess = _get_dt_sess(ctx)
+    filtered = [
+        r for r in sess.tasks
+        if (r.get("valuer_uid") or "") not in sess.excluded_uids
+    ]
+    sess.tasks = filtered   # store filtered for delivery step
+
+    excluded_count = len(sess.excluded_uids)
+    await query.edit_message_text(
+        f"✅ *{len(filtered)} task(s)* after excluding {excluded_count} valuer(s).\n\n"
+        "How would you like to receive the report?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("Every 2 hr",  callback_data="sla_interval:2"),
-                InlineKeyboardButton("Every 4 hr",  callback_data="sla_interval:4"),
-                InlineKeyboardButton("Every 6 hr",  callback_data="sla_interval:6"),
-            ],
-            [
-                InlineKeyboardButton("Every 12 hr", callback_data="sla_interval:12"),
-                InlineKeyboardButton("Every 24 hr", callback_data="sla_interval:24"),
+                InlineKeyboardButton("📩 Send to Email", callback_data="dt_delivery:email"),
+                InlineKeyboardButton("💬 View on Telegram", callback_data="dt_delivery:telegram"),
             ],
         ]),
     )
-    return SLA.INTERVAL
+    return DT.DELIVERY
 
 
-async def recv_sla_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def recv_dt_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
     query = update.callback_query
     await query.answer()
-    hours = int(query.data.split(":")[1])
-    threshold = ctx.user_data.get("sla_threshold", 7)
+    mode  = query.data.split(":")[1]
+    sess  = _get_dt_sess(ctx)
 
-    cfg = {"enabled": True, "threshold_days": threshold, "interval_hours": hours}
-    save_sla_config(cfg)
+    if mode == "telegram":
+        await _dt_send_telegram(query.message.chat_id, sess.tasks, ctx.bot)
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
 
-    for job in ctx.job_queue.get_jobs_by_name("sla_job"):
-        job.schedule_removal()
-    ctx.job_queue.run_repeating(
-        _sla_job,
-        interval=hours * 3600,
-        first=hours * 3600,
-        name="sla_job",
-    )
+    # email mode — ask for address
     await query.edit_message_text(
-        f"✅ *SLA Alerts enabled*\n"
-        f"Threshold: *{threshold} days* | Check every *{hours} hr*\n"
-        f"First check in {hours} hr.",
+        "📧 Enter the email address to receive the report, or send `skip` to get it only via Telegram:",
         parse_mode="Markdown",
     )
-    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    return DT.EMAIL_INPUT
+
+
+async def recv_dt_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    text = (update.message.text or "").strip()
+    sess = _get_dt_sess(ctx)
+
+    if text.lower() != "skip":
+        if "@" not in text or "." not in text.split("@")[-1]:
+            await update.message.reply_text(
+                "❌ Invalid email. Enter a valid address or send `skip`.",
+                parse_mode="Markdown",
+            )
+            return DT.EMAIL_INPUT
+        sess.email = text
+
+    xlsx_bytes = _dt_build_excel(sess.tasks)
+    filename   = f"DLV_Tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    chat_id    = update.effective_chat.id
+
+    await ctx.bot.send_document(
+        chat_id,
+        document=io.BytesIO(xlsx_bytes),
+        filename=filename,
+        caption=f"📋 DLV Tasks — {len(sess.tasks)} task(s)",
+    )
+
+    if sess.email:
+        try:
+            _send_bulk_export_email(sess.email, filename, xlsx_bytes)
+            await update.message.reply_text(f"📧 File also sent to *{sess.email}*.", parse_mode="Markdown")
+        except Exception as exc:
+            await update.message.reply_text(f"⚠️ Email failed: `{exc}`", parse_mode="Markdown")
+
+    await update.message.reply_text("Main menu.", reply_markup=_main_menu())
     return ConversationHandler.END
+
+
+async def _dt_send_telegram(chat_id: int, rows: List[dict], bot) -> None:
+    """Send DLV task list as Telegram messages grouped by valuer."""
+    if not rows:
+        await bot.send_message(chat_id, "ℹ️ No tasks to display.")
+        return
+
+    # Group by valuer
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    for r in rows:
+        key = r.get("valuer_name") or "Unassigned"
+        groups[key].append(r)
+
+    lines = [f"📋 *DLV Tasks Report* — {len(rows)} task(s)\n"]
+    for valuer, tasks in sorted(groups.items()):
+        lines.append(f"\n👤 *{valuer}* ({len(tasks)} task(s))")
+        for i, t in enumerate(tasks, start=1):
+            date_str = (t.get("date_created") or "")[:10]
+            assessor = t.get("assessor") or "—"
+            lines.append(
+                f"  {i}. `{t.get('ref', '—')}` | {t.get('parcel', '—')} | "
+                f"Added: {date_str} | Assessor: {assessor}"
+            )
+
+    # Telegram message limit is 4096 chars — split if needed
+    current_chunk = ""
+    for line in lines:
+        if len(current_chunk) + len(line) + 1 > 4000:
+            await bot.send_message(chat_id, current_chunk, parse_mode="Markdown")
+            current_chunk = line
+        else:
+            current_chunk += ("\n" if current_chunk else "") + line
+    if current_chunk:
+        await bot.send_message(chat_id, current_chunk, parse_mode="Markdown")
 
 
 # ──────────────────────────────────────────────────────────
@@ -8773,18 +8909,6 @@ def main():
         )
         logger.info("Auto Fetch schedule restored: every %d min", cfg.get("interval_minutes"))
 
-    # SLA Alerts: restore saved schedule on startup
-    sla_cfg = load_sla_config()
-    if sla_cfg and sla_cfg.get("enabled"):
-        hours = sla_cfg.get("interval_hours", 6)
-        app.job_queue.run_repeating(
-            _sla_job,
-            interval=hours * 3600,
-            first=hours * 3600,
-            name="sla_job",
-        )
-        logger.info("SLA alerts restored: every %d hr", hours)
-
     # Morning Briefing: restore if enabled
     briefing_cfg = load_briefing_config()
     if briefing_cfg and briefing_cfg.get("enabled"):
@@ -8795,17 +8919,18 @@ def main():
         )
         logger.info("Morning briefing restored: daily at 05:00 UTC")
 
-    sla_conv = ConversationHandler(
+    dt_conv = ConversationHandler(
         entry_points=[
-            CommandHandler("sla", cmd_sla),
-            MessageHandler(filters.Regex(f"^{re.escape(BTN_SLA)}$"), cmd_sla),
+            CommandHandler("dlvtasks", cmd_dlv_tasks),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_TASKS)}$"), cmd_dlv_tasks),
         ],
         states={
-            SLA.THRESHOLD: [
-                CallbackQueryHandler(recv_sla_threshold, pattern=r"^sla:"),
-                MessageHandler(not_cancel, recv_sla_threshold),
+            DT.EXCLUDE_VALUERS: [
+                CallbackQueryHandler(recv_dt_toggle,  pattern=r"^dt_toggle:"),
+                CallbackQueryHandler(recv_dt_confirm, pattern=r"^dt_confirm$|^dt_cancel$"),
             ],
-            SLA.INTERVAL: [CallbackQueryHandler(recv_sla_interval, pattern=r"^sla_interval:")],
+            DT.DELIVERY:   [CallbackQueryHandler(recv_dt_delivery, pattern=r"^dt_delivery:")],
+            DT.EMAIL_INPUT: [MessageHandler(not_cancel, recv_dt_email)],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
@@ -8815,7 +8940,7 @@ def main():
         allow_reentry=True,
         per_message=False,
     )
-    app.add_handler(sla_conv)
+    app.add_handler(dt_conv)
 
     sc_conv = ConversationHandler(
         entry_points=[
