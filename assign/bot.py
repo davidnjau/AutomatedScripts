@@ -3001,6 +3001,22 @@ def _resolve_valuer_from_saved(name: str) -> Optional[Dict]:
     return None
 
 
+def _lookup_collector(ctx: ContextTypes.DEFAULT_TYPE, ref: str) -> str:
+    """
+    Best-effort: find the collector (COUNTY_REGISTRAR officer) for ref among the
+    tasks from the user's last Fetch Tasks run. Returns "" if not found.
+    """
+    ft_sess = ctx.user_data.get("ft_session")
+    if not ft_sess:
+        return ""
+    for t in ft_sess.tasks:
+        if t.get("reference_number") == ref:
+            for o in t.get("officers", []):
+                if o.get("role") == "COUNTY_REGISTRAR":
+                    return o.get("name", "")
+    return ""
+
+
 def _search_valuer_api(name: str, tokens: AuthTokens) -> List[Dict]:
     http_sess = build_session()
     resp = http_sess.get(
@@ -3871,6 +3887,7 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
             "valuer_name":  item.get("valuer_name", ""),
             "valuer_uid":   item.get("valuer_uid", ""),
             "assessor":     assessor,
+            "collector":    item.get("collector", ""),
         }
 
     rows: List[dict] = []
@@ -4009,7 +4026,7 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
     ws = wb.active
     ws.title = "DLV Tasks"
     cols = ["Reference Number", "Parcel Number", "Registry", "County",
-            "Date Added", "Valuer", "Assessor"]
+            "Date Added", "Valuer", "Assessor", "Collector"]
     header_font = Font(bold=True)
     header_fill = PatternFill("solid", fgColor="BDD7EE")
     ws.append(cols)
@@ -4028,6 +4045,7 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
             r.get("date_created", ""),
             r.get("valuer_name", ""),
             r.get("assessor", ""),
+            r.get("collector", ""),
         ])
     for ci, col_name in enumerate(cols, start=1):
         col_letter = get_column_letter(ci)
@@ -4215,11 +4233,12 @@ async def _dt_send_telegram(chat_id: int, rows: List[dict], bot) -> None:
     for valuer, tasks in sorted(groups.items()):
         lines.append(f"\n👤 *{valuer}* ({len(tasks)} task(s))")
         for i, t in enumerate(tasks, start=1):
-            date_str = (t.get("date_created") or "")[:10]
-            assessor = t.get("assessor") or "—"
+            date_str  = (t.get("date_created") or "")[:10]
+            assessor  = t.get("assessor") or "—"
+            collector = t.get("collector") or "—"
             lines.append(
                 f"  {i}. `{t.get('ref', '—')}` | {t.get('parcel', '—')} | "
-                f"Added: {date_str} | Assessor: {assessor}"
+                f"Added: {date_str} | Assessor: {assessor} | Collector: {collector}"
             )
 
     # Telegram message limit is 4096 chars — split if needed
@@ -4839,27 +4858,6 @@ def _load_fetch_tasks(tokens: AuthTokens, days_back: int) -> Tuple[List[Dict], D
     return tasks, stats
 
 
-def _fetch_dlv_detail_one(http_sess, tokens: AuthTokens, task_id: str) -> Optional[Dict]:
-    """Fetch DLV application detail view for one task."""
-    headers = {
-        "Authorization": f"Bearer {tokens.access_token}",
-        "JWTAUTH":       f"Bearer {tokens.jwt}",
-        "cparams":       CPARAMS_VALUER_ROLE,
-    }
-    try:
-        resp = http_sess.get(
-            f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view",
-            headers=headers,
-            params={"request_id": task_id},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        logger.warning("DLV detail failed for %s: %s", task_id, e)
-        return None
-
-
 def _days_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -4874,100 +4872,6 @@ def _days_keyboard() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("✏️ Enter custom", callback_data="ft_days:custom")],
     ])
-
-
-def _load_dlv_tasks(tokens: AuthTokens) -> Tuple[List[Dict], int]:
-    """
-    Fetch all pending DLV/VALUER tasks created in the last 2 days,
-    enrich each with detail fields, return (enriched_tasks, raw_count).
-    raw_count = total results seen before date filtering.
-    """
-    http_sess = build_session()
-    cutoff = _date_cutoff_str(2)
-    headers = {
-        "Authorization": f"Bearer {tokens.access_token}",
-        "JWTAUTH":       f"Bearer {tokens.jwt}",
-        "cparams":       CPARAMS_VALUER_ROLE,
-    }
-
-    candidates: List[Dict] = []
-    raw_count = 0
-    page = 1
-    while True:
-        resp = http_sess.get(
-            f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
-            headers=headers,
-            params={
-                "filter": "Pending", "role": "VALUER",
-                "request_type": "STAMP_DUTY", "search": "", "page": page,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        results = data.get("results", [])
-        if not results:
-            break
-
-        raw_count += len(results)
-        for task in results:
-            if _within_days(task.get("date_created", ""), cutoff):
-                candidates.append(task)
-
-        if not data.get("next"):
-            break
-        page += 1
-
-    enriched: List[Dict] = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        future_map = {
-            pool.submit(_fetch_dlv_detail_one, http_sess, tokens, t["id"]): t
-            for t in candidates
-        }
-        for future in _futures_as_completed(future_map):
-            list_task = future_map[future]
-            detail    = future.result()
-            consideration = ""
-            if detail:
-                ext = detail.get("external_process_details") or {}
-                consideration = str(ext.get("consideration_amount", ""))
-            enriched.append({
-                "id":               list_task["id"],
-                "reference_number": list_task.get("reference_number", ""),
-                "date_created":     list_task.get("date_created", ""),
-                "consideration":    consideration,
-                "county":           list_task.get("county", ""),
-                "registry":         list_task.get("registry", ""),
-            })
-
-    enriched.sort(key=lambda x: x["date_created"], reverse=True)
-    return enriched, raw_count
-
-
-def _tasks_keyboard(tasks: List[Dict], checked: set, prefix: str) -> InlineKeyboardMarkup:
-    """Build a checklist inline keyboard for a task list."""
-    rows = []
-    for i, t in enumerate(tasks):
-        mark  = "☑️" if i in checked else "⬜"
-        ref   = t.get("reference_number", f"#{i+1}")
-        cons  = t.get("consideration", "")
-        try:
-            cons_str = f"KES {int(float(cons)):,}" if cons else "—"
-        except (ValueError, TypeError):
-            cons_str = cons or "—"
-        county = t.get("county", "")
-        date   = (t.get("date_created") or "")[:10]
-        label  = f"{mark} {ref} | {cons_str} | {county} | {date}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"{prefix}:{i}")])
-
-    action_row = [InlineKeyboardButton("🔄 Refresh", callback_data=f"{prefix}:refresh")]
-    if checked:
-        action_row.append(
-            InlineKeyboardButton(f"📤 Assign Selected ({len(checked)})", callback_data=f"{prefix}:assign")
-        )
-    rows.append(action_row)
-    return InlineKeyboardMarkup(rows)
 
 
 async def cmd_fetch_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5437,103 +5341,6 @@ async def _ft_show_results(message, tasks: List[Dict]):
             )
 
 
-async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return await deny(update)
-    tokens = _any_valid_tokens()
-    if not tokens:
-        await update.message.reply_text(
-            "⚠️ No valid cached tokens found.\n"
-            "Please authenticate first via *New Assignment* or *Receive Tasks*, then try again.",
-            parse_mode="Markdown",
-            reply_markup=_main_menu(),
-        )
-        return
-
-    await update.message.reply_text("⏳ Fetching DLV Tasks (last 2 days)…")
-    try:
-        tasks, raw_count = _load_dlv_tasks(tokens)
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ Failed to fetch tasks: `{e}`", parse_mode="Markdown", reply_markup=_main_menu()
-        )
-        return
-
-    if not tasks:
-        await update.message.reply_text(
-            f"ℹ️ No pending DLV tasks in the last 2 days.\n"
-            f"_(API returned {raw_count} total result(s) before date filter)_",
-            parse_mode="Markdown",
-            reply_markup=_main_menu(),
-        )
-        return
-
-    ctx.user_data["dlv_tasks"]   = tasks
-    ctx.user_data["dlv_checked"] = set()
-    await update.message.reply_text(
-        f"📋 *DLV Tasks* — {len(tasks)} task(s) in last 2 days\n"
-        f"_(fetched {raw_count} total from API)_\n"
-        "Tap any row to check/uncheck:",
-        parse_mode="Markdown",
-        reply_markup=_tasks_keyboard(tasks, set(), "dlv_ck"),
-    )
-
-
-async def recv_dlv_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    idx_str = query.data.split(":")[1]
-    tasks   = ctx.user_data.get("dlv_tasks", [])
-    checked = ctx.user_data.get("dlv_checked", set())
-
-    if idx_str == "refresh":
-        tokens = _any_valid_tokens()
-        if not tokens:
-            await query.answer("No valid tokens — authenticate first.", show_alert=True)
-            return
-        await query.edit_message_text("⏳ Refreshing DLV Tasks…")
-        try:
-            tasks, raw_count = _load_dlv_tasks(tokens)
-        except Exception as e:
-            logger.error("DLV task refresh failed: %s", e)
-            await query.edit_message_text("❌ Refresh failed — please try again.")
-            return
-        checked = set()
-        ctx.user_data["dlv_tasks"]   = tasks
-        ctx.user_data["dlv_checked"] = checked
-        await query.edit_message_text(
-            f"📋 *DLV Tasks* — {len(tasks)} task(s) in last 2 days\n"
-            f"_(fetched {raw_count} total from API)_\n"
-            "Tap any row to check/uncheck:",
-            parse_mode="Markdown",
-            reply_markup=_tasks_keyboard(tasks, checked, "dlv_ck"),
-        )
-        return
-
-    if idx_str == "assign":
-        if not checked:
-            await query.answer("No tasks selected.", show_alert=True)
-            return
-        selected = [tasks[i] for i in sorted(checked) if i < len(tasks)]
-        ctx.user_data["ta_pending"] = {"type": "dlv", "tasks": selected, "search_results": []}
-        await query.message.reply_text(
-            f"📤 Assigning *{len(selected)}* DLV task(s).\n\n"
-            "Select the valuer to assign to:",
-            parse_mode="Markdown",
-            reply_markup=_ta_valuer_picker_keyboard("dlv"),
-        )
-        return
-
-    idx = int(idx_str)
-    if idx in checked:
-        checked.discard(idx)
-    else:
-        checked.add(idx)
-    ctx.user_data["dlv_checked"] = checked
-    await query.edit_message_reply_markup(
-        reply_markup=_tasks_keyboard(tasks, checked, "dlv_ck"),
-    )
-
-
 # ──────────────────────────────────────────────────────────
 # DLV Batch — conversation handlers
 # ──────────────────────────────────────────────────────────
@@ -5675,6 +5482,7 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "valuer_name": g["valuer_name"],
                     "valuer_uid":  g["valuer_uid"],
                     "valuer_acct": g["valuer_acct"],
+                    "collector":   _lookup_collector(ctx, ref),
                     "queued_at":   datetime.now().isoformat(timespec="seconds"),
                 })
     flat_items = existing + new_items
@@ -5699,216 +5507,6 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg = msg[:4000] + "\n…_(truncated)_"
     await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=_main_menu())
     return ConversationHandler.END
-
-
-# ──────────────────────────────────────────────────────────
-# Task-assign sub-flow (valuer picker + assignment execution)
-# ──────────────────────────────────────────────────────────
-
-def _ta_valuer_picker_keyboard(task_type: str) -> InlineKeyboardMarkup:
-    """Inline keyboard: saved valuers + search-new option."""
-    rows = []
-    for i, v in enumerate(load_saved_valuers()):
-        rows.append([InlineKeyboardButton(
-            f"👤 {v['name']}", callback_data=f"ta:{task_type}:sv:{i}"
-        )])
-    rows.append([InlineKeyboardButton("🔍 Search New Valuer", callback_data=f"ta:{task_type}:ns")])
-    rows.append([InlineKeyboardButton("❌ Cancel",            callback_data=f"ta:{task_type}:cancel")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def _ta_run_assign(message, ctx: ContextTypes.DEFAULT_TYPE,
-                         task_type: str, valuer_uid: str, valuer_name: str, acct: str):
-    """Execute assignment for all tasks in ta_pending and report results."""
-    pending = ctx.user_data.get("ta_pending", {})
-    tasks   = pending.get("tasks", [])
-    tokens  = _any_valid_tokens()
-    if not tokens:
-        await message.reply_text(
-            "⚠️ Tokens expired. Please re-authenticate via New Assignment or Receive Tasks.",
-            reply_markup=_main_menu(),
-        )
-        return
-
-    http_sess = build_session()
-    url     = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/fix_application_details"
-    headers = {
-        "Authorization": f"Bearer {tokens.access_token}",
-        "JWTAUTH":       f"Bearer {tokens.jwt}",
-    }
-
-    await message.reply_text(f"⏳ Assigning {len(tasks)} task(s) to *{valuer_name}*…", parse_mode="Markdown")
-
-    ok_refs, fail_refs, result_lines = [], [], []
-    for task in tasks:
-        ref = task.get("reference_number", "")
-        try:
-            r = http_sess.post(
-                url, headers=headers,
-                json={
-                    "reference_number":  ref,
-                    "valuation_officer": valuer_uid,
-                    "node":              "VALUATION_STAMP_DUTY_VALUER_REPORT",
-                },
-                timeout=30,
-            )
-            r.raise_for_status()
-            ok_refs.append(ref)
-            result_lines.append(f"✅ `{ref}`")
-            persist_assignment(ref, valuer_name, valuer_uid)
-        except Exception as e:
-            logger.error("Assignment failed for %s: %s", ref, e)
-            fail_refs.append(ref)
-            result_lines.append(f"❌ `{ref}` — {_safe_err(e)}")
-
-    if ok_refs:
-        persist_valuer(valuer_name, valuer_uid, acct)
-
-    summary = (
-        f"🏁 *Assignment Complete*\n\n"
-        f"*Valuer:* {valuer_name}\n"
-        f"*Success:* {len(ok_refs)} / {len(tasks)}\n"
-        f"*Failed:*  {len(fail_refs)} / {len(tasks)}\n\n"
-        + "\n".join(result_lines)
-    )
-    if len(summary) > 4000:
-        summary = summary[:4000] + "\n…_(truncated)_"
-    await message.reply_text(summary, parse_mode="Markdown")
-
-    if ok_refs:
-        await message.reply_text("🔍 Fetching post-assignment status…", parse_mode="Markdown")
-        pages = await asyncio.to_thread(_post_assignment_report, tokens, ok_refs)
-        for i, page in enumerate(pages):
-            markup = _main_menu() if i == len(pages) - 1 else None
-            await message.reply_text(page, parse_mode="Markdown", reply_markup=markup)
-    else:
-        await message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
-
-    # Clear pending state
-    ctx.user_data.pop("ta_pending", None)
-
-
-async def recv_ta_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle all ta:* callback data for the task-assign sub-flow."""
-    query = update.callback_query
-    await query.answer()
-
-    # callback format: ta:{task_type}:{action}[:{idx}]
-    parts     = query.data.split(":")
-    task_type = parts[1]   # "impl" or "dlv"
-    action    = parts[2]   # "sv", "ns", "cancel", "sr"
-
-    pending = ctx.user_data.get("ta_pending", {})
-
-    if action == "cancel":
-        ctx.user_data.pop("ta_pending", None)
-        await query.edit_message_text("❌ Assignment cancelled.")
-        return
-
-    if action == "sv":
-        idx    = int(parts[3])
-        saved  = load_saved_valuers()
-        if idx >= len(saved):
-            await query.edit_message_text("⚠️ Valuer not found in saved list.")
-            return
-        v = saved[idx]
-        await query.edit_message_text(
-            f"✅ Valuer: *{v['name']}*\nStarting assignment…",
-            parse_mode="Markdown",
-        )
-        await _ta_run_assign(query.message, ctx, task_type, v["uid"], v["name"], v["account_number"])
-        return
-
-    if action == "ns":
-        pending["awaiting_search"] = True
-        ctx.user_data["ta_pending"] = pending
-        await query.edit_message_text(
-            "🔍 Enter the *valuer name* to search:\n_(Partial names work, e.g._ `JOHN KAMAU`_)_",
-            parse_mode="Markdown",
-        )
-        return
-
-    if action == "sr":
-        idx     = int(parts[3])
-        results = pending.get("search_results", [])
-        if idx >= len(results):
-            await query.edit_message_text("⚠️ Search result no longer available.")
-            return
-        v    = results[idx]
-        sd   = v.get("staff_details", {})
-        name = " ".join(filter(None, [sd.get("firstname"), sd.get("middlename"), sd.get("lastname")]))
-        uid  = str(v.get("id", ""))
-        acct = str(v.get("account_number", ""))
-        await query.edit_message_text(
-            f"✅ Valuer: *{name}*\nStarting assignment…",
-            parse_mode="Markdown",
-        )
-        await _ta_run_assign(query.message, ctx, task_type, uid, name, acct)
-        return
-
-
-async def handle_ta_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Global text handler: catches valuer search input during task-assign flow."""
-    pending = ctx.user_data.get("ta_pending")
-    if not pending or not pending.get("awaiting_search"):
-        return   # nothing to do — not in task-assign search mode
-
-    valuer_name = update.message.text.strip()
-    task_type   = pending.get("type", "impl")
-    pending["awaiting_search"] = False
-
-    tokens = _any_valid_tokens()
-    if not tokens:
-        await update.message.reply_text(
-            "⚠️ Tokens expired. Please re-authenticate first.",
-            reply_markup=_main_menu(),
-        )
-        ctx.user_data.pop("ta_pending", None)
-        return
-
-    await update.message.reply_text(f"🔍 Searching for *{valuer_name}*…", parse_mode="Markdown")
-    try:
-        http_sess = build_session()
-        resp = http_sess.get(
-            f"{BASE_URL}/acl/api/v1/accounts/list-user-accounts",
-            headers={
-                "Authorization": f"Bearer {tokens.access_token}",
-                "JWTAUTH":       f"Bearer {tokens.jwt}",
-            },
-            params={"account_type": "STAFF", "filter_type": "ACTIVE", "page": 1, "search": valuer_name},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        results = resp.json().get("results", [])
-    except Exception as e:
-        await update.message.reply_text(f"❌ Search failed: `{e}`", parse_mode="Markdown")
-        return
-
-    if not results:
-        await update.message.reply_text(
-            f"⚠️ No staff found matching *{valuer_name}*. Try again:",
-            parse_mode="Markdown",
-            reply_markup=_ta_valuer_picker_keyboard(task_type),
-        )
-        pending["awaiting_search"] = False
-        return
-
-    pending["search_results"] = results
-    ctx.user_data["ta_pending"] = pending
-
-    rows = []
-    for i, v in enumerate(results):
-        sd   = v.get("staff_details", {})
-        name = " ".join(filter(None, [sd.get("firstname"), sd.get("middlename"), sd.get("lastname")]))
-        rows.append([InlineKeyboardButton(
-            name or f"Valuer {i+1}", callback_data=f"ta:{task_type}:sr:{i}"
-        )])
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"ta:{task_type}:cancel")])
-    await update.message.reply_text(
-        f"Found *{len(results)}* match(es). Select one:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
 
 
 # ──────────────────────────────────────────────────────────
@@ -8960,20 +8558,12 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"),        cmd_help))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_VALUERS)}$"),     cmd_valuers))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DELETE)}$"),      cmd_delete_valuer))
-    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_TASKS)}$"),   cmd_dlv_tasks))
-    app.add_handler(CallbackQueryHandler(recv_dlv_check,       pattern=r"^dlv_ck:"))
     app.add_handler(CallbackQueryHandler(recv_dlv_queue_action, pattern=r"^dlvq:"))
-    app.add_handler(CallbackQueryHandler(recv_ta_valuer,        pattern=r"^ta:"))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_QUEUE)}$"),    cmd_dlv_queue))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ASSIGNMENTS)}$"), cmd_assignments))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_AF_RESULTS)}$"), cmd_af_results))
     app.add_handler(CallbackQueryHandler(recv_af_result_detail, pattern=r"^af_result:"))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_CANCEL)}$"),      cmd_cancel))
-    # Lowest-priority: catch valuer name text input during task-assign search
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND & ~_MENU_BUTTON_FILTER, handle_ta_search),
-        group=1,
-    )
 
     logger.info("Bot started. Polling for updates…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
