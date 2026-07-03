@@ -475,6 +475,12 @@ class SC(Enum):
     CRED     = auto()   # pick credential to use for auto-assignment
 
 
+# States — Morning Briefing conversation
+class MB(Enum):
+    DELIVERY    = auto()   # telegram or email
+    EMAIL_INPUT = auto()   # enter email address
+
+
 # County → list of registry names as they appear in the API response
 _BE_COUNTY_REGISTRIES: Dict[str, List[str]] = {
     "NAIROBI":   ["CENTRAL"],
@@ -4007,7 +4013,7 @@ async def _send_briefing(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
 
 
 async def _morning_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Daily 8 AM EAT briefing: ONGOING task backlog by county and age."""
+    """Daily 7 AM EAT briefing: DLV Open Tasks, delivered via Telegram or email."""
     cfg = load_briefing_config()
     if not cfg or not cfg.get("enabled"):
         return
@@ -4017,83 +4023,43 @@ async def _morning_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("Morning briefing job: no valid tokens — skipping.")
         return
 
-    http_sess = build_session()
-    headers = {
-        "Authorization": f"Bearer {tokens.access_token}",
-        "JWTAUTH":       f"Bearer {tokens.jwt}",
-        "cparams":       CPARAMS_DLV,
-    }
-
-    all_tasks = []
-    page = 1
-    while True:
-        try:
-            resp = http_sess.get(
-                f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
-                headers=headers,
-                params={"filter": "Ongoing", "role": "DLV", "request_type": "STAMP_DUTY", "page": page},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            results = data.get("results", [])
-            if not results:
-                break
-            all_tasks.extend(results)
-            if len(results) < 100:
-                break
-            page += 1
-        except Exception as e:
-            logger.warning("Morning briefing job: fetch page %d failed: %s", page, e)
-            break
-
-    if not all_tasks:
-        await _send_briefing(context, "📋 *Morning Briefing*\n\nNo ONGOING tasks found.")
+    try:
+        rows = await asyncio.to_thread(_dt_fetch_tasks, tokens)
+    except Exception as e:
+        logger.error("Morning briefing job: fetch failed: %s", e, exc_info=True)
         return
 
-    now = datetime.now(tz=timezone.utc)
-    buckets = {"0-3 days": 0, "4-7 days": 0, "8-14 days": 0, ">14 days": 0}
-    county_counts: Dict[str, int] = {}
-    oldest_days = 0
-    oldest_ref  = "—"
+    today = datetime.now().strftime("%d %b %Y")
 
-    for t in all_tasks:
-        raw_date = t.get("date_created") or t.get("created_at") or ""
+    if cfg.get("delivery") == "email":
+        email = cfg.get("email", "")
+        if not email:
+            logger.warning("Morning briefing job: email delivery configured but no address saved.")
+            return
+        xlsx_bytes = _dt_build_excel(rows)
+        filename   = f"Morning_Briefing_OpenTasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         try:
-            created   = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
-            age_days  = (now - created).days
-        except (ValueError, TypeError):
-            age_days = 0
+            _send_bulk_export_email(email, filename, xlsx_bytes)
+        except Exception as e:
+            logger.error("Morning briefing job: email send failed: %s", e)
+            await _send_briefing(context, f"⚠️ *Morning Briefing — {today}*\nEmail delivery failed: `{e}`")
+            return
+        await _send_briefing(
+            context,
+            f"🌅 *Morning Briefing — {today}*\n📧 {len(rows)} Open Task(s) emailed to *{email}*.",
+        )
+        return
 
-        if age_days <= 3:
-            buckets["0-3 days"] += 1
-        elif age_days <= 7:
-            buckets["4-7 days"] += 1
-        elif age_days <= 14:
-            buckets["8-14 days"] += 1
-        else:
-            buckets[">14 days"] += 1
+    if not rows:
+        await _send_briefing(context, f"🌅 *Morning Briefing — {today}*\n\nNo Open DLV Tasks.")
+        return
 
-        county = (t.get("county") or "Unknown").upper()
-        county_counts[county] = county_counts.get(county, 0) + 1
-
-        if age_days > oldest_days:
-            oldest_days = age_days
-            oldest_ref  = t.get("reference_number", "—")
-
-    bucket_lines = "\n".join(f"  {label}: {count}" for label, count in buckets.items())
-    county_lines = "\n".join(
-        f"  {c}: {n}" for c, n in sorted(county_counts.items(), key=lambda x: -x[1])[:8]
-    )
-    today = now.strftime("%d %b %Y")
-    msg = (
-        f"🌅 *Morning Briefing — {today}*\n"
-        f"Total ONGOING: *{len(all_tasks)}*\n\n"
-        f"*Age breakdown:*\n{bucket_lines}\n\n"
-        f"*Top counties:*\n{county_lines}\n\n"
-        f"Oldest task: *{oldest_days}d* ({oldest_ref})"
-    )
-    await _send_briefing(context, msg)
+    await _send_briefing(context, f"🌅 *Morning Briefing — {today}* — {len(rows)} Open DLV Task(s)")
+    for chat_id in ALLOWED_IDS:
+        try:
+            await _dt_send_telegram(chat_id, rows, context.bot)
+        except Exception as e:
+            logger.warning("Morning briefing job notify error for %s: %s", chat_id, e)
 
 
 # DLV Tasks command handlers
@@ -4418,6 +4384,23 @@ async def _dt_send_telegram(chat_id: int, rows: List[dict], bot) -> None:
 # Morning Briefing command handler
 # ──────────────────────────────────────────────────────────
 
+def _schedule_morning_briefing(job_queue) -> None:
+    for job in job_queue.get_jobs_by_name("morning_briefing_job"):
+        job.schedule_removal()
+    job_queue.run_daily(
+        _morning_briefing_job,
+        time=_dtime(4, 0, tzinfo=timezone.utc),
+        name="morning_briefing_job",
+    )
+
+
+def _mb_delivery_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("💬 Telegram", callback_data="mb_delivery:telegram"),
+        InlineKeyboardButton("📩 Email",    callback_data="mb_delivery:email"),
+    ]])
+
+
 async def cmd_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     cfg = load_briefing_config()
@@ -4429,19 +4412,56 @@ async def cmd_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "🛑 Morning Briefing disabled.",
             reply_markup=_main_menu(),
         )
-    else:
-        save_briefing_config({"enabled": True})
-        ctx.job_queue.run_daily(
-            _morning_briefing_job,
-            time=_dtime(5, 0, tzinfo=timezone.utc),
-            name="morning_briefing_job",
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "🌅 *Morning Briefing* — Open DLV Tasks, delivered daily at 7 AM EAT.\n\n"
+        "How would you like to receive it?",
+        parse_mode="Markdown",
+        reply_markup=_mb_delivery_keyboard(),
+    )
+    return MB.DELIVERY
+
+
+async def recv_mb_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    mode = query.data.split(":")[1]
+
+    if mode == "email":
+        await query.edit_message_text(
+            "📧 Enter the email address to receive the daily Open Tasks report:",
         )
-        await update.message.reply_text(
-            "🌅 *Morning Briefing enabled*\nRuns daily at 8 AM EAT (05:00 UTC).\n"
-            "Tap again to disable.",
-            parse_mode="Markdown",
-            reply_markup=_main_menu(),
-        )
+        return MB.EMAIL_INPUT
+
+    save_briefing_config({"enabled": True, "delivery": "telegram"})
+    _schedule_morning_briefing(ctx.job_queue)
+    await query.edit_message_text(
+        "🌅 *Morning Briefing enabled* — Open Tasks via Telegram, daily at 7 AM EAT.\n"
+        "Use /briefing again to disable.",
+        parse_mode="Markdown",
+    )
+    await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+    return ConversationHandler.END
+
+
+async def recv_mb_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    email = (update.message.text or "").strip()
+    if "@" not in email or "." not in email.split("@")[-1]:
+        await update.message.reply_text("❌ Invalid email. Enter a valid address:")
+        return MB.EMAIL_INPUT
+
+    save_briefing_config({"enabled": True, "delivery": "email", "email": email})
+    _schedule_morning_briefing(ctx.job_queue)
+    await update.message.reply_text(
+        f"🌅 *Morning Briefing enabled* — Open Tasks emailed to *{email}*, daily at 7 AM EAT.\n"
+        "Use /briefing again to disable.",
+        parse_mode="Markdown",
+        reply_markup=_main_menu(),
+    )
+    return ConversationHandler.END
 
 
 # ──────────────────────────────────────────────────────────
@@ -8666,12 +8686,9 @@ def main():
     # Morning Briefing: restore if enabled
     briefing_cfg = load_briefing_config()
     if briefing_cfg and briefing_cfg.get("enabled"):
-        app.job_queue.run_daily(
-            _morning_briefing_job,
-            time=_dtime(5, 0, tzinfo=timezone.utc),
-            name="morning_briefing_job",
-        )
-        logger.info("Morning briefing restored: daily at 05:00 UTC")
+        _schedule_morning_briefing(app.job_queue)
+        logger.info("Morning briefing restored: daily at 04:00 UTC (7 AM EAT), delivery=%s",
+                    briefing_cfg.get("delivery", "telegram"))
 
     dt_conv = ConversationHandler(
         entry_points=[
@@ -8718,8 +8735,24 @@ def main():
     )
     app.add_handler(sc_conv)
 
-    app.add_handler(CommandHandler("briefing", cmd_briefing))
-    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_BRIEFING)}$"), cmd_briefing))
+    mb_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("briefing", cmd_briefing),
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_BRIEFING)}$"), cmd_briefing),
+        ],
+        states={
+            MB.DELIVERY:    [CallbackQueryHandler(recv_mb_delivery, pattern=r"^mb_delivery:")],
+            MB.EMAIL_INPUT: [MessageHandler(not_cancel, recv_mb_email)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            MessageHandler(_CANCEL_FILTER, cmd_cancel),
+            MessageHandler(filters.TEXT, fallback),
+        ],
+        allow_reentry=True,
+        per_message=False,
+    )
+    app.add_handler(mb_conv)
 
     # Button handlers outside an active conversation
     app.add_handler(CallbackQueryHandler(recv_delete_valuer,  pattern=r"^del:"))
