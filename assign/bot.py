@@ -3159,9 +3159,98 @@ def _classify_dlv_detail(detail: Dict) -> Dict:
     }
 
 
+_DLV_BATCH_WORKERS = 8
+
+
+def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth_hdrs: dict, item: Dict) -> Dict:
+    """
+    Process a single queued ref: search + detail-view + classify, then either
+    assign, report on an existing assignment, or close it out. Returns
+    {"item", "keep", "line", "closed"} — pure w.r.t. shared state, so callers
+    can run this across worker threads and merge results afterwards.
+    """
+    ref         = item.get("ref", "")
+    valuer_name = item.get("valuer_name", "")
+    valuer_uid  = item.get("valuer_uid", "")
+
+    try:
+        task = _search_ref_dlv(tokens, ref)
+        if not task:
+            # Not in DLV yet — keep for retry
+            item["last_error"] = "Not found in DLV endpoint"
+            return {"item": item, "keep": True, "line": None, "closed": None}
+
+        detail = _fetch_ref_detail_dlv(tokens, task["id"])
+        if not detail:
+            # Transient failure — keep for retry
+            item["last_error"] = "Detail fetch returned empty response"
+            return {"item": item, "keep": True, "line": None, "closed": None}
+
+        info = _classify_dlv_detail(detail)
+
+        if info["bucket"] == "closed":
+            # No longer available for reallocation — move out of the active
+            # queue into the closed store instead of dropping it silently.
+            closed_record = {
+                **item,
+                "last_error":           None,
+                "closed_reason":        info["closed_reason"],
+                "application_status":   info["application_status"],
+                "node":                 info["node"],
+                "request_type":         task.get("_request_type", ""),
+                "consideration_amount": info["consideration_amount"],
+                "currency_code":        info["currency_code"],
+                "valuer_name":          info["actor_name"] or valuer_name,
+                "closed_at":            datetime.now().isoformat(timespec="seconds"),
+            }
+            label = "Completed" if info["closed_reason"] == "completed" else "Returned"
+            return {"item": item, "keep": False, "line": f"🔒 `{ref}` — Closed ({label})", "closed": closed_record}
+
+        item["assessor"] = info["assessor_name"]
+        node = info["node"]
+
+        if node == "VALUATION_STAMP_DUTY_CREATED":
+            r = http_sess.post(
+                assign_url, headers=auth_hdrs,
+                json={
+                    "reference_number":  ref,
+                    "valuation_officer": valuer_uid,
+                    "node":              "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            # Persist before reporting success; if disk write fails, log it but
+            # still report the correct outcome — the API assignment did succeed.
+            try:
+                persist_assignment(ref, valuer_name, valuer_uid)
+            except Exception as _pe:
+                logger.error("persist_assignment failed for %s: %s", ref, _pe)
+            return {"item": item, "keep": False, "line": f"✅ `{ref}` — assigned to *{valuer_name}*", "closed": None}
+
+        if node == "VALUATION_STAMP_DUTY_VALUER_REPORT":
+            actors = detail.get("actors", [])
+            if actors:
+                actor_name = actors[0].get("user_details", {}).get("names", "Unknown")
+                line = f"📋 `{ref}` — already with *{actor_name}*"
+            else:
+                line = f"📋 `{ref}` — at VALUER_REPORT stage, no actor listed"
+            return {"item": item, "keep": False, "line": line, "closed": None}
+
+        return {"item": item, "keep": False, "line": f"❓ `{ref}` — unexpected node: `{node}`", "closed": None}
+
+    except Exception as e:
+        # Keep for retry on error
+        item["last_error"] = str(e)[:120]
+        logger.warning("DLV batch error for %s: %s", ref, e)
+        return {"item": item, "keep": True, "line": None, "closed": None}
+
+
 def _process_dlv_batch_items(tokens: AuthTokens) -> str:
     """
-    Process the flat batch queue (list of {ref, valuer_name, valuer_uid, valuer_acct}).
+    Process the flat batch queue (list of {ref, valuer_name, valuer_uid, valuer_acct})
+    across worker threads — each ref's search/detail-view/assign calls are
+    independent I/O, same as the parallel fetch used elsewhere (e.g. Fetch Tasks).
     Refs not found in DLV are kept in the queue for the next 5-minute retry cycle.
     Returns a report string of completed items only, or "" if nothing was processed.
     """
@@ -3178,89 +3267,26 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> str:
 
     completed_lines: List[str] = []
     remaining:       List[Dict] = []
+    closed_items:    List[Dict] = []
 
-    for item in items:
-        ref         = item.get("ref", "")
-        valuer_name = item.get("valuer_name", "")
-        valuer_uid  = item.get("valuer_uid", "")
-
-        try:
-            task = _search_ref_dlv(tokens, ref)
-            if not task:
-                # Not in DLV yet — keep for retry
-                item["last_error"] = "Not found in DLV endpoint"
-                remaining.append(item)
-                continue
-
-            detail = _fetch_ref_detail_dlv(tokens, task["id"])
-            if not detail:
-                # Transient failure — keep for retry
-                item["last_error"] = "Detail fetch returned empty response"
-                remaining.append(item)
-                continue
-
-            info = _classify_dlv_detail(detail)
-
-            if info["bucket"] == "closed":
-                # No longer available for reallocation — move out of the active
-                # queue into the closed store instead of dropping it silently.
-                _append_dlv_closed({
-                    **item,
-                    "last_error":           None,
-                    "closed_reason":        info["closed_reason"],
-                    "application_status":   info["application_status"],
-                    "node":                 info["node"],
-                    "request_type":         task.get("_request_type", ""),
-                    "consideration_amount": info["consideration_amount"],
-                    "currency_code":        info["currency_code"],
-                    "valuer_name":          info["actor_name"] or valuer_name,
-                    "closed_at":            datetime.now().isoformat(timespec="seconds"),
-                })
-                label = "Completed" if info["closed_reason"] == "completed" else "Returned"
-                completed_lines.append(f"🔒 `{ref}` — Closed ({label})")
-                continue
-
-            item["assessor"] = info["assessor_name"]
-            node = info["node"]
-
-            if node == "VALUATION_STAMP_DUTY_CREATED":
-                r = http_sess.post(
-                    assign_url, headers=auth_hdrs,
-                    json={
-                        "reference_number":  ref,
-                        "valuation_officer": valuer_uid,
-                        "node":              "VALUATION_STAMP_DUTY_VALUER_REPORT",
-                    },
-                    timeout=30,
-                )
-                r.raise_for_status()
-                # Persist before reporting success; if disk write fails, log it but
-                # still report the correct outcome — the API assignment did succeed.
-                try:
-                    persist_assignment(ref, valuer_name, valuer_uid)
-                except Exception as _pe:
-                    logger.error("persist_assignment failed for %s: %s", ref, _pe)
-                completed_lines.append(f"✅ `{ref}` — assigned to *{valuer_name}*")
-
-            elif node == "VALUATION_STAMP_DUTY_VALUER_REPORT":
-                actors = detail.get("actors", [])
-                if actors:
-                    actor_name = actors[0].get("user_details", {}).get("names", "Unknown")
-                    completed_lines.append(f"📋 `{ref}` — already with *{actor_name}*")
-                else:
-                    completed_lines.append(f"📋 `{ref}` — at VALUER_REPORT stage, no actor listed")
-
-            else:
-                completed_lines.append(f"❓ `{ref}` — unexpected node: `{node}`")
-
-        except Exception as e:
-            # Keep for retry on error
-            item["last_error"] = str(e)[:120]
-            remaining.append(item)
-            logger.warning("DLV batch error for %s: %s", ref, e)
+    with ThreadPoolExecutor(max_workers=_DLV_BATCH_WORKERS) as pool:
+        fut_map = {
+            pool.submit(_process_dlv_batch_item, tokens, http_sess, assign_url, auth_hdrs, item): item
+            for item in items
+        }
+        for fut in _futures_as_completed(fut_map):
+            result = fut.result()
+            if result["line"]:
+                completed_lines.append(result["line"])
+            if result["keep"]:
+                remaining.append(result["item"])
+            if result["closed"]:
+                closed_items.append(result["closed"])
 
     # Save only refs that still need processing
     save_dlv_batch(remaining)
+    for closed_record in closed_items:
+        _append_dlv_closed(closed_record)
 
     if remaining:
         pending_refs = ", ".join(f"`{i['ref']}`" for i in remaining)
