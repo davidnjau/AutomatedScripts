@@ -3033,22 +3033,6 @@ def _resolve_valuer_from_saved(name: str) -> Optional[Dict]:
     return None
 
 
-def _lookup_collector(ctx: ContextTypes.DEFAULT_TYPE, ref: str) -> str:
-    """
-    Best-effort: find the collector (COUNTY_REGISTRAR officer) for ref among the
-    tasks from the user's last Fetch Tasks run. Returns "" if not found.
-    """
-    ft_sess = ctx.user_data.get("ft_session")
-    if not ft_sess:
-        return ""
-    for t in ft_sess.tasks:
-        if t.get("reference_number") == ref:
-            for o in t.get("officers", []):
-                if o.get("role") == "COUNTY_REGISTRAR":
-                    return o.get("name", "")
-    return ""
-
-
 def _search_valuer_api(name: str, tokens: AuthTokens) -> List[Dict]:
     http_sess = build_session()
     resp = http_sess.get(
@@ -3952,7 +3936,6 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
             "valuer_name":  item.get("valuer_name", ""),
             "valuer_uid":   item.get("valuer_uid", ""),
             "assessor":     "",
-            "collector":    item.get("collector", ""),
             "_closed":      None,
         }
         try:
@@ -4138,7 +4121,7 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
     ws = wb.active
     ws.title = "DLV Tasks"
     cols = ["Reference Number", "Parcel Number", "Registry", "County",
-            "Date Added", "Valuer", "Assessor", "Collector"]
+            "Date Added", "Valuer", "Assessor"]
     header_font = Font(bold=True)
     header_fill = PatternFill("solid", fgColor="BDD7EE")
     ws.append(cols)
@@ -4157,7 +4140,6 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
             r.get("date_created", ""),
             r.get("valuer_name", ""),
             r.get("assessor", ""),
-            r.get("collector", ""),
         ])
     for ci, col_name in enumerate(cols, start=1):
         col_letter = get_column_letter(ci)
@@ -4413,12 +4395,11 @@ async def _dt_send_telegram(chat_id: int, rows: List[dict], bot) -> None:
     for valuer, tasks in sorted(groups.items()):
         lines.append(f"\n👤 *{valuer}* ({len(tasks)} task(s))")
         for i, t in enumerate(tasks, start=1):
-            date_str  = (t.get("date_created") or "")[:10]
-            assessor  = t.get("assessor") or "—"
-            collector = t.get("collector") or "—"
+            date_str = (t.get("date_created") or "")[:10]
+            assessor = t.get("assessor") or "—"
             lines.append(
                 f"  {i}. `{t.get('ref', '—')}` | {t.get('parcel', '—')} | "
-                f"Added: {date_str} | Assessor: {assessor} | Collector: {collector}"
+                f"Added: {date_str} | Assessor: {assessor}"
             )
 
     # Telegram message limit is 4096 chars — split if needed
@@ -5674,7 +5655,6 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "valuer_name": g["valuer_name"],
                     "valuer_uid":  g["valuer_uid"],
                     "valuer_acct": g["valuer_acct"],
-                    "collector":   _lookup_collector(ctx, ref),
                     "queued_at":   datetime.now().isoformat(timespec="seconds"),
                 })
     flat_items = existing + new_items
