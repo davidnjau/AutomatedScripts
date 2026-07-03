@@ -3281,7 +3281,7 @@ async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     before_count = len(items)
-    report = _process_dlv_batch_items(tokens)
+    report = await asyncio.to_thread(_process_dlv_batch_items, tokens)
     after_count  = len(load_dlv_batch())
 
     # Only notify if something was actually completed (queue shrank)
@@ -4772,7 +4772,8 @@ async def recv_dlv_queue_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not items_before:
             await query.edit_message_text("✅ Queue is empty — nothing to process.")
             return
-        report = _process_dlv_batch_items(tokens)
+        await query.edit_message_text(f"⏳ Processing {len(items_before)} ref(s), please wait…")
+        report = await asyncio.to_thread(_process_dlv_batch_items, tokens)
         remaining = load_dlv_batch()
         msg = f"📋 *DLV Queue — Query Result*\n{report}" if report else "ℹ️ Nothing processed."
         if remaining:
@@ -5739,26 +5740,40 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 })
     flat_items = existing + new_items
     save_dlv_batch(flat_items)
-    await query.edit_message_text(
-        f"✅ *{len(new_items)} new ref(s)* added to queue ({len(flat_items)} total). Processing now…",
-        parse_mode="Markdown",
-    )
 
     tokens = _any_valid_tokens()
     if not tokens:
-        await query.message.reply_text(
+        await query.edit_message_text(
+            f"✅ *{len(new_items)} new ref(s)* added to queue ({len(flat_items)} total).\n\n"
             "⚠️ No valid tokens — authenticate first.\n"
             "Batch saved; will retry on the next 5-minute cycle.",
-            reply_markup=_main_menu(),
+            parse_mode="Markdown",
         )
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
         return ConversationHandler.END
 
-    report = _process_dlv_batch_items(tokens)
-    msg    = f"📋 *DLV Batch Report*\n{report}" if report else "ℹ️ Batch was already empty."
+    await query.edit_message_text(
+        f"✅ *{len(new_items)} new ref(s)* added to queue ({len(flat_items)} total).\n"
+        "⏳ Processing in the background — I'll message you with the report when it's done.",
+        parse_mode="Markdown",
+    )
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    asyncio.create_task(_run_dlv_batch_bg(ctx, query.message.chat_id, tokens))
+    return ConversationHandler.END
+
+
+async def _run_dlv_batch_bg(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, tokens: AuthTokens) -> None:
+    """Process the DLV batch queue off the event loop, then message the report back."""
+    try:
+        report = await asyncio.to_thread(_process_dlv_batch_items, tokens)
+    except Exception as e:
+        logger.error("DLV batch background processing failed: %s", e, exc_info=True)
+        await ctx.bot.send_message(chat_id, f"❌ DLV Batch processing failed: `{e}`", parse_mode="Markdown")
+        return
+    msg = f"📋 *DLV Batch Report*\n{report}" if report else "ℹ️ Batch was already empty."
     if len(msg) > 4000:
         msg = msg[:4000] + "\n…_(truncated)_"
-    await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=_main_menu())
-    return ConversationHandler.END
+    await ctx.bot.send_message(chat_id, msg, parse_mode="Markdown")
 
 
 # ──────────────────────────────────────────────────────────
