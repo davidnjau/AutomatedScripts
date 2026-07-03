@@ -2724,10 +2724,11 @@ async def recv_af_result_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             status = "⏳ pending"
             pending += 1
 
+        assessor = t.get("assessor") or "—"
         lines.append(
             f"{i}. `{ref}` — {status}\n"
             f"   {cnty}/{reg} | {date} | {cons}\n"
-            f"   {parcel}"
+            f"   {parcel} | Assessor: {assessor}"
         )
 
     summary_line = f"*Pending: {pending}  |  Assigned: {len(tasks) - pending}*\n\n"
@@ -3402,6 +3403,7 @@ def persist_af_result(run_id: str, run_at: str, tasks: List[Dict], cfg: Dict) ->
                 "consideration": t.get("consideration"),
                 "date_created": (t.get("date_created") or "")[:10],
                 "source":       t.get("source", ""),
+                "assessor":     t.get("assessor", ""),
             }
             for t in tasks
         ],
@@ -4799,6 +4801,14 @@ def _has_stamp_duty_invoice(invoices: list) -> bool:
     return False
 
 
+def _extract_assessor(officers: List[Dict]) -> str:
+    """Pick the ASSESSOR_OF_STAMP_DUTY officer's name out of a detail-view officers list."""
+    return next(
+        (o.get("name", "") for o in officers if o.get("role") == "ASSESSOR_OF_STAMP_DUTY"),
+        "",
+    )
+
+
 def _fetch_hq_list(http_sess, tokens: AuthTokens, cutoff: str) -> List[Dict]:
     """Fetch HQ digitised TRANSFER applications up to cutoff date."""
     headers = _ft_headers(tokens)
@@ -4992,6 +5002,7 @@ def _load_fetch_tasks(tokens: AuthTokens, days_back: int) -> Tuple[List[Dict], D
                 "currency_code":      d2a.get("currency_code", "KES"),
                 "parcel_number":      t.get("parcel_number", ""),
                 "officers":           officers,
+                "assessor":           _extract_assessor(officers),
             })
             stats["hq_kept"] += 1
 
@@ -5029,6 +5040,7 @@ def _load_fetch_tasks(tokens: AuthTokens, days_back: int) -> Tuple[List[Dict], D
                     "currency_code":      ext.get("currency_code", "KES"),
                     "parcel_number":      ext.get("parcel_number") or t.get("parcel_number", ""),
                     "officers":           officers,
+                    "assessor":           _extract_assessor(officers),
                 })
                 stats["county_kept"] += 1
 
@@ -5483,11 +5495,13 @@ async def _ft_show_results(message, tasks: List[Dict]):
         officers_str = ", ".join(
             f"{o['name']} ({o['role']})" for o in t.get("officers", []) if o.get("name")
         ) or "none"
+        assessor = t.get("assessor") or "—"
 
         lines.append(
             f"{i}. [{src}] {ref}\n"
             f"   {cnty} / {reg} | {date}\n"
             f"   {cons} | {parcel}\n"
+            f"   Assessor: {assessor}\n"
             f"   {officers_str}"
         )
 
