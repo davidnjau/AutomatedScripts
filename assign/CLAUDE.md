@@ -37,7 +37,7 @@ Three source files:
 - `login()` + `verify_otp()` implement the two-step OTP flow; `authenticate()` wraps both with stdin prompting
 - `auth_headers(tokens)` returns `{"Authorization": "Bearer ...", "JWTAUTH": "Bearer ..."}`
 - `AuthTokens` dataclass holds `access_token` + `jwt`; expiry detected by manually base64-decoding the JWT payload
-- **Note:** `token_refresh_daemon.py` imports `_CACHE_FILE`, `_decode_jwt_exp`, `_save_cached_tokens`, and `refresh_tokens` from this module, but these are not yet implemented here — the daemon is currently broken until these symbols are added.
+- `decode_jwt_exp()`, `build_session()`, and `AUTH_BASE_URL` are also imported directly by `token_refresh_daemon.py`
 
 **`bot.py`** — Telegram bot and orchestration:
 - Built on `python-telegram-bot` v21 using two parallel `ConversationHandler` state machines: `S` (assign flow) and `RS` (receive-tasks flow)
@@ -52,9 +52,9 @@ Three source files:
 
 **`token_refresh_daemon.py`** — Background token refresh daemon:
 - Watches the token cache and proactively refreshes each credential's tokens 5 minutes before JWT expiry
-- Launched from within the bot via the "🔄 Token Daemon" menu button (spawns a subprocess, writes PID to `data/daemon.pid`)
-- Can also be run standalone: `python token_refresh_daemon.py` or `nohup python token_refresh_daemon.py &`
-- Currently non-functional: depends on `_CACHE_FILE`, `refresh_tokens`, etc. not yet exported by `ardhisasa_auth.py`
+- Auto-started by `bot.py` on every boot (`_post_init` → `_daemon_start()`), so it comes back automatically after a redeploy/rebuild — no manual step needed
+- Can also be started/stopped manually via the "🔄 Token Daemon" menu button (spawns a subprocess, writes PID to `data/daemon.pid`) or run standalone: `python token_refresh_daemon.py` / `nohup python token_refresh_daemon.py &`
+- `_daemon_running()` cross-checks `/proc/<pid>/cmdline` against the daemon script (on Linux) to avoid a false-positive "already running" from a stale `daemon.pid` colliding with an unrelated PID after a container rebuild
 
 ### Assign Flow State Machine (`S` enum)
 
@@ -113,4 +113,4 @@ JSON files in `./data/` (mounted as Docker volume `bot_data`):
 - No test suite exists.
 - Credentials are hardcoded in `ardhisasa_auth.py` — do not move to `.env` without updating the `CRED_MAP` / `CRED_LABELS` dicts in `bot.py`.
 - The Dockerfile omits `tesseract-ocr` system package, so `pytesseract` will fail silently in Docker unless the image is updated; Claude Vision covers that fallback path.
-- The token refresh daemon is partially integrated but currently broken — `ardhisasa_auth.py` needs `_CACHE_FILE`, `_decode_jwt_exp`, `_save_cached_tokens`, and `refresh_tokens` implemented before the daemon can function.
+- The token refresh daemon auto-starts with the bot (`_post_init`) so it survives redeploys without a manual restart.
