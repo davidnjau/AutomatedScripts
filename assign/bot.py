@@ -8471,8 +8471,36 @@ async def _post_init(app) -> None:
         logger.info("Token refresh daemon auto-start skipped: %s", msg)
 
 
+async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Global fallback for exceptions PTB doesn't catch elsewhere (e.g. transient
+    Telegram API timeouts). Without this registered, PTB just dumps the raw
+    traceback and silently drops the update — the user's tap/message never
+    gets any response and a ConversationHandler can be left stuck mid-flow.
+    """
+    logger.error("Unhandled exception while processing update: %s", update, exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                "⚠️ Something went wrong processing that (likely a network hiccup) — please try again.",
+            )
+        except Exception:
+            pass   # best-effort notification only; don't let this raise too
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(20)
+        .read_timeout(20)
+        .write_timeout(20)
+        .pool_timeout(20)
+        .post_init(_post_init)
+        .build()
+    )
+    app.add_error_handler(_on_error)
 
     # Text filter that excludes the cancel button (so it reaches fallbacks)
     not_cancel = filters.TEXT & ~filters.COMMAND & ~_CANCEL_FILTER
