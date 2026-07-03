@@ -1,0 +1,16 @@
+services:
+  entries-bot:
+    build: .
+    container_name: ardhisasa_entries_bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - entries_data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  entries_data:
