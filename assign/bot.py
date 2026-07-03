@@ -3162,6 +3162,50 @@ def _classify_dlv_detail(detail: Dict) -> Dict:
     }
 
 
+def _search_ref_stampduty(tokens: AuthTokens, ref: str) -> Optional[Dict]:
+    """
+    Fallback search for a ref not yet visible in DLV — checks the assessor/HQ
+    stage instead, via the same stampdutyservice hod-or-clr endpoint Fetch
+    Tasks uses (fetch_tasks.md). Tries both the HQ (digitised) and County
+    (from_ardhipay) variants since the ref alone doesn't tell us which.
+    """
+    http_sess = build_session()
+    headers = _ft_headers(tokens)
+    for params in (
+        {"filter": "Ongoing", "page": 1, "search": ref},
+        {"filter": "Ongoing", "from_ardhipay": "true", "page": 1, "search": ref},
+    ):
+        try:
+            resp = http_sess.get(
+                f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/hod-or-clr",
+                headers=headers, params=params, timeout=30,
+            )
+            resp.raise_for_status()
+            for task in resp.json().get("results", []):
+                if task.get("reference_number") == ref:
+                    return task
+        except Exception as e:
+            logger.warning("Assessor-stage search failed for %s: %s", ref, e)
+    return None
+
+
+def _fetch_stampduty_detail(tokens: AuthTokens, request_id: str) -> Optional[Dict]:
+    """Detail-view for an assessor-stage (stampdutyservice) task."""
+    http_sess = build_session()
+    try:
+        resp = http_sess.get(
+            f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/detail-view",
+            headers=_ft_headers(tokens),
+            params={"request_id": request_id},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("details", {})
+    except Exception as e:
+        logger.warning("Assessor-stage detail failed for %s: %s", request_id, e)
+        return None
+
+
 _DLV_BATCH_WORKERS = 8
 
 
@@ -3989,40 +4033,60 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
             "valuer_name":  item.get("valuer_name", ""),
             "valuer_uid":   item.get("valuer_uid", ""),
             "assessor":     "",
-            "found":        False,   # not yet visible in the DLV queue at all
+            "found":        False,   # found anywhere (DLV or still with the assessor)
+            "location":     "",      # "dlv" | "assessor"
             "_closed":      None,
         }
         try:
             task = _search_ref_dlv(tokens, ref)
-            if not task:
+            if task:
+                row["found"]        = True
+                row["location"]     = "dlv"
+                row["parcel"]       = task.get("parcel_number", "")
+                row["registry"]     = (task.get("registry") or "").upper()
+                row["county"]       = (task.get("county") or "").upper()
+                row["date_created"] = task.get("date_created", row["date_created"])
+
+                detail = _fetch_ref_detail_dlv(tokens, task["id"])
+                if not detail:
+                    return row
+
+                info = _classify_dlv_detail(detail)
+                if info["bucket"] == "closed":
+                    row["_closed"] = {
+                        **item,
+                        "closed_reason":        info["closed_reason"],
+                        "application_status":   info["application_status"],
+                        "node":                 info["node"],
+                        "request_type":         task.get("_request_type", ""),
+                        "consideration_amount": info["consideration_amount"],
+                        "currency_code":        info["currency_code"],
+                        "valuer_name":          info["actor_name"] or row["valuer_name"],
+                        "closed_at":            datetime.now().isoformat(timespec="seconds"),
+                    }
+                    return row
+
+                row["assessor"] = info["assessor_name"]
                 return row
 
-            row["found"]        = True
-            row["parcel"]       = task.get("parcel_number", "")
-            row["registry"]     = (task.get("registry") or "").upper()
-            row["county"]       = (task.get("county") or "").upper()
-            row["date_created"] = task.get("date_created", row["date_created"])
+            # Not yet forwarded to DLV — check the assessor/HQ stage instead,
+            # the same stampdutyservice endpoints Fetch Tasks uses, so the
+            # report doesn't just go blank while a ref is still upstream.
+            assessor_task = _search_ref_stampduty(tokens, ref)
+            if assessor_task:
+                row["found"]        = True
+                row["location"]     = "assessor"
+                row["parcel"]       = assessor_task.get("parcel_number", "")
+                row["registry"]     = (assessor_task.get("registry") or "").upper()
+                row["county"]       = (assessor_task.get("county") or "").upper()
+                row["date_created"] = assessor_task.get("date_created", row["date_created"])
 
-            detail = _fetch_ref_detail_dlv(tokens, task["id"])
-            if not detail:
-                return row
-
-            info = _classify_dlv_detail(detail)
-            if info["bucket"] == "closed":
-                row["_closed"] = {
-                    **item,
-                    "closed_reason":        info["closed_reason"],
-                    "application_status":   info["application_status"],
-                    "node":                 info["node"],
-                    "request_type":         task.get("_request_type", ""),
-                    "consideration_amount": info["consideration_amount"],
-                    "currency_code":        info["currency_code"],
-                    "valuer_name":          info["actor_name"] or row["valuer_name"],
-                    "closed_at":            datetime.now().isoformat(timespec="seconds"),
-                }
-                return row
-
-            row["assessor"] = info["assessor_name"]
+                det = _fetch_stampduty_detail(tokens, assessor_task["id"])
+                if det:
+                    row["assessor"] = _extract_assessor([
+                        {"name": o.get("names", ""), "role": o.get("role", "")}
+                        for o in det.get("officers", [])
+                    ])
         except Exception as e:
             logger.warning("DLV Tasks enrich failed for %s: %s", ref, e)
 
@@ -4150,6 +4214,7 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
         cell.fill = header_fill
     ws.auto_filter.ref = ws.dimensions
     ws.freeze_panes    = "A2"
+    _status_labels = {"dlv": "In DLV", "assessor": "With Assessor (not yet in DLV)"}
     for r in rows:
         ws.append([
             r.get("ref", ""),
@@ -4159,7 +4224,7 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
             r.get("date_created", ""),
             r.get("valuer_name", ""),
             r.get("assessor", ""),
-            "In DLV" if r.get("found", True) else "Not yet in DLV",
+            _status_labels.get(r.get("location", ""), "Not found"),
         ])
     for ci, col_name in enumerate(cols, start=1):
         col_letter = get_column_letter(ci)
@@ -4418,7 +4483,13 @@ async def _dt_send_telegram(chat_id: int, rows: List[dict], bot) -> None:
             date_str = (t.get("date_created") or "")[:10] or "—"
             assessor = t.get("assessor") or "—"
             parcel   = t.get("parcel") or "—"
-            note     = "" if t.get("found", True) else " ⏳ _not yet visible in DLV_"
+            location = t.get("location", "")
+            if location == "assessor":
+                note = " ⏳ _still with Assessor, not yet in DLV_"
+            elif not t.get("found", True):
+                note = " ❓ _not found in Assessor or DLV queues_"
+            else:
+                note = ""
             lines.append(
                 f"  {i}. `{t.get('ref', '—')}` | {parcel} | "
                 f"Added: {date_str} | Assessor: {assessor}{note}"
