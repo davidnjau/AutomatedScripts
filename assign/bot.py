@@ -477,6 +477,7 @@ class SC(Enum):
 
 # States — Morning Briefing conversation
 class MB(Enum):
+    MENU        = auto()   # status + Run Now / Enable / Disable buttons
     DELIVERY    = auto()   # telegram or email
     EMAIL_INPUT = auto()   # enter email address
 
@@ -2769,15 +2770,32 @@ def _daemon_read_pid() -> Optional[int]:
 
 
 def _daemon_running() -> bool:
-    """Return True if the daemon process is alive."""
+    """
+    Return True if the daemon process is alive.
+
+    A container rebuild resets PIDs from scratch, so a stale daemon.pid left
+    over in the (persistent) data volume can coincidentally collide with an
+    unrelated live process — e.g. the bot's own PID. Matching /proc/<pid>/cmdline
+    against the daemon script guards against that false positive on Linux;
+    elsewhere it falls back to a plain liveness check.
+    """
     pid = _daemon_read_pid()
     if pid is None:
         return False
     try:
         os.kill(pid, 0)   # signal 0 = probe only, no actual signal sent
-        return True
     except (ProcessLookupError, PermissionError):
         return False
+
+    cmdline_path = f"/proc/{pid}/cmdline"
+    if os.path.exists(cmdline_path):
+        try:
+            with open(cmdline_path, "rb") as f:
+                cmdline = f.read().decode(errors="ignore")
+            return os.path.basename(DAEMON_SCRIPT) in cmdline
+        except OSError:
+            pass
+    return True
 
 
 def _daemon_start() -> Tuple[bool, str]:
@@ -3068,14 +3086,17 @@ def _search_ref_dlv(tokens: AuthTokens, ref: str) -> Optional[Dict]:
         "cparams":       CPARAMS_DLV,
     }
     for status_filter in filters:
+        params = {
+            "filter": status_filter, "role": "DLV", "request_type": request_type,
+            "search": ref, "page": 1,
+        }
+        if request_type == "COUNTY_STAMP_DUTY":
+            params["from_ardhipay"] = "true"   # required for county results, per dlv_batch.md
         try:
             resp = http_sess.get(
                 f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
                 headers=headers,
-                params={
-                    "filter": status_filter, "role": "DLV", "request_type": request_type,
-                    "search": ref, "page": 1,
-                },
+                params=params,
                 timeout=30,
             )
             resp.raise_for_status()
@@ -3141,9 +3162,142 @@ def _classify_dlv_detail(detail: Dict) -> Dict:
     }
 
 
+def _search_ref_stampduty(tokens: AuthTokens, ref: str) -> Optional[Dict]:
+    """
+    Fallback search for a ref not yet visible in DLV — checks the assessor/HQ
+    stage instead, via the same stampdutyservice hod-or-clr endpoint Fetch
+    Tasks uses (fetch_tasks.md). Tries both the HQ (digitised) and County
+    (from_ardhipay) variants since the ref alone doesn't tell us which.
+    """
+    http_sess = build_session()
+    headers = _ft_headers(tokens)
+    for params in (
+        {"filter": "Ongoing", "page": 1, "search": ref},
+        {"filter": "Ongoing", "from_ardhipay": "true", "page": 1, "search": ref},
+    ):
+        try:
+            resp = http_sess.get(
+                f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/hod-or-clr",
+                headers=headers, params=params, timeout=30,
+            )
+            resp.raise_for_status()
+            for task in resp.json().get("results", []):
+                if task.get("reference_number") == ref:
+                    return task
+        except Exception as e:
+            logger.warning("Assessor-stage search failed for %s: %s", ref, e)
+    return None
+
+
+def _fetch_stampduty_detail(tokens: AuthTokens, request_id: str) -> Optional[Dict]:
+    """Detail-view for an assessor-stage (stampdutyservice) task."""
+    http_sess = build_session()
+    try:
+        resp = http_sess.get(
+            f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/detail-view",
+            headers=_ft_headers(tokens),
+            params={"request_id": request_id},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("details", {})
+    except Exception as e:
+        logger.warning("Assessor-stage detail failed for %s: %s", request_id, e)
+        return None
+
+
+_DLV_BATCH_WORKERS = 8
+
+
+def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth_hdrs: dict, item: Dict) -> Dict:
+    """
+    Process a single queued ref: search + detail-view + classify, then either
+    assign, report on an existing assignment, or close it out. Returns
+    {"item", "keep", "line", "closed"} — pure w.r.t. shared state, so callers
+    can run this across worker threads and merge results afterwards.
+    """
+    ref         = item.get("ref", "")
+    valuer_name = item.get("valuer_name", "")
+    valuer_uid  = item.get("valuer_uid", "")
+
+    try:
+        task = _search_ref_dlv(tokens, ref)
+        if not task:
+            # Not in DLV yet — keep for retry
+            item["last_error"] = "Not found in DLV endpoint"
+            return {"item": item, "keep": True, "line": None, "closed": None}
+
+        detail = _fetch_ref_detail_dlv(tokens, task["id"])
+        if not detail:
+            # Transient failure — keep for retry
+            item["last_error"] = "Detail fetch returned empty response"
+            return {"item": item, "keep": True, "line": None, "closed": None}
+
+        info = _classify_dlv_detail(detail)
+
+        if info["bucket"] == "closed":
+            # No longer available for reallocation — move out of the active
+            # queue into the closed store instead of dropping it silently.
+            closed_record = {
+                **item,
+                "last_error":           None,
+                "closed_reason":        info["closed_reason"],
+                "application_status":   info["application_status"],
+                "node":                 info["node"],
+                "request_type":         task.get("_request_type", ""),
+                "consideration_amount": info["consideration_amount"],
+                "currency_code":        info["currency_code"],
+                "valuer_name":          info["actor_name"] or valuer_name,
+                "closed_at":            datetime.now().isoformat(timespec="seconds"),
+            }
+            label = "Completed" if info["closed_reason"] == "completed" else "Returned"
+            return {"item": item, "keep": False, "line": f"🔒 `{ref}` — Closed ({label})", "closed": closed_record}
+
+        item["assessor"] = info["assessor_name"]
+        node = info["node"]
+
+        if node == "VALUATION_STAMP_DUTY_CREATED":
+            r = http_sess.post(
+                assign_url, headers=auth_hdrs,
+                json={
+                    "reference_number":  ref,
+                    "valuation_officer": valuer_uid,
+                    "node":              "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            # Persist before reporting success; if disk write fails, log it but
+            # still report the correct outcome — the API assignment did succeed.
+            try:
+                persist_assignment(ref, valuer_name, valuer_uid)
+            except Exception as _pe:
+                logger.error("persist_assignment failed for %s: %s", ref, _pe)
+            return {"item": item, "keep": False, "line": f"✅ `{ref}` — assigned to *{valuer_name}*", "closed": None}
+
+        if node == "VALUATION_STAMP_DUTY_VALUER_REPORT":
+            actors = detail.get("actors", [])
+            if actors:
+                actor_name = actors[0].get("user_details", {}).get("names", "Unknown")
+                line = f"📋 `{ref}` — already with *{actor_name}*"
+            else:
+                line = f"📋 `{ref}` — at VALUER_REPORT stage, no actor listed"
+            return {"item": item, "keep": False, "line": line, "closed": None}
+
+        return {"item": item, "keep": False, "line": f"❓ `{ref}` — unexpected node: `{node}`", "closed": None}
+
+    except Exception as e:
+        # Keep for retry on error
+        item["last_error"] = str(e)[:120]
+        logger.warning("DLV batch error for %s: %s", ref, e)
+        return {"item": item, "keep": True, "line": None, "closed": None}
+
+
 def _process_dlv_batch_items(tokens: AuthTokens) -> str:
     """
-    Process the flat batch queue (list of {ref, valuer_name, valuer_uid, valuer_acct}).
+    Process the flat batch queue (list of {ref, valuer_name, valuer_uid, valuer_acct})
+    across worker threads — each ref's search/detail-view/assign calls are
+    independent I/O, same as the parallel fetch used elsewhere (e.g. Fetch Tasks).
     Refs not found in DLV are kept in the queue for the next 5-minute retry cycle.
     Returns a report string of completed items only, or "" if nothing was processed.
     """
@@ -3160,89 +3314,26 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> str:
 
     completed_lines: List[str] = []
     remaining:       List[Dict] = []
+    closed_items:    List[Dict] = []
 
-    for item in items:
-        ref         = item.get("ref", "")
-        valuer_name = item.get("valuer_name", "")
-        valuer_uid  = item.get("valuer_uid", "")
-
-        try:
-            task = _search_ref_dlv(tokens, ref)
-            if not task:
-                # Not in DLV yet — keep for retry
-                item["last_error"] = "Not found in DLV endpoint"
-                remaining.append(item)
-                continue
-
-            detail = _fetch_ref_detail_dlv(tokens, task["id"])
-            if not detail:
-                # Transient failure — keep for retry
-                item["last_error"] = "Detail fetch returned empty response"
-                remaining.append(item)
-                continue
-
-            info = _classify_dlv_detail(detail)
-
-            if info["bucket"] == "closed":
-                # No longer available for reallocation — move out of the active
-                # queue into the closed store instead of dropping it silently.
-                _append_dlv_closed({
-                    **item,
-                    "last_error":           None,
-                    "closed_reason":        info["closed_reason"],
-                    "application_status":   info["application_status"],
-                    "node":                 info["node"],
-                    "request_type":         task.get("_request_type", ""),
-                    "consideration_amount": info["consideration_amount"],
-                    "currency_code":        info["currency_code"],
-                    "valuer_name":          info["actor_name"] or valuer_name,
-                    "closed_at":            datetime.now().isoformat(timespec="seconds"),
-                })
-                label = "Completed" if info["closed_reason"] == "completed" else "Returned"
-                completed_lines.append(f"🔒 `{ref}` — Closed ({label})")
-                continue
-
-            item["assessor"] = info["assessor_name"]
-            node = info["node"]
-
-            if node == "VALUATION_STAMP_DUTY_CREATED":
-                r = http_sess.post(
-                    assign_url, headers=auth_hdrs,
-                    json={
-                        "reference_number":  ref,
-                        "valuation_officer": valuer_uid,
-                        "node":              "VALUATION_STAMP_DUTY_VALUER_REPORT",
-                    },
-                    timeout=30,
-                )
-                r.raise_for_status()
-                # Persist before reporting success; if disk write fails, log it but
-                # still report the correct outcome — the API assignment did succeed.
-                try:
-                    persist_assignment(ref, valuer_name, valuer_uid)
-                except Exception as _pe:
-                    logger.error("persist_assignment failed for %s: %s", ref, _pe)
-                completed_lines.append(f"✅ `{ref}` — assigned to *{valuer_name}*")
-
-            elif node == "VALUATION_STAMP_DUTY_VALUER_REPORT":
-                actors = detail.get("actors", [])
-                if actors:
-                    actor_name = actors[0].get("user_details", {}).get("names", "Unknown")
-                    completed_lines.append(f"📋 `{ref}` — already with *{actor_name}*")
-                else:
-                    completed_lines.append(f"📋 `{ref}` — at VALUER_REPORT stage, no actor listed")
-
-            else:
-                completed_lines.append(f"❓ `{ref}` — unexpected node: `{node}`")
-
-        except Exception as e:
-            # Keep for retry on error
-            item["last_error"] = str(e)[:120]
-            remaining.append(item)
-            logger.warning("DLV batch error for %s: %s", ref, e)
+    with ThreadPoolExecutor(max_workers=_DLV_BATCH_WORKERS) as pool:
+        fut_map = {
+            pool.submit(_process_dlv_batch_item, tokens, http_sess, assign_url, auth_hdrs, item): item
+            for item in items
+        }
+        for fut in _futures_as_completed(fut_map):
+            result = fut.result()
+            if result["line"]:
+                completed_lines.append(result["line"])
+            if result["keep"]:
+                remaining.append(result["item"])
+            if result["closed"]:
+                closed_items.append(result["closed"])
 
     # Save only refs that still need processing
     save_dlv_batch(remaining)
+    for closed_record in closed_items:
+        _append_dlv_closed(closed_record)
 
     if remaining:
         pending_refs = ", ".join(f"`{i['ref']}`" for i in remaining)
@@ -3263,7 +3354,7 @@ async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     before_count = len(items)
-    report = _process_dlv_batch_items(tokens)
+    report = await asyncio.to_thread(_process_dlv_batch_items, tokens)
     after_count  = len(load_dlv_batch())
 
     # Only notify if something was actually completed (queue shrank)
@@ -3942,38 +4033,60 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
             "valuer_name":  item.get("valuer_name", ""),
             "valuer_uid":   item.get("valuer_uid", ""),
             "assessor":     "",
+            "found":        False,   # found anywhere (DLV or still with the assessor)
+            "location":     "",      # "dlv" | "assessor"
             "_closed":      None,
         }
         try:
             task = _search_ref_dlv(tokens, ref)
-            if not task:
+            if task:
+                row["found"]        = True
+                row["location"]     = "dlv"
+                row["parcel"]       = task.get("parcel_number", "")
+                row["registry"]     = (task.get("registry") or "").upper()
+                row["county"]       = (task.get("county") or "").upper()
+                row["date_created"] = task.get("date_created", row["date_created"])
+
+                detail = _fetch_ref_detail_dlv(tokens, task["id"])
+                if not detail:
+                    return row
+
+                info = _classify_dlv_detail(detail)
+                if info["bucket"] == "closed":
+                    row["_closed"] = {
+                        **item,
+                        "closed_reason":        info["closed_reason"],
+                        "application_status":   info["application_status"],
+                        "node":                 info["node"],
+                        "request_type":         task.get("_request_type", ""),
+                        "consideration_amount": info["consideration_amount"],
+                        "currency_code":        info["currency_code"],
+                        "valuer_name":          info["actor_name"] or row["valuer_name"],
+                        "closed_at":            datetime.now().isoformat(timespec="seconds"),
+                    }
+                    return row
+
+                row["assessor"] = info["assessor_name"]
                 return row
 
-            row["parcel"]       = task.get("parcel_number", "")
-            row["registry"]     = (task.get("registry") or "").upper()
-            row["county"]       = (task.get("county") or "").upper()
-            row["date_created"] = task.get("date_created", row["date_created"])
+            # Not yet forwarded to DLV — check the assessor/HQ stage instead,
+            # the same stampdutyservice endpoints Fetch Tasks uses, so the
+            # report doesn't just go blank while a ref is still upstream.
+            assessor_task = _search_ref_stampduty(tokens, ref)
+            if assessor_task:
+                row["found"]        = True
+                row["location"]     = "assessor"
+                row["parcel"]       = assessor_task.get("parcel_number", "")
+                row["registry"]     = (assessor_task.get("registry") or "").upper()
+                row["county"]       = (assessor_task.get("county") or "").upper()
+                row["date_created"] = assessor_task.get("date_created", row["date_created"])
 
-            detail = _fetch_ref_detail_dlv(tokens, task["id"])
-            if not detail:
-                return row
-
-            info = _classify_dlv_detail(detail)
-            if info["bucket"] == "closed":
-                row["_closed"] = {
-                    **item,
-                    "closed_reason":        info["closed_reason"],
-                    "application_status":   info["application_status"],
-                    "node":                 info["node"],
-                    "request_type":         task.get("_request_type", ""),
-                    "consideration_amount": info["consideration_amount"],
-                    "currency_code":        info["currency_code"],
-                    "valuer_name":          info["actor_name"] or row["valuer_name"],
-                    "closed_at":            datetime.now().isoformat(timespec="seconds"),
-                }
-                return row
-
-            row["assessor"] = info["assessor_name"]
+                det = _fetch_stampduty_detail(tokens, assessor_task["id"])
+                if det:
+                    row["assessor"] = _extract_assessor([
+                        {"name": o.get("names", ""), "role": o.get("role", "")}
+                        for o in det.get("officers", [])
+                    ])
         except Exception as e:
             logger.warning("DLV Tasks enrich failed for %s: %s", ref, e)
 
@@ -4012,36 +4125,32 @@ async def _send_briefing(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
             logger.warning("Morning briefing notify error for %s: %s", chat_id, e)
 
 
-async def _morning_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Daily 7 AM EAT briefing: DLV Open Tasks, delivered via Telegram or email."""
-    cfg = load_briefing_config()
-    if not cfg or not cfg.get("enabled"):
-        return
-
+async def _run_morning_briefing(context: ContextTypes.DEFAULT_TYPE, delivery: str, email: str) -> None:
+    """Build and broadcast the Open DLV Tasks briefing — shared by the 7 AM job and Run Now."""
     tokens = _any_valid_tokens()
     if not tokens:
-        logger.warning("Morning briefing job: no valid tokens — skipping.")
+        await _send_briefing(context, "⚠️ *Morning Briefing*\nNo valid cached tokens — authenticate first.")
         return
 
     try:
         rows = await asyncio.to_thread(_dt_fetch_tasks, tokens)
     except Exception as e:
-        logger.error("Morning briefing job: fetch failed: %s", e, exc_info=True)
+        logger.error("Morning briefing: fetch failed: %s", e, exc_info=True)
+        await _send_briefing(context, f"⚠️ *Morning Briefing*\nFailed to fetch tasks: `{e}`")
         return
 
     today = datetime.now().strftime("%d %b %Y")
 
-    if cfg.get("delivery") == "email":
-        email = cfg.get("email", "")
+    if delivery == "email":
         if not email:
-            logger.warning("Morning briefing job: email delivery configured but no address saved.")
+            await _send_briefing(context, "⚠️ *Morning Briefing*\nEmail delivery selected but no address is saved.")
             return
         xlsx_bytes = _dt_build_excel(rows)
         filename   = f"Morning_Briefing_OpenTasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         try:
             _send_bulk_export_email(email, filename, xlsx_bytes)
         except Exception as e:
-            logger.error("Morning briefing job: email send failed: %s", e)
+            logger.error("Morning briefing: email send failed: %s", e)
             await _send_briefing(context, f"⚠️ *Morning Briefing — {today}*\nEmail delivery failed: `{e}`")
             return
         await _send_briefing(
@@ -4059,7 +4168,15 @@ async def _morning_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await _dt_send_telegram(chat_id, rows, context.bot)
         except Exception as e:
-            logger.warning("Morning briefing job notify error for %s: %s", chat_id, e)
+            logger.warning("Morning briefing notify error for %s: %s", chat_id, e)
+
+
+async def _morning_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Daily 7 AM EAT briefing: DLV Open Tasks, delivered via Telegram or email."""
+    cfg = load_briefing_config()
+    if not cfg or not cfg.get("enabled"):
+        return
+    await _run_morning_briefing(context, cfg.get("delivery", "telegram"), cfg.get("email", ""))
 
 
 # DLV Tasks command handlers
@@ -4087,7 +4204,7 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
     ws = wb.active
     ws.title = "DLV Tasks"
     cols = ["Reference Number", "Parcel Number", "Registry", "County",
-            "Date Added", "Valuer", "Assessor"]
+            "Date Added", "Valuer", "Assessor", "Status"]
     header_font = Font(bold=True)
     header_fill = PatternFill("solid", fgColor="BDD7EE")
     ws.append(cols)
@@ -4097,6 +4214,7 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
         cell.fill = header_fill
     ws.auto_filter.ref = ws.dimensions
     ws.freeze_panes    = "A2"
+    _status_labels = {"dlv": "In DLV", "assessor": "With Assessor (not yet in DLV)"}
     for r in rows:
         ws.append([
             r.get("ref", ""),
@@ -4106,6 +4224,7 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
             r.get("date_created", ""),
             r.get("valuer_name", ""),
             r.get("assessor", ""),
+            _status_labels.get(r.get("location", ""), "Not found"),
         ])
     for ci, col_name in enumerate(cols, start=1):
         col_letter = get_column_letter(ci)
@@ -4361,11 +4480,19 @@ async def _dt_send_telegram(chat_id: int, rows: List[dict], bot) -> None:
     for valuer, tasks in sorted(groups.items()):
         lines.append(f"\n👤 *{valuer}* ({len(tasks)} task(s))")
         for i, t in enumerate(tasks, start=1):
-            date_str = (t.get("date_created") or "")[:10]
+            date_str = (t.get("date_created") or "")[:10] or "—"
             assessor = t.get("assessor") or "—"
+            parcel   = t.get("parcel") or "—"
+            location = t.get("location", "")
+            if location == "assessor":
+                note = " ⏳ _still with Assessor, not yet in DLV_"
+            elif not t.get("found", True):
+                note = " ❓ _not found in Assessor or DLV queues_"
+            else:
+                note = ""
             lines.append(
-                f"  {i}. `{t.get('ref', '—')}` | {t.get('parcel', '—')} | "
-                f"Added: {date_str} | Assessor: {assessor}"
+                f"  {i}. `{t.get('ref', '—')}` | {parcel} | "
+                f"Added: {date_str} | Assessor: {assessor}{note}"
             )
 
     # Telegram message limit is 4096 chars — split if needed
@@ -4401,20 +4528,58 @@ def _mb_delivery_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
+def _mb_menu_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("▶️ Run Now", callback_data="mb:run_now")]]
+    if enabled:
+        rows.append([InlineKeyboardButton("🛑 Disable", callback_data="mb:disable")])
+    else:
+        rows.append([InlineKeyboardButton("✅ Enable",  callback_data="mb:enable")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def cmd_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
-    cfg = load_briefing_config()
-    if cfg and cfg.get("enabled"):
+    cfg      = load_briefing_config() or {}
+    enabled  = cfg.get("enabled", False)
+    delivery = cfg.get("delivery", "telegram")
+
+    if enabled:
+        via = f"📩 Email ({cfg.get('email', '—')})" if delivery == "email" else "💬 Telegram"
+        status = f"Status: ✅ Enabled — daily at 7 AM EAT via {via}"
+    else:
+        status = "Status: 🛑 Disabled"
+
+    await update.message.reply_text(
+        f"🌅 *Morning Briefing* — Open DLV Tasks\n{status}",
+        parse_mode="Markdown",
+        reply_markup=_mb_menu_keyboard(enabled),
+    )
+    return MB.MENU
+
+
+async def recv_mb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    query  = update.callback_query
+    await query.answer()
+    action = query.data.split(":")[1]
+
+    if action == "run_now":
+        cfg = load_briefing_config() or {}
+        await query.edit_message_text("⏳ Running Morning Briefing now…")
+        await _run_morning_briefing(ctx, cfg.get("delivery", "telegram"), cfg.get("email", ""))
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    if action == "disable":
         save_briefing_config({"enabled": False})
         for job in ctx.job_queue.get_jobs_by_name("morning_briefing_job"):
             job.schedule_removal()
-        await update.message.reply_text(
-            "🛑 Morning Briefing disabled.",
-            reply_markup=_main_menu(),
-        )
+        await query.edit_message_text("🛑 Morning Briefing disabled.")
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
         return ConversationHandler.END
 
-    await update.message.reply_text(
+    # action == "enable"
+    await query.edit_message_text(
         "🌅 *Morning Briefing* — Open DLV Tasks, delivered daily at 7 AM EAT.\n\n"
         "How would you like to receive it?",
         parse_mode="Markdown",
@@ -4712,7 +4877,8 @@ async def recv_dlv_queue_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not items_before:
             await query.edit_message_text("✅ Queue is empty — nothing to process.")
             return
-        report = _process_dlv_batch_items(tokens)
+        await query.edit_message_text(f"⏳ Processing {len(items_before)} ref(s), please wait…")
+        report = await asyncio.to_thread(_process_dlv_batch_items, tokens)
         remaining = load_dlv_batch()
         msg = f"📋 *DLV Queue — Query Result*\n{report}" if report else "ℹ️ Nothing processed."
         if remaining:
@@ -5679,26 +5845,40 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 })
     flat_items = existing + new_items
     save_dlv_batch(flat_items)
-    await query.edit_message_text(
-        f"✅ *{len(new_items)} new ref(s)* added to queue ({len(flat_items)} total). Processing now…",
-        parse_mode="Markdown",
-    )
 
     tokens = _any_valid_tokens()
     if not tokens:
-        await query.message.reply_text(
+        await query.edit_message_text(
+            f"✅ *{len(new_items)} new ref(s)* added to queue ({len(flat_items)} total).\n\n"
             "⚠️ No valid tokens — authenticate first.\n"
             "Batch saved; will retry on the next 5-minute cycle.",
-            reply_markup=_main_menu(),
+            parse_mode="Markdown",
         )
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
         return ConversationHandler.END
 
-    report = _process_dlv_batch_items(tokens)
-    msg    = f"📋 *DLV Batch Report*\n{report}" if report else "ℹ️ Batch was already empty."
+    await query.edit_message_text(
+        f"✅ *{len(new_items)} new ref(s)* added to queue ({len(flat_items)} total).\n"
+        "⏳ Processing in the background — I'll message you with the report when it's done.",
+        parse_mode="Markdown",
+    )
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    asyncio.create_task(_run_dlv_batch_bg(ctx, query.message.chat_id, tokens))
+    return ConversationHandler.END
+
+
+async def _run_dlv_batch_bg(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, tokens: AuthTokens) -> None:
+    """Process the DLV batch queue off the event loop, then message the report back."""
+    try:
+        report = await asyncio.to_thread(_process_dlv_batch_items, tokens)
+    except Exception as e:
+        logger.error("DLV batch background processing failed: %s", e, exc_info=True)
+        await ctx.bot.send_message(chat_id, f"❌ DLV Batch processing failed: `{e}`", parse_mode="Markdown")
+        return
+    msg = f"📋 *DLV Batch Report*\n{report}" if report else "ℹ️ Batch was already empty."
     if len(msg) > 4000:
         msg = msg[:4000] + "\n…_(truncated)_"
-    await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=_main_menu())
-    return ConversationHandler.END
+    await ctx.bot.send_message(chat_id, msg, parse_mode="Markdown")
 
 
 # ──────────────────────────────────────────────────────────
@@ -8401,9 +8581,46 @@ async def recv_be_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _post_init(app) -> None:
     _restore_schedules(app)
 
+    # Auto-start the token refresh daemon on every boot — a container rebuild
+    # (redeploy) kills it along with the bot, and it otherwise stays down
+    # until someone manually taps "Start Daemon" in the menu.
+    ok, msg = _daemon_start()
+    if ok:
+        logger.info("Token refresh daemon auto-started: %s", msg)
+    else:
+        logger.info("Token refresh daemon auto-start skipped: %s", msg)
+
+
+async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Global fallback for exceptions PTB doesn't catch elsewhere (e.g. transient
+    Telegram API timeouts). Without this registered, PTB just dumps the raw
+    traceback and silently drops the update — the user's tap/message never
+    gets any response and a ConversationHandler can be left stuck mid-flow.
+    """
+    logger.error("Unhandled exception while processing update: %s", update, exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                "⚠️ Something went wrong processing that (likely a network hiccup) — please try again.",
+            )
+        except Exception:
+            pass   # best-effort notification only; don't let this raise too
+
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(20)
+        .read_timeout(20)
+        .write_timeout(20)
+        .pool_timeout(20)
+        .post_init(_post_init)
+        .build()
+    )
+    app.add_error_handler(_on_error)
 
     # Text filter that excludes the cancel button (so it reaches fallbacks)
     not_cancel = filters.TEXT & ~filters.COMMAND & ~_CANCEL_FILTER
@@ -8741,6 +8958,7 @@ def main():
             MessageHandler(filters.Regex(f"^{re.escape(BTN_BRIEFING)}$"), cmd_briefing),
         ],
         states={
+            MB.MENU:        [CallbackQueryHandler(recv_mb_menu,     pattern=r"^mb:")],
             MB.DELIVERY:    [CallbackQueryHandler(recv_mb_delivery, pattern=r"^mb_delivery:")],
             MB.EMAIL_INPUT: [MessageHandler(not_cancel, recv_mb_email)],
         },
