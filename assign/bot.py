@@ -3086,14 +3086,17 @@ def _search_ref_dlv(tokens: AuthTokens, ref: str) -> Optional[Dict]:
         "cparams":       CPARAMS_DLV,
     }
     for status_filter in filters:
+        params = {
+            "filter": status_filter, "role": "DLV", "request_type": request_type,
+            "search": ref, "page": 1,
+        }
+        if request_type == "COUNTY_STAMP_DUTY":
+            params["from_ardhipay"] = "true"   # required for county results, per dlv_batch.md
         try:
             resp = http_sess.get(
                 f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
                 headers=headers,
-                params={
-                    "filter": status_filter, "role": "DLV", "request_type": request_type,
-                    "search": ref, "page": 1,
-                },
+                params=params,
                 timeout=30,
             )
             resp.raise_for_status()
@@ -3986,6 +3989,7 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
             "valuer_name":  item.get("valuer_name", ""),
             "valuer_uid":   item.get("valuer_uid", ""),
             "assessor":     "",
+            "found":        False,   # not yet visible in the DLV queue at all
             "_closed":      None,
         }
         try:
@@ -3993,6 +3997,7 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
             if not task:
                 return row
 
+            row["found"]        = True
             row["parcel"]       = task.get("parcel_number", "")
             row["registry"]     = (task.get("registry") or "").upper()
             row["county"]       = (task.get("county") or "").upper()
@@ -4135,7 +4140,7 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
     ws = wb.active
     ws.title = "DLV Tasks"
     cols = ["Reference Number", "Parcel Number", "Registry", "County",
-            "Date Added", "Valuer", "Assessor"]
+            "Date Added", "Valuer", "Assessor", "Status"]
     header_font = Font(bold=True)
     header_fill = PatternFill("solid", fgColor="BDD7EE")
     ws.append(cols)
@@ -4154,6 +4159,7 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
             r.get("date_created", ""),
             r.get("valuer_name", ""),
             r.get("assessor", ""),
+            "In DLV" if r.get("found", True) else "Not yet in DLV",
         ])
     for ci, col_name in enumerate(cols, start=1):
         col_letter = get_column_letter(ci)
@@ -4409,11 +4415,13 @@ async def _dt_send_telegram(chat_id: int, rows: List[dict], bot) -> None:
     for valuer, tasks in sorted(groups.items()):
         lines.append(f"\n👤 *{valuer}* ({len(tasks)} task(s))")
         for i, t in enumerate(tasks, start=1):
-            date_str = (t.get("date_created") or "")[:10]
+            date_str = (t.get("date_created") or "")[:10] or "—"
             assessor = t.get("assessor") or "—"
+            parcel   = t.get("parcel") or "—"
+            note     = "" if t.get("found", True) else " ⏳ _not yet visible in DLV_"
             lines.append(
-                f"  {i}. `{t.get('ref', '—')}` | {t.get('parcel', '—')} | "
-                f"Added: {date_str} | Assessor: {assessor}"
+                f"  {i}. `{t.get('ref', '—')}` | {parcel} | "
+                f"Added: {date_str} | Assessor: {assessor}{note}"
             )
 
     # Telegram message limit is 4096 chars — split if needed
