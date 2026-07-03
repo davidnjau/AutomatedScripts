@@ -2769,15 +2769,32 @@ def _daemon_read_pid() -> Optional[int]:
 
 
 def _daemon_running() -> bool:
-    """Return True if the daemon process is alive."""
+    """
+    Return True if the daemon process is alive.
+
+    A container rebuild resets PIDs from scratch, so a stale daemon.pid left
+    over in the (persistent) data volume can coincidentally collide with an
+    unrelated live process — e.g. the bot's own PID. Matching /proc/<pid>/cmdline
+    against the daemon script guards against that false positive on Linux;
+    elsewhere it falls back to a plain liveness check.
+    """
     pid = _daemon_read_pid()
     if pid is None:
         return False
     try:
         os.kill(pid, 0)   # signal 0 = probe only, no actual signal sent
-        return True
     except (ProcessLookupError, PermissionError):
         return False
+
+    cmdline_path = f"/proc/{pid}/cmdline"
+    if os.path.exists(cmdline_path):
+        try:
+            with open(cmdline_path, "rb") as f:
+                cmdline = f.read().decode(errors="ignore")
+            return os.path.basename(DAEMON_SCRIPT) in cmdline
+        except OSError:
+            pass
+    return True
 
 
 def _daemon_start() -> Tuple[bool, str]:
@@ -8400,6 +8417,15 @@ async def recv_be_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────
 async def _post_init(app) -> None:
     _restore_schedules(app)
+
+    # Auto-start the token refresh daemon on every boot — a container rebuild
+    # (redeploy) kills it along with the bot, and it otherwise stays down
+    # until someone manually taps "Start Daemon" in the menu.
+    ok, msg = _daemon_start()
+    if ok:
+        logger.info("Token refresh daemon auto-started: %s", msg)
+    else:
+        logger.info("Token refresh daemon auto-start skipped: %s", msg)
 
 
 def main():
