@@ -119,6 +119,7 @@ SAVED_ASSIGNMENTS_FILE  = os.path.join(DATA_DIR, "saved_assignments.json")
 SAVED_TASK_BATCHES_FILE = os.path.join(DATA_DIR, "saved_task_batches.json")
 SAVED_SCHEDULES_FILE    = os.path.join(DATA_DIR, "saved_schedules.json")
 SAVED_DLV_BATCH_FILE          = os.path.join(DATA_DIR, "saved_dlv_batch.json")
+SAVED_DLV_CLOSED_FILE         = os.path.join(DATA_DIR, "saved_dlv_closed.json")
 SAVED_BULK_EXPORT_SCHED_FILE    = os.path.join(DATA_DIR, "saved_bulk_export_schedule.json")
 SAVED_BULK_EXPORT_PARTIAL_FILE  = os.path.join(DATA_DIR, "saved_bulk_export_partial.json")
 SAVED_AUTO_FETCH_FILE   = os.path.join(DATA_DIR, "saved_auto_fetch.json")
@@ -460,6 +461,7 @@ class BE(Enum):
 
 # States — DLV Tasks conversation
 class DT(Enum):
+    SCOPE           = auto()   # choose Open Tasks vs Closed Tasks
     EXCLUDE_VALUERS = auto()   # toggle which valuers to exclude
     DELIVERY        = auto()   # telegram or email
     EMAIL_INPUT     = auto()   # enter email address
@@ -2974,6 +2976,35 @@ def clear_dlv_batch() -> None:
     save_dlv_batch([])
 
 
+def load_dlv_closed() -> List[Dict]:
+    try:
+        with open(SAVED_DLV_CLOSED_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_dlv_closed(items: List[Dict]) -> None:
+    _atomic_json_write(SAVED_DLV_CLOSED_FILE, items, indent=2)
+
+
+def _append_dlv_closed(item: Dict) -> None:
+    """Move a ref into the closed store, replacing any prior record for the same ref."""
+    closed = [c for c in load_dlv_closed() if c.get("ref") != item.get("ref")]
+    closed.append(item)
+    save_dlv_closed(closed)
+
+
+# Status filters to probe per DLV request type — a queued ref's current status
+# isn't known in advance, so every relevant filter is tried until it's found.
+_DLV_COUNTY_FILTERS    = ["Ongoing", "Completed", "Returned"]
+_DLV_NONCOUNTY_FILTERS = ["Pending", "Ongoing", "Completed", "Returned", "On-hold", "Cancelled"]
+
+
+def _dlv_request_type(ref: str) -> str:
+    return "COUNTY_STAMP_DUTY" if ref.upper().startswith("CNTYINV") else "STAMP_DUTY"
+
+
 def _parse_batch_input(text: str) -> List[Dict]:
     """
     Parse lines of format:  "REF1, REF2 : Valuer Name"
@@ -3030,25 +3061,39 @@ def _search_valuer_api(name: str, tokens: AuthTokens) -> List[Dict]:
 
 
 def _search_ref_dlv(tokens: AuthTokens, ref: str) -> Optional[Dict]:
-    """Search for a reference number via DLV endpoint. Returns the task dict or None."""
+    """
+    Search for a reference number via the DLV endpoint, trying every status
+    filter relevant to the ref's request type (County vs non-County) until
+    found — a ref's current status isn't known ahead of the search, and
+    checking a single filter misses refs that have moved on (e.g. Completed).
+    Returns the task dict (tagged with "_request_type") or None.
+    """
+    request_type = _dlv_request_type(ref)
+    filters = _DLV_COUNTY_FILTERS if request_type == "COUNTY_STAMP_DUTY" else _DLV_NONCOUNTY_FILTERS
     http_sess = build_session()
-    resp = http_sess.get(
-        f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
-        headers={
-            "Authorization": f"Bearer {tokens.access_token}",
-            "JWTAUTH":       f"Bearer {tokens.jwt}",
-            "cparams":       CPARAMS_DLV,
-        },
-        params={
-            "filter": "Pending", "role": "DLV", "request_type": "STAMP_DUTY",
-            "search": ref, "page": 1,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    for task in resp.json().get("results", []):
-        if task.get("reference_number") == ref:
-            return task
+    headers = {
+        "Authorization": f"Bearer {tokens.access_token}",
+        "JWTAUTH":       f"Bearer {tokens.jwt}",
+        "cparams":       CPARAMS_DLV,
+    }
+    for status_filter in filters:
+        try:
+            resp = http_sess.get(
+                f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
+                headers=headers,
+                params={
+                    "filter": status_filter, "role": "DLV", "request_type": request_type,
+                    "search": ref, "page": 1,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            for task in resp.json().get("results", []):
+                if task.get("reference_number") == ref:
+                    task["_request_type"] = request_type
+                    return task
+        except Exception as e:
+            logger.warning("DLV search failed for %s (%s/%s): %s", ref, request_type, status_filter, e)
     return None
 
 
@@ -3067,6 +3112,42 @@ def _fetch_ref_detail_dlv(tokens: AuthTokens, request_id: str) -> Optional[Dict]
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def _classify_dlv_detail(detail: Dict) -> Dict:
+    """
+    Classify a DLV application detail-view response per the rules in dlv_batch.md:
+      - node COMPLETED + status COMPLETED  -> closed (completed)
+      - status RETURNED + node CREATED     -> closed (returned)
+      - status ONGOING  + node CREATED     -> open (still available for reallocation)
+      - anything else                      -> open (in-progress / unclassified, keep tracking)
+    """
+    application_status = detail.get("application_status", "")
+    node                = detail.get("node", "")
+    ext                 = detail.get("external_process_details") or {}
+    assessor            = detail.get("assessor") or {}
+    assessor_ud         = assessor.get("user_details") or {}
+    actors              = detail.get("actors") or []
+    actor_name          = actors[0].get("user_details", {}).get("names", "") if actors else ""
+
+    if node == "VALUATION_STAMP_DUTY_COMPLETED" and application_status == "COMPLETED":
+        bucket, closed_reason = "closed", "completed"
+    elif application_status == "RETURNED" and node == "VALUATION_STAMP_DUTY_CREATED":
+        bucket, closed_reason = "closed", "returned"
+    else:
+        bucket, closed_reason = "open", ""
+
+    return {
+        "bucket":               bucket,
+        "closed_reason":        closed_reason,
+        "application_status":   application_status,
+        "node":                 node,
+        "assessor_role":        assessor.get("role", ""),
+        "assessor_name":        assessor_ud.get("names", ""),
+        "consideration_amount": ext.get("consideration_amount", ""),
+        "currency_code":        ext.get("currency_code", ""),
+        "actor_name":           actor_name,
+    }
 
 
 def _process_dlv_batch_items(tokens: AuthTokens) -> str:
@@ -3109,7 +3190,29 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> str:
                 remaining.append(item)
                 continue
 
-            node = detail.get("node", "")
+            info = _classify_dlv_detail(detail)
+
+            if info["bucket"] == "closed":
+                # No longer available for reallocation — move out of the active
+                # queue into the closed store instead of dropping it silently.
+                _append_dlv_closed({
+                    **item,
+                    "last_error":           None,
+                    "closed_reason":        info["closed_reason"],
+                    "application_status":   info["application_status"],
+                    "node":                 info["node"],
+                    "request_type":         task.get("_request_type", ""),
+                    "consideration_amount": info["consideration_amount"],
+                    "currency_code":        info["currency_code"],
+                    "valuer_name":          info["actor_name"] or valuer_name,
+                    "closed_at":            datetime.now().isoformat(timespec="seconds"),
+                })
+                label = "Completed" if info["closed_reason"] == "completed" else "Returned"
+                completed_lines.append(f"🔒 `{ref}` — Closed ({label})")
+                continue
+
+            item["assessor"] = info["assessor_name"]
+            node = info["node"]
 
             if node == "VALUATION_STAMP_DUTY_CREATED":
                 r = http_sess.post(
@@ -3825,76 +3928,83 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ──────────────────────────────────────────────────────────
 
 def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
-    """Load DLV batch queue and enrich each ref with API data (assessor, date, parcel)."""
+    """
+    Load the DLV batch queue and classify each ref's live status (County and
+    non-County alike). Only still-open (available for reallocation) rows are
+    returned; refs found to have since Completed or been Returned are moved
+    into the closed store so the active queue and the Closed Tasks view stay
+    in sync between timer runs.
+    """
     batch = load_dlv_batch()
     if not batch:
         return []
 
-    http_sess = build_session()
-    headers = {
-        "Authorization": f"Bearer {tokens.access_token}",
-        "JWTAUTH":       f"Bearer {tokens.jwt}",
-        "cparams":       CPARAMS_DLV,
-    }
-
     def _enrich(item: dict) -> dict:
-        ref          = item.get("ref", "")
-        assessor     = ""
-        parcel       = ""
-        registry     = ""
-        county       = ""
-        date_created = item.get("queued_at", "")   # fallback: when queued
-
+        ref = item.get("ref", "")
+        row = {
+            "ref":          ref,
+            "parcel":       "",
+            "registry":     "",
+            "county":       "",
+            "date_created": item.get("queued_at", ""),   # fallback: when queued
+            "valuer_name":  item.get("valuer_name", ""),
+            "valuer_uid":   item.get("valuer_uid", ""),
+            "assessor":     "",
+            "collector":    item.get("collector", ""),
+            "_closed":      None,
+        }
         try:
-            resp = http_sess.get(
-                f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
-                headers=headers,
-                params={"filter": "Pending", "role": "DLV",
-                        "request_type": "STAMP_DUTY", "search": ref, "page": 1},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            task = next(
-                (t for t in resp.json().get("results", [])
-                 if t.get("reference_number") == ref),
-                None,
-            )
-            if task:
-                parcel       = task.get("parcel_number", "")
-                registry     = (task.get("registry") or "").upper()
-                county       = (task.get("county") or "").upper()
-                date_created = task.get("date_created", date_created)
+            task = _search_ref_dlv(tokens, ref)
+            if not task:
+                return row
 
-                dresp = http_sess.get(
-                    f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view",
-                    headers=headers,
-                    params={"request_id": task["id"]},
-                    timeout=30,
-                )
-                dresp.raise_for_status()
-                detail      = dresp.json()
-                assessor_ud = (detail.get("assessor") or {}).get("user_details") or {}
-                assessor    = assessor_ud.get("names", "")
+            row["parcel"]       = task.get("parcel_number", "")
+            row["registry"]     = (task.get("registry") or "").upper()
+            row["county"]       = (task.get("county") or "").upper()
+            row["date_created"] = task.get("date_created", row["date_created"])
+
+            detail = _fetch_ref_detail_dlv(tokens, task["id"])
+            if not detail:
+                return row
+
+            info = _classify_dlv_detail(detail)
+            if info["bucket"] == "closed":
+                row["_closed"] = {
+                    **item,
+                    "closed_reason":        info["closed_reason"],
+                    "application_status":   info["application_status"],
+                    "node":                 info["node"],
+                    "request_type":         task.get("_request_type", ""),
+                    "consideration_amount": info["consideration_amount"],
+                    "currency_code":        info["currency_code"],
+                    "valuer_name":          info["actor_name"] or row["valuer_name"],
+                    "closed_at":            datetime.now().isoformat(timespec="seconds"),
+                }
+                return row
+
+            row["assessor"] = info["assessor_name"]
         except Exception as e:
             logger.warning("DLV Tasks enrich failed for %s: %s", ref, e)
 
-        return {
-            "ref":          ref,
-            "parcel":       parcel,
-            "registry":     registry,
-            "county":       county,
-            "date_created": date_created,
-            "valuer_name":  item.get("valuer_name", ""),
-            "valuer_uid":   item.get("valuer_uid", ""),
-            "assessor":     assessor,
-            "collector":    item.get("collector", ""),
-        }
+        return row
 
     rows: List[dict] = []
+    closed_items: List[dict] = []
     with ThreadPoolExecutor(max_workers=5) as pool:
         fut_map = {pool.submit(_enrich, item): item for item in batch}
         for fut in _futures_as_completed(fut_map):
-            rows.append(fut.result())
+            result = fut.result()
+            closed = result.pop("_closed", None)
+            if closed:
+                closed_items.append(closed)
+            else:
+                rows.append(result)
+
+    if closed_items:
+        closed_refs = {c["ref"] for c in closed_items}
+        save_dlv_batch([i for i in batch if i.get("ref") not in closed_refs])
+        for c in closed_items:
+            _append_dlv_closed(c)
 
     return rows
 
@@ -4062,28 +4172,42 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
 
 async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
+    open_count   = len(load_dlv_batch())
+    closed_count = len(load_dlv_closed())
+    await update.message.reply_text(
+        f"📋 *DLV Tasks*\n\nOpen: *{open_count}* task(s) · Closed: *{closed_count}* task(s)\n\n"
+        "Open Tasks are still ONGOING/CREATED and available for reallocation.\n"
+        "Closed Tasks have Completed or been Returned.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📂 Open Tasks",   callback_data="dt_scope:open"),
+            InlineKeyboardButton("🔒 Closed Tasks", callback_data="dt_scope:closed"),
+        ]]),
+    )
+    return DT.SCOPE
+
+
+async def _dt_run_open_tasks(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
+    """Live-check the DLV batch queue and present the valuer-exclusion keyboard for Open Tasks."""
     tokens = _any_valid_tokens()
     if not tokens:
-        await update.message.reply_text(
-            "❌ No valid cached tokens. Use *🔑 Refresh Auth* first.",
-            parse_mode="Markdown",
-            reply_markup=_main_menu(),
-        )
+        await edit_fn("❌ No valid cached tokens. Use *🔑 Refresh Auth* first.", parse_mode="Markdown")
+        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu())
         return ConversationHandler.END
 
-    msg = await update.message.reply_text("⏳ Loading DLV Batch queue and enriching tasks, please wait…")
+    await edit_fn("⏳ Checking DLV Batch queue status, please wait…")
 
     try:
         rows = await asyncio.to_thread(_dt_fetch_tasks, tokens)
     except Exception as exc:
         logger.error("DLV Tasks fetch failed: %s", exc, exc_info=True)
-        await msg.edit_text(f"❌ Failed to fetch tasks: `{exc}`", parse_mode="Markdown")
-        await ctx.bot.send_message(update.effective_chat.id, "Main menu.", reply_markup=_main_menu())
+        await edit_fn(f"❌ Failed to fetch tasks: `{exc}`", parse_mode="Markdown")
+        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu())
         return ConversationHandler.END
 
     if not rows:
-        await msg.edit_text("ℹ️ DLV Batch queue is empty.")
-        await ctx.bot.send_message(update.effective_chat.id, "Main menu.", reply_markup=_main_menu())
+        await edit_fn("ℹ️ No open DLV tasks — queue is empty or every item has since closed.")
+        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu())
         return ConversationHandler.END
 
     # Collect unique valuers (preserve insertion order, dedupe by uid)
@@ -4103,13 +4227,67 @@ async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess.excluded_uids = set()
     sess.email         = ""
 
-    await msg.edit_text(
-        f"📋 *DLV Tasks* — {len(rows)} queued task(s), {len(valuers)} valuer(s)\n\n"
+    await edit_fn(
+        f"📂 *Open DLV Tasks* — {len(rows)} task(s), {len(valuers)} valuer(s)\n\n"
         "Tap a valuer to *exclude* their tasks from the report. ✅ = included, ❌ = excluded.",
         parse_mode="Markdown",
         reply_markup=_dt_exclusion_keyboard(valuers, sess.excluded_uids),
     )
     return DT.EXCLUDE_VALUERS
+
+
+async def _dt_send_closed_report(chat_id: int, rows: List[dict], bot) -> None:
+    """Send the Closed DLV Tasks list (Completed + Returned), grouped by reason."""
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    for r in rows:
+        groups[r.get("closed_reason") or "unknown"].append(r)
+
+    label_for = {"completed": "✅ Completed", "returned": "↩️ Returned", "unknown": "❓ Unknown"}
+    lines = [f"🔒 *Closed DLV Tasks* — {len(rows)} task(s)\n"]
+    for reason in ("completed", "returned", "unknown"):
+        tasks = groups.get(reason)
+        if not tasks:
+            continue
+        lines.append(f"\n{label_for[reason]} ({len(tasks)})")
+        for i, t in enumerate(tasks, start=1):
+            currency   = t.get("currency_code") or ""
+            amount     = t.get("consideration_amount") or ""
+            amount_str = f" | {currency} {amount}" if amount else ""
+            closed_at  = (t.get("closed_at") or "")[:10]
+            lines.append(
+                f"  {i}. `{t.get('ref', '—')}` | Valuer: {t.get('valuer_name') or '—'}"
+                f"{amount_str} | Closed: {closed_at or '—'}"
+            )
+
+    current_chunk = ""
+    for line in lines:
+        if len(current_chunk) + len(line) + 1 > 4000:
+            await bot.send_message(chat_id, current_chunk, parse_mode="Markdown")
+            current_chunk = line
+        else:
+            current_chunk += ("\n" if current_chunk else "") + line
+    if current_chunk:
+        await bot.send_message(chat_id, current_chunk, parse_mode="Markdown")
+
+
+async def recv_dt_scope(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    scope = query.data.split(":")[1]   # "open" | "closed"
+
+    if scope == "closed":
+        rows = load_dlv_closed()
+        if not rows:
+            await query.edit_message_text("ℹ️ No closed tasks yet.")
+            await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+            return ConversationHandler.END
+        await _dt_send_closed_report(query.message.chat_id, rows, ctx.bot)
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    return await _dt_run_open_tasks(query.edit_message_text, query.message.chat_id, ctx)
 
 
 async def recv_dt_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -8507,6 +8685,7 @@ def main():
             MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_TASKS)}$"), cmd_dlv_tasks),
         ],
         states={
+            DT.SCOPE: [CallbackQueryHandler(recv_dt_scope, pattern=r"^dt_scope:")],
             DT.EXCLUDE_VALUERS: [
                 CallbackQueryHandler(recv_dt_toggle,  pattern=r"^dt_toggle:"),
                 CallbackQueryHandler(recv_dt_confirm, pattern=r"^dt_confirm$|^dt_cancel$"),
