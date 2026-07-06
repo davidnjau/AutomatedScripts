@@ -455,7 +455,6 @@ class BE(Enum):
     COUNTY    = auto()   # pick county
     EMAIL     = auto()   # ask for recipient email address
     SCHEDULE  = auto()   # pick repeat interval
-    PICK_CRED = auto()   # choose which cached credential to run as
     CONFIRM   = auto()   # confirm → kick off background export
 
 
@@ -6046,9 +6045,6 @@ async def recv_auth_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 _BE_LIST_URL   = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application"
 _BE_DETAIL_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view"
 _BE_REPORT_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/office-reports/get-current-office-report"
-# Ardhisasa report-specific endpoints
-_AR_OFFICE_REPORTS_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/office-reports"
-_AR_REPORT_DETAIL_URL  = f"{BASE_URL}/valuationservice/api/v1/valuation-reports/search/get_report_detail_view"
 _BE_PAGE_SIZE  = 10   # API default
 _BE_LIST_WORKERS        = 5
 _BE_DETAIL_WORKERS      = 5
@@ -6305,126 +6301,6 @@ def _be_fetch_full_record(sess: requests.Session, rotator: "_TokenRotator", app_
     docs   = report.get("combined_document") or []
     row["Combined Report"] = docs[0].get("document", "") if docs else ""
     return row
-
-
-def _ar_fetch_office_reports(sess: requests.Session, rotator: "_TokenRotator", app_id: str) -> dict:
-    """Fetch /stamp-duty/office-reports?request_id=<id>&current_previous=CURRENT. Returns results[0] or {}."""
-    retries = 0
-    while True:
-        tokens = rotator.current()
-        if tokens is None:
-            return {}
-        headers = {**_be_headers(tokens), "cparams": CPARAMS_DLV}
-        try:
-            resp = sess.get(
-                _AR_OFFICE_REPORTS_URL,
-                headers=headers,
-                params={"request_id": app_id, "current_previous": "CURRENT"},
-                timeout=30,
-            )
-            if resp.status_code == 403:
-                new_tokens = rotator.rotate(tokens)
-                if new_tokens is None:
-                    return {}
-                time.sleep(_BE_TOKEN_ROTATE_DELAY)
-                continue
-            if resp.status_code in (429, 502, 503, 504):
-                retries += 1
-                if retries >= _MAX_FETCH_RETRIES:
-                    return {}
-                time.sleep(2)
-                continue
-            if resp.status_code == 404:
-                return {}
-            resp.raise_for_status()
-            results = resp.json().get("results") or []
-            return results[0] if results else {}
-        except Exception:
-            return {}
-
-
-def _ar_fetch_report_detail(sess: requests.Session, rotator: "_TokenRotator", report_id: str) -> dict:
-    """Fetch /valuation-reports/search/get_report_detail_view?id=<report_id>. Returns the report dict or {}."""
-    retries = 0
-    while True:
-        tokens = rotator.current()
-        if tokens is None:
-            return {}
-        headers = {**_be_headers(tokens), "cparams": CPARAMS_DLV}
-        try:
-            resp = sess.get(
-                _AR_REPORT_DETAIL_URL,
-                headers=headers,
-                params={"id": report_id},
-                timeout=30,
-            )
-            if resp.status_code == 403:
-                new_tokens = rotator.rotate(tokens)
-                if new_tokens is None:
-                    return {}
-                time.sleep(_BE_TOKEN_ROTATE_DELAY)
-                continue
-            if resp.status_code in (429, 502, 503, 504):
-                retries += 1
-                if retries >= _MAX_FETCH_RETRIES:
-                    return {}
-                time.sleep(2)
-                continue
-            if resp.status_code == 404:
-                return {}
-            resp.raise_for_status()
-            return resp.json()
-        except Exception:
-            return {}
-
-
-def _ar_extract_row(detail: dict, office_report: dict, report_detail: dict) -> dict:
-    """Extract columns for the Ardhisasa report from detail + office-reports + report-detail responses."""
-    vo_name = ""
-    for actor in (detail.get("actors") or []):
-        if (actor.get("role") or "").upper() == "VALUATION OFFICER":
-            vo_name = (actor.get("user_details") or {}).get("names", "")
-            break
-
-    doc_url = ""
-    for pdoc in (detail.get("process_documents") or []):
-        if (pdoc.get("document_name") or "").upper() == "VALUATION CERTIFICATE":
-            doc_url = pdoc.get("document", "")
-            break
-
-    combined_url = ""
-    for cdoc in (report_detail.get("combined_document") or []):
-        if (cdoc.get("document_name") or "").lower() == "combined report file":
-            combined_url = cdoc.get("document", "")
-            break
-
-    return {
-        "Filter":                            detail.get("application_status", ""),
-        "Reference Number":                  detail.get("reference_number", ""),
-        "Parcel Number":                     detail.get("parcel_number", ""),
-        "Registry":                          detail.get("registry", ""),
-        "County":                            detail.get("county", ""),
-        "Valuation Request Type":            detail.get("valuation_request_type", ""),
-        "Application Status":                detail.get("application_status", ""),
-        "Application Date Created":          detail.get("date_created", ""),
-        "Valuation Officer":                 vo_name,
-        "Date of Valuation":                 office_report.get("date_of_valuation", ""),
-        "Valuer Total Land Value (KES)":     office_report.get("valuer_total_land_value", ""),
-        "Harmonized Total Land Value (KES)": office_report.get("harmonized_total_land_value", ""),
-        "Document URL":                      doc_url,
-        "Combined Report":                   combined_url,
-        "Enrich Error":                      "",
-    }
-
-
-def _ar_fetch_full_record(sess: requests.Session, rotator: "_TokenRotator", app_id: str) -> dict:
-    """Ardhisasa report: detail → office-reports → report-detail → merged row."""
-    detail        = _be_fetch_detail(sess, rotator, app_id)   # raises on error
-    office_report = _ar_fetch_office_reports(sess, rotator, app_id)
-    report_detail: dict = {}
-    if office_report.get("id"):
-        report_detail = _ar_fetch_report_detail(sess, rotator, office_report["id"])
-    return _ar_extract_row(detail, office_report, report_detail)
 
 
 def _be_extract_row(detail: dict) -> dict:
@@ -6728,6 +6604,8 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop,
     sess.mount("https://", adapter)
     sess.mount("http://",  adapter)
     list_headers = _be_headers(tokens)
+    if report_type == "ardhisasa":
+        list_headers = {**list_headers, "cparams": CPARAMS_DLV, "Content-Type": "application/json"}
 
     try:
         # ── Step 1: fetch list pages ───────────────────────────────
@@ -6791,7 +6669,7 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop,
             current_done_ids = list(done_ids)
             exhausted_flag   = threading.Event()
 
-            _fetch_fn = _ar_fetch_full_record if report_type == "ardhisasa" else _be_fetch_full_record
+            _fetch_fn = _be_fetch_full_record
             with ThreadPoolExecutor(max_workers=_BE_DETAIL_WORKERS) as pool:
                 futures = {pool.submit(_fetch_fn, sess, rotator, app_id): app_id
                            for app_id in id_list}
@@ -8457,35 +8335,19 @@ async def recv_be_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     secs = int(query.data.split(":")[1])
     sess = _get_be_sess(ctx)
     sess.schedule_seconds = secs
+    sess.cred_type = "staff_valuer"
 
-    kbd = _be_cred_keyboard()
-    if not kbd:
+    if not get_valid_tokens(sess.cred_type):
         await query.edit_message_text(
-            "❌ No valid cached tokens. Use *🔑 Refresh Auth* first.",
+            "❌ No valid cached tokens for *🏢 Staff Valuer*. Use *🔑 Refresh Auth* first.",
             parse_mode="Markdown",
         )
         await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
         return ConversationHandler.END
 
-    await query.edit_message_text(
-        "👤 *Select the account to run the export as:*",
-        parse_mode="Markdown",
-        reply_markup=kbd,
-    )
-    return BE.PICK_CRED
-
-
-async def recv_be_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return await deny(update)
-    query = update.callback_query
-    await query.answer()
-    sess           = _get_be_sess(ctx)
-    sess.cred_type = query.data.split(":")[1]
-
     cred_label   = CRED_LABELS.get(sess.cred_type, sess.cred_type)
     county_label = _BE_COUNTY_LABELS.get(sess.county, sess.county.title())
     reg_list     = ", ".join(sess.registries)
-    secs         = sess.schedule_seconds
     sched_label  = next((l for l, s in _BE_SCHEDULE_OPTIONS if s == secs), "Run Once")
     if secs > 0:
         sched_label += " (repeating)"
@@ -8787,7 +8649,6 @@ def main():
             BE.COUNTY:    [CallbackQueryHandler(recv_be_county,    pattern=r"^be_county:")],
             BE.EMAIL:     [MessageHandler(not_cancel, recv_be_email)],
             BE.SCHEDULE:  [CallbackQueryHandler(recv_be_schedule,  pattern=r"^be_sched:")],
-            BE.PICK_CRED: [CallbackQueryHandler(recv_be_cred,      pattern=r"^be_cred:")],
             BE.CONFIRM:   [CallbackQueryHandler(recv_be_confirm,   pattern=r"^be:")],
         },
         fallbacks=[
