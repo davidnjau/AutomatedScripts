@@ -6249,7 +6249,7 @@ def _be_fetch_detail(sess: requests.Session, rotator: "_TokenRotator", app_id: s
             # Record no longer exists — return empty dict so caller marks it cleanly
             logger.debug("_be_fetch_detail: 404 for app_id=%s — record not found", app_id)
             return {}
-        if resp.status_code in (429, 502, 503, 504):
+        if resp.status_code in (429, 500, 502, 503, 504):
             retries += 1
             if retries >= _MAX_FETCH_RETRIES:
                 raise RuntimeError(
@@ -6668,6 +6668,7 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop,
             rows: List[dict] = list(resume_rows)
             current_done_ids = list(done_ids)
             exhausted_flag   = threading.Event()
+            id_to_item       = {r["id"]: r for r in filtered if r.get("id")}
 
             _fetch_fn = _be_fetch_full_record
             with ThreadPoolExecutor(max_workers=_BE_DETAIL_WORKERS) as pool:
@@ -6688,6 +6689,25 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop,
                         logger.warning("Bulk export: all tokens exhausted at id=%s", app_id)
                     except Exception as exc:
                         logger.warning("Bulk export detail failed id=%s: %s", app_id, exc)
+                        item = id_to_item.get(app_id, {})
+                        rows.append({
+                            "Filter":                          "Completed",
+                            "Reference Number":                item.get("reference_number", ""),
+                            "Parcel Number":                   item.get("parcel_number", ""),
+                            "Registry":                        item.get("registry", ""),
+                            "County":                          item.get("county", ""),
+                            "Valuation Request Type":          item.get("valuation_request_type", ""),
+                            "Application Status":              item.get("application_status", ""),
+                            "Application Date Created":        item.get("date_created", ""),
+                            "Valuation Officer":               "",
+                            "Date of Valuation":                "",
+                            "Valuer Total Land Value (KES)":   "",
+                            "Harmonized Total Land Value (KES)": "",
+                            "Document URL":                    "",
+                            "Combined Report":                 "",
+                            "Enrich Error":                    str(exc),
+                        })
+                        current_done_ids.append(app_id)
                         _set_status(
                             details_done=_BE_STATUS[chat_id]["details_done"] + 1,
                             errors=_BE_STATUS[chat_id]["errors"] + 1,
