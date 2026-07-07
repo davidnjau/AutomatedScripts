@@ -6237,7 +6237,7 @@ def _be_fetch_detail(sess: requests.Session, rotator: "_TokenRotator", app_id: s
         tokens = rotator.current()
         if tokens is None:
             raise _AllTokensExhausted(f"All tokens exhausted fetching {app_id}")
-        headers = _be_headers(tokens)
+        headers = {**_be_headers(tokens), "cparams": CPARAMS_DLV}
         resp = sess.get(_BE_DETAIL_URL, headers=headers, params={"request_id": app_id}, timeout=30)
         if resp.status_code == 403:
             new_tokens = rotator.rotate(tokens)
@@ -6269,7 +6269,7 @@ def _be_fetch_office_report(sess: requests.Session, rotator: "_TokenRotator", ap
         tokens = rotator.current()
         if tokens is None:
             return {}
-        headers = _be_headers(tokens)
+        headers = {**_be_headers(tokens), "cparams": CPARAMS_DLV}
         try:
             resp = sess.get(_BE_REPORT_URL, headers=headers, params={"request_id": app_id}, timeout=30)
             if resp.status_code == 403:
