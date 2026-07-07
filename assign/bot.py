@@ -25,6 +25,7 @@ import base64
 import io
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import asyncio
 import os
 import re
@@ -85,10 +86,20 @@ from ardhisasa_auth import (
 # ──────────────────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+_log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_log_formatter)
+
+_file_handler = RotatingFileHandler(
+    os.path.join(DATA_DIR, "bot.log"), maxBytes=5 * 1024 * 1024, backupCount=5
 )
+_file_handler.setFormatter(_log_formatter)
+
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
 logger = logging.getLogger("ardhisasa.bot")
 
 load_dotenv()
@@ -112,7 +123,6 @@ BASE_URL = "https://ardhisasa-api.lands.go.ke"
 # ──────────────────────────────────────────────────────────
 # Persistent storage
 # ──────────────────────────────────────────────────────────
-DATA_DIR           = os.path.join(os.path.dirname(__file__), "data")
 SAVED_VALUERS_FILE      = os.path.join(DATA_DIR, "saved_valuers.json")
 SAVED_TOKENS_FILE       = os.path.join(DATA_DIR, "saved_tokens.json")
 SAVED_ASSIGNMENTS_FILE  = os.path.join(DATA_DIR, "saved_assignments.json")
@@ -587,6 +597,7 @@ BTN_AUTO_FETCH    = "⏰ Auto Fetch"
 BTN_ASSIGNMENTS   = "📜 Assignments"
 BTN_AUTH          = "🔑 Refresh Auth"
 BTN_TOKEN_STATUS  = "🔒 Token Status"
+BTN_ERROR_REPORT  = "📉 Error Report"
 BTN_DAEMON        = "🔄 Token Daemon"
 BTN_VALUERS       = "👥 Saved Valuers"
 BTN_DELETE        = "🗑 Delete Valuer"
@@ -609,7 +620,7 @@ BTN_SECTIONAL     = "🔲 Sectional"
 _MENU_BUTTON_FILTER = filters.Regex(
     f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_DLV_BATCH)}|{re.escape(BTN_DLV_QUEUE)}"
     f"|{re.escape(BTN_AUTO_FETCH)}|{re.escape(BTN_ASSIGNMENTS)}|{re.escape(BTN_AUTH)}"
-    f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_DAEMON)}"
+    f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_ERROR_REPORT)}|{re.escape(BTN_DAEMON)}"
     f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
     f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_AF_RESULTS)}|{re.escape(BTN_BULK_EXPORT)}"
     f"|{re.escape(BTN_EXPORT_STATUS)}|{re.escape(BTN_JOB_DIST)}|{re.escape(BTN_LOOKUP)}"
@@ -636,6 +647,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
             # ── Lookup ──────────────────────────────────────
             [KeyboardButton(BTN_LOOKUP)],
             [KeyboardButton(BTN_AUTH),           KeyboardButton(BTN_TOKEN_STATUS)],
+            [KeyboardButton(BTN_ERROR_REPORT)],
             [KeyboardButton(BTN_VALUERS),        KeyboardButton(BTN_DELETE)],
             # ── System ──────────────────────────────────────
             [KeyboardButton(BTN_DAEMON)],
@@ -2920,6 +2932,100 @@ async def cmd_token_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text = "🔒 *Token Status*\n\n" + "\n\n".join(lines)
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu())
+
+
+_LOG_LINE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2},\d{3} \[(WARNING|ERROR|CRITICAL)\] [\w.]+: (.*)$"
+)
+_LOG_NORMALIZE_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|\d+"
+)
+
+
+def _read_log_records(max_lines: int = 50_000) -> List[tuple]:
+    """Parse data/bot.log into (date_str, level, message) tuples for WARNING+ lines."""
+    log_path = os.path.join(DATA_DIR, "bot.log")
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-max_lines:]
+    except FileNotFoundError:
+        return []
+
+    records = []
+    for line in lines:
+        m = _LOG_LINE_RE.match(line)
+        if m:
+            records.append((m.group(1), m.group(2), m.group(3)))
+    return records
+
+
+async def cmd_error_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+
+    records = _read_log_records()
+    if not records:
+        await update.message.reply_text(
+            "✅ No warnings or errors logged yet (`data/bot.log`).",
+            reply_markup=_main_menu(),
+        )
+        return
+
+    from collections import Counter, defaultdict
+
+    by_day_level: dict = defaultdict(lambda: {"WARNING": 0, "ERROR": 0, "CRITICAL": 0})
+    categories = Counter()
+    for date_str, level, message in records:
+        by_day_level[date_str][level] += 1
+        category = _LOG_NORMALIZE_RE.sub("#", message)[:80]
+        categories[category] += 1
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        await update.message.reply_text(
+            "❌ `matplotlib` is not installed — cannot render the chart.",
+            parse_mode="Markdown", reply_markup=_main_menu(),
+        )
+        return
+
+    days = sorted(by_day_level.keys())
+    warnings = [by_day_level[d]["WARNING"] for d in days]
+    errors   = [by_day_level[d]["ERROR"] + by_day_level[d]["CRITICAL"] for d in days]
+
+    top_categories = categories.most_common(8)[::-1]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 9))
+
+    ax1.bar(days, warnings, label="Warning", color="#f1c40f")
+    ax1.bar(days, errors, bottom=warnings, label="Error/Critical", color="#e74c3c")
+    ax1.set_title("Log entries per day")
+    ax1.set_ylabel("Count")
+    ax1.legend()
+    ax1.tick_params(axis="x", rotation=45)
+
+    if top_categories:
+        labels = [c for c, _ in top_categories]
+        counts = [n for _, n in top_categories]
+        ax2.barh(labels, counts, color="#3498db")
+        ax2.set_title("Top error/warning categories")
+        ax2.set_xlabel("Count")
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    plt.close(fig)
+    buf.seek(0)
+
+    total = sum(warnings) + sum(errors)
+    caption = (
+        f"📉 *Error Report* — {total:,} entries across {len(days)} day(s)\n"
+        f"Range: `{days[0]}` → `{days[-1]}`"
+    )
+    await update.message.reply_photo(
+        photo=buf, caption=caption, parse_mode="Markdown", reply_markup=_main_menu()
+    )
 
 
 async def recv_daemon_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -8858,6 +8964,7 @@ def main():
     app.add_handler(CallbackQueryHandler(recv_daemon_action,  pattern=r"^daemon:"))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_AUTH)}$"),         cmd_auth))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_TOKEN_STATUS)}$"), cmd_token_status))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ERROR_REPORT)}$"), cmd_error_report))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DAEMON)}$"),       cmd_daemon))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_RESTART)}$"),     cmd_restart))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"),        cmd_help))
