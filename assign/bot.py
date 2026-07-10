@@ -472,10 +472,11 @@ class BE(Enum):
 
 # States — DLV Tasks conversation
 class DT(Enum):
-    SCOPE           = auto()   # choose Open Tasks vs Closed Tasks
+    SCOPE           = auto()   # choose Open Tasks vs Closed Tasks vs Delete Task(s)
     EXCLUDE_VALUERS = auto()   # toggle which valuers to exclude
     DELIVERY        = auto()   # telegram or email
     EMAIL_INPUT     = auto()   # enter email address
+    DELETE_SELECT   = auto()   # multi-select which queued refs to delete
 
 
 # States — Sectional Properties conversation
@@ -3578,10 +3579,12 @@ def clear_auto_fetch_schedule() -> None:
 
 @dataclass
 class DTSession:
-    tasks:         List[dict] = field(default_factory=list)   # enriched task rows
-    valuers:       List[dict] = field(default_factory=list)   # unique valuers [{uid, name}]
-    excluded_uids: set        = field(default_factory=set)
-    email:         str        = ""
+    tasks:            List[dict] = field(default_factory=list)   # enriched task rows
+    valuers:          List[dict] = field(default_factory=list)   # unique valuers [{uid, name}]
+    excluded_uids:    set        = field(default_factory=set)
+    email:            str        = ""
+    delete_items:     List[dict] = field(default_factory=list)   # open queue snapshot for deletion
+    delete_selected:  set        = field(default_factory=set)    # refs selected for deletion
 
 
 def _get_dt_sess(ctx: ContextTypes.DEFAULT_TYPE) -> DTSession:
@@ -4378,6 +4381,43 @@ def _dt_exclusion_keyboard(valuers: List[dict], excluded_uids: set) -> InlineKey
     return InlineKeyboardMarkup(rows)
 
 
+def _dt_delete_keyboard(items: List[dict], selected_refs: set) -> InlineKeyboardMarkup:
+    rows = []
+    for i, item in enumerate(items):
+        ref    = item.get("ref", "")
+        valuer = (item.get("valuer_name") or "Unassigned").split()[0]
+        icon   = "✅" if ref in selected_refs else "⬜"
+        rows.append([InlineKeyboardButton(
+            f"{icon} {ref} — {valuer}", callback_data=f"dt_deltoggle:{i}",
+        )])
+    rows.append([
+        InlineKeyboardButton(f"🗑 Delete Selected ({len(selected_refs)})", callback_data="dt_delconfirm"),
+        InlineKeyboardButton("🛑 Cancel", callback_data="dt_delcancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _dt_run_delete_select(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show the open DLV queue with a multi-select keyboard for bulk deletion."""
+    items = load_dlv_batch()
+    if not items:
+        await edit_fn("ℹ️ The DLV queue is empty — nothing to delete.")
+        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    sess = _get_dt_sess(ctx)
+    sess.delete_items    = items
+    sess.delete_selected = set()
+
+    await edit_fn(
+        f"🗑 *Delete Task(s)* — {len(items)} queued ref(s)\n\n"
+        "Tap refs to select, then confirm. ✅ = selected for deletion.",
+        parse_mode="Markdown",
+        reply_markup=_dt_delete_keyboard(items, sess.delete_selected),
+    )
+    return DT.DELETE_SELECT
+
+
 def _dt_build_excel(rows: List[dict]) -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -4427,10 +4467,13 @@ async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Open Tasks are still ONGOING/CREATED and available for reallocation.\n"
         "Closed Tasks have Completed or been Returned.",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("📂 Open Tasks",   callback_data="dt_scope:open"),
-            InlineKeyboardButton("🔒 Closed Tasks", callback_data="dt_scope:closed"),
-        ]]),
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📂 Open Tasks",   callback_data="dt_scope:open"),
+                InlineKeyboardButton("🔒 Closed Tasks", callback_data="dt_scope:closed"),
+            ],
+            [InlineKeyboardButton("🗑 Delete Task(s)", callback_data="dt_scope:delete")],
+        ]),
     )
     return DT.SCOPE
 
@@ -4523,7 +4566,7 @@ async def recv_dt_scope(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     query = update.callback_query
     await query.answer()
-    scope = query.data.split(":")[1]   # "open" | "closed"
+    scope = query.data.split(":")[1]   # "open" | "closed" | "delete"
 
     if scope == "closed":
         rows = load_dlv_closed()
@@ -4534,6 +4577,9 @@ async def recv_dt_scope(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _dt_send_closed_report(query.message.chat_id, rows, ctx.bot)
         await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
         return ConversationHandler.END
+
+    if scope == "delete":
+        return await _dt_run_delete_select(query.edit_message_text, query.message.chat_id, ctx)
 
     return await _dt_run_open_tasks(query.edit_message_text, query.message.chat_id, ctx)
 
@@ -4639,6 +4685,60 @@ async def recv_dt_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ Email failed: `{exc}`", parse_mode="Markdown")
 
     await update.message.reply_text("Main menu.", reply_markup=_main_menu())
+    return ConversationHandler.END
+
+
+async def recv_dt_delete_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    sess = _get_dt_sess(ctx)
+    idx  = int(query.data.split(":")[1])
+    if idx >= len(sess.delete_items):
+        return DT.DELETE_SELECT
+
+    ref = sess.delete_items[idx].get("ref", "")
+    if ref in sess.delete_selected:
+        sess.delete_selected.discard(ref)
+    else:
+        sess.delete_selected.add(ref)
+
+    await query.edit_message_reply_markup(
+        reply_markup=_dt_delete_keyboard(sess.delete_items, sess.delete_selected),
+    )
+    return DT.DELETE_SELECT
+
+
+async def recv_dt_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "dt_delcancel":
+        await query.edit_message_text("❌ Deletion cancelled.")
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    sess = _get_dt_sess(ctx)
+    if not sess.delete_selected:
+        await query.edit_message_text(
+            "⚠️ Nothing selected. Tap refs to select, then confirm.\n\n"
+            f"🗑 *Delete Task(s)* — {len(sess.delete_items)} queued ref(s)",
+            parse_mode="Markdown",
+            reply_markup=_dt_delete_keyboard(sess.delete_items, sess.delete_selected),
+        )
+        return DT.DELETE_SELECT
+
+    remaining = [i for i in load_dlv_batch() if i.get("ref") not in sess.delete_selected]
+    save_dlv_batch(remaining)
+
+    removed_refs = ", ".join(f"`{r}`" for r in sorted(sess.delete_selected))
+    await query.edit_message_text(
+        f"🗑 Removed *{len(sess.delete_selected)}* task(s) from the DLV queue:\n{removed_refs}\n\n"
+        f"{len(remaining)} task(s) remain queued.",
+        parse_mode="Markdown",
+    )
+    await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
     return ConversationHandler.END
 
 
@@ -8995,6 +9095,10 @@ def main():
             ],
             DT.DELIVERY:   [CallbackQueryHandler(recv_dt_delivery, pattern=r"^dt_delivery:")],
             DT.EMAIL_INPUT: [MessageHandler(not_cancel, recv_dt_email)],
+            DT.DELETE_SELECT: [
+                CallbackQueryHandler(recv_dt_delete_toggle,  pattern=r"^dt_deltoggle:"),
+                CallbackQueryHandler(recv_dt_delete_confirm, pattern=r"^dt_delconfirm$|^dt_delcancel$"),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
