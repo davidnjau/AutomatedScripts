@@ -130,6 +130,8 @@ SAVED_TASK_BATCHES_FILE = os.path.join(DATA_DIR, "saved_task_batches.json")
 SAVED_SCHEDULES_FILE    = os.path.join(DATA_DIR, "saved_schedules.json")
 SAVED_DLV_BATCH_FILE          = os.path.join(DATA_DIR, "saved_dlv_batch.json")
 SAVED_DLV_CLOSED_FILE         = os.path.join(DATA_DIR, "saved_dlv_closed.json")
+SAVED_FETCH_TASKS_LOG_FILE    = os.path.join(DATA_DIR, "fetch_tasks_log.json")
+FETCH_TASKS_LOG_TTL_SECONDS   = 86400  # 1 day — entries older than this are dropped on read
 SAVED_BULK_EXPORT_SCHED_FILE    = os.path.join(DATA_DIR, "saved_bulk_export_schedule.json")
 SAVED_BULK_EXPORT_PARTIAL_FILE  = os.path.join(DATA_DIR, "saved_bulk_export_partial.json")
 SAVED_AUTO_FETCH_FILE   = os.path.join(DATA_DIR, "saved_auto_fetch.json")
@@ -3125,6 +3127,69 @@ def _append_dlv_closed(item: Dict) -> None:
     save_dlv_closed(closed)
 
 
+# ──────────────────────────────────────────────────────────
+# Fetch Tasks log — short-lived assessor cache, keyed by ref
+#
+# Fetch Tasks sees the assessor while a ref is still upstream of DLV; by the
+# time a ref is added to the DLV batch (or the DLV Tasks report runs), the
+# live assessor/DLV searches sometimes come up empty. Caching what Fetch
+# Tasks last saw lets both flows fall back to it instead of showing "—".
+# ──────────────────────────────────────────────────────────
+
+def load_fetch_tasks_log() -> Dict[str, Dict]:
+    try:
+        with open(SAVED_FETCH_TASKS_LOG_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_fetch_tasks_log(log: Dict[str, Dict]) -> None:
+    _atomic_json_write(SAVED_FETCH_TASKS_LOG_FILE, log, indent=2)
+
+
+def _prune_fetch_tasks_log(log: Dict[str, Dict]) -> Dict[str, Dict]:
+    cutoff = (datetime.now() - timedelta(seconds=FETCH_TASKS_LOG_TTL_SECONDS)).isoformat(timespec="seconds")
+    return {ref: entry for ref, entry in log.items() if entry.get("cached_at", "") >= cutoff}
+
+
+def _log_fetch_tasks(tasks: List[Dict]) -> None:
+    """Cache ref -> assessor (+ context) from a Fetch Tasks run for later lookup."""
+    if not tasks:
+        return
+    log = _prune_fetch_tasks_log(load_fetch_tasks_log())
+    now = datetime.now().isoformat(timespec="seconds")
+    for t in tasks:
+        ref = t.get("reference_number", "")
+        if not ref:
+            continue
+        log[ref] = {
+            "assessor":     t.get("assessor", ""),
+            "parcel":       t.get("parcel_number", ""),
+            "registry":     t.get("registry", ""),
+            "county":       t.get("county", ""),
+            "date_created": t.get("date_created", ""),
+            "cached_at":    now,
+        }
+    save_fetch_tasks_log(log)
+
+
+def _fetch_tasks_log_lookup(ref: str) -> Optional[Dict]:
+    """Return the cached Fetch Tasks entry for ref, or None if absent/expired."""
+    return _prune_fetch_tasks_log(load_fetch_tasks_log()).get(ref)
+
+
+def _fetch_tasks_log_remove(refs: List[str]) -> None:
+    """Drop cached entries once their ref has been queued into the DLV batch."""
+    if not refs:
+        return
+    log = load_fetch_tasks_log()
+    if any(ref in log for ref in refs):
+        for ref in refs:
+            log.pop(ref, None)
+        save_fetch_tasks_log(log)
+
+
 # Status filters to probe per DLV request type — a queued ref's current status
 # isn't known in advance, so every relevant filter is tried until it's found.
 _DLV_COUNTY_FILTERS    = ["Ongoing", "Completed", "Returned"]
@@ -4153,47 +4218,56 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
                 row["date_created"] = task.get("date_created", row["date_created"])
 
                 detail = _fetch_ref_detail_dlv(tokens, task["id"])
-                if not detail:
-                    return row
+                if detail:
+                    info = _classify_dlv_detail(detail)
+                    if info["bucket"] == "closed":
+                        row["_closed"] = {
+                            **item,
+                            "closed_reason":        info["closed_reason"],
+                            "application_status":   info["application_status"],
+                            "node":                 info["node"],
+                            "request_type":         task.get("_request_type", ""),
+                            "consideration_amount": info["consideration_amount"],
+                            "currency_code":        info["currency_code"],
+                            "valuer_name":          info["actor_name"] or row["valuer_name"],
+                            "closed_at":            datetime.now().isoformat(timespec="seconds"),
+                        }
+                        return row
 
-                info = _classify_dlv_detail(detail)
-                if info["bucket"] == "closed":
-                    row["_closed"] = {
-                        **item,
-                        "closed_reason":        info["closed_reason"],
-                        "application_status":   info["application_status"],
-                        "node":                 info["node"],
-                        "request_type":         task.get("_request_type", ""),
-                        "consideration_amount": info["consideration_amount"],
-                        "currency_code":        info["currency_code"],
-                        "valuer_name":          info["actor_name"] or row["valuer_name"],
-                        "closed_at":            datetime.now().isoformat(timespec="seconds"),
-                    }
-                    return row
+                    row["assessor"] = info["assessor_name"]
+            else:
+                # Not yet forwarded to DLV — check the assessor/HQ stage instead,
+                # the same stampdutyservice endpoints Fetch Tasks uses, so the
+                # report doesn't just go blank while a ref is still upstream.
+                assessor_task = _search_ref_stampduty(tokens, ref)
+                if assessor_task:
+                    row["found"]        = True
+                    row["location"]     = "assessor"
+                    row["parcel"]       = assessor_task.get("parcel_number", "")
+                    row["registry"]     = (assessor_task.get("registry") or "").upper()
+                    row["county"]       = (assessor_task.get("county") or "").upper()
+                    row["date_created"] = assessor_task.get("date_created", row["date_created"])
 
-                row["assessor"] = info["assessor_name"]
-                return row
-
-            # Not yet forwarded to DLV — check the assessor/HQ stage instead,
-            # the same stampdutyservice endpoints Fetch Tasks uses, so the
-            # report doesn't just go blank while a ref is still upstream.
-            assessor_task = _search_ref_stampduty(tokens, ref)
-            if assessor_task:
-                row["found"]        = True
-                row["location"]     = "assessor"
-                row["parcel"]       = assessor_task.get("parcel_number", "")
-                row["registry"]     = (assessor_task.get("registry") or "").upper()
-                row["county"]       = (assessor_task.get("county") or "").upper()
-                row["date_created"] = assessor_task.get("date_created", row["date_created"])
-
-                det = _fetch_stampduty_detail(tokens, assessor_task["id"])
-                if det:
-                    row["assessor"] = _extract_assessor([
-                        {"name": o.get("names", ""), "role": o.get("role", "")}
-                        for o in det.get("officers", [])
-                    ])
+                    det = _fetch_stampduty_detail(tokens, assessor_task["id"])
+                    if det:
+                        row["assessor"] = _extract_assessor([
+                            {"name": o.get("names", ""), "role": o.get("role", "")}
+                            for o in det.get("officers", [])
+                        ])
         except Exception as e:
             logger.warning("DLV Tasks enrich failed for %s: %s", ref, e)
+
+        # Live search came up empty or without an assessor — fall back to
+        # what the last Fetch Tasks run cached for this ref (still fresh,
+        # see FETCH_TASKS_LOG_TTL_SECONDS) rather than showing blanks.
+        if not row["assessor"]:
+            cached = _fetch_tasks_log_lookup(ref)
+            if cached:
+                row["assessor"]     = cached.get("assessor", "")
+                row["parcel"]       = row["parcel"]       or cached.get("parcel", "")
+                row["registry"]     = row["registry"]     or cached.get("registry", "")
+                row["county"]       = row["county"]       or cached.get("county", "")
+                row["date_created"] = row["date_created"] or cached.get("date_created", "")
 
         return row
 
@@ -5317,6 +5391,7 @@ def _load_fetch_tasks(tokens: AuthTokens, days_back: int) -> Tuple[List[Dict], D
                 stats["county_kept"] += 1
 
     tasks.sort(key=lambda x: x["date_created"], reverse=True)
+    _log_fetch_tasks(tasks)
     return tasks, stats
 
 
@@ -5894,7 +5969,13 @@ async def recv_db_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for g in resolved:
         refs_str = ", ".join(f"`{r}`" for r in g["refs"])
         if g["status"] == "resolved":
-            lines.append(f"✅ {refs_str}\n   → *{g['valuer_name']}*")
+            assessors = {
+                a for a in (
+                    (_fetch_tasks_log_lookup(r) or {}).get("assessor", "") for r in g["refs"]
+                ) if a
+            }
+            assessor_note = f"\n   Assessor: {', '.join(sorted(assessors))}" if assessors else ""
+            lines.append(f"✅ {refs_str}\n   → *{g['valuer_name']}*{assessor_note}")
         else:
             lines.append(f"⚠️ {refs_str}\n   → _{g['valuer_name']}_ (NOT FOUND — will be skipped)")
             has_unresolved = True
@@ -5941,15 +6022,22 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for g in to_save:
         for ref in g["refs"]:
             if ref not in existing_refs:
-                new_items.append({
+                new_item = {
                     "ref":         ref,
                     "valuer_name": g["valuer_name"],
                     "valuer_uid":  g["valuer_uid"],
                     "valuer_acct": g["valuer_acct"],
                     "queued_at":   datetime.now().isoformat(timespec="seconds"),
-                })
+                }
+                cached = _fetch_tasks_log_lookup(ref)
+                if cached and cached.get("assessor"):
+                    new_item["assessor"] = cached["assessor"]
+                new_items.append(new_item)
     flat_items = existing + new_items
     save_dlv_batch(flat_items)
+    # The Fetch Tasks cache has now been folded into the batch item itself —
+    # drop it so the cache doesn't keep growing with refs already queued.
+    _fetch_tasks_log_remove([i["ref"] for i in new_items])
 
     tokens = _any_valid_tokens()
     if not tokens:
