@@ -4261,8 +4261,12 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
             logger.warning("DLV Tasks enrich failed for %s: %s", ref, e)
 
         # Live search came up empty or without an assessor — fall back to
-        # what the last Fetch Tasks run cached for this ref (still fresh,
-        # see FETCH_TASKS_LOG_TTL_SECONDS) rather than showing blanks.
+        # whatever was captured on the batch item itself when it was queued
+        # (copied from the Fetch Tasks cache at DLV Batch add-time, see
+        # recv_db_confirm), then to the Fetch Tasks cache directly for items
+        # queued before that field existed.
+        if not row["assessor"]:
+            row["assessor"] = item.get("assessor", "")
         if not row["assessor"]:
             cached = _fetch_tasks_log_lookup(ref)
             if cached:
