@@ -39,7 +39,7 @@ from email.mime.text import MIMEText
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_completed
-from datetime import datetime, timedelta, timezone, time as _dtime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import anthropic
@@ -84,7 +84,6 @@ from common import (
     BTN_ASSIGNMENTS,
     BTN_AUTH,
     BTN_AUTO_FETCH,
-    BTN_BRIEFING,
     BTN_BULK_EXPORT,
     BTN_CANCEL,
     BTN_DAEMON,
@@ -139,7 +138,7 @@ from fetch_tasks_cache import (
 )
 import dlv_batch
 import dlv_tasks
-from dlv_tasks import _dt_build_excel, _dt_fetch_tasks, _dt_send_telegram
+import morning_briefing
 
 load_dotenv()
 
@@ -155,7 +154,6 @@ SAVED_BULK_EXPORT_SCHED_FILE    = os.path.join(DATA_DIR, "saved_bulk_export_sche
 SAVED_BULK_EXPORT_PARTIAL_FILE  = os.path.join(DATA_DIR, "saved_bulk_export_partial.json")
 SAVED_AUTO_FETCH_FILE   = os.path.join(DATA_DIR, "saved_auto_fetch.json")
 SAVED_AF_RESULTS_FILE   = os.path.join(DATA_DIR, "saved_af_results.json")
-SAVED_BRIEFING_CONFIG_FILE  = os.path.join(DATA_DIR, "saved_briefing_config.json")
 SAVED_SECTIONAL_CONFIG_FILE = os.path.join(DATA_DIR, "saved_sectional_config.json")
 
 DAEMON_SCRIPT = os.path.join(os.path.dirname(__file__), "token_refresh_daemon.py")
@@ -371,11 +369,8 @@ class SC(Enum):
     CRED     = auto()   # pick credential to use for auto-assignment
 
 
-# States — Morning Briefing conversation
-class MB(Enum):
-    MENU        = auto()   # status + Run Now / Enable / Disable buttons
-    DELIVERY    = auto()   # telegram or email
-    EMAIL_INPUT = auto()   # enter email address
+# (MB enum lives in morning_briefing.py — imported by main() at the point
+#  of registration)
 
 
 # County → list of registry names as they appear in the API response
@@ -2918,18 +2913,7 @@ def clear_auto_fetch_schedule() -> None:
 #  the point of registration)
 
 
-# ── Morning Briefing config ────────────────────────────────
-
-def load_briefing_config() -> Optional[Dict]:
-    try:
-        with open(SAVED_BRIEFING_CONFIG_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
-
-
-def save_briefing_config(cfg: Dict) -> None:
-    _atomic_json_write(SAVED_BRIEFING_CONFIG_FILE, cfg, indent=2)
+# (load_briefing_config/save_briefing_config live in morning_briefing.py)
 
 
 # ── Sectional Properties config ────────────────────────────
@@ -3505,201 +3489,9 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("Auto Fetch email failed: %s", e)
 
 
-# (_dt_fetch_tasks lives in dlv_tasks.py — imported by _run_morning_briefing
-#  below and by main() at the point of registration)
-
-
-# ──────────────────────────────────────────────────────────
-# Morning Briefing background job
-# ──────────────────────────────────────────────────────────
-
-async def _send_briefing(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    for chat_id in ALLOWED_IDS:
-        try:
-            await context.bot.send_message(chat_id, text, parse_mode="Markdown")
-        except Exception as e:
-            logger.warning("Morning briefing notify error for %s: %s", chat_id, e)
-
-
-async def _run_morning_briefing(context: ContextTypes.DEFAULT_TYPE, delivery: str, email: str) -> None:
-    """Build and broadcast the Open DLV Tasks briefing — shared by the 7 AM job and Run Now."""
-    tokens = _any_valid_tokens()
-    if not tokens:
-        await _send_briefing(context, "⚠️ *Morning Briefing*\nNo valid cached tokens — authenticate first.")
-        return
-
-    try:
-        rows = await asyncio.to_thread(_dt_fetch_tasks, tokens)
-    except Exception as e:
-        logger.error("Morning briefing: fetch failed: %s", e, exc_info=True)
-        await _send_briefing(context, f"⚠️ *Morning Briefing*\nFailed to fetch tasks: `{e}`")
-        return
-
-    today = datetime.now().strftime("%d %b %Y")
-
-    if delivery == "email":
-        if not email:
-            await _send_briefing(context, "⚠️ *Morning Briefing*\nEmail delivery selected but no address is saved.")
-            return
-        xlsx_bytes = _dt_build_excel(rows)
-        filename   = f"Morning_Briefing_OpenTasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        try:
-            _send_bulk_export_email(email, filename, xlsx_bytes)
-        except Exception as e:
-            logger.error("Morning briefing: email send failed: %s", e)
-            await _send_briefing(context, f"⚠️ *Morning Briefing — {today}*\nEmail delivery failed: `{e}`")
-            return
-        await _send_briefing(
-            context,
-            f"🌅 *Morning Briefing — {today}*\n📧 {len(rows)} Open Task(s) emailed to *{email}*.",
-        )
-        return
-
-    if not rows:
-        await _send_briefing(context, f"🌅 *Morning Briefing — {today}*\n\nNo Open DLV Tasks.")
-        return
-
-    await _send_briefing(context, f"🌅 *Morning Briefing — {today}* — {len(rows)} Open DLV Task(s)")
-    for chat_id in ALLOWED_IDS:
-        try:
-            await _dt_send_telegram(chat_id, rows, context.bot)
-        except Exception as e:
-            logger.warning("Morning briefing notify error for %s: %s", chat_id, e)
-
-
-async def _morning_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Daily 7 AM EAT briefing: DLV Open Tasks, delivered via Telegram or email."""
-    cfg = load_briefing_config()
-    if not cfg or not cfg.get("enabled"):
-        return
-    await _run_morning_briefing(context, cfg.get("delivery", "telegram"), cfg.get("email", ""))
-
-
-# (DLV Tasks command handlers — cmd_dlv_tasks, recv_dt_*, _dt_exclusion_keyboard,
-#  _dt_delete_keyboard, _dt_run_delete_select, _dt_build_excel, _dt_run_open_tasks,
-#  _dt_send_closed_report, _dt_send_telegram — live in dlv_tasks.py)
-
-# ──────────────────────────────────────────────────────────
-# Morning Briefing command handler
-# ──────────────────────────────────────────────────────────
-
-def _schedule_morning_briefing(job_queue) -> None:
-    for job in job_queue.get_jobs_by_name("morning_briefing_job"):
-        job.schedule_removal()
-    job_queue.run_daily(
-        _morning_briefing_job,
-        time=_dtime(4, 0, tzinfo=timezone.utc),
-        name="morning_briefing_job",
-    )
-
-
-def _mb_delivery_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("💬 Telegram", callback_data="mb_delivery:telegram"),
-        InlineKeyboardButton("📩 Email",    callback_data="mb_delivery:email"),
-    ]])
-
-
-def _mb_menu_keyboard(enabled: bool) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("▶️ Run Now", callback_data="mb:run_now")]]
-    if enabled:
-        rows.append([InlineKeyboardButton("🛑 Disable", callback_data="mb:disable")])
-    else:
-        rows.append([InlineKeyboardButton("✅ Enable",  callback_data="mb:enable")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def cmd_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return await deny(update)
-    cfg      = load_briefing_config() or {}
-    enabled  = cfg.get("enabled", False)
-    delivery = cfg.get("delivery", "telegram")
-
-    if enabled:
-        via = f"📩 Email ({cfg.get('email', '—')})" if delivery == "email" else "💬 Telegram"
-        status = f"Status: ✅ Enabled — daily at 7 AM EAT via {via}"
-    else:
-        status = "Status: 🛑 Disabled"
-
-    await update.message.reply_text(
-        f"🌅 *Morning Briefing* — Open DLV Tasks\n{status}",
-        parse_mode="Markdown",
-        reply_markup=_mb_menu_keyboard(enabled),
-    )
-    return MB.MENU
-
-
-async def recv_mb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return await deny(update)
-    query  = update.callback_query
-    await query.answer()
-    action = query.data.split(":")[1]
-
-    if action == "run_now":
-        cfg = load_briefing_config() or {}
-        await query.edit_message_text("⏳ Running Morning Briefing now…")
-        await _run_morning_briefing(ctx, cfg.get("delivery", "telegram"), cfg.get("email", ""))
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
-        return ConversationHandler.END
-
-    if action == "disable":
-        save_briefing_config({"enabled": False})
-        for job in ctx.job_queue.get_jobs_by_name("morning_briefing_job"):
-            job.schedule_removal()
-        await query.edit_message_text("🛑 Morning Briefing disabled.")
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
-        return ConversationHandler.END
-
-    # action == "enable"
-    await query.edit_message_text(
-        "🌅 *Morning Briefing* — Open DLV Tasks, delivered daily at 7 AM EAT.\n\n"
-        "How would you like to receive it?",
-        parse_mode="Markdown",
-        reply_markup=_mb_delivery_keyboard(),
-    )
-    return MB.DELIVERY
-
-
-async def recv_mb_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return await deny(update)
-    query = update.callback_query
-    await query.answer()
-    mode = query.data.split(":")[1]
-
-    if mode == "email":
-        await query.edit_message_text(
-            "📧 Enter the email address to receive the daily Open Tasks report:",
-        )
-        return MB.EMAIL_INPUT
-
-    save_briefing_config({"enabled": True, "delivery": "telegram"})
-    _schedule_morning_briefing(ctx.job_queue)
-    await query.edit_message_text(
-        "🌅 *Morning Briefing enabled* — Open Tasks via Telegram, daily at 7 AM EAT.\n"
-        "Use /briefing again to disable.",
-        parse_mode="Markdown",
-    )
-    await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
-    return ConversationHandler.END
-
-
-async def recv_mb_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return await deny(update)
-    email = (update.message.text or "").strip()
-    if "@" not in email or "." not in email.split("@")[-1]:
-        await update.message.reply_text("❌ Invalid email. Enter a valid address:")
-        return MB.EMAIL_INPUT
-
-    save_briefing_config({"enabled": True, "delivery": "email", "email": email})
-    _schedule_morning_briefing(ctx.job_queue)
-    await update.message.reply_text(
-        f"🌅 *Morning Briefing enabled* — Open Tasks emailed to *{email}*, daily at 7 AM EAT.\n"
-        "Use /briefing again to disable.",
-        parse_mode="Markdown",
-        reply_markup=_main_menu(),
-    )
-    return ConversationHandler.END
-
+# (Morning Briefing — _send_briefing, _run_morning_briefing,
+#  _morning_briefing_job, _schedule_morning_briefing, _mb_* keyboards,
+#  cmd_briefing, recv_mb_* — all live in morning_briefing.py)
 
 # ──────────────────────────────────────────────────────────
 # Sectional Properties command handlers
@@ -7484,13 +7276,6 @@ def main():
         )
         logger.info("Auto Fetch schedule restored: every %d min", cfg.get("interval_minutes"))
 
-    # Morning Briefing: restore if enabled
-    briefing_cfg = load_briefing_config()
-    if briefing_cfg and briefing_cfg.get("enabled"):
-        _schedule_morning_briefing(app.job_queue)
-        logger.info("Morning briefing restored: daily at 04:00 UTC (7 AM EAT), delivery=%s",
-                    briefing_cfg.get("delivery", "telegram"))
-
     dlv_tasks.register(app)
 
     sc_conv = ConversationHandler(
@@ -7514,25 +7299,7 @@ def main():
     )
     app.add_handler(sc_conv)
 
-    mb_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("briefing", cmd_briefing),
-            MessageHandler(filters.Regex(f"^{re.escape(BTN_BRIEFING)}$"), cmd_briefing),
-        ],
-        states={
-            MB.MENU:        [CallbackQueryHandler(recv_mb_menu,     pattern=r"^mb:")],
-            MB.DELIVERY:    [CallbackQueryHandler(recv_mb_delivery, pattern=r"^mb_delivery:")],
-            MB.EMAIL_INPUT: [MessageHandler(not_cancel, recv_mb_email)],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cmd_cancel),
-            MessageHandler(_CANCEL_FILTER, cmd_cancel),
-            MessageHandler(filters.TEXT, fallback),
-        ],
-        allow_reentry=True,
-        per_message=False,
-    )
-    app.add_handler(mb_conv)
+    morning_briefing.register(app)
 
     # Button handlers outside an active conversation
     app.add_handler(CallbackQueryHandler(recv_delete_valuer,  pattern=r"^del:"))
