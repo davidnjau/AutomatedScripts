@@ -4211,60 +4211,63 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
             "_closed":      None,
         }
         try:
-            task = _search_ref_dlv(tokens, ref)
-            if task:
+            # 1. Assessor/HQ stage first (stampdutyservice) — the same endpoints
+            #    Fetch Tasks uses. A queued ref's assessor lives here before it
+            #    ever reaches DLV, so checking this first gets the assessor's
+            #    name without waiting on the DLV search to fail.
+            assessor_task = _search_ref_stampduty(tokens, ref)
+            if assessor_task:
                 row["found"]        = True
-                row["location"]     = "dlv"
-                row["parcel"]       = task.get("parcel_number", "")
-                row["registry"]     = (task.get("registry") or "").upper()
-                row["county"]       = (task.get("county") or "").upper()
-                row["date_created"] = task.get("date_created", row["date_created"])
+                row["location"]     = "assessor"
+                row["parcel"]       = assessor_task.get("parcel_number", "")
+                row["registry"]     = (assessor_task.get("registry") or "").upper()
+                row["county"]       = (assessor_task.get("county") or "").upper()
+                row["date_created"] = assessor_task.get("date_created", row["date_created"])
 
-                detail = _fetch_ref_detail_dlv(tokens, task["id"])
-                if detail:
-                    info = _classify_dlv_detail(detail)
-                    if info["bucket"] == "closed":
-                        row["_closed"] = {
-                            **item,
-                            "closed_reason":        info["closed_reason"],
-                            "application_status":   info["application_status"],
-                            "node":                 info["node"],
-                            "request_type":         task.get("_request_type", ""),
-                            "consideration_amount": info["consideration_amount"],
-                            "currency_code":        info["currency_code"],
-                            "valuer_name":          info["actor_name"] or row["valuer_name"],
-                            "closed_at":            datetime.now().isoformat(timespec="seconds"),
-                        }
-                        return row
-
-                    row["assessor"] = info["assessor_name"]
+                det = _fetch_stampduty_detail(tokens, assessor_task["id"])
+                if det:
+                    row["assessor"] = _extract_assessor([
+                        {"name": o.get("names", ""), "role": o.get("role", "")}
+                        for o in det.get("officers", [])
+                    ])
             else:
-                # Not yet forwarded to DLV — check the assessor/HQ stage instead,
-                # the same stampdutyservice endpoints Fetch Tasks uses, so the
-                # report doesn't just go blank while a ref is still upstream.
-                assessor_task = _search_ref_stampduty(tokens, ref)
-                if assessor_task:
+                # 2. Not upstream anymore — check DLV (valuationservice), which
+                #    also tells us if the ref has since Completed or Returned.
+                task = _search_ref_dlv(tokens, ref)
+                if task:
                     row["found"]        = True
-                    row["location"]     = "assessor"
-                    row["parcel"]       = assessor_task.get("parcel_number", "")
-                    row["registry"]     = (assessor_task.get("registry") or "").upper()
-                    row["county"]       = (assessor_task.get("county") or "").upper()
-                    row["date_created"] = assessor_task.get("date_created", row["date_created"])
+                    row["location"]     = "dlv"
+                    row["parcel"]       = task.get("parcel_number", "")
+                    row["registry"]     = (task.get("registry") or "").upper()
+                    row["county"]       = (task.get("county") or "").upper()
+                    row["date_created"] = task.get("date_created", row["date_created"])
 
-                    det = _fetch_stampduty_detail(tokens, assessor_task["id"])
-                    if det:
-                        row["assessor"] = _extract_assessor([
-                            {"name": o.get("names", ""), "role": o.get("role", "")}
-                            for o in det.get("officers", [])
-                        ])
+                    detail = _fetch_ref_detail_dlv(tokens, task["id"])
+                    if detail:
+                        info = _classify_dlv_detail(detail)
+                        if info["bucket"] == "closed":
+                            row["_closed"] = {
+                                **item,
+                                "closed_reason":        info["closed_reason"],
+                                "application_status":   info["application_status"],
+                                "node":                 info["node"],
+                                "request_type":         task.get("_request_type", ""),
+                                "consideration_amount": info["consideration_amount"],
+                                "currency_code":        info["currency_code"],
+                                "valuer_name":          info["actor_name"] or row["valuer_name"],
+                                "closed_at":            datetime.now().isoformat(timespec="seconds"),
+                            }
+                            return row
+
+                        row["assessor"] = info["assessor_name"]
         except Exception as e:
             logger.warning("DLV Tasks enrich failed for %s: %s", ref, e)
 
-        # Live search came up empty or without an assessor — fall back to
-        # whatever was captured on the batch item itself when it was queued
-        # (copied from the Fetch Tasks cache at DLV Batch add-time, see
-        # recv_db_confirm), then to the Fetch Tasks cache directly for items
-        # queued before that field existed.
+        # 3. Neither live call found it (or found it without an assessor) —
+        # fall back to whatever was captured on the batch item itself when it
+        # was queued (copied from the Fetch Tasks cache at DLV Batch add-time,
+        # see recv_db_confirm), then to the Fetch Tasks cache directly for
+        # items queued before that field existed.
         if not row["assessor"]:
             row["assessor"] = item.get("assessor", "")
         if not row["assessor"]:
