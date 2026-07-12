@@ -60,5 +60,25 @@ class TestSectionalConfigPersistence(unittest.TestCase):
         self.assertEqual(cfg["cred_type"], "staff2")
 
 
+class TestBeCredKeyboard(unittest.TestCase):
+    def test_no_valid_tokens_returns_none(self):
+        with patch.object(common, "get_valid_tokens", return_value=None):
+            self.assertIsNone(common._be_cred_keyboard())
+
+    def test_only_lists_creds_with_valid_tokens(self):
+        with patch.object(common, "get_valid_tokens", side_effect=lambda k: "tok" if k == "staff2" else None):
+            kbd = common._be_cred_keyboard()
+        self.assertIsNotNone(kbd)
+        self.assertEqual(len(kbd.inline_keyboard), 1)
+        self.assertEqual(kbd.inline_keyboard[0][0].callback_data, "be_cred:staff2")
+
+
+class TestNodeLabels(unittest.TestCase):
+    def test_known_node_codes_have_labels(self):
+        self.assertIn("VALUATION_STAMP_DUTY_CREATED", common._NODE_LABELS)
+        self.assertIn("VALUATION_STAMP_DUTY_VALUER_REPORT", common._NODE_LABELS)
+        self.assertIn("STAMP_DUTY_PAYMENT_DEFINITION", common._NODE_LABELS)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -93,6 +93,7 @@ from common import (
     SAVED_VALUERS_FILE,
     _any_valid_tokens,
     _atomic_json_write,
+    _be_cred_keyboard,
     _CANCEL_FILTER,
     _cred_keyboard,
     _date_cutoff_str,
@@ -100,6 +101,7 @@ from common import (
     _jwt_exp,
     _load_tokens_raw,
     _main_menu,
+    _NODE_LABELS,
     _within_days,
     allowed,
     cmd_cancel,
@@ -116,6 +118,7 @@ from common import (
     _safe_err,
 )
 from email_service import _send_bulk_export_email
+from token_rotator import _AllTokensExhausted, _TokenRotator
 import auto_fetch
 import dlv_batch
 import dlv_tasks
@@ -1549,46 +1552,8 @@ _BE_TOKEN_ROTATE_DELAY  = 10   # seconds to wait before retrying with a new toke
 _MAX_FETCH_RETRIES      = 5    # max 429/5xx retries before aborting a fetch loop
 
 
-class _AllTokensExhausted(Exception):
-    pass
-
-
-class _TokenRotator:
-    """Thread-safe token rotator — advances to the next valid credential on 403."""
-
-    def __init__(self, token_pairs: List[tuple]):
-        # token_pairs: [(cred_type, AuthTokens), ...]
-        self._tokens = list(token_pairs)
-        self._idx    = 0
-        self._lock   = threading.Lock()
-
-    def current(self) -> Optional["AuthTokens"]:
-        with self._lock:
-            return self._tokens[self._idx][1] if self._idx < len(self._tokens) else None
-
-    def current_label(self) -> str:
-        with self._lock:
-            if self._idx < len(self._tokens):
-                return CRED_LABELS.get(self._tokens[self._idx][0], self._tokens[self._idx][0])
-            return "none"
-
-    def rotate(self, failed: "AuthTokens") -> Optional["AuthTokens"]:
-        """Advance past `failed` if it is still the current token. Returns new token or None.
-
-        The identity (`is`) check is intentional: if two threads both get 403 on the
-        same token and both call rotate(), only the first one advances the index — the
-        second sees the index already moved and simply returns the new current token,
-        avoiding a double-skip.  This is correct thread-safe behaviour, not a bug.
-        """
-        with self._lock:
-            if self._idx < len(self._tokens) and self._tokens[self._idx][1] is failed:
-                self._idx += 1
-            return self._tokens[self._idx][1] if self._idx < len(self._tokens) else None
-
-    @property
-    def exhausted(self) -> bool:
-        with self._lock:
-            return self._idx >= len(self._tokens)
+# (_AllTokensExhausted + _TokenRotator live in token_rotator.py — imported
+#  above, shared by Bulk Export and Job Distribution)
 
 
 _EXCEL_COLUMNS = [
@@ -1697,15 +1662,8 @@ def _ar_county_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _be_cred_keyboard() -> Optional[InlineKeyboardMarkup]:
-    """Return an inline keyboard of credential profiles that currently have valid tokens.
-    Returns None if no credentials are valid."""
-    rows = [
-        [InlineKeyboardButton(label, callback_data=f"be_cred:{key}")]
-        for key, label in CRED_LABELS.items()
-        if get_valid_tokens(key)
-    ]
-    return InlineKeyboardMarkup(rows) if rows else None
+# (_be_cred_keyboard lives in common.py — imported above, shared by Bulk
+#  Export, Job Distribution, Lookup Reference, and Valuer Tasks)
 
 
 def _be_fetch_page(sess: requests.Session, headers: dict, page: int) -> dict:
@@ -2252,12 +2210,8 @@ def _get_lu_sess(ctx: ContextTypes.DEFAULT_TYPE) -> LUSession:
     return ctx.user_data["lu_session"]
 
 
-# Node code → human-readable label
-_NODE_LABELS: Dict[str, str] = {
-    "VALUATION_STAMP_DUTY_CREATED":        "📭 Unassigned (awaiting valuer)",
-    "VALUATION_STAMP_DUTY_VALUER_REPORT":  "✍️ Assigned — valuer report pending",
-    "STAMP_DUTY_PAYMENT_DEFINITION":       "💳 Payment stage",
-}
+# (_NODE_LABELS lives in common.py — imported above, shared by Lookup
+#  Reference and Valuer Tasks)
 
 # (filter, role, cparams) combos to try when searching by reference number.
 # Ordered from most likely to least likely.

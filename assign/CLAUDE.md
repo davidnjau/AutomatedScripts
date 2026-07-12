@@ -31,11 +31,12 @@ Required environment variables (in `.env`):
 
 `bot.py` originally held every feature in one file. It's being split incrementally, one feature at a time, into sibling modules that each own their conversation handlers and register themselves into `bot.py`'s `main()` via a `register(app)` function:
 
-- **`common.py`** — shared bot-wide infra: logger, generic JSON persistence (`_atomic_json_write`), the token cache (`get_valid_tokens`, `_any_valid_tokens`, `persist_tokens`), `CRED_MAP`/`CRED_LABELS`/`_cred_keyboard`, `cparams` constants, the main menu keyboard, auth guards (`allowed`/`deny`), `_safe_err` (redacts exception detail before it reaches a Telegram message), `_date_cutoff_str`/`_within_days`, shared filter keyboards (`_ft_county_keyboard`, `_ft_registry_keyboard`, `_ft_amount_keyboard`, `_sectional_keyboard`), and `load_sectional_config`/`save_sectional_config` (owned conceptually by Sectional Properties, but read by Auto Fetch too, so it lives here rather than forcing a cross-feature-module import).
+- **`common.py`** — shared bot-wide infra: logger, generic JSON persistence (`_atomic_json_write`), the token cache (`get_valid_tokens`, `_any_valid_tokens`, `persist_tokens`), `CRED_MAP`/`CRED_LABELS`/`_cred_keyboard`/`_be_cred_keyboard` (lists only creds with an already-cached token — used by Bulk Export/Job Distribution/Lookup Reference/Valuer Tasks, not a duplicate of `_cred_keyboard`), `_NODE_LABELS` (node-code → human label, shared by Lookup Reference and Valuer Tasks), `cparams` constants, the main menu keyboard, auth guards (`allowed`/`deny`), `_safe_err` (redacts exception detail before it reaches a Telegram message), `_date_cutoff_str`/`_within_days`, shared filter keyboards (`_ft_county_keyboard`, `_ft_registry_keyboard`, `_ft_amount_keyboard`, `_sectional_keyboard`), and `load_sectional_config`/`save_sectional_config` (owned conceptually by Sectional Properties, but read by Auto Fetch too, so it lives here rather than forcing a cross-feature-module import).
 - **`dlv_core.py`** — the DLV queue storage (`load_dlv_batch`/`save_dlv_batch`/etc.) and the assessor/DLV search-and-classify layer shared by DLV Batch and DLV Tasks.
 - **`fetch_tasks_cache.py`** — the 1-day assessor cache bridging Fetch Tasks, DLV Batch, and DLV Tasks.
 - **`email_service.py`** — the shared SMTP sender: `_send_bulk_export_email` (attachment-based, used by Bulk Export/DLV Tasks/Morning Briefing) and `_send_auto_fetch_email` (plain+HTML, used by Auto Fetch). Any feature that offers "email me the report" calls into here rather than building its own SMTP boilerplate.
 - **`telegram_report.py`** — the shared "paginate a report and send it to Telegram" helper: `_chunk_lines` (pure, splits a list of text lines into ≤4000-char blocks) and `_send_chunked_report` (drives sending, attaching a footer/`reply_markup` to the last chunk only). DLV Tasks' and Fetch Tasks' report senders build their own lines/footer/keyboard, then delegate the chunking+sending to this.
+- **`token_rotator.py`** — `_TokenRotator` (thread-safe multi-credential failover, advances to the next valid credential on 403) and `_AllTokensExhausted`, shared by Bulk Export and Job Distribution's background bulk-fetch loops.
 - **`dlv_batch.py`**, **`dlv_tasks.py`**, **`morning_briefing.py`**, **`fetch_tasks.py`**, **`refresh_auth.py`**, **`sectional_properties.py`**, **`auto_fetch.py`**, **`receive_tasks.py`** — one feature each, extracted out of `bot.py`.
 - **`bot.py`** — everything not yet extracted, plus `main()`, which imports each module and calls its `register(app)`.
 - **`tests/`** — `unittest`-based tests per module (stdlib only, no new dependencies). Run with `python3 -m unittest discover -s assign/tests -v`.
@@ -55,7 +56,7 @@ Required environment variables (in `.env`):
 
 ### Extraction Roadmap
 
-As of this writing `bot.py` is **~4,157 lines**, down from ~9,200 before extraction began. Already extracted: `common.py`, `dlv_core.py`, `fetch_tasks_cache.py`, `email_service.py`, `telegram_report.py`, `dlv_batch.py`, `dlv_tasks.py`, `morning_briefing.py`, `fetch_tasks.py`, `refresh_auth.py`, `sectional_properties.py`, `auto_fetch.py`, `receive_tasks.py`.
+As of this writing `bot.py` is **~4,111 lines**, down from ~9,200 before extraction began. Already extracted: `common.py`, `dlv_core.py`, `fetch_tasks_cache.py`, `email_service.py`, `telegram_report.py`, `token_rotator.py`, `dlv_batch.py`, `dlv_tasks.py`, `morning_briefing.py`, `fetch_tasks.py`, `refresh_auth.py`, `sectional_properties.py`, `auto_fetch.py`, `receive_tasks.py`.
 
 **Remaining features and their approximate size/contiguity:**
 
@@ -73,11 +74,11 @@ As of this writing `bot.py` is **~4,157 lines**, down from ~9,200 before extract
 
 **Cross-dependency blockers found (why a naive one-at-a-time order breaks down):**
 
-1. `_be_cred_keyboard()` and `_TokenRotator`/`_AllTokensExhausted` (currently in Bulk Export's section, ~bot.py:3768-3924) are also used by Job Distribution, Lookup Reference, and Valuer Tasks. `_be_cred_keyboard` is **not** a duplicate of `common.py`'s `_cred_keyboard()` — it only lists credential profiles that already have valid cached tokens, so it needs its own promotion, not a merge.
+1. ~~`_be_cred_keyboard()` and `_TokenRotator`/`_AllTokensExhausted` were only in Bulk Export's section~~ — resolved: `_be_cred_keyboard` promoted to `common.py`, `_TokenRotator`/`_AllTokensExhausted` promoted to `token_rotator.py`. Job Distribution, Lookup Reference, and Valuer Tasks can now import both without depending on Bulk Export's not-yet-extracted code.
 2. `cmd_export_status` (~bot.py:5864) renders both Bulk Export's and Job Distribution's status dicts in one message — owned by neither.
 3. New Assignment's `recv_confirm` calls `_post_assignment_report`/`_lookup_one_ref`, which are built on Lookup Reference's `_lu_search_ref`/`_lu_fetch_detail`/`_lu_format_result`. LU must export these as its public API before New Assignment can cleanly depend on them.
 4. Auto Fetch's `_auto_fetch_job` reads Sectional Properties' `load_sectional_config` for auto-routing.
-5. Lookup Reference and Valuer Tasks both use `_NODE_LABELS` (currently defined near LU).
+5. ~~Lookup Reference and Valuer Tasks both use `_NODE_LABELS`~~ — resolved: `_NODE_LABELS` promoted to `common.py`.
 
 **Recommended order:**
 
@@ -85,7 +86,7 @@ As of this writing `bot.py` is **~4,157 lines**, down from ~9,200 before extract
 2. ~~**Sectional Properties**~~ — done (`sectional_properties.py`). `load_sectional_config`/`save_sectional_config` promoted to `common.py` as planned; also promoted `_safe_err` there (needed by Sectional's name-search error path, and already duplicated-in-spirit by New Assignment/Receive Tasks — all three now share the one copy).
 3. ~~**Auto Fetch**~~ (bundled `cmd_af_results`/`recv_af_result_detail`) — done (`auto_fetch.py`). Both previously-unmigrated Telegram-chunking spots (`_auto_fetch_job`'s notify loop, `recv_af_result_detail`) now go through `telegram_report._send_chunked_report`.
 4. ~~**Receive Tasks**~~ (bundled `cmd_schedules`/`cmd_task_batches`) — done (`receive_tasks.py`). Follows the same startup-restore pattern `morning_briefing.py`/`auto_fetch.py` established: `register(app)` calls `_restore_schedules(app)` internally rather than `bot.py`'s `_post_init` doing it.
-5. **Prerequisite cleanup**: promote `_be_cred_keyboard`, `_TokenRotator`/`_AllTokensExhausted`, and `_NODE_LABELS` out of Bulk Export's section — the keyboard and labels into `common.py`, the rotator classes into a new `token_rotator.py`.
+5. ~~**Prerequisite cleanup**~~ — done. `_be_cred_keyboard` and `_NODE_LABELS` promoted to `common.py`; `_TokenRotator`/`_AllTokensExhausted` promoted to a new `token_rotator.py`. `bot.py`'s Bulk Export/Job Distribution/Lookup Reference sections now import all three rather than defining/duplicating them, so steps 6-10 no longer depend on Bulk Export extracting first.
 6. **Lookup Reference** — export `_lu_search_ref`/`_lu_fetch_detail`/`_lu_format_result` as its public API; move `_post_assignment_report`/`_lookup_one_ref` out of LU's file, staged for New Assignment (step 9) to import from `lookup_reference.py`.
 7. **Valuer Tasks** — now just imports the promoted keyboard/rotator/labels like everyone else.
 8. **Job Distribution** — same. Leave `cmd_export_status` in `bot.py` for now (thin combiner reading both BE's and JD's status dicts) until Bulk Export also lands.

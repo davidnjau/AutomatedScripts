@@ -290,6 +290,28 @@ def _cred_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _be_cred_keyboard() -> Optional[InlineKeyboardMarkup]:
+    """Return an inline keyboard of credential profiles that currently have valid tokens.
+    Returns None if no credentials are valid. Used by Bulk Export, Job Distribution,
+    Lookup Reference, and Valuer Tasks — unlike _cred_keyboard() above, this only lists
+    profiles with a cached token already, since those features run against a fixed
+    credential rather than triggering a fresh login."""
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"be_cred:{key}")]
+        for key, label in CRED_LABELS.items()
+        if get_valid_tokens(key)
+    ]
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+# Node code → human-readable label — shared by Lookup Reference and Valuer Tasks
+_NODE_LABELS: Dict[str, str] = {
+    "VALUATION_STAMP_DUTY_CREATED":        "📭 Unassigned (awaiting valuer)",
+    "VALUATION_STAMP_DUTY_VALUER_REPORT":  "✍️ Assigned — valuer report pending",
+    "STAMP_DUTY_PAYMENT_DEFINITION":       "💳 Payment stage",
+}
+
+
 # ──────────────────────────────────────────────────────────
 # Fetch Tasks / Auto Fetch shared filter keyboards
 # ──────────────────────────────────────────────────────────
