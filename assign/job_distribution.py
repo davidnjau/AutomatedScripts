@@ -22,7 +22,6 @@ import asyncio
 import io
 import re
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -61,7 +60,7 @@ from common import (
     logger,
 )
 from excel_report import autofit_columns, style_header_row
-from token_rotator import _AllTokensExhausted, _TokenRotator
+from token_rotator import _AllTokensExhausted, _TokenRotator, fetch_with_rotation
 
 _JD_TOKEN_ROTATE_DELAY = 10   # seconds to wait before retrying with a new token
 _JD_MAX_RETRIES        = 5    # max 429/5xx retries before aborting a detail fetch
@@ -183,30 +182,11 @@ def _jd_fetch_ongoing_page(sess: requests.Session, headers: dict, page: int) -> 
 
 def _jd_fetch_task_detail(sess: requests.Session, rotator: "_TokenRotator", task_id: str) -> dict:
     """Fetch detail for one task with token rotation on 403."""
-    retries = 0
-    while True:
-        tokens = rotator.current()
-        if tokens is None:
-            raise _AllTokensExhausted(f"All tokens exhausted fetching task {task_id}")
-        headers = _jd_headers(tokens)
-        resp = sess.get(_JD_DETAIL_URL, headers=headers, params={"request_id": task_id}, timeout=30)
-        if resp.status_code == 403:
-            new_tokens = rotator.rotate(tokens)
-            if new_tokens is None:
-                raise _AllTokensExhausted(f"All tokens exhausted (403) fetching task {task_id}")
-            time.sleep(_JD_TOKEN_ROTATE_DELAY)
-            continue
-        if resp.status_code in (429, 502, 503, 504):
-            retries += 1
-            if retries >= _JD_MAX_RETRIES:
-                raise RuntimeError(
-                    f"_jd_fetch_task_detail: too many transient errors (HTTP {resp.status_code}) "
-                    f"for task_id={task_id}"
-                )
-            time.sleep(2)
-            continue
-        resp.raise_for_status()
-        return resp.json()
+    return fetch_with_rotation(
+        sess, rotator, _JD_DETAIL_URL, {"request_id": task_id}, _jd_headers,
+        context=f"task {task_id}",
+        rotate_delay=_JD_TOKEN_ROTATE_DELAY, max_retries=_JD_MAX_RETRIES,
+    )
 
 
 def _jd_build_excel(

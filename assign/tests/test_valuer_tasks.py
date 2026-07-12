@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import token_rotator
 import valuer_tasks as vt
 from ardhisasa_auth import AuthTokens
 from token_rotator import _AllTokensExhausted, _TokenRotator
@@ -103,7 +104,7 @@ class TestVtFetchTaskDetail(unittest.TestCase):
             MagicMock(status_code=403),
             MagicMock(status_code=200, raise_for_status=lambda: None, json=lambda: {"node": "Y"}),
         ]
-        with patch.object(vt.time, "sleep"):
+        with patch.object(token_rotator.time, "sleep"):
             result = vt._vt_fetch_task_detail(fake_session, rotator, "task-1")
         self.assertEqual(result, {"node": "Y"})
 
@@ -111,7 +112,7 @@ class TestVtFetchTaskDetail(unittest.TestCase):
         rotator = _TokenRotator([("staff", TOKENS)])
         fake_session = MagicMock()
         fake_session.get.return_value = MagicMock(status_code=503)
-        with patch.object(vt.time, "sleep"):
+        with patch.object(token_rotator.time, "sleep"):
             with self.assertRaises(RuntimeError):
                 vt._vt_fetch_task_detail(fake_session, rotator, "task-1")
 
