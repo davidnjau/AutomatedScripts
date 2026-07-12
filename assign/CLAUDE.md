@@ -29,7 +29,27 @@ Required environment variables (in `.env`):
 
 ## Architecture
 
-Three source files:
+`bot.py` originally held every feature in one file. It's being split incrementally, one feature at a time, into sibling modules that each own their conversation handlers and register themselves into `bot.py`'s `main()` via a `register(app)` function:
+
+- **`common.py`** — shared bot-wide infra: logger, generic JSON persistence (`_atomic_json_write`), the token cache (`get_valid_tokens`, `_any_valid_tokens`, `persist_tokens`), `CRED_MAP`/`CRED_LABELS`/`_cred_keyboard`, `cparams` constants, the main menu keyboard, auth guards (`allowed`/`deny`), `_date_cutoff_str`/`_within_days`, shared filter keyboards (`_ft_county_keyboard`, `_ft_registry_keyboard`, `_ft_amount_keyboard`, `_sectional_keyboard`), and the bulk-export email sender.
+- **`dlv_core.py`** — the DLV queue storage (`load_dlv_batch`/`save_dlv_batch`/etc.) and the assessor/DLV search-and-classify layer shared by DLV Batch and DLV Tasks.
+- **`fetch_tasks_cache.py`** — the 1-day assessor cache bridging Fetch Tasks, DLV Batch, and DLV Tasks.
+- **`dlv_batch.py`**, **`dlv_tasks.py`**, **`morning_briefing.py`**, **`fetch_tasks.py`** — one feature each, extracted out of `bot.py`.
+- **`bot.py`** — everything not yet extracted, plus `main()`, which imports each module and calls its `register(app)`.
+- **`tests/`** — `unittest`-based tests per module (stdlib only, no new dependencies). Run with `python3 -m unittest discover -s assign/tests -v`.
+
+**When extracting a new feature into its own module, follow the pattern established by the modules above:**
+
+1. Move only that feature's enum/session dataclass/handlers/keyboards into the new file; leave anything shared by ≥2 features in `common.py`, `dlv_core.py`, or `fetch_tasks_cache.py` instead of duplicating it.
+2. Expose a `register(app: Application) -> None` that builds and adds the feature's `ConversationHandler` (and any jobs/other handlers it owns) — `bot.py`'s `main()` calls it instead of building the handler inline.
+3. **Authentication must follow the existing check-cache-then-login pattern, the same way every feature already does it — do not invent a new login flow.** Concretely (see `fetch_tasks.py`'s `recv_ft_cred` for the canonical example):
+   - On credential selection, call `get_valid_tokens(cred_type)` (or `_any_valid_tokens()` for background jobs) from `common.py`.
+   - **If cached tokens are valid** — store them on the session and go straight to the next step. Do not re-login.
+   - **If not** — fall back to the standard OTP workflow: `build_session()` → `POST {AUTH_BASE_URL}/login` with `CRED_MAP[cred_type]` → transition to a `WAIT_OTP` state → on OTP reply, `POST {AUTH_BASE_URL}/otpverify` → `persist_tokens(cred_type, access_token, jwt, refresh_token)` → continue.
+   - Use `CRED_LABELS[cred_type]` for user-facing text and `_cred_keyboard()` for the picker, so every feature's credential-selection UI looks identical.
+4. Add `import <module>` and `<module>.register(app)` to `bot.py`'s `main()`; add a `COPY <module>.py .` line to the `Dockerfile` (it copies files explicitly, not the whole directory — missed modules fail with `ImportError` only at container start, not at build time).
+5. Add a `tests/test_<module>.py` covering the module's non-trivial logic (pure functions directly, handlers via mocked Telegram objects), and confirm the full suite still passes.
+6. Verify: `python3 -m py_compile` + `python3 -m pyflakes` on all touched files, `import bot` succeeds, a `bot.main()` dry-run (with `Application.run_polling` stubbed) wires every handler without raising, and — when practical — a real `docker compose up` against a local/non-production bot token confirms it connects and polls cleanly before stopping it.
 
 **`ardhisasa_auth.py`** — Authentication layer:
 - Exports four hardcoded credential profiles: `PUBLIC_CREDENTIALS`, `STAFF_CREDENTIALS_ICT`, `STAFF_CREDENTIALS_SUPPORT`, `STAFF_CREDENTIALS_VALUER`
@@ -48,7 +68,7 @@ Three source files:
 - Detects already-assigned references before proceeding and asks the user whether to reassign
 - Three `cparams` constants (base64-encoded role JSON sent as `cparams` header): `CPARAMS_DLV` (`{"active_role":"DLV"}`), `CPARAMS_ASSESSOR` (`{"active_role":"ASSESSOR_OF_STAMP_DUTY"}`), `CPARAMS_VALUER_ROLE` (`{"active_role":"VALUER"}`) — each required by the respective task endpoints
 - OCR pipeline in `ocr_extract_refs()`: tries `pytesseract` first, falls back to Claude Vision (`claude-opus-4-6`) if no refs found; reference numbers matched by `_REF_RE = r'\b[A-Z0-9]{2,}(?:/[A-Z0-9]{2,}){2,}\b'`
-- `CRED_MAP` / `CRED_LABELS` dicts in `bot.py` must be updated in sync with any credential changes in `ardhisasa_auth.py`
+- `CRED_MAP` / `CRED_LABELS` dicts (now in `common.py`) must be updated in sync with any credential changes in `ardhisasa_auth.py`
 
 **`token_refresh_daemon.py`** — Background token refresh daemon:
 - Watches the token cache and proactively refreshes each credential's tokens 5 minutes before JWT expiry
@@ -110,7 +130,8 @@ JSON files in `./data/` (mounted as Docker volume `bot_data`):
 
 ## Notes
 
-- No test suite exists.
-- Credentials are hardcoded in `ardhisasa_auth.py` — do not move to `.env` without updating the `CRED_MAP` / `CRED_LABELS` dicts in `bot.py`.
+- Test suite: `tests/` (stdlib `unittest`, no new dependencies). Run with `python3 -m unittest discover -s assign/tests -v`.
+- Credentials are hardcoded in `ardhisasa_auth.py` — do not move to `.env` without updating the `CRED_MAP` / `CRED_LABELS` dicts in `common.py`.
+- The Dockerfile `COPY`s each source file explicitly (no wildcard) — any new module (extracted feature, shared helper) must get its own `COPY <module>.py .` line added, or the container fails with `ImportError` at startup despite building successfully.
 - The Dockerfile omits `tesseract-ocr` system package, so `pytesseract` will fail silently in Docker unless the image is updated; Claude Vision covers that fallback path.
 - The token refresh daemon auto-starts with the bot (`_post_init`) so it survives redeploys without a manual restart.
