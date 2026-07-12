@@ -43,7 +43,6 @@ from common import (
     _any_valid_tokens,
     _CANCEL_FILTER,
     _main_menu,
-    _send_bulk_export_email,
     allowed,
     cmd_cancel,
     deny,
@@ -63,7 +62,9 @@ from dlv_core import (
     load_dlv_closed,
     save_dlv_batch,
 )
+from email_service import _send_bulk_export_email
 from fetch_tasks_cache import _fetch_tasks_log_lookup
+from telegram_report import _send_chunked_report
 
 
 # ──────────────────────────────────────────────────────────
@@ -409,15 +410,10 @@ async def _dt_send_closed_report(chat_id: int, rows: List[dict], bot) -> None:
                 f"{amount_str} | Closed: {closed_at or '—'}"
             )
 
-    current_chunk = ""
-    for line in lines:
-        if len(current_chunk) + len(line) + 1 > 4000:
-            await bot.send_message(chat_id, current_chunk, parse_mode="Markdown")
-            current_chunk = line
-        else:
-            current_chunk += ("\n" if current_chunk else "") + line
-    if current_chunk:
-        await bot.send_message(chat_id, current_chunk, parse_mode="Markdown")
+    async def _send(text, reply_markup):
+        await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
+
+    await _send_chunked_report(_send, lines, join="\n")
 
 
 async def recv_dt_scope(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -632,16 +628,10 @@ async def _dt_send_telegram(chat_id: int, rows: List[dict], bot) -> None:
                 f"Added: {date_str} | Assessor: {assessor}{note}"
             )
 
-    # Telegram message limit is 4096 chars — split if needed
-    current_chunk = ""
-    for line in lines:
-        if len(current_chunk) + len(line) + 1 > 4000:
-            await bot.send_message(chat_id, current_chunk, parse_mode="Markdown")
-            current_chunk = line
-        else:
-            current_chunk += ("\n" if current_chunk else "") + line
-    if current_chunk:
-        await bot.send_message(chat_id, current_chunk, parse_mode="Markdown")
+    async def _send(text, reply_markup):
+        await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
+
+    await _send_chunked_report(_send, lines, join="\n")
 
 
 # ──────────────────────────────────────────────────────────

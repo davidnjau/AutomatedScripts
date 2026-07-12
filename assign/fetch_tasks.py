@@ -56,6 +56,7 @@ from common import (
 )
 from dlv_core import _extract_assessor, load_dlv_batch
 from fetch_tasks_cache import _log_fetch_tasks
+from telegram_report import _send_chunked_report
 
 
 # ──────────────────────────────────────────────────────────
@@ -754,32 +755,18 @@ async def _ft_show_results(message, tasks: List[Dict]):
             f"   {officers_str}"
         )
 
-    chunks = []
-    chunk = ""
-    for line in lines:
-        candidate = (chunk + "\n\n" + line).strip()
-        if len(candidate) > 4000:
-            chunks.append(chunk)
-            chunk = line
-        else:
-            chunk = candidate
-    if chunk:
-        chunks.append(chunk)
-
-    for i, c in enumerate(chunks):
-        is_last = (i == len(chunks) - 1)
-        text = c + (f"\n\nTotal: {len(tasks)} task(s)" if is_last else "")
+    async def _send(text, reply_markup):
         try:
-            await message.reply_text(
-                text,
-                reply_markup=_main_menu() if is_last else None,
-            )
+            await message.reply_text(text, reply_markup=reply_markup)
         except Exception as e:
             logger.warning("_ft_show_results send failed: %s", e)
-            await message.reply_text(
-                text[:4000],
-                reply_markup=_main_menu() if is_last else None,
-            )
+            await message.reply_text(text[:4000], reply_markup=reply_markup)
+
+    await _send_chunked_report(
+        _send, lines,
+        footer=f"\n\nTotal: {len(tasks)} task(s)",
+        reply_markup=_main_menu(),
+    )
 
 
 # ──────────────────────────────────────────────────────────

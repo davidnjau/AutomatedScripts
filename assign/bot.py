@@ -28,14 +28,11 @@ import asyncio
 import os
 import re
 import signal
-import smtplib
 import subprocess
 import sys
 import threading
 import time
 import uuid
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_completed
@@ -100,10 +97,6 @@ from common import (
     CRED_MAP,
     DATA_DIR,
     SAVED_VALUERS_FILE,
-    SMTP_HOST,
-    SMTP_PASS,
-    SMTP_PORT,
-    SMTP_USER,
     _any_valid_tokens,
     _atomic_json_write,
     _CANCEL_FILTER,
@@ -130,9 +123,9 @@ from common import (
     persist_assignment,
     persist_tokens,
     persist_valuer,
-    _send_bulk_export_email,
 )
 from dlv_core import load_dlv_batch
+from email_service import _send_auto_fetch_email, _send_bulk_export_email
 import dlv_batch
 import dlv_tasks
 import morning_briefing
@@ -3206,28 +3199,7 @@ async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-def _send_auto_fetch_email(to_email: str, subject: str, body: str) -> None:
-    """Send Auto Fetch results via SMTP. Raises on failure."""
-    if not SMTP_USER or not SMTP_PASS:
-        raise RuntimeError("SMTP_USER / SMTP_PASS not configured in .env")
-
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = SMTP_USER
-    msg["To"]      = to_email
-
-    # Plain text part
-    msg.attach(MIMEText(body, "plain"))
-
-    # Simple HTML version
-    html_body = "<pre style='font-family:monospace'>" + body.replace("&", "&amp;").replace("<", "&lt;") + "</pre>"
-    msg.attach(MIMEText(html_body, "html"))
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_USER, to_email, msg.as_string())
+# (_send_auto_fetch_email lives in email_service.py)
 
 
 async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:

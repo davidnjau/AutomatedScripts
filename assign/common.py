@@ -4,8 +4,7 @@ common.py
 =========
 Shared infrastructure used by multiple feature modules: logging, generic
 JSON persistence, the auth-token cache, saved-valuer/assignment storage,
-cparams headers, the main menu keyboard, auth guards, and the bulk-export
-email sender.
+cparams headers, the main menu keyboard, and auth guards.
 
 Moved out of bot.py so that feature modules (dlv_batch.py, dlv_tasks.py,
 and future extractions) can import this without creating a circular
@@ -16,16 +15,11 @@ import base64
 import json
 import logging
 import os
-import smtplib
 import threading
 import time
 import re
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders as _email_encoders
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -424,34 +418,4 @@ async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ──────────────────────────────────────────────────────────
-# Email (bulk export + morning briefing delivery)
-# ──────────────────────────────────────────────────────────
-def _send_bulk_export_email(to_email: str, filename: str, xlsx_bytes: bytes) -> None:
-    """Send the Excel file as an email attachment. Raises on failure."""
-    if not SMTP_USER or not SMTP_PASS:
-        raise RuntimeError("SMTP_USER / SMTP_PASS not configured in .env")
-
-    msg            = MIMEMultipart()
-    msg["Subject"] = f"Ardhisasa Export Valuation Report — {filename}"
-    msg["From"]    = SMTP_USER
-    msg["To"]      = to_email
-
-    body = (
-        f"Please find attached the Ardhisasa stamp-duty bulk export.\n\n"
-        f"File: {filename}\n"
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-    )
-    msg.attach(MIMEText(body, "plain"))
-
-    part = MIMEBase("application", "octet-stream")
-    part.set_payload(xlsx_bytes)
-    _email_encoders.encode_base64(part)
-    part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
-    msg.attach(part)
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_USER, to_email, msg.as_string())
+# (_send_bulk_export_email / _send_auto_fetch_email live in email_service.py)

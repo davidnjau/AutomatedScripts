@@ -39,7 +39,6 @@ from common import (
     _atomic_json_write,
     _CANCEL_FILTER,
     _main_menu,
-    _send_bulk_export_email,
     allowed,
     cmd_cancel,
     deny,
@@ -48,6 +47,7 @@ from common import (
     not_cancel,
 )
 from dlv_tasks import _dt_build_excel, _dt_fetch_tasks, _dt_send_telegram
+from email_service import _send_bulk_export_email
 
 SAVED_BRIEFING_CONFIG_FILE = os.path.join(DATA_DIR, "saved_briefing_config.json")
 
