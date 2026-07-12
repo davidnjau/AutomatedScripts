@@ -37,7 +37,7 @@ Required environment variables (in `.env`):
 - **`email_service.py`** — the shared SMTP sender: `_send_bulk_export_email` (attachment-based, used by Bulk Export/DLV Tasks/Morning Briefing) and `_send_auto_fetch_email` (plain+HTML, used by Auto Fetch). Any feature that offers "email me the report" calls into here rather than building its own SMTP boilerplate.
 - **`telegram_report.py`** — the shared "paginate a report and send it to Telegram" helper: `_chunk_lines` (pure, splits a list of text lines into ≤4000-char blocks) and `_send_chunked_report` (drives sending, attaching a footer/`reply_markup` to the last chunk only). DLV Tasks' and Fetch Tasks' report senders build their own lines/footer/keyboard, then delegate the chunking+sending to this.
 - **`token_rotator.py`** — `_TokenRotator` (thread-safe multi-credential failover, advances to the next valid credential on 403) and `_AllTokensExhausted`, shared by Bulk Export and Job Distribution's background bulk-fetch loops.
-- **`dlv_batch.py`**, **`dlv_tasks.py`**, **`morning_briefing.py`**, **`fetch_tasks.py`**, **`refresh_auth.py`**, **`sectional_properties.py`**, **`auto_fetch.py`**, **`receive_tasks.py`**, **`lookup_reference.py`** — one feature each, extracted out of `bot.py`. `lookup_reference.py` additionally exports `_lu_search_ref`/`_lu_fetch_detail`/`_lu_format_result` as a public API — `bot.py`'s `_lookup_one_ref`/`_post_assignment_report` (used by New Assignment, not yet extracted) import these rather than duplicating the search/detail/format logic.
+- **`dlv_batch.py`**, **`dlv_tasks.py`**, **`morning_briefing.py`**, **`fetch_tasks.py`**, **`refresh_auth.py`**, **`sectional_properties.py`**, **`auto_fetch.py`**, **`receive_tasks.py`**, **`lookup_reference.py`**, **`valuer_tasks.py`** — one feature each, extracted out of `bot.py`. `lookup_reference.py` additionally exports `_lu_search_ref`/`_lu_fetch_detail`/`_lu_format_result` as a public API — `bot.py`'s `_lookup_one_ref`/`_post_assignment_report` (used by New Assignment, not yet extracted) import these rather than duplicating the search/detail/format logic. `valuer_tasks.py` has its own `_vt_fetch_task_detail` (token-rotation + retry against the detail-view endpoint) rather than importing Job Distribution's near-identical `_jd_fetch_task_detail` — the two were independent copies even before extraction (JD isn't extracted yet), so VT got its own copy instead of forcing an early JD extraction or a premature shared abstraction.
 - **`bot.py`** — everything not yet extracted, plus `main()`, which imports each module and calls its `register(app)`.
 - **`tests/`** — `unittest`-based tests per module (stdlib only, no new dependencies). Run with `python3 -m unittest discover -s assign/tests -v`.
 
@@ -56,7 +56,7 @@ Required environment variables (in `.env`):
 
 ### Extraction Roadmap
 
-As of this writing `bot.py` is **~3,895 lines**, down from ~9,200 before extraction began. Already extracted: `common.py`, `dlv_core.py`, `fetch_tasks_cache.py`, `email_service.py`, `telegram_report.py`, `token_rotator.py`, `dlv_batch.py`, `dlv_tasks.py`, `morning_briefing.py`, `fetch_tasks.py`, `refresh_auth.py`, `sectional_properties.py`, `auto_fetch.py`, `receive_tasks.py`, `lookup_reference.py`.
+As of this writing `bot.py` is **~3,419 lines**, down from ~9,200 before extraction began. Already extracted: `common.py`, `dlv_core.py`, `fetch_tasks_cache.py`, `email_service.py`, `telegram_report.py`, `token_rotator.py`, `dlv_batch.py`, `dlv_tasks.py`, `morning_briefing.py`, `fetch_tasks.py`, `refresh_auth.py`, `sectional_properties.py`, `auto_fetch.py`, `receive_tasks.py`, `lookup_reference.py`, `valuer_tasks.py`.
 
 **Remaining features and their approximate size/contiguity:**
 
@@ -67,10 +67,10 @@ As of this writing `bot.py` is **~3,895 lines**, down from ~9,200 before extract
 | ~~Auto Fetch (+ AF Results)~~ | ~~`AF`~~ | ~~~350 lines~~ | **done — `auto_fetch.py`** |
 | ~~Receive Tasks (+ schedules/batches)~~ | ~~`RS`~~ | ~~~1,089 lines~~ | **done — `receive_tasks.py`** |
 | ~~Lookup Reference~~ | ~~`LU`~~ | ~~~268 lines~~ | **done — `lookup_reference.py`** |
-| Valuer Tasks | `VT` | ~447 lines | yes |
+| ~~Valuer Tasks~~ | ~~`VT`~~ | ~~~447 lines~~ | **done — `valuer_tasks.py`** |
 | Job Distribution | `JD` | ~633 lines | mostly |
 | New Assignment | `S` | ~840 lines | yes |
-| Bulk Export | `BE` | ~1,000+ lines | no — split into two chunks with `JD`/`VT` sandwiched between |
+| Bulk Export | `BE` | ~1,000+ lines | no — split into two chunks with `JD` sandwiched between |
 
 **Cross-dependency blockers found (why a naive one-at-a-time order breaks down):**
 
@@ -79,6 +79,7 @@ As of this writing `bot.py` is **~3,895 lines**, down from ~9,200 before extract
 3. ~~New Assignment's `recv_confirm` calls `_post_assignment_report`/`_lookup_one_ref`, built on Lookup Reference's primitives~~ — resolved: `lookup_reference.py` exports `_lu_search_ref`/`_lu_fetch_detail`/`_lu_format_result`; `_post_assignment_report`/`_lookup_one_ref` stayed in `bot.py` (they belong to New Assignment, not yet extracted) and now import from `lookup_reference` instead of defining their own copies.
 4. Auto Fetch's `_auto_fetch_job` reads Sectional Properties' `load_sectional_config` for auto-routing.
 5. ~~Lookup Reference and Valuer Tasks both use `_NODE_LABELS`~~ — resolved: `_NODE_LABELS` promoted to `common.py`.
+6. ~~Valuer Tasks' `_vt_run` called Job Distribution's `_jd_fetch_task_detail`/`_jd_headers`/`_JD_WORKERS` (undocumented until Valuer Tasks was extracted)~~ — resolved: `valuer_tasks.py` got its own `_vt_fetch_task_detail`/`_vt_headers`/`_VT_WORKERS` (same logic, same detail-view endpoint, its own retry constants) instead of reaching into `bot.py`'s still-inline Job Distribution section. When Job Distribution is extracted (step 8), check whether the two copies are still identical enough to warrant promoting the pattern into `token_rotator.py` — don't do it preemptively.
 
 **Recommended order:**
 
@@ -88,7 +89,7 @@ As of this writing `bot.py` is **~3,895 lines**, down from ~9,200 before extract
 4. ~~**Receive Tasks**~~ (bundled `cmd_schedules`/`cmd_task_batches`) — done (`receive_tasks.py`). Follows the same startup-restore pattern `morning_briefing.py`/`auto_fetch.py` established: `register(app)` calls `_restore_schedules(app)` internally rather than `bot.py`'s `_post_init` doing it.
 5. ~~**Prerequisite cleanup**~~ — done. `_be_cred_keyboard` and `_NODE_LABELS` promoted to `common.py`; `_TokenRotator`/`_AllTokensExhausted` promoted to a new `token_rotator.py`. `bot.py`'s Bulk Export/Job Distribution/Lookup Reference sections now import all three rather than defining/duplicating them, so steps 6-10 no longer depend on Bulk Export extracting first.
 6. ~~**Lookup Reference**~~ — done (`lookup_reference.py`). Exports `_lu_search_ref`/`_lu_fetch_detail`/`_lu_format_result` as its public API; `_post_assignment_report`/`_lookup_one_ref` stayed in `bot.py` (owned by New Assignment) importing from `lookup_reference.py` rather than duplicating the logic.
-7. **Valuer Tasks** — now just imports the promoted keyboard/rotator/labels like everyone else.
+7. ~~**Valuer Tasks**~~ — done (`valuer_tasks.py`). Imports the promoted keyboard/rotator/labels like everyone else; also revealed blocker #6 (undocumented dependency on Job Distribution's `_jd_fetch_task_detail`), resolved with its own `_vt_fetch_task_detail` copy rather than reaching into `bot.py`.
 8. **Job Distribution** — same. Leave `cmd_export_status` in `bot.py` for now (thin combiner reading both BE's and JD's status dicts) until Bulk Export also lands.
 9. **New Assignment** — the original core flow, last of the "clean" features since it can now cleanly import Lookup Reference's primitives (already available via `lookup_reference.py`). Migrate `cmd_assignments`'s chunking loop onto `telegram_report.py` while here.
 10. **Bulk Export** — last and biggest, but by now `_TokenRotator`/`_be_cred_keyboard` already live in shared modules, so this is mostly mechanical stitching of its two chunks back into one file. Resolve `cmd_export_status` for real (import both modules' status dicts).
@@ -106,7 +107,7 @@ After step 10, `bot.py` should be left with just `cmd_start`/`cmd_help`, saved-v
 - `decode_jwt_exp()`, `build_session()`, and `AUTH_BASE_URL` are also imported directly by `token_refresh_daemon.py`
 
 **`bot.py`** — Telegram bot and orchestration:
-- Built on `python-telegram-bot` v21; owns the `S` (New Assignment) `ConversationHandler` directly, plus several more not yet extracted (`BE`, `JD`, `LU`, `VT`) — `RS` (Receive Tasks) now lives in `receive_tasks.py`, imported and registered via `receive_tasks.register(app)`
+- Built on `python-telegram-bot` v21; owns the `S` (New Assignment) `ConversationHandler` directly, plus `BE`/`JD` not yet extracted — `RS` (Receive Tasks), `LU` (Lookup Reference), and `VT` (Valuer Tasks) now live in `receive_tasks.py`/`lookup_reference.py`/`valuer_tasks.py` respectively, each imported and registered via its own `register(app)`
 - `Session` dataclass tracks per-user assign-flow state; Receive Tasks' `RTSession` lives alongside its `RS` enum in `receive_tasks.py`
 - Token cache: checks `saved_tokens.json` first; falls back to full login+OTP flow only when tokens are expired (5 min buffer)
 - Reference numbers can be typed manually or extracted from photos via `pytesseract` + Claude Vision (Anthropic API) as fallback
