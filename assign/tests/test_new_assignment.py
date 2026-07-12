@@ -185,6 +185,49 @@ class TestRecvConfirm(unittest.TestCase):
             result = _run(na.recv_confirm(update, ctx))
         self.assertEqual(result, na.ConversationHandler.END)
 
+    def test_large_result_set_paginates_instead_of_truncating(self):
+        """A large batch must be split across multiple messages, not truncated."""
+        update = _make_update_with_callback("confirm:yes")
+        ctx = MagicMock()
+        many_refs = [f"REF/{i}" for i in range(400)]   # long enough to exceed one 4000-char chunk
+        sess = na.Session(refs=many_refs, tokens=TOKENS, saved_valuer={"name": "Jane", "uid": "1", "account_number": "A1"})
+        sess.session = MagicMock()
+        sess.session.post.return_value = MagicMock(raise_for_status=lambda: None)
+        ctx.user_data = {"session": sess}
+        with patch.object(na, "persist_valuer"), \
+             patch.object(na, "persist_assignment"), \
+             patch.object(na.asyncio, "to_thread", new=AsyncMock(return_value=[])):
+            _run(na.recv_confirm(update, ctx))
+        sent_texts = [c.args[0] for c in update.callback_query.message.reply_text.call_args_list]
+        self.assertGreater(len(sent_texts), 1)
+        for ref in many_refs:
+            self.assertTrue(any(ref in t for t in sent_texts), f"{ref} missing from any sent chunk")
+
+
+class TestCmdAssignments(unittest.TestCase):
+    def test_no_assignments_shows_empty_message(self):
+        update = _make_update_with_message()
+        ctx = MagicMock()
+        with patch.object(na, "allowed", return_value=True), \
+             patch.object(na, "load_saved_assignments", return_value={}):
+            _run(na.cmd_assignments(update, ctx))
+        self.assertIn("No assignments", update.message.reply_text.call_args[0][0])
+
+    def test_large_history_paginates_instead_of_truncating(self):
+        assignments = {
+            f"REF/{i}": {"valuer_name": f"Valuer {i}", "assigned_at": "2026-01-01"}
+            for i in range(400)
+        }
+        update = _make_update_with_message()
+        ctx = MagicMock()
+        with patch.object(na, "allowed", return_value=True), \
+             patch.object(na, "load_saved_assignments", return_value=assignments):
+            _run(na.cmd_assignments(update, ctx))
+        sent_texts = [c.args[0] for c in update.message.reply_text.call_args_list]
+        self.assertGreater(len(sent_texts), 1)
+        self.assertTrue(any("REF/0" in t for t in sent_texts))
+        self.assertTrue(any("REF/399" in t for t in sent_texts))
+
 
 if __name__ == "__main__":
     unittest.main()

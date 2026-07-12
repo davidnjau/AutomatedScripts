@@ -264,6 +264,57 @@ class TestRecvRtTaskCount(unittest.TestCase):
         self.assertEqual(ctx.user_data["rt_session"].task_count, 10)
 
 
+class TestDoAssignTasks(unittest.TestCase):
+    def test_large_result_set_paginates_instead_of_truncating(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        http_sess = MagicMock()
+        http_sess.post.return_value = MagicMock(raise_for_status=lambda: None)
+        tasks = [
+            {"reference_number": f"REF/{i}", "consideration_amount": 1000 + i}
+            for i in range(400)
+        ]
+        with patch.object(rt_mod, "persist_assignment"), \
+             patch.object(rt_mod, "persist_task_batch"):
+            _run(rt_mod._do_assign_tasks(bot, 555, http_sess, TOKENS, tasks, "uid1", "Jane", "staff"))
+        sent_texts = [c.args[1] for c in bot.send_message.call_args_list]
+        self.assertGreater(len(sent_texts), 1)
+        self.assertTrue(any("REF/0" in t for t in sent_texts))
+        self.assertTrue(any("REF/399" in t for t in sent_texts))
+
+
+class TestRtFetchAndShow(unittest.TestCase):
+    def test_large_matched_list_paginates_instead_of_collapsing(self):
+        message = MagicMock()
+        message.reply_text = AsyncMock()
+        rt = rt_mod.RTSession()
+        rt.task_type = "STAMP_DUTY"
+        rt.tokens = TOKENS
+        rt.session = MagicMock()
+        rt.session.get.side_effect = RuntimeError("skip peek")
+        rt.task_count = 400
+        rt.staff_data = {"staff_details": {"firstname": "Jane", "lastname": "Doe"}}
+
+        matched = [
+            {
+                "reference_number": f"REF/{i}",
+                "consideration_amount": 1000 + i,
+                "parcel_number": "P1",
+                "registry": "NAIROBI",
+                "date_created": "2026-01-01",
+            }
+            for i in range(400)
+        ]
+        with patch.object(rt_mod, "_fetch_tasks", return_value=[{"id": str(i)} for i in range(400)]), \
+             patch.object(rt_mod, "_verify_and_filter_tasks", return_value=matched):
+            result = _run(rt_mod._rt_fetch_and_show(message, rt))
+        self.assertEqual(result, rt_mod.RS.RT_CONFIRM)
+        sent_texts = [c.args[0] for c in message.reply_text.call_args_list]
+        self.assertGreater(len(sent_texts), 1)
+        self.assertTrue(any("REF/0" in t for t in sent_texts))
+        self.assertTrue(any("REF/399" in t for t in sent_texts))
+
+
 class TestRecvRtAmountChoice(unittest.TestCase):
     def test_custom_asks_for_text_input(self):
         update = _make_update_with_callback("ft_amount:custom")

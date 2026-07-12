@@ -60,6 +60,7 @@ from common import (
     persist_tokens,
     _safe_err,
 )
+from telegram_report import _send_chunked_report
 
 SAVED_TASK_BATCHES_FILE = os.path.join(DATA_DIR, "saved_task_batches.json")
 SAVED_SCHEDULES_FILE    = os.path.join(DATA_DIR, "saved_schedules.json")
@@ -373,17 +374,17 @@ async def _do_assign_tasks(
     }
     persist_task_batch(batch)
 
-    summary = (
+    header = (
         f"🏁 *Receive Tasks Complete*\n\n"
         f"*Valuer:* {staff_name}\n"
         f"*Assigned:* {len(ok_refs)} / {len(tasks)}\n"
-        f"*Failed:*   {len(fail_refs)} / {len(tasks)}\n\n"
-        + "\n".join(result_lines)
+        f"*Failed:*   {len(fail_refs)} / {len(tasks)}\n"
     )
-    if len(summary) > 4000:
-        summary = summary[:4000] + "\n…_(truncated)_"
 
-    await bot.send_message(chat_id, summary, parse_mode="Markdown")
+    async def _send(text, reply_markup):
+        await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
+
+    await _send_chunked_report(_send, [header] + result_lines, join="\n")
 
 
 # ──────────────────────────────────────────────────────────
@@ -718,20 +719,14 @@ async def _rt_fetch_and_show(message, rt: RTSession) -> int:
             f"   📅 {t['date_created'][:10]}"
         )
 
-    summary = (
-        f"📋 *Tasks for {name}* ({len(matched)} task(s))\n\n"
-        + "\n\n".join(lines)
-        + "\n\nConfirm assignment?"
-    )
-    if len(summary) > 4000:
-        summary = (
-            f"📋 *{len(matched)} tasks* ready to assign to *{name}*.\n"
-            "_(List too long to display in full)_\n\nConfirm assignment?"
-        )
+    header = f"📋 *Tasks for {name}* ({len(matched)} task(s))"
 
-    await message.reply_text(
-        summary,
-        parse_mode="Markdown",
+    async def _send(text, reply_markup):
+        await message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+
+    await _send_chunked_report(
+        _send, [header] + lines,
+        footer="\n\nConfirm assignment?",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Confirm & Assign", callback_data="rt_confirm:yes")],
             [InlineKeyboardButton("❌ Cancel",           callback_data="rt_confirm:no")],

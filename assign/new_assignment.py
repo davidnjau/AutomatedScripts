@@ -75,6 +75,7 @@ from common import (
     persist_valuer,
 )
 from lookup_reference import _lu_fetch_detail, _lu_format_result, _lu_search_ref
+from telegram_report import _send_chunked_report
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
@@ -255,31 +256,16 @@ async def cmd_assignments(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reverse=True,
     )
 
-    lines = []
+    lines = [f"📜 *Assignments ({len(sorted_items)} total)*"]
     for ref, info in sorted_items:
         valuer = info.get("valuer_name", "Unknown")
         when   = info.get("assigned_at", "—")
         lines.append(f"• `{ref}`\n  👤 {valuer} | 🕐 {when}")
 
-    header = f"📜 *Assignments ({len(lines)} total)*\n\n"
-    chunks = []
-    chunk  = header
-    for line in lines:
-        candidate = (chunk + line + "\n\n").strip()
-        if len(candidate) > 4000:
-            chunks.append(chunk)
-            chunk = line + "\n\n"
-        else:
-            chunk = candidate + "\n"
-    if chunk.strip():
-        chunks.append(chunk)
+    async def _send(text, reply_markup):
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
 
-    for i, c in enumerate(chunks):
-        await update.message.reply_text(
-            c,
-            parse_mode="Markdown",
-            reply_markup=_main_menu() if i == len(chunks) - 1 else None,
-        )
+    await _send_chunked_report(_send, lines, reply_markup=_main_menu())
 
 
 # ──────────────────────────────────────────────────────────
@@ -902,18 +888,17 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for ref in ok_refs:
             persist_assignment(ref, name, uid)   # record ref → valuer mapping
 
-    summary = (
+    header = (
         f"🏁 *Assignment Complete*\n\n"
         f"*Valuer:* {name}\n"
         f"*Success:* {len(ok_refs)} / {len(sess.refs)}\n"
-        f"*Failed:*  {len(fail_refs)} / {len(sess.refs)}\n\n"
-        + "\n".join(result_lines)
+        f"*Failed:*  {len(fail_refs)} / {len(sess.refs)}\n"
     )
 
-    if len(summary) > 4000:
-        summary = summary[:4000] + "\n…_(truncated)_"
+    async def _send_summary(text, reply_markup):
+        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
 
-    await query.message.reply_text(summary, parse_mode="Markdown")
+    await _send_chunked_report(_send_summary, [header] + result_lines, join="\n")
 
     if fail_refs:
         await query.message.reply_text(
