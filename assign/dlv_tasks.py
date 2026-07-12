@@ -22,8 +22,6 @@ from typing import List
 
 import asyncio
 import openpyxl
-from openpyxl.styles import Font, PatternFill
-from openpyxl.utils import get_column_letter
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -63,6 +61,7 @@ from dlv_core import (
     save_dlv_batch,
 )
 from email_service import _send_bulk_export_email
+from excel_report import autofit_columns, style_header_row
 from fetch_tasks_cache import _fetch_tasks_log_lookup
 from telegram_report import _send_chunked_report
 
@@ -283,15 +282,7 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
     ws.title = "DLV Tasks"
     cols = ["Reference Number", "Parcel Number", "Registry", "County",
             "Date Added", "Valuer", "Assessor", "Status"]
-    header_font = Font(bold=True)
-    header_fill = PatternFill("solid", fgColor="BDD7EE")
-    ws.append(cols)
-    for ci, _ in enumerate(cols, start=1):
-        cell = ws.cell(row=1, column=ci)
-        cell.font = header_font
-        cell.fill = header_fill
-    ws.auto_filter.ref = ws.dimensions
-    ws.freeze_panes    = "A2"
+    style_header_row(ws, cols)
     _status_labels = {"dlv": "In DLV", "assessor": "With Assessor (not yet in DLV)"}
     for r in rows:
         ws.append([
@@ -304,14 +295,7 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
             r.get("assessor", ""),
             _status_labels.get(r.get("location", ""), "Not found"),
         ])
-    for ci, col_name in enumerate(cols, start=1):
-        col_letter = get_column_letter(ci)
-        max_len = len(col_name)
-        for row in ws.iter_rows(min_col=ci, max_col=ci, min_row=2):
-            val = str(row[0].value or "")
-            if len(val) > max_len:
-                max_len = len(val)
-        ws.column_dimensions[col_letter].width = max(15, min(60, max_len + 2))
+    autofit_columns(ws, min_width=15, max_width=60)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()

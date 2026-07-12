@@ -25,7 +25,7 @@ from typing import List
 
 import openpyxl
 import requests
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import PatternFill
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -58,6 +58,7 @@ from common import (
     logger,
     not_cancel,
 )
+from excel_report import autofit_columns, style_header_row
 from token_rotator import _AllTokensExhausted, _TokenRotator
 
 _VT_TOKEN_ROTATE_DELAY = 10   # seconds to wait before retrying with a new token
@@ -179,21 +180,13 @@ def _vt_build_excel(
     ws       = wb.active
     ws.title = "Valuer Tasks"
 
-    hdr_font = Font(bold=True)
-    hdr_fill = PatternFill("solid", fgColor="BDD7EE")
     alt_fill = PatternFill("solid", fgColor="F2F2F2")
 
     headers = [
         "Reference Number", "Parcel Number", "Registry", "County",
         "Consideration (KES)", "Node / Status", "Date Created",
     ]
-    ws.append(headers)
-    for c in range(1, len(headers) + 1):
-        cell      = ws.cell(row=1, column=c)
-        cell.font = hdr_font
-        cell.fill = hdr_fill
-    ws.auto_filter.ref = ws.dimensions
-    ws.freeze_panes    = "A2"
+    style_header_row(ws, headers)
 
     for i, t in enumerate(tasks, start=2):
         node_raw = t.get("node", "")
@@ -217,9 +210,7 @@ def _vt_build_excel(
     ws.append([f"Valuer: {valuer_name}", "", "", "", "", "", f"Days back: {days_back}"])
     ws.append([f"Total tasks: {len(tasks)}"])
 
-    for col in ws.columns:
-        max_len = max((len(str(c.value or "")) for c in col), default=10)
-        ws.column_dimensions[col[0].column_letter].width = max(12, min(55, max_len + 2))
+    autofit_columns(ws)
 
     buf = io.BytesIO()
     wb.save(buf)

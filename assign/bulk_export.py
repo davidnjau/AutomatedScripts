@@ -71,6 +71,7 @@ from common import (
     not_cancel,
 )
 from email_service import _send_bulk_export_email
+from excel_report import autofit_columns, style_header_row
 from job_distribution import _JD_STATUS
 from token_rotator import _AllTokensExhausted, _TokenRotator
 
@@ -441,15 +442,7 @@ def _be_build_excel(rows: List[dict]) -> bytes:
     date_cols    = {"Application Date Created", "Date of Valuation"}
     number_cols  = {"Valuer Total Land Value (KES)", "Harmonized Total Land Value (KES)"}
 
-    # Write header
-    ws.append(_EXCEL_COLUMNS)
-    for col_idx, col_name in enumerate(_EXCEL_COLUMNS, start=1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.font  = header_font
-        cell.fill  = header_fill
-
-    ws.auto_filter.ref = ws.dimensions
-    ws.freeze_panes    = "A2"
+    style_header_row(ws, _EXCEL_COLUMNS, font=header_font, fill=header_fill)
 
     # Write data rows
     for row_data in rows:
@@ -467,15 +460,7 @@ def _be_build_excel(rows: List[dict]) -> bytes:
                 except (ValueError, TypeError):
                     pass
 
-    # Auto-fit column widths (min 15, max 50)
-    for col_idx, col_name in enumerate(_EXCEL_COLUMNS, start=1):
-        col_letter = get_column_letter(col_idx)
-        max_len    = len(col_name)
-        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx, min_row=2):
-            val = str(row[0].value or "")
-            if len(val) > max_len:
-                max_len = len(val)
-        ws.column_dimensions[col_letter].width = max(15, min(50, max_len + 2))
+    autofit_columns(ws, min_width=15, max_width=50)
 
     # ── Summary sheet ─────────────────────────────────────────
     ws2 = wb.create_sheet("Summary")

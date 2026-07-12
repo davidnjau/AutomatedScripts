@@ -60,6 +60,7 @@ from common import (
     get_valid_tokens,
     logger,
 )
+from excel_report import autofit_columns, style_header_row
 from token_rotator import _AllTokensExhausted, _TokenRotator
 
 _JD_TOKEN_ROTATE_DELAY = 10   # seconds to wait before retrying with a new token
@@ -221,18 +222,10 @@ def _jd_build_excel(
     alt_fill = PatternFill("solid", fgColor="F2F2F2")
 
     def _header_row(ws, cols):
-        ws.append(cols)
-        for c in range(1, len(cols) + 1):
-            cell       = ws.cell(row=1, column=c)
-            cell.font  = hdr_font
-            cell.fill  = hdr_fill
-        ws.auto_filter.ref = ws.dimensions
-        ws.freeze_panes    = "A2"
+        style_header_row(ws, cols, font=hdr_font, fill=hdr_fill)
 
     def _autofit(ws):
-        for col in ws.columns:
-            max_len = max((len(str(c.value or "")) for c in col), default=10)
-            ws.column_dimensions[col[0].column_letter].width = max(12, min(55, max_len + 2))
+        autofit_columns(ws)
 
     # ── Sheet 1: Team Summary ──────────────────────────────
     ws1 = wb.active
