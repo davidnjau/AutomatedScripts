@@ -4,8 +4,7 @@ common.py
 =========
 Shared infrastructure used by multiple feature modules: logging, generic
 JSON persistence, the auth-token cache, saved-valuer/assignment storage,
-cparams headers, the main menu keyboard, auth guards, and the bulk-export
-email sender.
+cparams headers, the main menu keyboard, and auth guards.
 
 Moved out of bot.py so that feature modules (dlv_batch.py, dlv_tasks.py,
 and future extractions) can import this without creating a circular
@@ -16,27 +15,32 @@ import base64
 import json
 import logging
 import os
-import smtplib
 import threading
 import time
 import re
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders as _email_encoders
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
+import requests
 from dotenv import load_dotenv
 from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
     Update,
 )
 from telegram.ext import ContextTypes, ConversationHandler, filters
 
-from ardhisasa_auth import AuthTokens, decode_jwt_exp
+from ardhisasa_auth import (
+    PUBLIC_CREDENTIALS,
+    STAFF_CREDENTIALS_ICT,
+    STAFF_CREDENTIALS_SUPPORT,
+    STAFF_CREDENTIALS_VALUER,
+    AuthTokens,
+    decode_jwt_exp,
+)
 
 # ──────────────────────────────────────────────────────────
 # Logging
@@ -76,9 +80,10 @@ BASE_URL = "https://ardhisasa-api.lands.go.ke"
 # ──────────────────────────────────────────────────────────
 # Persistent storage
 # ──────────────────────────────────────────────────────────
-SAVED_VALUERS_FILE     = os.path.join(DATA_DIR, "saved_valuers.json")
-SAVED_TOKENS_FILE      = os.path.join(DATA_DIR, "saved_tokens.json")
-SAVED_ASSIGNMENTS_FILE = os.path.join(DATA_DIR, "saved_assignments.json")
+SAVED_VALUERS_FILE          = os.path.join(DATA_DIR, "saved_valuers.json")
+SAVED_TOKENS_FILE           = os.path.join(DATA_DIR, "saved_tokens.json")
+SAVED_ASSIGNMENTS_FILE      = os.path.join(DATA_DIR, "saved_assignments.json")
+SAVED_SECTIONAL_CONFIG_FILE = os.path.join(DATA_DIR, "saved_sectional_config.json")
 
 # base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
 CPARAMS_DLV          = base64.b64encode(b'{"active_role":"DLV"}').decode()
@@ -103,6 +108,19 @@ def _atomic_json_write(path: str, data, **dump_kwargs) -> None:
     with open(tmp, "w") as f:
         json.dump(data, f, **dump_kwargs)
     os.replace(tmp, path)
+
+
+def _safe_err(e: Exception) -> str:
+    """Return a user-facing error string that contains no internal URLs or server detail.
+
+    HTTP errors are reduced to their status code; everything else becomes a
+    generic phrase so that API internals never leak into Telegram messages.
+    The full exception is intentionally NOT included here — callers should
+    log it separately before sending this string to the user.
+    """
+    if isinstance(e, requests.HTTPError) and e.response is not None:
+        return f"server returned HTTP {e.response.status_code}"
+    return "unexpected error — check logs"
 
 
 # ── Valuers ───────────────────────────────────────────────
@@ -149,6 +167,23 @@ def persist_assignment(ref: str, valuer_name: str, valuer_uid: str):
             assignments = dict(list(assignments.items())[-500:])
         _atomic_json_write(SAVED_ASSIGNMENTS_FILE, assignments, indent=2)
     logger.info("Saved assignment %s → %s", ref, valuer_name)
+
+
+# ── Sectional Properties config ────────────────────────────
+# Read by Auto Fetch (for sectional-task auto-routing) as well as by
+# Sectional Properties itself, so it lives here rather than in either
+# feature module.
+
+def load_sectional_config() -> Optional[Dict]:
+    try:
+        with open(SAVED_SECTIONAL_CONFIG_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_sectional_config(cfg: Dict) -> None:
+    _atomic_json_write(SAVED_SECTIONAL_CONFIG_FILE, cfg, indent=2)
 
 
 # ── Tokens ────────────────────────────────────────────────
@@ -209,6 +244,128 @@ def _ft_headers(tokens: AuthTokens) -> dict:
         "JWTAUTH":       f"Bearer {tokens.jwt}",
         "cparams":       CPARAMS_SUPPORT,
     }
+
+
+def _date_cutoff_str(days: int) -> str:
+    """Return a YYYY-MM-DD cutoff string for N days ago (UTC)."""
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def _within_days(date_created: str, cutoff: str) -> bool:
+    """
+    Compare date_created from the API response against a YYYY-MM-DD cutoff.
+    ISO date strings are lexicographically sortable, so simple string compare works.
+    If date_created is missing or unparseable, include the task (fail-open).
+    """
+    if not date_created:
+        return True
+    # Take only the date part (first 10 chars: YYYY-MM-DD) regardless of time/timezone suffix
+    return date_created[:10] >= cutoff
+
+
+# ──────────────────────────────────────────────────────────
+# Credential profiles (used by any feature with its own login step)
+# ──────────────────────────────────────────────────────────
+CRED_MAP = {
+    "publicuser":   PUBLIC_CREDENTIALS,
+    "staff":        STAFF_CREDENTIALS_ICT,
+    "staff2":       STAFF_CREDENTIALS_SUPPORT,
+    "staff_valuer": STAFF_CREDENTIALS_VALUER,
+}
+
+CRED_LABELS = {
+    "publicuser":   "👤 Public User",
+    "staff":        "🏢 ICT",
+    "staff2":       "🏢 Support Reg",
+    "staff_valuer": "🏢 Staff Valuer",
+}
+
+
+def _cred_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(CRED_LABELS["publicuser"],   callback_data="cred:publicuser")],
+        [InlineKeyboardButton(CRED_LABELS["staff"],        callback_data="cred:staff")],
+        [InlineKeyboardButton(CRED_LABELS["staff2"],       callback_data="cred:staff2")],
+        [InlineKeyboardButton(CRED_LABELS["staff_valuer"], callback_data="cred:staff_valuer")],
+    ])
+
+
+def _be_cred_keyboard() -> Optional[InlineKeyboardMarkup]:
+    """Return an inline keyboard of credential profiles that currently have valid tokens.
+    Returns None if no credentials are valid. Used by Bulk Export, Job Distribution,
+    Lookup Reference, and Valuer Tasks — unlike _cred_keyboard() above, this only lists
+    profiles with a cached token already, since those features run against a fixed
+    credential rather than triggering a fresh login."""
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"be_cred:{key}")]
+        for key, label in CRED_LABELS.items()
+        if get_valid_tokens(key)
+    ]
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+# Node code → human-readable label — shared by Lookup Reference and Valuer Tasks
+_NODE_LABELS: Dict[str, str] = {
+    "VALUATION_STAMP_DUTY_CREATED":        "📭 Unassigned (awaiting valuer)",
+    "VALUATION_STAMP_DUTY_VALUER_REPORT":  "✍️ Assigned — valuer report pending",
+    "STAMP_DUTY_PAYMENT_DEFINITION":       "💳 Payment stage",
+}
+
+
+# ──────────────────────────────────────────────────────────
+# Fetch Tasks / Auto Fetch shared filter keyboards
+# ──────────────────────────────────────────────────────────
+def _ft_county_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🌆 Nairobi",      callback_data="ft_county:nairobi"),
+            InlineKeyboardButton("📋 All Counties", callback_data="ft_county:all"),
+        ],
+    ])
+
+
+def _ft_registry_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📁 Central",        callback_data="ft_registry:central"),
+            InlineKeyboardButton("📁 Nairobi",         callback_data="ft_registry:nairobi"),
+        ],
+        [
+            InlineKeyboardButton("📋 All Registries", callback_data="ft_registry:all"),
+        ],
+    ])
+
+
+def _ft_amount_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("0 – 1M",        callback_data="ft_amount:0_1m"),
+            InlineKeyboardButton("1M – 5M",        callback_data="ft_amount:1m_5m"),
+        ],
+        [
+            InlineKeyboardButton("5M – 10M",       callback_data="ft_amount:5m_10m"),
+            InlineKeyboardButton("20M – 50M",      callback_data="ft_amount:20m_50m"),
+        ],
+        [
+            InlineKeyboardButton("50M – 100M",     callback_data="ft_amount:50m_100m"),
+            InlineKeyboardButton("80M – 300M",     callback_data="ft_amount:80m_300m"),
+        ],
+        [
+            InlineKeyboardButton("80M – 3B",       callback_data="ft_amount:80m_3b"),
+            InlineKeyboardButton("✏️ Custom",       callback_data="ft_amount:custom"),
+        ],
+        [
+            InlineKeyboardButton("📋 No filter",   callback_data="ft_amount:all"),
+        ],
+    ])
+
+
+def _sectional_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🚫 Exclude Sectional", callback_data="ft_sectional:exclude"),
+        InlineKeyboardButton("🏢 Sectional Only",    callback_data="ft_sectional:only"),
+        InlineKeyboardButton("📋 All",               callback_data="ft_sectional:all"),
+    ]])
 
 
 # ──────────────────────────────────────────────────────────
@@ -315,34 +472,4 @@ async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ──────────────────────────────────────────────────────────
-# Email (bulk export + morning briefing delivery)
-# ──────────────────────────────────────────────────────────
-def _send_bulk_export_email(to_email: str, filename: str, xlsx_bytes: bytes) -> None:
-    """Send the Excel file as an email attachment. Raises on failure."""
-    if not SMTP_USER or not SMTP_PASS:
-        raise RuntimeError("SMTP_USER / SMTP_PASS not configured in .env")
-
-    msg            = MIMEMultipart()
-    msg["Subject"] = f"Ardhisasa Export Valuation Report — {filename}"
-    msg["From"]    = SMTP_USER
-    msg["To"]      = to_email
-
-    body = (
-        f"Please find attached the Ardhisasa stamp-duty bulk export.\n\n"
-        f"File: {filename}\n"
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-    )
-    msg.attach(MIMEText(body, "plain"))
-
-    part = MIMEBase("application", "octet-stream")
-    part.set_payload(xlsx_bytes)
-    _email_encoders.encode_base64(part)
-    part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
-    msg.attach(part)
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_USER, to_email, msg.as_string())
+# (_send_bulk_export_email / _send_auto_fetch_email live in email_service.py)
