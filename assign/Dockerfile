@@ -18,6 +18,7 @@ COPY fetch_tasks.py .
 COPY email_service.py .
 COPY telegram_report.py .
 COPY refresh_auth.py .
+COPY sectional_properties.py .
 COPY ardhisasa_auth.py .
 COPY token_refresh_daemon.py .
 

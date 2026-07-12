@@ -31,12 +31,12 @@ Required environment variables (in `.env`):
 
 `bot.py` originally held every feature in one file. It's being split incrementally, one feature at a time, into sibling modules that each own their conversation handlers and register themselves into `bot.py`'s `main()` via a `register(app)` function:
 
-- **`common.py`** — shared bot-wide infra: logger, generic JSON persistence (`_atomic_json_write`), the token cache (`get_valid_tokens`, `_any_valid_tokens`, `persist_tokens`), `CRED_MAP`/`CRED_LABELS`/`_cred_keyboard`, `cparams` constants, the main menu keyboard, auth guards (`allowed`/`deny`), `_date_cutoff_str`/`_within_days`, and shared filter keyboards (`_ft_county_keyboard`, `_ft_registry_keyboard`, `_ft_amount_keyboard`, `_sectional_keyboard`).
+- **`common.py`** — shared bot-wide infra: logger, generic JSON persistence (`_atomic_json_write`), the token cache (`get_valid_tokens`, `_any_valid_tokens`, `persist_tokens`), `CRED_MAP`/`CRED_LABELS`/`_cred_keyboard`, `cparams` constants, the main menu keyboard, auth guards (`allowed`/`deny`), `_safe_err` (redacts exception detail before it reaches a Telegram message), `_date_cutoff_str`/`_within_days`, shared filter keyboards (`_ft_county_keyboard`, `_ft_registry_keyboard`, `_ft_amount_keyboard`, `_sectional_keyboard`), and `load_sectional_config`/`save_sectional_config` (owned conceptually by Sectional Properties, but read by Auto Fetch too, so it lives here rather than forcing a cross-feature-module import).
 - **`dlv_core.py`** — the DLV queue storage (`load_dlv_batch`/`save_dlv_batch`/etc.) and the assessor/DLV search-and-classify layer shared by DLV Batch and DLV Tasks.
 - **`fetch_tasks_cache.py`** — the 1-day assessor cache bridging Fetch Tasks, DLV Batch, and DLV Tasks.
 - **`email_service.py`** — the shared SMTP sender: `_send_bulk_export_email` (attachment-based, used by Bulk Export/DLV Tasks/Morning Briefing) and `_send_auto_fetch_email` (plain+HTML, used by Auto Fetch). Any feature that offers "email me the report" calls into here rather than building its own SMTP boilerplate.
 - **`telegram_report.py`** — the shared "paginate a report and send it to Telegram" helper: `_chunk_lines` (pure, splits a list of text lines into ≤4000-char blocks) and `_send_chunked_report` (drives sending, attaching a footer/`reply_markup` to the last chunk only). DLV Tasks' and Fetch Tasks' report senders build their own lines/footer/keyboard, then delegate the chunking+sending to this.
-- **`dlv_batch.py`**, **`dlv_tasks.py`**, **`morning_briefing.py`**, **`fetch_tasks.py`**, **`refresh_auth.py`** — one feature each, extracted out of `bot.py`.
+- **`dlv_batch.py`**, **`dlv_tasks.py`**, **`morning_briefing.py`**, **`fetch_tasks.py`**, **`refresh_auth.py`**, **`sectional_properties.py`** — one feature each, extracted out of `bot.py`.
 - **`bot.py`** — everything not yet extracted, plus `main()`, which imports each module and calls its `register(app)`.
 - **`tests/`** — `unittest`-based tests per module (stdlib only, no new dependencies). Run with `python3 -m unittest discover -s assign/tests -v`.
 
@@ -55,14 +55,14 @@ Required environment variables (in `.env`):
 
 ### Extraction Roadmap
 
-As of this writing `bot.py` is **~6,286 lines**, down from ~9,200 before extraction began. Already extracted: `common.py`, `dlv_core.py`, `fetch_tasks_cache.py`, `email_service.py`, `telegram_report.py`, `dlv_batch.py`, `dlv_tasks.py`, `morning_briefing.py`, `fetch_tasks.py`, `refresh_auth.py`.
+As of this writing `bot.py` is **~6,082 lines**, down from ~9,200 before extraction began. Already extracted: `common.py`, `dlv_core.py`, `fetch_tasks_cache.py`, `email_service.py`, `telegram_report.py`, `dlv_batch.py`, `dlv_tasks.py`, `morning_briefing.py`, `fetch_tasks.py`, `refresh_auth.py`, `sectional_properties.py`.
 
 **Remaining features and their approximate size/contiguity:**
 
 | Feature | Enum | Size | Contiguous? |
 |---|---|---|---|
 | ~~Refresh Auth~~ | ~~`AS`~~ | ~~~155 lines~~ | **done — `refresh_auth.py`** |
-| Sectional Properties | `SC` | ~170 lines | yes |
+| ~~Sectional Properties~~ | ~~`SC`~~ | ~~~170 lines~~ | **done — `sectional_properties.py`** |
 | Auto Fetch (+ AF Results) | `AF` | ~350 lines | mostly |
 | Receive Tasks (+ schedules/batches) | `RS` | ~1,089 lines | yes |
 | Lookup Reference | `LU` | ~268 lines | no — split in two, physically misfiled under a "Job Distribution Analysis" comment near `JD` |
@@ -82,7 +82,7 @@ As of this writing `bot.py` is **~6,286 lines**, down from ~9,200 before extract
 **Recommended order:**
 
 1. ~~**Refresh Auth**~~ — done (`refresh_auth.py`).
-2. **Sectional Properties** — while extracting, promote `load_sectional_config`/`save_sectional_config` to `common.py` (matches the existing `load_briefing_config`-style convention) so Auto Fetch doesn't need to import a whole feature module just for config.
+2. ~~**Sectional Properties**~~ — done (`sectional_properties.py`). `load_sectional_config`/`save_sectional_config` promoted to `common.py` as planned; also promoted `_safe_err` there (needed by Sectional's name-search error path, and already duplicated-in-spirit by New Assignment/Receive Tasks — all three now share the one copy).
 3. **Auto Fetch** (bundle `cmd_af_results`/`recv_af_result_detail`) — now unblocked by step 2. Migrate its two unmigrated Telegram-chunking spots (`_auto_fetch_job`'s notify loop, `recv_af_result_detail`) onto `telegram_report.py` while here.
 4. **Receive Tasks** (bundle `cmd_schedules`/`cmd_task_batches`) — fully self-contained; follows the same startup-restore pattern `morning_briefing.py` already established (`_restore_schedules(app)` called from `register(app)`).
 5. **Prerequisite cleanup**: promote `_be_cred_keyboard`, `_TokenRotator`/`_AllTokensExhausted`, and `_NODE_LABELS` out of Bulk Export's section — the keyboard and labels into `common.py`, the rotator classes into a new `token_rotator.py`.

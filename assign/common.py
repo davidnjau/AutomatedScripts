@@ -22,6 +22,7 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
+import requests
 from dotenv import load_dotenv
 from telegram import (
     InlineKeyboardButton,
@@ -79,9 +80,10 @@ BASE_URL = "https://ardhisasa-api.lands.go.ke"
 # ──────────────────────────────────────────────────────────
 # Persistent storage
 # ──────────────────────────────────────────────────────────
-SAVED_VALUERS_FILE     = os.path.join(DATA_DIR, "saved_valuers.json")
-SAVED_TOKENS_FILE      = os.path.join(DATA_DIR, "saved_tokens.json")
-SAVED_ASSIGNMENTS_FILE = os.path.join(DATA_DIR, "saved_assignments.json")
+SAVED_VALUERS_FILE          = os.path.join(DATA_DIR, "saved_valuers.json")
+SAVED_TOKENS_FILE           = os.path.join(DATA_DIR, "saved_tokens.json")
+SAVED_ASSIGNMENTS_FILE      = os.path.join(DATA_DIR, "saved_assignments.json")
+SAVED_SECTIONAL_CONFIG_FILE = os.path.join(DATA_DIR, "saved_sectional_config.json")
 
 # base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
 CPARAMS_DLV          = base64.b64encode(b'{"active_role":"DLV"}').decode()
@@ -106,6 +108,19 @@ def _atomic_json_write(path: str, data, **dump_kwargs) -> None:
     with open(tmp, "w") as f:
         json.dump(data, f, **dump_kwargs)
     os.replace(tmp, path)
+
+
+def _safe_err(e: Exception) -> str:
+    """Return a user-facing error string that contains no internal URLs or server detail.
+
+    HTTP errors are reduced to their status code; everything else becomes a
+    generic phrase so that API internals never leak into Telegram messages.
+    The full exception is intentionally NOT included here — callers should
+    log it separately before sending this string to the user.
+    """
+    if isinstance(e, requests.HTTPError) and e.response is not None:
+        return f"server returned HTTP {e.response.status_code}"
+    return "unexpected error — check logs"
 
 
 # ── Valuers ───────────────────────────────────────────────
@@ -152,6 +167,23 @@ def persist_assignment(ref: str, valuer_name: str, valuer_uid: str):
             assignments = dict(list(assignments.items())[-500:])
         _atomic_json_write(SAVED_ASSIGNMENTS_FILE, assignments, indent=2)
     logger.info("Saved assignment %s → %s", ref, valuer_name)
+
+
+# ── Sectional Properties config ────────────────────────────
+# Read by Auto Fetch (for sectional-task auto-routing) as well as by
+# Sectional Properties itself, so it lives here rather than in either
+# feature module.
+
+def load_sectional_config() -> Optional[Dict]:
+    try:
+        with open(SAVED_SECTIONAL_CONFIG_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_sectional_config(cfg: Dict) -> None:
+    _atomic_json_write(SAVED_SECTIONAL_CONFIG_FILE, cfg, indent=2)
 
 
 # ── Tokens ────────────────────────────────────────────────

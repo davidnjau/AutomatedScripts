@@ -86,7 +86,6 @@ from common import (
     BTN_JOB_DIST,
     BTN_LOOKUP,
     BTN_RESTART,
-    BTN_SECTIONAL,
     BTN_TOKEN_STATUS,
     BTN_VALUER_TASKS,
     BTN_VALUERS,
@@ -117,11 +116,13 @@ from common import (
     get_valid_tokens,
     load_saved_assignments,
     load_saved_valuers,
+    load_sectional_config,
     logger,
     not_cancel,
     persist_assignment,
     persist_tokens,
     persist_valuer,
+    _safe_err,
 )
 from dlv_core import load_dlv_batch
 from email_service import _send_auto_fetch_email, _send_bulk_export_email
@@ -130,6 +131,7 @@ import dlv_tasks
 import morning_briefing
 import fetch_tasks
 import refresh_auth
+import sectional_properties
 from fetch_tasks import _load_fetch_tasks
 
 load_dotenv()
@@ -146,24 +148,13 @@ SAVED_BULK_EXPORT_SCHED_FILE    = os.path.join(DATA_DIR, "saved_bulk_export_sche
 SAVED_BULK_EXPORT_PARTIAL_FILE  = os.path.join(DATA_DIR, "saved_bulk_export_partial.json")
 SAVED_AUTO_FETCH_FILE   = os.path.join(DATA_DIR, "saved_auto_fetch.json")
 SAVED_AF_RESULTS_FILE   = os.path.join(DATA_DIR, "saved_af_results.json")
-SAVED_SECTIONAL_CONFIG_FILE = os.path.join(DATA_DIR, "saved_sectional_config.json")
 
 DAEMON_SCRIPT = os.path.join(os.path.dirname(__file__), "token_refresh_daemon.py")
 DAEMON_PID_FILE = os.path.join(DATA_DIR, "daemon.pid")
 DAEMON_LOG_FILE = os.path.join(DATA_DIR, "daemon.log")
 
-
-def _safe_err(e: Exception) -> str:
-    """Return a user-facing error string that contains no internal URLs or server detail.
-
-    HTTP errors are reduced to their status code; everything else becomes a
-    generic phrase so that API internals never leak into Telegram messages.
-    The full exception is intentionally NOT included here — callers should
-    log it separately before sending this string to the user.
-    """
-    if isinstance(e, requests.HTTPError) and e.response is not None:
-        return f"server returned HTTP {e.response.status_code}"
-    return "unexpected error — check logs"
+# (_safe_err, SAVED_SECTIONAL_CONFIG_FILE, load_sectional_config,
+#  save_sectional_config all live in common.py now — imported above)
 
 
 # ──────────────────────────────────────────────────────────
@@ -305,12 +296,8 @@ class BE(Enum):
 #  registration)
 
 
-# States — Sectional Properties conversation
-class SC(Enum):
-    ACTION   = auto()   # show current config + action buttons
-    SET_NAME = auto()   # enter specialist name to search
-    SELECT   = auto()   # pick from search results
-    CRED     = auto()   # pick credential to use for auto-assignment
+# (SC enum lives in sectional_properties.py — imported by main() at the
+#  point of registration)
 
 
 # (MB enum lives in morning_briefing.py — imported by main() at the point
@@ -2837,20 +2824,7 @@ def clear_auto_fetch_schedule() -> None:
 
 
 # (load_briefing_config/save_briefing_config live in morning_briefing.py)
-
-
-# ── Sectional Properties config ────────────────────────────
-
-def load_sectional_config() -> Optional[Dict]:
-    try:
-        with open(SAVED_SECTIONAL_CONFIG_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
-
-
-def save_sectional_config(cfg: Dict) -> None:
-    _atomic_json_write(SAVED_SECTIONAL_CONFIG_FILE, cfg, indent=2)
+# (load_sectional_config/save_sectional_config live in common.py)
 
 
 # ── Auto Fetch result history ──────────────────────────────
@@ -3395,165 +3369,8 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 #  _morning_briefing_job, _schedule_morning_briefing, _mb_* keyboards,
 #  cmd_briefing, recv_mb_* — all live in morning_briefing.py)
 
-# ──────────────────────────────────────────────────────────
-# Sectional Properties command handlers
-# ──────────────────────────────────────────────────────────
-
-async def cmd_sectional(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return await deny(update)
-    cfg = load_sectional_config()
-    specialist = cfg.get("specialist") if cfg else None
-    auto_route = cfg.get("auto_route", False) if cfg else False
-    cred_type  = cfg.get("cred_type", "") if cfg else ""
-
-    if specialist:
-        status = (
-            f"🔲 *Sectional Properties*\n\n"
-            f"Specialist: *{specialist['name']}*\n"
-            f"Auto-routing: {'✅ On' if auto_route else '❌ Off'}\n"
-            f"Credential: {CRED_LABELS.get(cred_type, cred_type) if cred_type else '—'}\n\n"
-            f"Choose an action:"
-        )
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "❌ Disable Auto-Route" if auto_route else "✅ Enable Auto-Route",
-                    callback_data="sc:toggle_route",
-                ),
-            ],
-            [InlineKeyboardButton("👤 Change Specialist", callback_data="sc:change")],
-            [InlineKeyboardButton("🗑 Clear Config",       callback_data="sc:clear")],
-        ])
-    else:
-        status = (
-            "🔲 *Sectional Properties*\n\n"
-            "No specialist configured. Set a specialist valuer to enable auto-routing "
-            "of sectional tasks from Auto Fetch.\n\n"
-            "Enter the specialist's name to search:"
-        )
-        keyboard = None
-
-    await update.message.reply_text(status, parse_mode="Markdown", reply_markup=keyboard)
-    return SC.ACTION if specialist else SC.SET_NAME
-
-
-async def recv_sc_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    cfg = load_sectional_config() or {}
-
-    if query.data == "sc:toggle_route":
-        cfg["auto_route"] = not cfg.get("auto_route", False)
-        save_sectional_config(cfg)
-        state = "enabled" if cfg["auto_route"] else "disabled"
-        await query.edit_message_text(f"✅ Auto-routing {state}.", reply_markup=None)
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
-        return ConversationHandler.END
-
-    if query.data == "sc:clear":
-        save_sectional_config({})
-        await query.edit_message_text("🗑 Sectional config cleared.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
-        return ConversationHandler.END
-
-    # sc:change — ask for new name
-    await query.edit_message_text(
-        "Enter the specialist valuer's name to search:",
-        reply_markup=None,
-    )
-    return SC.SET_NAME
-
-
-async def recv_sc_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-    if not name:
-        await update.message.reply_text("❌ Please enter a name.")
-        return SC.SET_NAME
-
-    tokens = _any_valid_tokens()
-    if not tokens:
-        await update.message.reply_text("❌ No valid tokens. Please refresh auth first.")
-        return ConversationHandler.END
-
-    http_sess = build_session()
-    try:
-        resp = http_sess.get(
-            f"{BASE_URL}/acl/api/v1/accounts/list-user-accounts",
-            headers={"Authorization": f"Bearer {tokens.access_token}", "JWTAUTH": f"Bearer {tokens.jwt}"},
-            params={"account_type": "STAFF", "search": name, "page": 1},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        results = resp.json().get("results", [])
-    except Exception as e:
-        logger.error("Sectional name search failed: %s", e)
-        await update.message.reply_text(f"❌ Search failed: {_safe_err(e)}")
-        return ConversationHandler.END
-
-    if not results:
-        await update.message.reply_text(f"No staff found matching '{name}'. Try again:")
-        return SC.SET_NAME
-
-    ctx.user_data["sc_results"] = results[:10]
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"{r.get('first_name','')} {r.get('last_name','')} ({r.get('employee_number','')})".strip(),
-            callback_data=f"sc_pick:{i}",
-        )]
-        for i, r in enumerate(results[:10])
-    ])
-    await update.message.reply_text("Select the specialist valuer:", reply_markup=keyboard)
-    return SC.SELECT
-
-
-async def recv_sc_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    idx = int(query.data.split(":")[1])
-    results = ctx.user_data.get("sc_results", [])
-    if idx >= len(results):
-        await query.edit_message_text("❌ Invalid selection.")
-        return ConversationHandler.END
-
-    person = results[idx]
-    uid    = str(person.get("id") or person.get("uid", ""))
-    name   = f"{person.get('first_name','')} {person.get('last_name','')}".strip()
-    acct   = str(person.get("account_number") or person.get("employee_number") or "")
-    ctx.user_data["sc_specialist"] = {"name": name, "uid": uid, "account_number": acct}
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(label, callback_data=f"sc_cred:{key}")]
-        for key, label in CRED_LABELS.items()
-    ])
-    await query.edit_message_text(
-        f"Selected: *{name}*\n\nWhich credential to use for auto-assignment?",
-        parse_mode="Markdown",
-        reply_markup=keyboard,
-    )
-    return SC.CRED
-
-
-async def recv_sc_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    cred_type  = query.data.split(":")[1]
-    specialist = ctx.user_data.get("sc_specialist", {})
-    cfg = load_sectional_config() or {}
-    cfg.update({
-        "specialist": specialist,
-        "cred_type":  cred_type,
-        "auto_route": cfg.get("auto_route", False),
-    })
-    save_sectional_config(cfg)
-    await query.edit_message_text(
-        f"✅ *Sectional specialist set*\n"
-        f"Name: *{specialist.get('name')}*\n"
-        f"Credential: *{CRED_LABELS.get(cred_type, cred_type)}*\n\n"
-        f"Use /sectional to toggle auto-routing.",
-        parse_mode="Markdown",
-    )
-    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
-    return ConversationHandler.END
+# (Sectional Properties command handlers — cmd_sectional, recv_sc_action,
+#  recv_sc_name, recv_sc_select, recv_sc_cred — live in sectional_properties.py)
 
 
 # (DLV Queue viewer — _dlv_queue_keyboard, cmd_dlv_queue,
@@ -6237,28 +6054,7 @@ def main():
         logger.info("Auto Fetch schedule restored: every %d min", cfg.get("interval_minutes"))
 
     dlv_tasks.register(app)
-
-    sc_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("sectional", cmd_sectional),
-            MessageHandler(filters.Regex(f"^{re.escape(BTN_SECTIONAL)}$"), cmd_sectional),
-        ],
-        states={
-            SC.ACTION:   [CallbackQueryHandler(recv_sc_action,  pattern=r"^sc:")],
-            SC.SET_NAME: [MessageHandler(not_cancel, recv_sc_name)],
-            SC.SELECT:   [CallbackQueryHandler(recv_sc_select,  pattern=r"^sc_pick:")],
-            SC.CRED:     [CallbackQueryHandler(recv_sc_cred,    pattern=r"^sc_cred:")],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cmd_cancel),
-            MessageHandler(_CANCEL_FILTER, cmd_cancel),
-            MessageHandler(filters.TEXT, fallback),
-        ],
-        allow_reentry=True,
-        per_message=False,
-    )
-    app.add_handler(sc_conv)
-
+    sectional_properties.register(app)
     morning_briefing.register(app)
 
     # Button handlers outside an active conversation
