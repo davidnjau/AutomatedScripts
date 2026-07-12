@@ -14,6 +14,7 @@ COPY fetch_tasks_cache.py .
 COPY dlv_batch.py .
 COPY dlv_tasks.py .
 COPY morning_briefing.py .
+COPY fetch_tasks.py .
 COPY ardhisasa_auth.py .
 COPY token_refresh_daemon.py .
 

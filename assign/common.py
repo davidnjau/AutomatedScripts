@@ -21,7 +21,7 @@ import threading
 import time
 import re
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -30,13 +30,22 @@ from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
     Update,
 )
 from telegram.ext import ContextTypes, ConversationHandler, filters
 
-from ardhisasa_auth import AuthTokens, decode_jwt_exp
+from ardhisasa_auth import (
+    PUBLIC_CREDENTIALS,
+    STAFF_CREDENTIALS_ICT,
+    STAFF_CREDENTIALS_SUPPORT,
+    STAFF_CREDENTIALS_VALUER,
+    AuthTokens,
+    decode_jwt_exp,
+)
 
 # ──────────────────────────────────────────────────────────
 # Logging
@@ -209,6 +218,106 @@ def _ft_headers(tokens: AuthTokens) -> dict:
         "JWTAUTH":       f"Bearer {tokens.jwt}",
         "cparams":       CPARAMS_SUPPORT,
     }
+
+
+def _date_cutoff_str(days: int) -> str:
+    """Return a YYYY-MM-DD cutoff string for N days ago (UTC)."""
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def _within_days(date_created: str, cutoff: str) -> bool:
+    """
+    Compare date_created from the API response against a YYYY-MM-DD cutoff.
+    ISO date strings are lexicographically sortable, so simple string compare works.
+    If date_created is missing or unparseable, include the task (fail-open).
+    """
+    if not date_created:
+        return True
+    # Take only the date part (first 10 chars: YYYY-MM-DD) regardless of time/timezone suffix
+    return date_created[:10] >= cutoff
+
+
+# ──────────────────────────────────────────────────────────
+# Credential profiles (used by any feature with its own login step)
+# ──────────────────────────────────────────────────────────
+CRED_MAP = {
+    "publicuser":   PUBLIC_CREDENTIALS,
+    "staff":        STAFF_CREDENTIALS_ICT,
+    "staff2":       STAFF_CREDENTIALS_SUPPORT,
+    "staff_valuer": STAFF_CREDENTIALS_VALUER,
+}
+
+CRED_LABELS = {
+    "publicuser":   "👤 Public User",
+    "staff":        "🏢 ICT",
+    "staff2":       "🏢 Support Reg",
+    "staff_valuer": "🏢 Staff Valuer",
+}
+
+
+def _cred_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(CRED_LABELS["publicuser"],   callback_data="cred:publicuser")],
+        [InlineKeyboardButton(CRED_LABELS["staff"],        callback_data="cred:staff")],
+        [InlineKeyboardButton(CRED_LABELS["staff2"],       callback_data="cred:staff2")],
+        [InlineKeyboardButton(CRED_LABELS["staff_valuer"], callback_data="cred:staff_valuer")],
+    ])
+
+
+# ──────────────────────────────────────────────────────────
+# Fetch Tasks / Auto Fetch shared filter keyboards
+# ──────────────────────────────────────────────────────────
+def _ft_county_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🌆 Nairobi",      callback_data="ft_county:nairobi"),
+            InlineKeyboardButton("📋 All Counties", callback_data="ft_county:all"),
+        ],
+    ])
+
+
+def _ft_registry_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📁 Central",        callback_data="ft_registry:central"),
+            InlineKeyboardButton("📁 Nairobi",         callback_data="ft_registry:nairobi"),
+        ],
+        [
+            InlineKeyboardButton("📋 All Registries", callback_data="ft_registry:all"),
+        ],
+    ])
+
+
+def _ft_amount_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("0 – 1M",        callback_data="ft_amount:0_1m"),
+            InlineKeyboardButton("1M – 5M",        callback_data="ft_amount:1m_5m"),
+        ],
+        [
+            InlineKeyboardButton("5M – 10M",       callback_data="ft_amount:5m_10m"),
+            InlineKeyboardButton("20M – 50M",      callback_data="ft_amount:20m_50m"),
+        ],
+        [
+            InlineKeyboardButton("50M – 100M",     callback_data="ft_amount:50m_100m"),
+            InlineKeyboardButton("80M – 300M",     callback_data="ft_amount:80m_300m"),
+        ],
+        [
+            InlineKeyboardButton("80M – 3B",       callback_data="ft_amount:80m_3b"),
+            InlineKeyboardButton("✏️ Custom",       callback_data="ft_amount:custom"),
+        ],
+        [
+            InlineKeyboardButton("📋 No filter",   callback_data="ft_amount:all"),
+        ],
+    ])
+
+
+def _sectional_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🚫 Exclude Sectional", callback_data="ft_sectional:exclude"),
+        InlineKeyboardButton("🏢 Sectional Only",    callback_data="ft_sectional:only"),
+        InlineKeyboardButton("📋 All",               callback_data="ft_sectional:all"),
+    ]])
 
 
 # ──────────────────────────────────────────────────────────
