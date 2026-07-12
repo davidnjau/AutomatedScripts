@@ -36,7 +36,7 @@ Required environment variables (in `.env`):
 - **`fetch_tasks_cache.py`** — the 1-day assessor cache bridging Fetch Tasks, DLV Batch, and DLV Tasks.
 - **`email_service.py`** — the shared SMTP sender: `_send_bulk_export_email` (attachment-based, used by Bulk Export/DLV Tasks/Morning Briefing) and `_send_auto_fetch_email` (plain+HTML, used by Auto Fetch). Any feature that offers "email me the report" calls into here rather than building its own SMTP boilerplate.
 - **`telegram_report.py`** — the shared "paginate a report and send it to Telegram" helper: `_chunk_lines` (pure, splits a list of text lines into ≤4000-char blocks) and `_send_chunked_report` (drives sending, attaching a footer/`reply_markup` to the last chunk only). DLV Tasks' and Fetch Tasks' report senders build their own lines/footer/keyboard, then delegate the chunking+sending to this.
-- **`dlv_batch.py`**, **`dlv_tasks.py`**, **`morning_briefing.py`**, **`fetch_tasks.py`**, **`refresh_auth.py`**, **`sectional_properties.py`** — one feature each, extracted out of `bot.py`.
+- **`dlv_batch.py`**, **`dlv_tasks.py`**, **`morning_briefing.py`**, **`fetch_tasks.py`**, **`refresh_auth.py`**, **`sectional_properties.py`**, **`auto_fetch.py`** — one feature each, extracted out of `bot.py`.
 - **`bot.py`** — everything not yet extracted, plus `main()`, which imports each module and calls its `register(app)`.
 - **`tests/`** — `unittest`-based tests per module (stdlib only, no new dependencies). Run with `python3 -m unittest discover -s assign/tests -v`.
 
@@ -55,7 +55,7 @@ Required environment variables (in `.env`):
 
 ### Extraction Roadmap
 
-As of this writing `bot.py` is **~6,082 lines**, down from ~9,200 before extraction began. Already extracted: `common.py`, `dlv_core.py`, `fetch_tasks_cache.py`, `email_service.py`, `telegram_report.py`, `dlv_batch.py`, `dlv_tasks.py`, `morning_briefing.py`, `fetch_tasks.py`, `refresh_auth.py`, `sectional_properties.py`.
+As of this writing `bot.py` is **~5,353 lines**, down from ~9,200 before extraction began. Already extracted: `common.py`, `dlv_core.py`, `fetch_tasks_cache.py`, `email_service.py`, `telegram_report.py`, `dlv_batch.py`, `dlv_tasks.py`, `morning_briefing.py`, `fetch_tasks.py`, `refresh_auth.py`, `sectional_properties.py`, `auto_fetch.py`.
 
 **Remaining features and their approximate size/contiguity:**
 
@@ -63,7 +63,7 @@ As of this writing `bot.py` is **~6,082 lines**, down from ~9,200 before extract
 |---|---|---|---|
 | ~~Refresh Auth~~ | ~~`AS`~~ | ~~~155 lines~~ | **done — `refresh_auth.py`** |
 | ~~Sectional Properties~~ | ~~`SC`~~ | ~~~170 lines~~ | **done — `sectional_properties.py`** |
-| Auto Fetch (+ AF Results) | `AF` | ~350 lines | mostly |
+| ~~Auto Fetch (+ AF Results)~~ | ~~`AF`~~ | ~~~350 lines~~ | **done — `auto_fetch.py`** |
 | Receive Tasks (+ schedules/batches) | `RS` | ~1,089 lines | yes |
 | Lookup Reference | `LU` | ~268 lines | no — split in two, physically misfiled under a "Job Distribution Analysis" comment near `JD` |
 | Valuer Tasks | `VT` | ~447 lines | yes |
@@ -83,7 +83,7 @@ As of this writing `bot.py` is **~6,082 lines**, down from ~9,200 before extract
 
 1. ~~**Refresh Auth**~~ — done (`refresh_auth.py`).
 2. ~~**Sectional Properties**~~ — done (`sectional_properties.py`). `load_sectional_config`/`save_sectional_config` promoted to `common.py` as planned; also promoted `_safe_err` there (needed by Sectional's name-search error path, and already duplicated-in-spirit by New Assignment/Receive Tasks — all three now share the one copy).
-3. **Auto Fetch** (bundle `cmd_af_results`/`recv_af_result_detail`) — now unblocked by step 2. Migrate its two unmigrated Telegram-chunking spots (`_auto_fetch_job`'s notify loop, `recv_af_result_detail`) onto `telegram_report.py` while here.
+3. ~~**Auto Fetch**~~ (bundled `cmd_af_results`/`recv_af_result_detail`) — done (`auto_fetch.py`). Both previously-unmigrated Telegram-chunking spots (`_auto_fetch_job`'s notify loop, `recv_af_result_detail`) now go through `telegram_report._send_chunked_report`.
 4. **Receive Tasks** (bundle `cmd_schedules`/`cmd_task_batches`) — fully self-contained; follows the same startup-restore pattern `morning_briefing.py` already established (`_restore_schedules(app)` called from `register(app)`).
 5. **Prerequisite cleanup**: promote `_be_cred_keyboard`, `_TokenRotator`/`_AllTokensExhausted`, and `_NODE_LABELS` out of Bulk Export's section — the keyboard and labels into `common.py`, the rotator classes into a new `token_rotator.py`.
 6. **Lookup Reference** — export `_lu_search_ref`/`_lu_fetch_detail`/`_lu_format_result` as its public API; move `_post_assignment_report`/`_lookup_one_ref` out of LU's file, staged for New Assignment (step 9) to import from `lookup_reference.py`.
