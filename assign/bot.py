@@ -75,7 +75,6 @@ from common import (
     BTN_AF_RESULTS,
     BTN_ASSIGN,
     BTN_ASSIGNMENTS,
-    BTN_AUTH,
     BTN_AUTO_FETCH,
     BTN_BULK_EXPORT,
     BTN_CANCEL,
@@ -130,6 +129,7 @@ import dlv_batch
 import dlv_tasks
 import morning_briefing
 import fetch_tasks
+import refresh_auth
 from fetch_tasks import _load_fetch_tasks
 
 load_dotenv()
@@ -258,25 +258,8 @@ class AF(Enum):
 #  point of registration)
 
 
-# ──────────────────────────────────────────────────────────
-# States — Refresh Auth conversation
-# ──────────────────────────────────────────────────────────
-class AS(Enum):
-    CHOOSE_CRED   = auto()
-    FORCE_CONFIRM = auto()
-    WAIT_OTP      = auto()
-
-
-@dataclass
-class AuthSession:
-    cred_type:    str = ""
-    http_session: Optional[requests.Session] = None
-
-
-def _get_auth_sess(ctx: ContextTypes.DEFAULT_TYPE) -> AuthSession:
-    if "auth_session" not in ctx.user_data:
-        ctx.user_data["auth_session"] = AuthSession()
-    return ctx.user_data["auth_session"]
+# (AS enum + AuthSession + _get_auth_sess live in refresh_auth.py —
+#  imported by main() at the point of registration)
 
 
 # (FT enum + FTSession + _get_ft_sess live in fetch_tasks.py — imported by
@@ -3592,163 +3575,9 @@ async def recv_sc_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # (DLV Batch conversation handlers — cmd_dlv_batch, recv_db_input,
 #  recv_db_confirm, _run_dlv_batch_bg — live in dlv_batch.py)
 
-# ──────────────────────────────────────────────────────────
-# Refresh Auth — conversation handlers
-# ──────────────────────────────────────────────────────────
-
-def _auth_cred_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(CRED_LABELS["publicuser"],   callback_data="auth_cred:publicuser")],
-        [InlineKeyboardButton(CRED_LABELS["staff"],        callback_data="auth_cred:staff")],
-        [InlineKeyboardButton(CRED_LABELS["staff2"],       callback_data="auth_cred:staff2")],
-        [InlineKeyboardButton(CRED_LABELS["staff_valuer"], callback_data="auth_cred:staff_valuer")],
-        [InlineKeyboardButton("❌ Cancel",                 callback_data="auth_cred:cancel")],
-    ])
-
-
-async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update): return await deny(update)
-    ctx.user_data["auth_session"] = AuthSession()
-    await update.message.reply_text(
-        "🔑 *Refresh Auth*\n\nSelect a credential profile to authenticate:",
-        parse_mode="Markdown",
-        reply_markup=_auth_cred_keyboard(),
-    )
-    return AS.CHOOSE_CRED
-
-
-async def recv_auth_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    cred_type = query.data.split(":")[1]
-
-    if cred_type == "cancel":
-        await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
-        return ConversationHandler.END
-
-    auth_sess           = _get_auth_sess(ctx)
-    auth_sess.cred_type = cred_type
-
-    cached = get_valid_tokens(cred_type)
-    if cached:
-        entry   = _load_tokens_raw().get(cred_type, {})
-        exp_ts  = entry.get("expires_at", 0)
-        exp_str = (
-            datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            if exp_ts else "unknown"
-        )
-        await query.edit_message_text(
-            f"✅ *{CRED_LABELS[cred_type]}* already has valid cached tokens.\n"
-            f"*Expires:* {exp_str}\n\n"
-            "Force a fresh login anyway?",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Yes, re-authenticate", callback_data="auth_force:yes")],
-                [InlineKeyboardButton("✅ No, keep current",     callback_data="auth_force:no")],
-            ]),
-        )
-        return AS.FORCE_CONFIRM
-
-    # No valid tokens — go straight to login
-    return await _auth_trigger_login(query, auth_sess)
-
-
-async def recv_auth_force(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    auth_sess = _get_auth_sess(ctx)
-
-    if query.data.split(":")[1] == "no":
-        await query.edit_message_text(
-            f"✅ Keeping existing tokens for *{CRED_LABELS[auth_sess.cred_type]}*.",
-            parse_mode="Markdown",
-        )
-        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
-        return ConversationHandler.END
-
-    return await _auth_trigger_login(query, auth_sess)
-
-
-async def _auth_trigger_login(query, auth_sess: AuthSession) -> int:
-    """Send the login request and transition to WAIT_OTP, or END on failure."""
-    creds = CRED_MAP[auth_sess.cred_type]
-    auth_sess.http_session = build_session()
-
-    await query.edit_message_text(
-        f"🔐 Sending login request for *{CRED_LABELS[auth_sess.cred_type]}*…",
-        parse_mode="Markdown",
-    )
-    try:
-        resp = auth_sess.http_session.post(
-            f"{AUTH_BASE_URL}/login",
-            json={"username": creds["username"], "password": creds["password"],
-                  "usertype": creds["usertype"], "otpcode": ""},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("success") is False and "error" in data:
-            raise RuntimeError(data.get("error") or data.get("message"))
-    except Exception as e:
-        await query.message.reply_text(
-            f"❌ Login failed: `{e}`\n\nUse the menu to retry.",
-            parse_mode="Markdown",
-            reply_markup=_main_menu(),
-        )
-        return ConversationHandler.END
-
-    await query.message.reply_text(
-        "📲 OTP sent to the registered device.\n\nPlease *reply with the OTP code*:",
-        parse_mode="Markdown",
-    )
-    return AS.WAIT_OTP
-
-
-async def recv_auth_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    auth_sess = _get_auth_sess(ctx)
-    otp       = update.message.text.strip()
-    creds     = CRED_MAP[auth_sess.cred_type]
-
-    await update.message.reply_text("🔄 Verifying OTP…")
-    try:
-        resp = auth_sess.http_session.post(
-            f"{AUTH_BASE_URL}/otpverify",
-            json={"username": creds["username"], "password": creds["password"], "otpcode": otp},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data          = resp.json()
-        details       = data.get("details", {})
-        access_token  = details.get("access_token")
-        jwt           = details.get("jwt")
-        refresh_token = details.get("refresh_token", "")
-        if not access_token or not jwt:
-            raise RuntimeError(f"Tokens missing. Keys: {list(data.keys())}")
-
-        persist_tokens(auth_sess.cred_type, access_token, jwt, refresh_token)
-
-        exp_ts  = _jwt_exp(jwt)
-        exp_str = (
-            datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            if exp_ts else "unknown"
-        )
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ OTP verification failed: `{e}`\n\nSend the OTP again or tap 🛑 Cancel.",
-            parse_mode="Markdown",
-        )
-        return AS.WAIT_OTP
-
-    await update.message.reply_text(
-        f"✅ *Authenticated successfully!*\n\n"
-        f"*Profile:* {CRED_LABELS[auth_sess.cred_type]}\n"
-        f"*Token expires:* {exp_str}",
-        parse_mode="Markdown",
-        reply_markup=_main_menu(),
-    )
-    return ConversationHandler.END
-
+# (Refresh Auth conversation handlers — _auth_cred_keyboard, cmd_auth,
+#  recv_auth_cred, recv_auth_force, _auth_trigger_login, recv_auth_otp —
+#  live in refresh_auth.py)
 
 # ──────────────────────────────────────────────────────────
 # Bulk Export — NAIROBI Completed stamp-duty applications
@@ -6223,25 +6052,7 @@ def main():
     )
 
     # db_conv (DLV Batch) is registered via dlv_batch.register(app) below.
-
-    auth_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("auth", cmd_auth),
-            MessageHandler(filters.Regex(f"^{re.escape(BTN_AUTH)}$"), cmd_auth),
-        ],
-        states={
-            AS.CHOOSE_CRED:   [CallbackQueryHandler(recv_auth_cred,  pattern=r"^auth_cred:")],
-            AS.FORCE_CONFIRM: [CallbackQueryHandler(recv_auth_force, pattern=r"^auth_force:")],
-            AS.WAIT_OTP:      [MessageHandler(not_cancel, recv_auth_otp)],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cmd_cancel),
-            MessageHandler(_CANCEL_FILTER, cmd_cancel),
-            MessageHandler(filters.TEXT, fallback),
-        ],
-        allow_reentry=True,
-        per_message=False,
-    )
+    # auth_conv (Refresh Auth) is registered via refresh_auth.register(app) below.
 
     app.add_handler(CommandHandler("start",         cmd_start))
     app.add_handler(CommandHandler("help",          cmd_help))
@@ -6363,7 +6174,7 @@ def main():
 
     app.add_handler(conv)
     dlv_batch.register(app)
-    app.add_handler(auth_conv)
+    refresh_auth.register(app)
     fetch_tasks.register(app)
     app.add_handler(af_conv)
     app.add_handler(rs_conv)
@@ -6451,9 +6262,9 @@ def main():
     morning_briefing.register(app)
 
     # Button handlers outside an active conversation
+    # (bare BTN_AUTH handler registered via refresh_auth.register(app) above)
     app.add_handler(CallbackQueryHandler(recv_delete_valuer,  pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(recv_daemon_action,  pattern=r"^daemon:"))
-    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_AUTH)}$"),         cmd_auth))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_TOKEN_STATUS)}$"), cmd_token_status))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ERROR_REPORT)}$"), cmd_error_report))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DAEMON)}$"),       cmd_daemon))

@@ -36,7 +36,7 @@ Required environment variables (in `.env`):
 - **`fetch_tasks_cache.py`** — the 1-day assessor cache bridging Fetch Tasks, DLV Batch, and DLV Tasks.
 - **`email_service.py`** — the shared SMTP sender: `_send_bulk_export_email` (attachment-based, used by Bulk Export/DLV Tasks/Morning Briefing) and `_send_auto_fetch_email` (plain+HTML, used by Auto Fetch). Any feature that offers "email me the report" calls into here rather than building its own SMTP boilerplate.
 - **`telegram_report.py`** — the shared "paginate a report and send it to Telegram" helper: `_chunk_lines` (pure, splits a list of text lines into ≤4000-char blocks) and `_send_chunked_report` (drives sending, attaching a footer/`reply_markup` to the last chunk only). DLV Tasks' and Fetch Tasks' report senders build their own lines/footer/keyboard, then delegate the chunking+sending to this.
-- **`dlv_batch.py`**, **`dlv_tasks.py`**, **`morning_briefing.py`**, **`fetch_tasks.py`** — one feature each, extracted out of `bot.py`.
+- **`dlv_batch.py`**, **`dlv_tasks.py`**, **`morning_briefing.py`**, **`fetch_tasks.py`**, **`refresh_auth.py`** — one feature each, extracted out of `bot.py`.
 - **`bot.py`** — everything not yet extracted, plus `main()`, which imports each module and calls its `register(app)`.
 - **`tests/`** — `unittest`-based tests per module (stdlib only, no new dependencies). Run with `python3 -m unittest discover -s assign/tests -v`.
 
@@ -55,13 +55,13 @@ Required environment variables (in `.env`):
 
 ### Extraction Roadmap
 
-As of this writing `bot.py` is **~6,475 lines**, down from ~9,200 before extraction began. Already extracted: `common.py`, `dlv_core.py`, `fetch_tasks_cache.py`, `email_service.py`, `telegram_report.py`, `dlv_batch.py`, `dlv_tasks.py`, `morning_briefing.py`, `fetch_tasks.py`.
+As of this writing `bot.py` is **~6,286 lines**, down from ~9,200 before extraction began. Already extracted: `common.py`, `dlv_core.py`, `fetch_tasks_cache.py`, `email_service.py`, `telegram_report.py`, `dlv_batch.py`, `dlv_tasks.py`, `morning_briefing.py`, `fetch_tasks.py`, `refresh_auth.py`.
 
 **Remaining features and their approximate size/contiguity:**
 
 | Feature | Enum | Size | Contiguous? |
 |---|---|---|---|
-| Refresh Auth | `AS` | ~155 lines | yes |
+| ~~Refresh Auth~~ | ~~`AS`~~ | ~~~155 lines~~ | **done — `refresh_auth.py`** |
 | Sectional Properties | `SC` | ~170 lines | yes |
 | Auto Fetch (+ AF Results) | `AF` | ~350 lines | mostly |
 | Receive Tasks (+ schedules/batches) | `RS` | ~1,089 lines | yes |
@@ -81,7 +81,7 @@ As of this writing `bot.py` is **~6,475 lines**, down from ~9,200 before extract
 
 **Recommended order:**
 
-1. **Refresh Auth** — zero cross-deps, smallest, good pattern-validation checkpoint.
+1. ~~**Refresh Auth**~~ — done (`refresh_auth.py`).
 2. **Sectional Properties** — while extracting, promote `load_sectional_config`/`save_sectional_config` to `common.py` (matches the existing `load_briefing_config`-style convention) so Auto Fetch doesn't need to import a whole feature module just for config.
 3. **Auto Fetch** (bundle `cmd_af_results`/`recv_af_result_detail`) — now unblocked by step 2. Migrate its two unmigrated Telegram-chunking spots (`_auto_fetch_job`'s notify loop, `recv_af_result_detail`) onto `telegram_report.py` while here.
 4. **Receive Tasks** (bundle `cmd_schedules`/`cmd_task_batches`) — fully self-contained; follows the same startup-restore pattern `morning_briefing.py` already established (`_restore_schedules(app)` called from `register(app)`).

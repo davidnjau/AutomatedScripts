@@ -17,6 +17,7 @@ COPY morning_briefing.py .
 COPY fetch_tasks.py .
 COPY email_service.py .
 COPY telegram_report.py .
+COPY refresh_auth.py .
 COPY ardhisasa_auth.py .
 COPY token_refresh_daemon.py .
 
