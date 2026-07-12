@@ -53,6 +53,49 @@ Required environment variables (in `.env`):
 5. Add a `tests/test_<module>.py` covering the module's non-trivial logic (pure functions directly, handlers via mocked Telegram objects), and confirm the full suite still passes.
 6. Verify: `python3 -m py_compile` + `python3 -m pyflakes` on all touched files, `import bot` succeeds, a `bot.main()` dry-run (with `Application.run_polling` stubbed) wires every handler without raising, and — when practical — a real `docker compose up` against a local/non-production bot token confirms it connects and polls cleanly before stopping it.
 
+### Extraction Roadmap
+
+As of this writing `bot.py` is **~6,475 lines**, down from ~9,200 before extraction began. Already extracted: `common.py`, `dlv_core.py`, `fetch_tasks_cache.py`, `email_service.py`, `telegram_report.py`, `dlv_batch.py`, `dlv_tasks.py`, `morning_briefing.py`, `fetch_tasks.py`.
+
+**Remaining features and their approximate size/contiguity:**
+
+| Feature | Enum | Size | Contiguous? |
+|---|---|---|---|
+| Refresh Auth | `AS` | ~155 lines | yes |
+| Sectional Properties | `SC` | ~170 lines | yes |
+| Auto Fetch (+ AF Results) | `AF` | ~350 lines | mostly |
+| Receive Tasks (+ schedules/batches) | `RS` | ~1,089 lines | yes |
+| Lookup Reference | `LU` | ~268 lines | no — split in two, physically misfiled under a "Job Distribution Analysis" comment near `JD` |
+| Valuer Tasks | `VT` | ~447 lines | yes |
+| Job Distribution | `JD` | ~633 lines | mostly |
+| New Assignment | `S` | ~840 lines | yes |
+| Bulk Export | `BE` | ~1,000+ lines | no — split into two chunks with `JD`/`LU`/`VT` sandwiched between |
+
+**Cross-dependency blockers found (why a naive one-at-a-time order breaks down):**
+
+1. `_be_cred_keyboard()` and `_TokenRotator`/`_AllTokensExhausted` (currently in Bulk Export's section, ~bot.py:3768-3924) are also used by Job Distribution, Lookup Reference, and Valuer Tasks. `_be_cred_keyboard` is **not** a duplicate of `common.py`'s `_cred_keyboard()` — it only lists credential profiles that already have valid cached tokens, so it needs its own promotion, not a merge.
+2. `cmd_export_status` (~bot.py:5864) renders both Bulk Export's and Job Distribution's status dicts in one message — owned by neither.
+3. New Assignment's `recv_confirm` calls `_post_assignment_report`/`_lookup_one_ref`, which are built on Lookup Reference's `_lu_search_ref`/`_lu_fetch_detail`/`_lu_format_result`. LU must export these as its public API before New Assignment can cleanly depend on them.
+4. Auto Fetch's `_auto_fetch_job` reads Sectional Properties' `load_sectional_config` for auto-routing.
+5. Lookup Reference and Valuer Tasks both use `_NODE_LABELS` (currently defined near LU).
+
+**Recommended order:**
+
+1. **Refresh Auth** — zero cross-deps, smallest, good pattern-validation checkpoint.
+2. **Sectional Properties** — while extracting, promote `load_sectional_config`/`save_sectional_config` to `common.py` (matches the existing `load_briefing_config`-style convention) so Auto Fetch doesn't need to import a whole feature module just for config.
+3. **Auto Fetch** (bundle `cmd_af_results`/`recv_af_result_detail`) — now unblocked by step 2. Migrate its two unmigrated Telegram-chunking spots (`_auto_fetch_job`'s notify loop, `recv_af_result_detail`) onto `telegram_report.py` while here.
+4. **Receive Tasks** (bundle `cmd_schedules`/`cmd_task_batches`) — fully self-contained; follows the same startup-restore pattern `morning_briefing.py` already established (`_restore_schedules(app)` called from `register(app)`).
+5. **Prerequisite cleanup**: promote `_be_cred_keyboard`, `_TokenRotator`/`_AllTokensExhausted`, and `_NODE_LABELS` out of Bulk Export's section — the keyboard and labels into `common.py`, the rotator classes into a new `token_rotator.py`.
+6. **Lookup Reference** — export `_lu_search_ref`/`_lu_fetch_detail`/`_lu_format_result` as its public API; move `_post_assignment_report`/`_lookup_one_ref` out of LU's file, staged for New Assignment (step 9) to import from `lookup_reference.py`.
+7. **Valuer Tasks** — now just imports the promoted keyboard/rotator/labels like everyone else.
+8. **Job Distribution** — same. Leave `cmd_export_status` in `bot.py` for now (thin combiner reading both BE's and JD's status dicts) until Bulk Export also lands.
+9. **New Assignment** — the original core flow, last of the "clean" features since it can now cleanly import Lookup Reference's primitives. Migrate `cmd_assignments`'s chunking loop onto `telegram_report.py` while here.
+10. **Bulk Export** — last and biggest, but by now `_TokenRotator`/`_be_cred_keyboard` already live in shared modules, so this is mostly mechanical stitching of its two chunks back into one file. Resolve `cmd_export_status` for real (import both modules' status dicts).
+
+**Optional cleanup pass** (anytime after step 10): a shared `excel_report.py` for the openpyxl styling boilerplate duplicated across `_dt_build_excel` (already extracted), `_be_build_excel`, `_jd_build_excel`, `_vt_build_excel` (identical bold-blue-header/autofilter/frozen-pane/auto-width pattern in all four) — plus sweeping the three remaining single-message truncate-only spots (`recv_confirm`, `_do_assign_tasks`, `_rt_fetch_and_show`) onto a lightweight truncate helper, distinct from `telegram_report.py`'s multi-chunk `_send_chunked_report` since these only ever send one message.
+
+After step 10, `bot.py` should be left with just `cmd_start`/`cmd_help`, saved-valuers management (`cmd_valuers`/`cmd_delete_valuer`/`recv_delete_valuer`), daemon control (`cmd_daemon`/`recv_daemon_action`), token/error-report status (`cmd_token_status`/`cmd_error_report`), `cmd_restart`, and `main()`'s wiring — a genuinely thin orchestrator.
+
 **`ardhisasa_auth.py`** — Authentication layer:
 - Exports four hardcoded credential profiles: `PUBLIC_CREDENTIALS`, `STAFF_CREDENTIALS_ICT`, `STAFF_CREDENTIALS_SUPPORT`, `STAFF_CREDENTIALS_VALUER`
 - `build_session()` returns a `requests.Session` with exponential backoff retry on 429/5xx, browser-like headers to avoid bot detection
