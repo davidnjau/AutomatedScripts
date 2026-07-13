@@ -65,8 +65,17 @@ This is the standard way to add **any** new feature to this bot — not just a h
    - **If not** — fall back to the standard OTP workflow: `build_session()` → `POST {AUTH_BASE_URL}/login` with `CRED_MAP[cred_type]` → transition to a `WAIT_OTP` state → on OTP reply, `POST {AUTH_BASE_URL}/otpverify` → `persist_tokens(cred_type, access_token, jwt, refresh_token)` → continue.
    - Use `CRED_LABELS[cred_type]` for user-facing text and `_cred_keyboard()` for the picker, so every feature's credential-selection UI looks identical.
 4. Add `import <feature>` and `<feature>.register(app)` to `bot.py`'s `main()`; add a `COPY <feature>.py .` line to the `Dockerfile` (it copies files explicitly, not the whole directory — a missed module fails with `ImportError` only at container start, not at build time).
-5. Add a `tests/test_<feature>.py` covering the module's non-trivial logic (pure functions directly, handlers via mocked Telegram objects), and confirm the full suite still passes.
-6. Verify: `python3 -m py_compile` + `python3 -m pyflakes` on all touched files, `import bot` succeeds, a `bot.main()` dry-run (with `Application.run_polling` stubbed) wires every handler without raising, and — when practical — a real `docker compose up` against a local/non-production bot token confirms it connects and polls cleanly before stopping it.
+5. **Mandatory:** add `tests/test_<feature>.py` covering the module's non-trivial logic (pure functions directly, handlers via mocked Telegram objects) *before* the module is considered done — a new module without its own test file is an incomplete PR, not an optional follow-up. See [Testing & Documentation Conventions](#testing--documentation-conventions) below.
+6. **Mandatory:** every function in the new module has a comment describing what it does — see [Testing & Documentation Conventions](#testing--documentation-conventions) below.
+7. Verify: `python3 -m py_compile` + `python3 -m pyflakes` on all touched files, `import bot` succeeds, a `bot.main()` dry-run (with `Application.run_polling` stubbed) wires every handler without raising, and — when practical — a real `docker compose up` against a local/non-production bot token confirms it connects and polls cleanly before stopping it.
+
+### Testing & Documentation Conventions
+
+These apply to every change in this codebase, not just new-module extractions:
+
+- **Starting a module**: a brand-new `assign/<module>.py` must ship together with its own `tests/test_<module>.py` in the same change — never added as a follow-up later. If the module has zero non-trivial logic (e.g. it's pure constants, like `endpoints.py`), the test file still exists and verifies the constants are well-formed (see `tests/test_endpoints.py` for the pattern).
+- **Updating a module**: any change to `assign/<module>.py`'s behavior — a new function, a changed code path, a fixed bug — must come with a matching update to `tests/test_<module>.py` in the same change: a new test for new behavior, an updated assertion for changed behavior, or a regression test for a fixed bug. A PR that changes a module's logic without touching its test file should be treated as incomplete.
+- **Comments per function**: every function and method (including pure helpers, handlers, and one-liners) gets a short comment directly above or as its docstring, stating what it does. This applies repo-wide in `assign/`, and takes precedence over the general "don't add comments that just restate the code" preference elsewhere — in this codebase, every function is commented regardless of how self-explanatory its name is.
 
 ### Extraction history
 
@@ -181,7 +190,7 @@ JSON files in `./data/` (mounted as Docker volume `bot_data`):
 
 ## Notes
 
-- Test suite: `tests/` (stdlib `unittest`, no new dependencies). Run with `python3 -m unittest discover -s assign/tests -v`.
+- Test suite: `tests/` (stdlib `unittest`, no new dependencies). Run with `python3 -m unittest discover -s assign/tests -v`. See [Testing & Documentation Conventions](#testing--documentation-conventions) — every module gets its own test file, kept in sync as the module changes, and every function is commented.
 - Credentials are hardcoded in `ardhisasa_auth.py` — do not move to `.env` without updating the `CRED_MAP` / `CRED_LABELS` dicts in `common.py`.
 - The Dockerfile `COPY`s each source file explicitly (no wildcard) — any new module (extracted feature, shared helper) must get its own `COPY <module>.py .` line added, or the container fails with `ImportError` at startup despite building successfully.
 - The Dockerfile omits `tesseract-ocr` system package, so `pytesseract` will fail silently in Docker unless the image is updated; Claude Vision covers that fallback path.

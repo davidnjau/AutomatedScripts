@@ -77,12 +77,12 @@ AutomatedScripts/
 
 New features are added as their **own new module**, not written inline in `bot.py`. The short version:
 
-1. Create `assign/<feature>.py` with the feature's state enum, session dataclass, conversation handlers, and a `register(app: Application) -> None` that wires them up.
+1. Create `assign/<feature>.py` with the feature's state enum, session dataclass, conversation handlers, and a `register(app: Application) -> None` that wires them up. Every function gets a short comment describing what it does.
 2. **Import, don't duplicate.** If the feature needs a token cache, a credential keyboard, chunked Telegram sending, Excel styling, an SMTP sender, or rotate-on-403 HTTP fetching, import it from `common.py` / `telegram_report.py` / `excel_report.py` / `email_service.py` / `token_rotator.py` — don't rewrite it.
 3. Add `import <feature>` + `<feature>.register(app)` to `bot.py`'s `main()`, and a `COPY <feature>.py .` line to the `Dockerfile`.
-4. Add `tests/test_<feature>.py`.
+4. **Mandatory:** add `tests/test_<feature>.py` in the same change — a new module isn't done until its own test file exists. When you later change that module's behavior, update its test file in the same change too (new tests for new behavior, updated assertions for changed behavior).
 
-See `CLAUDE.md`'s Architecture section for the full checklist (auth-flow consistency, verification steps) and the reasoning behind every shared module's boundaries.
+See `CLAUDE.md`'s Architecture section for the full checklist (auth-flow consistency, verification steps) and the reasoning behind every shared module's boundaries, and its [Testing & Documentation Conventions](CLAUDE.md#testing--documentation-conventions) section for the full comment/test rules.
 
 ---
 
@@ -151,15 +151,15 @@ python3 -m unittest discover -s tests -v
 
 Stdlib `unittest` only — no new test dependencies. One test file per module, covering pure logic directly and conversation handlers via mocked Telegram objects.
 
+Two rules apply to every change, not just new features:
+- **Starting a module** — it ships with its own `tests/test_<module>.py` in the same change, not as a later follow-up.
+- **Updating a module** — its test file gets updated in the same change (new tests for new behavior, updated assertions for changed behavior, a regression test for a fixed bug).
+
 ---
 
-## Deployment
+## CI
 
-Pushes to `main` or `develop` trigger automatic deployment via GitHub Actions:
-1. Files are copied to the VM via SCP
-2. Docker Compose rebuilds and restarts the container
-
-Required GitHub secrets: `VM_HOST`, `VM_USER`, `VM_PASSWORD`
+GitHub Actions (`.github/workflows/ci.yml`) runs the test suite above on every push/PR to `main` or `assign` (`assign` is this bot's actual mainline — PRs land there). There is no automatic deploy step; deploying to the VM is a manual/separate process.
 
 ---
 
