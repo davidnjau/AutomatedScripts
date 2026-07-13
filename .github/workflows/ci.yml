@@ -25,6 +25,10 @@ jobs:
       STAFF_VALUER_PASS: ci-test
       PUBLIC_USER: ci-test
       PUBLIC_PASS: ci-test
+      # common.py's ALLOWED_IDS must be non-empty — some tests (e.g.
+      # test_auto_fetch's _auto_fetch_job tests) assert a Telegram send
+      # happened, which only fires per-chat_id in ALLOWED_IDS.
+      ALLOWED_TELEGRAM_IDS: "123456789"
 
     steps:
       - name: Checkout code
