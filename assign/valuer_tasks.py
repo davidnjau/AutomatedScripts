@@ -38,7 +38,6 @@ from telegram.ext import (
 
 from ardhisasa_auth import AuthTokens, build_session
 from common import (
-    BASE_URL,
     BTN_VALUER_TASKS,
     CPARAMS_DLV,
     CRED_LABELS,
@@ -56,6 +55,11 @@ from common import (
     get_valid_tokens,
     logger,
     not_cancel,
+)
+from endpoints import (
+    ACCOUNTS_LIST_URL,
+    STAMP_DUTY_APPLICATION_DETAIL_URL,
+    STAMP_DUTY_APPLICATION_LIST_URL,
 )
 from excel_report import autofit_columns, style_header_row
 from token_rotator import _AllTokensExhausted, _TokenRotator, fetch_with_rotation
@@ -88,8 +92,8 @@ def _get_vt_sess(ctx: ContextTypes.DEFAULT_TYPE) -> VTSession:
     return ctx.user_data["vt_session"]
 
 
-_VT_TASK_LIST_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application"
-_VT_DETAIL_URL    = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view"
+_VT_TASK_LIST_URL = STAMP_DUTY_APPLICATION_LIST_URL
+_VT_DETAIL_URL    = STAMP_DUTY_APPLICATION_DETAIL_URL
 
 
 def _vt_headers(tokens: AuthTokens) -> dict:
@@ -387,7 +391,7 @@ async def recv_vt_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         http_sess = build_session()
         resp = http_sess.get(
-            f"{BASE_URL}/acl/api/v1/accounts/list-user-accounts",
+            ACCOUNTS_LIST_URL,
             headers={"Authorization": f"Bearer {tokens.access_token}", "JWTAUTH": f"Bearer {tokens.jwt}"},
             params={"account_type": "STAFF", "filter_type": "ACTIVE", "page": 1, "search": name},
             timeout=30,

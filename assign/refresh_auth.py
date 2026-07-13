@@ -29,7 +29,7 @@ from telegram.ext import (
     filters,
 )
 
-from ardhisasa_auth import AUTH_BASE_URL, build_session
+from ardhisasa_auth import build_session
 
 from common import (
     BTN_AUTH,
@@ -47,6 +47,7 @@ from common import (
     not_cancel,
     persist_tokens,
 )
+from endpoints import AUTH_LOGIN_URL, AUTH_OTP_VERIFY_URL
 
 
 # ──────────────────────────────────────────────────────────
@@ -159,7 +160,7 @@ async def _auth_trigger_login(query, auth_sess: AuthSession) -> int:
     )
     try:
         resp = auth_sess.http_session.post(
-            f"{AUTH_BASE_URL}/login",
+            AUTH_LOGIN_URL,
             json={"username": creds["username"], "password": creds["password"],
                   "usertype": creds["usertype"], "otpcode": ""},
             timeout=30,
@@ -191,7 +192,7 @@ async def recv_auth_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Verifying OTP…")
     try:
         resp = auth_sess.http_session.post(
-            f"{AUTH_BASE_URL}/otpverify",
+            AUTH_OTP_VERIFY_URL,
             json={"username": creds["username"], "password": creds["password"], "otpcode": otp},
             timeout=30,
         )

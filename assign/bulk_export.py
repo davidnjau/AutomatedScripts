@@ -51,7 +51,6 @@ from telegram.ext import (
 
 from ardhisasa_auth import AuthTokens, build_session
 from common import (
-    BASE_URL,
     BTN_BULK_EXPORT,
     BTN_EXPORT_STATUS,
     CPARAMS_DLV,
@@ -71,6 +70,11 @@ from common import (
     not_cancel,
 )
 from email_service import _send_bulk_export_email
+from endpoints import (
+    STAMP_DUTY_APPLICATION_DETAIL_URL,
+    STAMP_DUTY_APPLICATION_LIST_URL,
+    STAMP_DUTY_OFFICE_REPORT_URL,
+)
 from excel_report import autofit_columns, style_header_row
 from job_distribution import _JD_STATUS
 from token_rotator import _AllTokensExhausted, _TokenRotator
@@ -169,9 +173,9 @@ def _get_be_sess(ctx: ContextTypes.DEFAULT_TYPE) -> BESession:
     return ctx.user_data["be_session"]
 
 
-_BE_LIST_URL   = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application"
-_BE_DETAIL_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view"
-_BE_REPORT_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/office-reports/get-current-office-report"
+_BE_LIST_URL   = STAMP_DUTY_APPLICATION_LIST_URL
+_BE_DETAIL_URL = STAMP_DUTY_APPLICATION_DETAIL_URL
+_BE_REPORT_URL = STAMP_DUTY_OFFICE_REPORT_URL
 _BE_PAGE_SIZE  = 10   # API default
 _BE_LIST_WORKERS        = 5
 _BE_DETAIL_WORKERS      = 5

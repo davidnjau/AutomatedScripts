@@ -48,10 +48,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from ardhisasa_auth import (
-    AUTH_BASE_URL,
     build_session,
     decode_jwt_exp,
 )
+from endpoints import AUTH_REFRESH_TOKEN_URL
 
 load_dotenv()
 
@@ -193,7 +193,7 @@ def _try_refresh_token(
 
     try:
         resp = _api_sess.post(
-            f"{AUTH_BASE_URL}/refresh-token",
+            AUTH_REFRESH_TOKEN_URL,
             headers={
                 "Authorization": f"Bearer {access_token}",
                 "JWTAUTH":       f"Bearer {jwt_token}",

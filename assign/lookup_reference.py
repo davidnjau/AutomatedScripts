@@ -33,7 +33,6 @@ from telegram.ext import (
 
 from ardhisasa_auth import AuthTokens, build_session
 from common import (
-    BASE_URL,
     BTN_LOOKUP,
     CPARAMS_DLV,
     CPARAMS_VALUER_ROLE,
@@ -49,6 +48,10 @@ from common import (
     get_valid_tokens,
     logger,
     not_cancel,
+)
+from endpoints import (
+    STAMP_DUTY_APPLICATION_DETAIL_URL,
+    STAMP_DUTY_APPLICATION_LIST_URL,
 )
 
 
@@ -81,8 +84,8 @@ _LU_SEARCH_COMBOS = [
     ("Pending",   "VALUER", CPARAMS_VALUER_ROLE),
 ]
 
-_LU_LIST_URL   = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application"
-_LU_DETAIL_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view"
+_LU_LIST_URL   = STAMP_DUTY_APPLICATION_LIST_URL
+_LU_DETAIL_URL = STAMP_DUTY_APPLICATION_DETAIL_URL
 
 
 def _lu_search_ref(tokens: AuthTokens, ref: str) -> Optional[Dict]:

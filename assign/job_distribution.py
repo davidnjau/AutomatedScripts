@@ -44,7 +44,6 @@ from telegram.ext import (
 
 from ardhisasa_auth import AuthTokens, build_session
 from common import (
-    BASE_URL,
     BTN_JOB_DIST,
     CPARAMS_DLV,
     CRED_LABELS,
@@ -58,6 +57,12 @@ from common import (
     fallback,
     get_valid_tokens,
     logger,
+)
+from endpoints import (
+    STAMP_DUTY_APPLICATION_DETAIL_URL,
+    STAMP_DUTY_APPLICATION_LIST_URL,
+    TEAM_MEMBERS_URL,
+    TEAMS_LIST_URL,
 )
 from excel_report import autofit_columns, style_header_row
 from token_rotator import _AllTokensExhausted, _TokenRotator, fetch_with_rotation
@@ -76,10 +81,10 @@ class JD(Enum):
     CONFIRM   = auto()   # confirm → kick off background analysis
 
 
-_TEAMS_URL        = f"{BASE_URL}/acl/api/v1/list-teams"
-_TEAM_MEMBERS_URL = f"{BASE_URL}/acl/api/v1/staff-teams/get-team-members"
-_JD_ONGOING_URL   = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application"
-_JD_DETAIL_URL    = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view"
+_TEAMS_URL        = TEAMS_LIST_URL
+_TEAM_MEMBERS_URL = TEAM_MEMBERS_URL
+_JD_ONGOING_URL   = STAMP_DUTY_APPLICATION_LIST_URL
+_JD_DETAIL_URL    = STAMP_DUTY_APPLICATION_DETAIL_URL
 
 # Per-chat job distribution status tracker
 _JD_STATUS: Dict[int, dict] = {}

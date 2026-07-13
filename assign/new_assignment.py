@@ -50,9 +50,8 @@ from telegram.ext import (
     filters,
 )
 
-from ardhisasa_auth import AUTH_BASE_URL, AuthTokens, build_session
+from ardhisasa_auth import AuthTokens, build_session
 from common import (
-    BASE_URL,
     BTN_ASSIGN,
     BTN_ASSIGNMENTS,
     CRED_LABELS,
@@ -73,6 +72,12 @@ from common import (
     persist_assignment,
     persist_tokens,
     persist_valuer,
+)
+from endpoints import (
+    ACCOUNTS_LIST_URL,
+    AUTH_LOGIN_URL,
+    AUTH_OTP_VERIFY_URL,
+    STAMP_DUTY_FIX_APPLICATION_URL,
 )
 from lookup_reference import _lu_fetch_detail, _lu_format_result, _lu_search_ref
 from telegram_report import _send_chunked_report
@@ -148,7 +153,7 @@ async def _do_valuer_search(message, sess: Session) -> Optional[List[Dict]]:
             "search":       sess.valuer_name,
         }
         resp = sess.session.get(
-            f"{BASE_URL}/acl/api/v1/accounts/list-user-accounts",
+            ACCOUNTS_LIST_URL,
             headers=headers, params=params, timeout=30,
         )
         resp.raise_for_status()
@@ -646,7 +651,7 @@ async def recv_cred_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess.session = build_session()
     try:
         resp = sess.session.post(
-            f"{AUTH_BASE_URL}/login",
+            AUTH_LOGIN_URL,
             json={
                 "username": creds["username"],
                 "password": creds["password"],
@@ -687,7 +692,7 @@ async def recv_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     try:
         resp = sess.session.post(
-            f"{AUTH_BASE_URL}/otpverify",
+            AUTH_OTP_VERIFY_URL,
             json={
                 "username": creds["username"],
                 "password": creds["password"],
@@ -859,7 +864,7 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-    url     = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/fix_application_details"
+    url     = STAMP_DUTY_FIX_APPLICATION_URL
     headers = {
         "Authorization": f"Bearer {sess.tokens.access_token}",
         "JWTAUTH":       f"Bearer {sess.tokens.jwt}",

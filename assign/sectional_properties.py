@@ -28,7 +28,6 @@ from telegram.ext import (
 from ardhisasa_auth import build_session
 
 from common import (
-    BASE_URL,
     BTN_SECTIONAL,
     CRED_LABELS,
     _any_valid_tokens,
@@ -44,6 +43,7 @@ from common import (
     not_cancel,
     save_sectional_config,
 )
+from endpoints import ACCOUNTS_LIST_URL
 
 
 # ──────────────────────────────────────────────────────────
@@ -139,7 +139,7 @@ async def recv_sc_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     http_sess = build_session()
     try:
         resp = http_sess.get(
-            f"{BASE_URL}/acl/api/v1/accounts/list-user-accounts",
+            ACCOUNTS_LIST_URL,
             headers={"Authorization": f"Bearer {tokens.access_token}", "JWTAUTH": f"Bearer {tokens.jwt}"},
             params={"account_type": "STAFF", "search": name, "page": 1},
             timeout=30,
