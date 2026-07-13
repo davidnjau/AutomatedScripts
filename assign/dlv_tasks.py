@@ -41,6 +41,7 @@ from common import (
     _any_valid_tokens,
     _CANCEL_FILTER,
     _main_menu,
+    _NODE_LABELS,
     allowed,
     cmd_cancel,
     deny,
@@ -99,6 +100,16 @@ def _get_dt_sess(ctx: ContextTypes.DEFAULT_TYPE) -> DTSession:
 # DLV Tasks — fetch and enrich ongoing tasks
 # ──────────────────────────────────────────────────────────
 
+def _format_consideration(amount: str, currency: str) -> str:
+    """Format a raw consideration amount + currency code as 'KES 6,000,000.00', or '' if amount is empty."""
+    if not amount:
+        return ""
+    try:
+        return f"{currency or 'KES'} {float(amount):,.2f}"
+    except (ValueError, TypeError):
+        return str(amount)
+
+
 def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
     """
     Load the DLV batch queue and classify each ref's live status (County and
@@ -114,17 +125,20 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
     def _enrich(item: dict) -> dict:
         ref = item.get("ref", "")
         row = {
-            "ref":          ref,
-            "parcel":       "",
-            "registry":     "",
-            "county":       "",
-            "date_created": item.get("queued_at", ""),   # fallback: when queued
-            "valuer_name":  item.get("valuer_name", ""),
-            "valuer_uid":   item.get("valuer_uid", ""),
-            "assessor":     "",
-            "found":        False,   # found anywhere (DLV or still with the assessor)
-            "location":     "",      # "dlv" | "assessor"
-            "_closed":      None,
+            "ref":           ref,
+            "parcel":        "",
+            "registry":      "",
+            "county":        "",
+            "date_created":  item.get("queued_at", ""),   # fallback: when queued
+            "valuer_name":   item.get("valuer_name", ""),
+            "valuer_uid":    item.get("valuer_uid", ""),
+            "assessor":      "",
+            "status":        "",   # application/stamp-duty status, e.g. "ONGOING"
+            "node":          "",   # workflow node code, mapped to a label via _NODE_LABELS
+            "consideration": "",   # formatted "KES 1,234.00", or "" if unknown
+            "found":         False,   # found anywhere (DLV or still with the assessor)
+            "location":      "",      # "dlv" | "assessor"
+            "_closed":       None,
         }
         try:
             # 1. Assessor/HQ stage first (stampdutyservice) — the same endpoints
@@ -146,6 +160,7 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
                         {"name": o.get("names", ""), "role": o.get("role", "")}
                         for o in det.get("officers", [])
                     ])
+                    row["status"] = det.get("application_status") or det.get("stamp_duty_status", "")
             else:
                 # 2. Not upstream anymore — check DLV (valuationservice), which
                 #    also tells us if the ref has since Completed or Returned.
@@ -175,7 +190,12 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
                             }
                             return row
 
-                        row["assessor"] = info["assessor_name"]
+                        row["assessor"]      = info["assessor_name"]
+                        row["status"]        = info["application_status"]
+                        row["node"]          = info["node"]
+                        row["consideration"] = _format_consideration(
+                            info["consideration_amount"], info["currency_code"]
+                        )
         except Exception as e:
             logger.warning("DLV Tasks enrich failed for %s: %s", ref, e)
 
@@ -580,8 +600,36 @@ async def recv_dt_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
+def _dt_format_task_block(i: int, t: dict) -> str:
+    """Format one task's full detail block (ref, status, node, valuer, registry, county,
+    consideration, parcel, created), matching Lookup Reference's field layout."""
+    node_label = _NODE_LABELS.get(t.get("node", ""), t.get("node") or "—")
+    location   = t.get("location", "")
+    if location == "assessor":
+        note = "⏳ _still with Assessor, not yet in DLV_"
+    elif not t.get("found", True):
+        note = "❓ _not found in Assessor or DLV queues_"
+    else:
+        note = ""
+
+    block = (
+        f"  {i}. *Ref:* `{t.get('ref') or '—'}`\n"
+        f"     📊 Status: {t.get('status') or '—'}\n"
+        f"     🔄 Node: {node_label}\n"
+        f"     👤 Valuer: {t.get('valuer_name') or '—'}\n"
+        f"     🏢 Registry: {t.get('registry') or '—'}\n"
+        f"     📍 County: {t.get('county') or '—'}\n"
+        f"     💰 Consideration: {t.get('consideration') or '—'}\n"
+        f"     📋 Parcel: {t.get('parcel') or '—'}\n"
+        f"     📅 Created: {t.get('date_created') or '—'}"
+    )
+    if note:
+        block += f"\n     {note}"
+    return block
+
+
 async def _dt_send_telegram(chat_id: int, rows: List[dict], bot) -> None:
-    """Send DLV task list as Telegram messages grouped by valuer."""
+    """Send DLV task list as Telegram messages grouped by valuer, one detail block per task."""
     if not rows:
         await bot.send_message(chat_id, "ℹ️ No tasks to display.")
         return
@@ -597,20 +645,7 @@ async def _dt_send_telegram(chat_id: int, rows: List[dict], bot) -> None:
     for valuer, tasks in sorted(groups.items()):
         lines.append(f"\n👤 *{valuer}* ({len(tasks)} task(s))")
         for i, t in enumerate(tasks, start=1):
-            date_str = (t.get("date_created") or "")[:10] or "—"
-            assessor = t.get("assessor") or "—"
-            parcel   = t.get("parcel") or "—"
-            location = t.get("location", "")
-            if location == "assessor":
-                note = " ⏳ _still with Assessor, not yet in DLV_"
-            elif not t.get("found", True):
-                note = " ❓ _not found in Assessor or DLV queues_"
-            else:
-                note = ""
-            lines.append(
-                f"  {i}. `{t.get('ref', '—')}` | {parcel} | "
-                f"Added: {date_str} | Assessor: {assessor}{note}"
-            )
+            lines.append(_dt_format_task_block(i, t))
 
     async def _send(text, reply_markup):
         await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
