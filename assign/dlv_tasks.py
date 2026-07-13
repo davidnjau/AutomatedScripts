@@ -601,8 +601,9 @@ async def recv_dt_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 
 def _dt_format_task_block(i: int, t: dict) -> str:
-    """Format one task's full detail block (ref, status, node, valuer, registry, county,
-    consideration, parcel, created), matching Lookup Reference's field layout."""
+    """Format one task's full detail block (ref, status, node, valuer, assessor, registry,
+    county, consideration, parcel, added), matching Lookup Reference's field layout while
+    keeping every field the old one-line format showed (assessor, added-date, not-found note)."""
     node_label = _NODE_LABELS.get(t.get("node", ""), t.get("node") or "—")
     location   = t.get("location", "")
     if location == "assessor":
@@ -617,11 +618,12 @@ def _dt_format_task_block(i: int, t: dict) -> str:
         f"     📊 Status: {t.get('status') or '—'}\n"
         f"     🔄 Node: {node_label}\n"
         f"     👤 Valuer: {t.get('valuer_name') or '—'}\n"
+        f"     Assessor: {t.get('assessor') or '—'}\n"
         f"     🏢 Registry: {t.get('registry') or '—'}\n"
         f"     📍 County: {t.get('county') or '—'}\n"
         f"     💰 Consideration: {t.get('consideration') or '—'}\n"
         f"     📋 Parcel: {t.get('parcel') or '—'}\n"
-        f"     📅 Created: {t.get('date_created') or '—'}"
+        f"     📅 Added: {t.get('date_created') or '—'}"
     )
     if note:
         block += f"\n     {note}"
