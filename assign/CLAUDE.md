@@ -29,7 +29,9 @@ Required environment variables (in `.env`):
 
 ## Architecture
 
-`bot.py` originally held every feature in one ~9,200-line file. It has been split, one feature at a time, into sibling modules that each own their conversation handlers and register themselves into `bot.py`'s `main()` via a `register(app)` function. The extraction is complete — `bot.py` is now a ~751-line thin orchestrator. See "Extraction history" below for how this was done and the reasoning behind each cross-module dependency; the same `register(app)` pattern applies to any future feature work in this codebase.
+`bot.py` originally held every feature in one ~9,200-line file. It has been split into sibling modules that each own their conversation handlers and register themselves into `bot.py`'s `main()` via a `register(app)` function. The extraction is complete — `bot.py` is now a ~751-line thin orchestrator. See "Extraction history" below for how this was done and the reasoning behind each cross-module dependency.
+
+**Going forward, every new feature is added as its own new module from day one — never written inline in `bot.py`.** `bot.py` should stay a thin orchestrator permanently. Concretely: a new feature gets its own `assign/<feature>.py` with that feature's state enum/session dataclass/handlers/keyboards, a `register(app)` function, its own `tests/test_<feature>.py`, and imports whatever shared behavior it needs (token cache, chunked Telegram sending, Excel styling, SMTP, rotate-on-403 fetching) from the existing shared modules below rather than reimplementing it. See "Adding a new feature module" further down for the full checklist.
 
 - **`common.py`** — shared bot-wide infra: logger, generic JSON persistence (`_atomic_json_write`), the token cache (`get_valid_tokens`, `_any_valid_tokens`, `persist_tokens`), `CRED_MAP`/`CRED_LABELS`/`_cred_keyboard`/`_be_cred_keyboard` (lists only creds with an already-cached token — used by Bulk Export/Job Distribution/Lookup Reference/Valuer Tasks, not a duplicate of `_cred_keyboard`), `_NODE_LABELS` (node-code → human label, shared by Lookup Reference and Valuer Tasks), `cparams` constants, the main menu keyboard, auth guards (`allowed`/`deny`), `_safe_err` (redacts exception detail before it reaches a Telegram message), `_date_cutoff_str`/`_within_days`, shared filter keyboards (`_ft_county_keyboard`, `_ft_registry_keyboard`, `_ft_amount_keyboard`, `_sectional_keyboard`), and `load_sectional_config`/`save_sectional_config` (owned conceptually by Sectional Properties, but read by Auto Fetch too, so it lives here rather than forcing a cross-feature-module import).
 - **`dlv_core.py`** — the DLV queue storage (`load_dlv_batch`/`save_dlv_batch`/etc.) and the assessor/DLV search-and-classify layer shared by DLV Batch and DLV Tasks.
@@ -42,17 +44,26 @@ Required environment variables (in `.env`):
 - **`bot.py`** — the thin orchestrator: `cmd_start`/`cmd_help`, saved-valuers management (`cmd_valuers`/`cmd_delete_valuer`/`recv_delete_valuer`), daemon control (`cmd_daemon`/`recv_daemon_action`), token/error-report status (`cmd_token_status`/`cmd_error_report`), `cmd_restart`, and `main()`, which imports every feature module and calls its `register(app)`.
 - **`tests/`** — `unittest`-based tests per module (stdlib only, no new dependencies). Run with `python3 -m unittest discover -s assign/tests -v`.
 
-**When extracting a new feature into its own module (e.g. splitting a newly-added feature back out later), follow the pattern established during this extraction:**
+### Adding a new feature module
 
-1. Move only that feature's enum/session dataclass/handlers/keyboards into the new file; leave anything shared by ≥2 features in `common.py`, `dlv_core.py`, `fetch_tasks_cache.py`, `email_service.py`, `telegram_report.py`, `token_rotator.py`, or `excel_report.py` instead of duplicating it — e.g. a new feature that emails a report calls `email_service`'s senders, one that displays a paginated list in Telegram calls `telegram_report._send_chunked_report` rather than writing its own chunking loop, one that fetches from an API under multi-credential rotation calls `token_rotator.fetch_with_rotation()` rather than writing its own rotate-on-403 loop, and one that builds an Excel report calls `excel_report.style_header_row()`/`autofit_columns()` rather than re-styling row 1 by hand.
+This is the standard way to add **any** new feature to this bot — not just a historical extraction pattern. A new feature is a new file, `assign/<feature>.py`, from the moment it's written; it is never prototyped inline in `bot.py` and extracted later.
+
+1. Create `assign/<feature>.py` containing only that feature's own enum/session dataclass/handlers/keyboards. Leave anything shared by ≥2 features in the existing shared modules instead of duplicating it — a new feature that:
+   - emails a report → calls `email_service`'s senders
+   - displays a paginated list in Telegram → calls `telegram_report._send_chunked_report` rather than writing its own chunking loop
+   - fetches from an API under multi-credential rotation → calls `token_rotator.fetch_with_rotation()` rather than writing its own rotate-on-403 loop
+   - builds an Excel report → calls `excel_report.style_header_row()`/`autofit_columns()` rather than re-styling row 1 by hand
+   - needs the token cache, `CRED_MAP`/`CRED_LABELS`, the main menu, or auth guards → imports them from `common.py`
+
+   (Quick reference: `common.py` / `dlv_core.py` / `fetch_tasks_cache.py` / `email_service.py` / `telegram_report.py` / `token_rotator.py` / `excel_report.py` — see the Architecture bullets above for what each one owns.)
 2. Expose a `register(app: Application) -> None` that builds and adds the feature's `ConversationHandler` (and any jobs/other handlers it owns) — `bot.py`'s `main()` calls it instead of building the handler inline.
 3. **Authentication must follow the existing check-cache-then-login pattern, the same way every feature already does it — do not invent a new login flow.** Concretely (see `fetch_tasks.py`'s `recv_ft_cred` for the canonical example):
    - On credential selection, call `get_valid_tokens(cred_type)` (or `_any_valid_tokens()` for background jobs) from `common.py`.
    - **If cached tokens are valid** — store them on the session and go straight to the next step. Do not re-login.
    - **If not** — fall back to the standard OTP workflow: `build_session()` → `POST {AUTH_BASE_URL}/login` with `CRED_MAP[cred_type]` → transition to a `WAIT_OTP` state → on OTP reply, `POST {AUTH_BASE_URL}/otpverify` → `persist_tokens(cred_type, access_token, jwt, refresh_token)` → continue.
    - Use `CRED_LABELS[cred_type]` for user-facing text and `_cred_keyboard()` for the picker, so every feature's credential-selection UI looks identical.
-4. Add `import <module>` and `<module>.register(app)` to `bot.py`'s `main()`; add a `COPY <module>.py .` line to the `Dockerfile` (it copies files explicitly, not the whole directory — missed modules fail with `ImportError` only at container start, not at build time).
-5. Add a `tests/test_<module>.py` covering the module's non-trivial logic (pure functions directly, handlers via mocked Telegram objects), and confirm the full suite still passes.
+4. Add `import <feature>` and `<feature>.register(app)` to `bot.py`'s `main()`; add a `COPY <feature>.py .` line to the `Dockerfile` (it copies files explicitly, not the whole directory — a missed module fails with `ImportError` only at container start, not at build time).
+5. Add a `tests/test_<feature>.py` covering the module's non-trivial logic (pure functions directly, handlers via mocked Telegram objects), and confirm the full suite still passes.
 6. Verify: `python3 -m py_compile` + `python3 -m pyflakes` on all touched files, `import bot` succeeds, a `bot.main()` dry-run (with `Application.run_polling` stubbed) wires every handler without raising, and — when practical — a real `docker compose up` against a local/non-production bot token confirms it connects and polls cleanly before stopping it.
 
 ### Extraction history
@@ -143,7 +154,7 @@ Required environment variables (in `.env`):
   → RT_CONFIRM → fetch + assign matching tasks → show results
 ```
 
-Menu buttons: `📋 New Assignment`, `📥 Receive Tasks`, `📊 Implementor Tasks`, `📋 DLV Tasks`, `🔄 Token Daemon`, `👥 Saved Valuers`, `🗑 Delete Valuer`, `❓ Help`, `🛑 Cancel`.
+Menu buttons (all `BTN_*` constants defined in `common.py`, laid out by `_main_menu()`): `📋 New Assignment`, `📊 Fetch Tasks`, `⏰ Auto Fetch`, `🗂 AF Results`, `📜 Assignments`, `📥 DLV Batch`, `📤 Export Valuation Report`, `📊 Export Status`, `🏆 Job Distribution`, `👤 Valuer Tasks`, `📋 DLV Tasks`, `🔲 Sectional`, `🌅 Morning Briefing`, `🔎 Lookup Reference`, `🔑 Refresh Auth`, `🔒 Token Status`, `📉 Error Report`, `👥 Saved Valuers`, `🗑 Delete Valuer`, `🔄 Token Daemon`, `🔁 Restart Bot`, `❓ Help`, `🛑 Cancel`. Receive Tasks (`/receive`) and DLV Queue (`🔍 DLV Queue`, reached from within the DLV Batch flow) have no top-level menu entry.
 
 ### Key API Endpoints
 
