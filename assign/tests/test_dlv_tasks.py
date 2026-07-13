@@ -68,7 +68,8 @@ class TestDtFetchTasksPriorityOrder(unittest.TestCase):
         assessor_task = {"id": "1", "parcel_number": "P1", "registry": "NAIROBI", "county": "NAIROBI",
                           "date_created": "2026-07-10"}
         with patch.object(dlv_tasks, "_fetch_stampduty_detail",
-                           return_value={"officers": [{"names": "LIVE ASSESSOR", "role": "ASSESSOR_OF_STAMP_DUTY"}]}):
+                           return_value={"application_status": "ONGOING",
+                                         "officers": [{"names": "LIVE ASSESSOR", "role": "ASSESSOR_OF_STAMP_DUTY"}]}):
             row = self._run(
                 _batch_item(assessor="STALE CACHED NAME"),
                 _search_ref_stampduty=assessor_task,
@@ -76,6 +77,7 @@ class TestDtFetchTasksPriorityOrder(unittest.TestCase):
         self.assertEqual(row["assessor"], "LIVE ASSESSOR")
         self.assertEqual(row["location"], "assessor")
         self.assertTrue(row["found"])
+        self.assertEqual(row["status"], "ONGOING")
 
     def test_dlv_found_with_assessor_takes_priority_over_item_field(self):
         dlv_task = {"id": "1", "parcel_number": "P1", "registry": "NAIROBI", "county": "NAIROBI",
@@ -83,8 +85,8 @@ class TestDtFetchTasksPriorityOrder(unittest.TestCase):
         with patch.object(dlv_tasks, "_fetch_ref_detail_dlv", return_value={"node": "X"}), \
              patch.object(dlv_tasks, "_classify_dlv_detail", return_value={
                  "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
-                 "node": "X", "assessor_name": "DLV ASSESSOR", "consideration_amount": "",
-                 "currency_code": "", "actor_name": "",
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT", "assessor_name": "DLV ASSESSOR",
+                 "consideration_amount": "6000000", "currency_code": "KES", "actor_name": "",
              }):
             row = self._run(
                 _batch_item(assessor="STALE CACHED NAME"),
@@ -92,6 +94,9 @@ class TestDtFetchTasksPriorityOrder(unittest.TestCase):
             )
         self.assertEqual(row["assessor"], "DLV ASSESSOR")
         self.assertEqual(row["location"], "dlv")
+        self.assertEqual(row["status"], "ONGOING")
+        self.assertEqual(row["node"], "VALUATION_STAMP_DUTY_VALUER_REPORT")
+        self.assertEqual(row["consideration"], "KES 6,000,000.00")
 
     def test_neither_live_search_found_falls_back_to_batch_item_field(self):
         """This is the exact bug: both live searches miss the ref, but the
@@ -155,6 +160,70 @@ class TestDtFetchTasksPriorityOrder(unittest.TestCase):
             rows = dlv_tasks._dt_fetch_tasks(TOKENS)
         self.assertEqual(rows, [])
         mock_search.assert_not_called()
+
+
+class TestFormatConsideration(unittest.TestCase):
+    """_format_consideration turns a raw amount + currency into 'KES 1,234.00'."""
+
+    def test_formats_amount_with_currency(self):
+        self.assertEqual(dlv_tasks._format_consideration("6000000", "KES"), "KES 6,000,000.00")
+
+    def test_defaults_currency_to_kes_when_missing(self):
+        self.assertEqual(dlv_tasks._format_consideration("100", ""), "KES 100.00")
+
+    def test_empty_amount_returns_empty_string(self):
+        self.assertEqual(dlv_tasks._format_consideration("", "KES"), "")
+
+    def test_non_numeric_amount_falls_back_to_str(self):
+        self.assertEqual(dlv_tasks._format_consideration("N/A", "KES"), "N/A")
+
+
+class TestDtFormatTaskBlock(unittest.TestCase):
+    """_dt_format_task_block renders one task's full Lookup-Reference-style detail block."""
+
+    def _task(self, **overrides):
+        t = {
+            "ref": "REG/TSFR/SHIZU9NCC8", "status": "ONGOING",
+            "node": "VALUATION_STAMP_DUTY_VALUER_REPORT", "valuer_name": "BYRON MARCEL ONDITI",
+            "registry": "NAIROBI", "county": "nairobi", "consideration": "KES 6,000,000.00",
+            "parcel": "NAIROBI/BLOCK209/309", "date_created": "2026-07-08T15:36:21.616029",
+            "found": True, "location": "dlv",
+        }
+        t.update(overrides)
+        return t
+
+    def test_all_fields_present(self):
+        block = dlv_tasks._dt_format_task_block(1, self._task())
+        self.assertIn("📌 *Ref:* `REG/TSFR/SHIZU9NCC8`", block)
+        self.assertIn("📊 Status: ONGOING", block)
+        self.assertIn("🔄 Node: ✍️ Assigned — valuer report pending", block)
+        self.assertIn("👤 Valuer: BYRON MARCEL ONDITI", block)
+        self.assertIn("🏢 Registry: NAIROBI", block)
+        self.assertIn("📍 County: nairobi", block)
+        self.assertIn("💰 Consideration: KES 6,000,000.00", block)
+        self.assertIn("📋 Parcel: NAIROBI/BLOCK209/309", block)
+        self.assertIn("📅 Created: 2026-07-08T15:36:21.616029", block)
+        self.assertNotIn("not found", block)
+
+    def test_missing_fields_fall_back_to_em_dash(self):
+        block = dlv_tasks._dt_format_task_block(1, self._task(
+            status="", node="", registry="", county="", consideration="", parcel="", date_created="",
+        ))
+        self.assertIn("📊 Status: —", block)
+        self.assertIn("🔄 Node: —", block)
+        self.assertIn("🏢 Registry: —", block)
+        self.assertIn("📍 County: —", block)
+        self.assertIn("💰 Consideration: —", block)
+        self.assertIn("📋 Parcel: —", block)
+        self.assertIn("📅 Created: —", block)
+
+    def test_not_found_appends_note(self):
+        block = dlv_tasks._dt_format_task_block(1, self._task(found=False, location=""))
+        self.assertIn("❓ _not found in Assessor or DLV queues_", block)
+
+    def test_still_with_assessor_appends_note(self):
+        block = dlv_tasks._dt_format_task_block(1, self._task(location="assessor"))
+        self.assertIn("⏳ _still with Assessor, not yet in DLV_", block)
 
 
 if __name__ == "__main__":
