@@ -70,6 +70,7 @@ import auto_fetch
 import bulk_export
 import dlv_batch
 import dlv_tasks
+import hold_tasks
 import morning_briefing
 import fetch_tasks
 import job_distribution
@@ -726,6 +727,7 @@ def main():
     dlv_tasks.register(app)
     sectional_properties.register(app)
     morning_briefing.register(app)
+    hold_tasks.register(app)
 
     # Button handlers outside an active conversation
     # (bare BTN_AUTH handler registered via refresh_auth.register(app) above)
