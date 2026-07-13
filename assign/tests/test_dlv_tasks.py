@@ -185,6 +185,7 @@ class TestDtFormatTaskBlock(unittest.TestCase):
         t = {
             "ref": "REG/TSFR/SHIZU9NCC8", "status": "ONGOING",
             "node": "VALUATION_STAMP_DUTY_VALUER_REPORT", "valuer_name": "BYRON MARCEL ONDITI",
+            "assessor": "REDEMPTA AKOTH OKWANY",
             "registry": "NAIROBI", "county": "nairobi", "consideration": "KES 6,000,000.00",
             "parcel": "NAIROBI/BLOCK209/309", "date_created": "2026-07-08T15:36:21.616029",
             "found": True, "location": "dlv",
@@ -198,24 +199,26 @@ class TestDtFormatTaskBlock(unittest.TestCase):
         self.assertIn("📊 Status: ONGOING", block)
         self.assertIn("🔄 Node: ✍️ Assigned — valuer report pending", block)
         self.assertIn("👤 Valuer: BYRON MARCEL ONDITI", block)
+        self.assertIn("Assessor: REDEMPTA AKOTH OKWANY", block)
         self.assertIn("🏢 Registry: NAIROBI", block)
         self.assertIn("📍 County: nairobi", block)
         self.assertIn("💰 Consideration: KES 6,000,000.00", block)
         self.assertIn("📋 Parcel: NAIROBI/BLOCK209/309", block)
-        self.assertIn("📅 Created: 2026-07-08T15:36:21.616029", block)
+        self.assertIn("📅 Added: 2026-07-08T15:36:21.616029", block)
         self.assertNotIn("not found", block)
 
     def test_missing_fields_fall_back_to_em_dash(self):
         block = dlv_tasks._dt_format_task_block(1, self._task(
-            status="", node="", registry="", county="", consideration="", parcel="", date_created="",
+            status="", node="", assessor="", registry="", county="", consideration="", parcel="", date_created="",
         ))
         self.assertIn("📊 Status: —", block)
         self.assertIn("🔄 Node: —", block)
+        self.assertIn("Assessor: —", block)
         self.assertIn("🏢 Registry: —", block)
         self.assertIn("📍 County: —", block)
         self.assertIn("💰 Consideration: —", block)
         self.assertIn("📋 Parcel: —", block)
-        self.assertIn("📅 Created: —", block)
+        self.assertIn("📅 Added: —", block)
 
     def test_not_found_appends_note(self):
         block = dlv_tasks._dt_format_task_block(1, self._task(found=False, location=""))
