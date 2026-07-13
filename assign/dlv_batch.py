@@ -41,7 +41,6 @@ from ardhisasa_auth import AuthTokens, build_session
 
 from common import (
     ALLOWED_IDS,
-    BASE_URL,
     BTN_DLV_BATCH,
     BTN_DLV_QUEUE,
     _any_valid_tokens,
@@ -64,6 +63,7 @@ from dlv_core import (
     load_dlv_batch,
     save_dlv_batch,
 )
+from endpoints import ACCOUNTS_LIST_URL, STAMP_DUTY_FIX_APPLICATION_URL
 from fetch_tasks_cache import _fetch_tasks_log_lookup, _fetch_tasks_log_remove
 
 
@@ -121,7 +121,7 @@ def _resolve_valuer_from_saved(name: str) -> Optional[Dict]:
 def _search_valuer_api(name: str, tokens: AuthTokens) -> List[Dict]:
     http_sess = build_session()
     resp = http_sess.get(
-        f"{BASE_URL}/acl/api/v1/accounts/list-user-accounts",
+        ACCOUNTS_LIST_URL,
         headers={"Authorization": f"Bearer {tokens.access_token}", "JWTAUTH": f"Bearer {tokens.jwt}"},
         params={"account_type": "STAFF", "filter_type": "ACTIVE", "page": 1, "search": name},
         timeout=30,
@@ -230,7 +230,7 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> str:
         return ""
 
     http_sess = build_session()
-    assign_url = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/fix_application_details"
+    assign_url = STAMP_DUTY_FIX_APPLICATION_URL
     auth_hdrs = {
         "Authorization": f"Bearer {tokens.access_token}",
         "JWTAUTH":       f"Bearer {tokens.jwt}",

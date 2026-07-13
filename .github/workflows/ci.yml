@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main, assign]
+  pull_request:
+    branches: [main, assign]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: assign
+    env:
+      # Dummy values — ardhisasa_auth.py reads these via os.environ[...] at
+      # import time to build its credential-profile dicts. Tests mock every
+      # network call, so real credentials are never needed here.
+      STAFF_SUPPORT_USER: ci-test
+      STAFF_SUPPORT_PASS: ci-test
+      STAFF_ICT_USER: ci-test
+      STAFF_ICT_PASS: ci-test
+      STAFF_VALUER_USER: ci-test
+      STAFF_VALUER_PASS: ci-test
+      PUBLIC_USER: ci-test
+      PUBLIC_PASS: ci-test
+      # common.py's ALLOWED_IDS must be non-empty — some tests (e.g.
+      # test_auto_fetch's _auto_fetch_job tests) assert a Telegram send
+      # happened, which only fires per-chat_id in ALLOWED_IDS.
+      ALLOWED_TELEGRAM_IDS: "123456789"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run test suite
+        run: python3 -m unittest discover -s tests -v
