@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, develop, assign]
+    branches: [main, assign]
   pull_request:
-    branches: [main, develop, assign]
+    branches: [main, assign]
   workflow_dispatch:
 
 jobs:
@@ -44,14 +44,3 @@ jobs:
 
       - name: Run test suite
         run: python3 -m unittest discover -s tests -v
-
-  docker-build:
-    runs-on: ubuntu-latest
-    needs: test
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Build Docker image
-        run: docker build -t ardhisasa-bot ./assign
