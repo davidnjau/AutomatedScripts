@@ -194,7 +194,7 @@ class TestDtFormatTaskBlock(unittest.TestCase):
 
     def test_all_fields_present(self):
         block = dlv_tasks._dt_format_task_block(1, self._task())
-        self.assertIn("*Ref:* `REG/TSFR/SHIZU9NCC8`", block)
+        self.assertIn("📌 *Ref:* `REG/TSFR/SHIZU9NCC8`", block)
         self.assertIn("📊 Status: ONGOING", block)
         self.assertIn("🔄 Node: ✍️ Assigned — valuer report pending", block)
         self.assertIn("👤 Valuer: BYRON MARCEL ONDITI", block)

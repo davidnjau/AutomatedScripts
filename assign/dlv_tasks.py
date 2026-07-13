@@ -613,7 +613,7 @@ def _dt_format_task_block(i: int, t: dict) -> str:
         note = ""
 
     block = (
-        f"  {i}. *Ref:* `{t.get('ref') or '—'}`\n"
+        f"  {i}. 📌 *Ref:* `{t.get('ref') or '—'}`\n"
         f"     📊 Status: {t.get('status') or '—'}\n"
         f"     🔄 Node: {node_label}\n"
         f"     👤 Valuer: {t.get('valuer_name') or '—'}\n"
