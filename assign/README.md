@@ -19,6 +19,7 @@ Each feature below is its own module (see [Project Structure](#project-structure
 - **🏆 Job Distribution** — team/task-load analysis across DLV valuation teams, exported to a multi-sheet Excel report
 - **📤 Export Valuation Report / 📊 Export Status** — full stamp-duty valuation report export (Ardhisasa or Ardhipay) to Excel, optionally emailed and/or scheduled; resumes from a checkpoint if interrupted
 - **🔲 Sectional** — configure a specialist valuer that sectional-property tasks auto-route to
+- **✋ Hold Tasks** — guard specific assigned refs against takeover: pick tasks from tracked assignments or a live DLV query, and a background job (1–10 min interval) reassigns any takeover back to the held valuer automatically, releasing the hold once the ref moves past the valuer-report-pending stage
 - **🔑 Refresh Auth** — manually trigger a new OTP login for any credential profile
 - **🔄 Token Daemon / 🔒 Token Status** — background daemon that refreshes auth tokens before they expire, plus a status view
 - **📉 Error Report** — view recent error activity
@@ -60,6 +61,7 @@ AutomatedScripts/
 │   ├── job_distribution.py
 │   ├── bulk_export.py
 │   ├── sectional_properties.py
+│   ├── hold_tasks.py
 │   ├── refresh_auth.py
 │   │
 │   ├── data/                      # Persistent JSON storage (Docker volume `bot_data`)
