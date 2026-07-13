@@ -35,9 +35,8 @@ from telegram.ext import (
     filters,
 )
 
-from ardhisasa_auth import AUTH_BASE_URL, AuthTokens, build_session
+from ardhisasa_auth import AuthTokens, build_session
 from common import (
-    BASE_URL,
     CPARAMS_DLV,
     CRED_LABELS,
     CRED_MAP,
@@ -59,6 +58,18 @@ from common import (
     persist_assignment,
     persist_tokens,
     _safe_err,
+)
+from endpoints import (
+    ACCOUNTS_BY_ID_URL,
+    ACCOUNTS_GET_USER_DETAIL_URL,
+    ACCOUNTS_LIST_URL,
+    ACCOUNTS_USER_DETAILS_URL,
+    ACCOUNTS_VIEW_USER_URL,
+    AUTH_LOGIN_URL,
+    AUTH_OTP_VERIFY_URL,
+    STAMP_DUTY_APPLICATION_DETAIL_URL,
+    STAMP_DUTY_APPLICATION_LIST_URL,
+    STAMP_DUTY_FIX_APPLICATION_URL,
 )
 from telegram_report import _send_chunked_report
 
@@ -230,7 +241,7 @@ def _fetch_tasks(rt: RTSession, needed: int) -> List[Dict]:
 
     while len(tasks) < target:
         resp = rt.session.get(
-            f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
+            STAMP_DUTY_APPLICATION_LIST_URL,
             headers=headers, params={**base_params, "page": page}, timeout=30,
         )
         resp.raise_for_status()
@@ -264,7 +275,7 @@ def _fetch_task_detail(rt: RTSession, task_id: str) -> Optional[Dict]:
     """
     try:
         resp = rt.session.get(
-            f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view",
+            STAMP_DUTY_APPLICATION_DETAIL_URL,
             headers=_rt_auth_headers(rt),
             params={"request_id": task_id},
             timeout=30,
@@ -331,7 +342,7 @@ async def _do_assign_tasks(
     cred_type: str,
 ):
     """POST assignments and send a result summary to chat_id."""
-    url     = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/fix_application_details"
+    url     = STAMP_DUTY_FIX_APPLICATION_URL
     headers = {
         "Authorization": f"Bearer {tokens.access_token}",
         "JWTAUTH":       f"Bearer {tokens.jwt}",
@@ -488,11 +499,11 @@ def _fetch_staff_detail(rt: RTSession, list_entry: Dict) -> Dict:
     user_id    = list_entry.get("staff_details", {}).get("user_id", account_id)
 
     candidates = [
-        f"{BASE_URL}/acl/api/v1/accounts/get-user-detail?user_id={user_id}",
-        f"{BASE_URL}/acl/api/v1/accounts/get-user-detail/{user_id}",
-        f"{BASE_URL}/acl/api/v1/accounts/user-details?user_id={user_id}",
-        f"{BASE_URL}/acl/api/v1/accounts/view-user?user_id={user_id}",
-        f"{BASE_URL}/acl/api/v1/accounts/{account_id}",
+        f"{ACCOUNTS_GET_USER_DETAIL_URL}?user_id={user_id}",
+        f"{ACCOUNTS_GET_USER_DETAIL_URL}/{user_id}",
+        f"{ACCOUNTS_USER_DETAILS_URL}?user_id={user_id}",
+        f"{ACCOUNTS_VIEW_USER_URL}?user_id={user_id}",
+        f"{ACCOUNTS_BY_ID_URL}/{account_id}",
     ]
 
     for url in candidates:
@@ -528,7 +539,7 @@ async def _rt_resolve_saved_valuer(message, rt: RTSession) -> int:
             "JWTAUTH":       f"Bearer {rt.tokens.jwt}",
         }
         resp = rt.session.get(
-            f"{BASE_URL}/acl/api/v1/accounts/list-user-accounts",
+            ACCOUNTS_LIST_URL,
             headers=headers,
             params={"account_type": "STAFF", "filter_type": "ACTIVE",
                     "page": 1, "search": sv["name"]},
@@ -615,7 +626,7 @@ async def _rt_do_staff_search(message, rt: RTSession) -> int:
             "JWTAUTH":       f"Bearer {rt.tokens.jwt}",
         }
         resp = rt.session.get(
-            f"{BASE_URL}/acl/api/v1/accounts/list-user-accounts",
+            ACCOUNTS_LIST_URL,
             headers=headers,
             params={"account_type": "STAFF", "filter_type": "ACTIVE",
                     "page": 1, "search": rt.staff_name},
@@ -670,7 +681,7 @@ async def _rt_fetch_and_show(message, rt: RTSession) -> int:
 
     try:
         peek = rt.session.get(
-            f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
+            STAMP_DUTY_APPLICATION_LIST_URL,
             headers=headers, params=peek_params, timeout=30,
         )
         peek.raise_for_status()
@@ -851,7 +862,7 @@ async def recv_rt_cred_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     try:
         resp = rt.session.post(
-            f"{AUTH_BASE_URL}/login",
+            AUTH_LOGIN_URL,
             json={"username": creds["username"], "password": creds["password"],
                   "usertype": creds["usertype"], "otpcode": ""},
             timeout=30,
@@ -881,7 +892,7 @@ async def recv_rt_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Verifying OTP…")
     try:
         resp = rt.session.post(
-            f"{AUTH_BASE_URL}/otpverify",
+            AUTH_OTP_VERIFY_URL,
             json={"username": creds["username"], "password": creds["password"], "otpcode": otp},
             timeout=30,
         )

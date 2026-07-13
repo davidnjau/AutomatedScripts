@@ -29,10 +29,9 @@ from telegram.ext import (
     filters,
 )
 
-from ardhisasa_auth import AUTH_BASE_URL, AuthTokens, build_session
+from ardhisasa_auth import AuthTokens, build_session
 
 from common import (
-    BASE_URL,
     BTN_FETCH_TASKS,
     CRED_LABELS,
     CRED_MAP,
@@ -55,6 +54,13 @@ from common import (
     persist_tokens,
 )
 from dlv_core import _extract_assessor, load_dlv_batch
+from endpoints import (
+    ASSESSOR_STAGE_DETAIL_URL,
+    ASSESSOR_STAGE_LIST_URL,
+    AUTH_LOGIN_URL,
+    AUTH_OTP_VERIFY_URL,
+    COUNTY_TRANSFER_DETAIL_URL,
+)
 from fetch_tasks_cache import _log_fetch_tasks
 from telegram_report import _send_chunked_report
 
@@ -116,7 +122,7 @@ def _fetch_hq_list(http_sess, tokens: AuthTokens, cutoff: str) -> List[Dict]:
     while not stop:
         try:
             resp = http_sess.get(
-                f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/hod-or-clr",
+                ASSESSOR_STAGE_LIST_URL,
                 headers=headers,
                 params={"filter": "Ongoing", "page": page, "search": ""},
                 timeout=30,
@@ -153,7 +159,7 @@ def _fetch_county_list(http_sess, tokens: AuthTokens, cutoff: str) -> List[Dict]
     while not stop:
         try:
             resp = http_sess.get(
-                f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/hod-or-clr",
+                ASSESSOR_STAGE_LIST_URL,
                 headers=headers,
                 params={"filter": "Ongoing", "from_ardhipay": "true", "page": page, "search": ""},
                 timeout=30,
@@ -184,7 +190,7 @@ def _fetch_hq_detail_2a(http_sess, tokens: AuthTokens, application_id: str) -> O
     """Fetch registration detail (2a) using application_id."""
     try:
         resp = http_sess.get(
-            f"{BASE_URL}/registrationservice/api/v1/transfer/transfer-request-staff-detailed-view",
+            COUNTY_TRANSFER_DETAIL_URL,
             headers=_ft_headers(tokens),
             params={"request_id": application_id},
             timeout=30,
@@ -200,7 +206,7 @@ def _fetch_hq_detail_2b(http_sess, tokens: AuthTokens, task_id: str) -> Optional
     """Fetch stamp-duty detail (2b) using task id — has officer assignments."""
     try:
         resp = http_sess.get(
-            f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/detail-view",
+            ASSESSOR_STAGE_DETAIL_URL,
             headers=_ft_headers(tokens),
             params={"request_id": task_id},
             timeout=30,
@@ -216,7 +222,7 @@ def _fetch_county_detail(http_sess, tokens: AuthTokens, task_id: str) -> Optiona
     """Fetch county stamp-duty detail view."""
     try:
         resp = http_sess.get(
-            f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/detail-view",
+            ASSESSOR_STAGE_DETAIL_URL,
             headers=_ft_headers(tokens),
             params={"request_id": task_id},
             timeout=30,
@@ -404,7 +410,7 @@ async def recv_ft_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     try:
         resp = sess.http_session.post(
-            f"{AUTH_BASE_URL}/login",
+            AUTH_LOGIN_URL,
             json={"username": creds["username"], "password": creds["password"],
                   "usertype": creds["usertype"], "otpcode": ""},
             timeout=30,
@@ -434,7 +440,7 @@ async def recv_ft_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Verifying OTP…")
     try:
         resp = sess.http_session.post(
-            f"{AUTH_BASE_URL}/otpverify",
+            AUTH_OTP_VERIFY_URL,
             json={"username": creds["username"], "password": creds["password"], "otpcode": otp},
             timeout=30,
         )

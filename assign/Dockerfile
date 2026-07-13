@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source files
 COPY bot.py .
 COPY common.py .
+COPY endpoints.py .
 COPY dlv_core.py .
 COPY fetch_tasks_cache.py .
 COPY dlv_batch.py .

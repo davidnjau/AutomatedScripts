@@ -23,12 +23,17 @@ from typing import Dict, List, Optional
 from ardhisasa_auth import AuthTokens, build_session
 
 from common import (
-    BASE_URL,
     CPARAMS_DLV,
     DATA_DIR,
     _atomic_json_write,
     _ft_headers,
     logger,
+)
+from endpoints import (
+    ASSESSOR_STAGE_DETAIL_URL,
+    ASSESSOR_STAGE_LIST_URL,
+    STAMP_DUTY_APPLICATION_DETAIL_URL,
+    STAMP_DUTY_APPLICATION_LIST_URL,
 )
 
 SAVED_DLV_BATCH_FILE  = os.path.join(DATA_DIR, "saved_dlv_batch.json")
@@ -109,7 +114,7 @@ def _search_ref_dlv(tokens: AuthTokens, ref: str) -> Optional[Dict]:
             params["from_ardhipay"] = "true"   # required for county results, per dlv_batch.md
         try:
             resp = http_sess.get(
-                f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application",
+                STAMP_DUTY_APPLICATION_LIST_URL,
                 headers=headers,
                 params=params,
                 timeout=30,
@@ -128,7 +133,7 @@ def _fetch_ref_detail_dlv(tokens: AuthTokens, request_id: str) -> Optional[Dict]
     """Fetch the detail view for a DLV application."""
     http_sess = build_session()
     resp = http_sess.get(
-        f"{BASE_URL}/valuationservice/api/v1/stamp-duty/application/detail-view",
+        STAMP_DUTY_APPLICATION_DETAIL_URL,
         headers={
             "Authorization": f"Bearer {tokens.access_token}",
             "JWTAUTH":       f"Bearer {tokens.jwt}",
@@ -192,7 +197,7 @@ def _search_ref_stampduty(tokens: AuthTokens, ref: str) -> Optional[Dict]:
     ):
         try:
             resp = http_sess.get(
-                f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/hod-or-clr",
+                ASSESSOR_STAGE_LIST_URL,
                 headers=headers, params=params, timeout=30,
             )
             resp.raise_for_status()
@@ -209,7 +214,7 @@ def _fetch_stampduty_detail(tokens: AuthTokens, request_id: str) -> Optional[Dic
     http_sess = build_session()
     try:
         resp = http_sess.get(
-            f"{BASE_URL}/stampdutyservice/api/v1/stamp-duty/detail-view",
+            ASSESSOR_STAGE_DETAIL_URL,
             headers=_ft_headers(tokens),
             params={"request_id": request_id},
             timeout=30,

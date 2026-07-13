@@ -41,7 +41,6 @@ from ardhisasa_auth import build_session
 
 from common import (
     ALLOWED_IDS,
-    BASE_URL,
     BTN_AF_RESULTS,
     BTN_AUTO_FETCH,
     CPARAMS_VALUER_ROLE,
@@ -68,6 +67,7 @@ from common import (
 )
 from dlv_core import load_dlv_batch
 from email_service import _send_auto_fetch_email
+from endpoints import STAMP_DUTY_FIX_APPLICATION_URL
 from fetch_tasks import _load_fetch_tasks
 from telegram_report import _send_chunked_report
 
@@ -535,7 +535,7 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     ref = t.get("reference_number", "")
                     try:
                         r = sc_sess.put(
-                            f"{BASE_URL}/valuationservice/api/v1/stamp-duty/fix_application_details",
+                            STAMP_DUTY_FIX_APPLICATION_URL,
                             headers=sc_hdrs,
                             json={"request_id": t.get("id", ""), "valuation_officer": specialist["uid"]},
                             timeout=30,
