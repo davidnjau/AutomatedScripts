@@ -324,7 +324,7 @@ async def recv_af_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "ft_amount:5m_10m":  (5_000_000.0,  10_000_000.0),
         "ft_amount:20m_50m": (20_000_000.0, 50_000_000.0),
         "ft_amount:50m_100m":(50_000_000.0,100_000_000.0),
-        "ft_amount:80m_300m":(80_000_000.0,300_000_000.0),
+        "ft_amount:10m_80m": (10_000_000.0, 80_000_000.0),
         "ft_amount:80m_3b":  (80_000_000.0,  3_000_000_000.0),
         "ft_amount:all":     (None,           None),
     }

@@ -346,7 +346,7 @@ def _ft_amount_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("50M – 100M",     callback_data="ft_amount:50m_100m"),
-            InlineKeyboardButton("80M – 300M",     callback_data="ft_amount:80m_300m"),
+            InlineKeyboardButton("10M – 80M",      callback_data="ft_amount:10m_80m"),
         ],
         [
             InlineKeyboardButton("80M – 3B",       callback_data="ft_amount:80m_3b"),
