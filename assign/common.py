@@ -75,8 +75,6 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587").strip())
 SMTP_USER = os.getenv("SMTP_USER", "").strip()
 SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
 
-BASE_URL = "https://ardhisasa-api.lands.go.ke"
-
 # ──────────────────────────────────────────────────────────
 # Persistent storage
 # ──────────────────────────────────────────────────────────

@@ -19,8 +19,25 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import endpoints
-from ardhisasa_auth import AUTH_BASE_URL
-from common import BASE_URL
+from endpoints import AUTH_BASE_URL, BASE_URL
+
+
+class TestRootUrls(unittest.TestCase):
+    def test_base_url_is_the_bare_domain(self):
+        self.assertEqual(BASE_URL, "https://ardhisasa-api.lands.go.ke")
+
+    def test_auth_base_url_is_built_from_base_url(self):
+        self.assertEqual(AUTH_BASE_URL, f"{BASE_URL}/acl/api/v1/auth")
+
+    def test_ardhisasa_auth_reexports_the_same_login_urls(self):
+        # ardhisasa_auth.py's login()/verify_otp() build their request URL
+        # from these imported constants rather than a second literal copy —
+        # this guards against a future edit reintroducing a duplicate that
+        # silently drifts from endpoints.py.
+        import ardhisasa_auth
+
+        self.assertIs(ardhisasa_auth.AUTH_LOGIN_URL, endpoints.AUTH_LOGIN_URL)
+        self.assertIs(ardhisasa_auth.AUTH_OTP_VERIFY_URL, endpoints.AUTH_OTP_VERIFY_URL)
 
 
 class TestEndpointConstants(unittest.TestCase):

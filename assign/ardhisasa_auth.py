@@ -24,6 +24,8 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from endpoints import AUTH_LOGIN_URL, AUTH_OTP_VERIFY_URL
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -58,7 +60,6 @@ PUBLIC_CREDENTIALS = {
 # Constants
 # ---------------------------------------------------------------------------
 
-AUTH_BASE_URL = "https://ardhisasa-api.lands.go.ke/acl/api/v1/auth"
 REQUEST_TIMEOUT = 30  # seconds
 
 logger = logging.getLogger("ardhisasa.auth")
@@ -142,7 +143,7 @@ def login(session: requests.Session, credentials: dict) -> None:
     Raises:
         RuntimeError: If the server returns a login error.
     """
-    url = f"{AUTH_BASE_URL}/login"
+    url = AUTH_LOGIN_URL
     payload = {
         "username": credentials["username"],
         "password": credentials["password"],
@@ -177,7 +178,7 @@ def verify_otp(session: requests.Session, credentials: dict, otp_code: str) -> A
     Raises:
         RuntimeError: If OTP verification fails or tokens are absent.
     """
-    url = f"{AUTH_BASE_URL}/otpverify"
+    url = AUTH_OTP_VERIFY_URL
     payload = {
         "username": credentials["username"],
         "password": credentials["password"],

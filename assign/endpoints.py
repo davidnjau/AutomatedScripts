@@ -3,12 +3,21 @@
 endpoints.py
 ============
 Single source of truth for every Ardhisasa API endpoint path used across
-this bot. Before this existed, ~18 distinct endpoint paths were each
-hardcoded as an f-string in 2-6 different feature modules — if the API
-ever renames a path or moves to a new service prefix, every call site had
-to be found and edited individually. Now there is exactly one constant per
-endpoint; every feature module imports the constant it needs instead of
-rebuilding the URL itself.
+this bot — including the two root URLs (`BASE_URL`, `AUTH_BASE_URL`) that
+every other endpoint is built from. Before this existed, ~18 distinct
+endpoint paths were each hardcoded as an f-string in 2-6 different feature
+modules, and `BASE_URL`/`AUTH_BASE_URL` themselves were duplicated between
+`common.py` and `ardhisasa_auth.py` — if the API ever renames a path, moves
+to a new service prefix, or changes domain entirely, every call site had to
+be found and edited individually. Now there is exactly one constant per
+endpoint (including the two roots); every module imports the constant it
+needs instead of rebuilding the URL itself.
+
+This module has zero imports from the rest of the codebase — it is the
+lowest-level module here. `common.py` imports `BASE_URL` from here and
+`ardhisasa_auth.py` imports `AUTH_BASE_URL` (and, for its own `login()`/
+`verify_otp()`, `AUTH_LOGIN_URL`/`AUTH_OTP_VERIFY_URL`) from here — neither
+creates a cycle since nothing below imports back from either of them.
 
 Each constant below is documented with the HTTP method(s) actually used
 against it in this codebase, the request query params / JSON body, and the
@@ -17,35 +26,29 @@ just what matters here. Where a single path is hit with more than one
 shape (see `STAMP_DUTY_FIX_APPLICATION_URL`), both are documented rather
 than picking a "correct" one, since this file only centralizes paths and
 must not silently change request behavior.
-
-`ardhisasa_auth.py`'s own `login()`/`verify_otp()` are the one exception:
-they keep building `f"{AUTH_BASE_URL}/login"`/`f"{AUTH_BASE_URL}/otpverify"`
-inline rather than importing from here, since `ardhisasa_auth.py` is the
-lowest-level foundational module (predates this modularization and is
-copied independently into other script trees) and this file already
-imports `AUTH_BASE_URL` from it — importing back would be circular. If
-the login/OTP path ever changes, update both `ardhisasa_auth.py` and the
-two constants below.
 """
 
-from ardhisasa_auth import AUTH_BASE_URL
-from common import BASE_URL
+# ──────────────────────────────────────────────────────────
+# Root URLs — every endpoint below is built from one of these two.
+# ──────────────────────────────────────────────────────────
+
+BASE_URL = "https://ardhisasa-api.lands.go.ke"
+AUTH_BASE_URL = f"{BASE_URL}/acl/api/v1/auth"
 
 # ──────────────────────────────────────────────────────────
-# Auth (AUTH_BASE_URL = "https://ardhisasa-api.lands.go.ke/acl/api/v1/auth")
+# Auth
 # ──────────────────────────────────────────────────────────
 
 # POST — body: {"username", "password", "usertype", "otpcode": ""}
 # Triggers OTP dispatch to the registered device. Response: {"success": bool,
-# "error"/"message" on failure}. Used by fetch_tasks.py, new_assignment.py,
-# receive_tasks.py, refresh_auth.py (ardhisasa_auth.py builds this inline —
-# see module docstring above).
+# "error"/"message" on failure}. Used by ardhisasa_auth.py's login(),
+# fetch_tasks.py, new_assignment.py, receive_tasks.py, refresh_auth.py.
 AUTH_LOGIN_URL = f"{AUTH_BASE_URL}/login"
 
 # POST — body: {"username", "password", "otpcode"}
 # Response: {"details": {"access_token", "jwt", "refresh_token"}}.
-# Used by fetch_tasks.py, new_assignment.py, receive_tasks.py, refresh_auth.py
-# (ardhisasa_auth.py builds this inline — see module docstring above).
+# Used by ardhisasa_auth.py's verify_otp(), fetch_tasks.py, new_assignment.py,
+# receive_tasks.py, refresh_auth.py.
 AUTH_OTP_VERIFY_URL = f"{AUTH_BASE_URL}/otpverify"
 
 # POST — headers: current (possibly-about-to-expire) Authorization/JWTAUTH.
