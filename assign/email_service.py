@@ -14,6 +14,13 @@ Two entry points, matching the two MIME shapes currently in use:
 Both raise RuntimeError if SMTP_USER/SMTP_PASS aren't configured, and
 propagate any smtplib exception on send failure — callers are expected to
 catch and report those the same way they always have.
+
+Run this file directly to smoke-test SMTP connectivity from wherever it's
+run (useful for checking from inside the server/container, since that's a
+different network path than a local machine):
+
+    python3 email_service.py                    # connect + login only
+    python3 email_service.py you@example.com    # also sends a test email
 """
 
 import smtplib
@@ -72,3 +79,41 @@ def _send_auto_fetch_email(to_email: str, subject: str, body: str) -> None:
     msg.attach(MIMEText(html_body, "html"))
 
     _dispatch(msg, to_email)
+
+
+def check_smtp_connection() -> None:
+    """Connect, STARTTLS, and login to the configured SMTP server without sending
+    anything. Raises RuntimeError if creds aren't configured, or whatever smtplib
+    raises on connection/login failure. A 15s timeout keeps a blocked outbound
+    port from hanging indefinitely instead of failing fast."""
+    if not SMTP_USER or not SMTP_PASS:
+        raise RuntimeError("SMTP_USER / SMTP_PASS not configured in .env")
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+
+
+if __name__ == "__main__":
+    import sys
+
+    print(f"Connecting to {SMTP_HOST}:{SMTP_PORT} as {SMTP_USER or '(SMTP_USER not set)'}...")
+    try:
+        check_smtp_connection()
+        print("OK — SMTP connection + login succeeded.")
+    except Exception as e:
+        print(f"FAIL — {type(e).__name__}: {e}")
+        sys.exit(1)
+
+    if len(sys.argv) > 1:
+        to_email = sys.argv[1]
+        print(f"Sending a test email to {to_email}...")
+        try:
+            _send_auto_fetch_email(
+                to_email, "Ardhisasa Bot — SMTP Test",
+                "This is a test email confirming SMTP delivery is working.",
+            )
+            print("OK — test email sent.")
+        except Exception as e:
+            print(f"FAIL — {type(e).__name__}: {e}")
+            sys.exit(1)
