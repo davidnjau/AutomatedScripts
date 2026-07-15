@@ -14,6 +14,14 @@ both features fetch the same task schema), dlv_core.py's load_dlv_batch to
 exclude already-queued refs, and common.py's load_sectional_config for
 optional sectional-task auto-routing to a configured specialist valuer.
 
+The background job always fetches under the Support Reg credential (see
+_AF_CRED_TYPE below) — the HQ/County list endpoints are queried with
+cparams=CPARAMS_SUPPORT regardless of whose token is used, so a token from
+an account that doesn't actually hold that role gets back an empty/
+restricted list with no error. Fetch Tasks lets you pick any cached
+credential interactively, but only the Support one reliably returns
+results for this reason.
+
 Call register(app) from bot.py's main() to wire this feature in (this
 also restores the repeating job on startup if a prior run left one
 scheduled).
@@ -45,8 +53,8 @@ from common import (
     BTN_AF_RESULTS,
     BTN_AUTO_FETCH,
     CPARAMS_VALUER_ROLE,
+    CRED_LABELS,
     DATA_DIR,
-    _any_valid_tokens,
     _atomic_json_write,
     _CANCEL_FILTER,
     _ensure_data_dir,
@@ -93,6 +101,17 @@ class AF(Enum):
 # ──────────────────────────────────────────────────────────
 # Auto Fetch — scheduled periodic fetch + notify
 # ──────────────────────────────────────────────────────────
+
+# The HQ/County list endpoints _load_fetch_tasks calls are queried with
+# cparams=CPARAMS_SUPPORT regardless of whose token is used — an account
+# that doesn't hold the Support role gets an empty/restricted result back,
+# not an error. The job used _any_valid_tokens() (first cached credential in
+# a fixed priority order, staff_valuer first), which could silently pick a
+# non-Support account even when a valid Support token was also cached,
+# reproducing exactly as "Auto Fetch never finds anything" while Fetch
+# Tasks (credential picked explicitly each run) works fine. Always use the
+# Support credential specifically instead.
+_AF_CRED_TYPE = "staff2"   # Support Reg — see CRED_LABELS in common.py
 
 # Restoring a saved schedule on startup used to wait a full interval before
 # the first run — every container restart pushed the next run out by up to
@@ -454,6 +473,7 @@ async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"County: *{co_label}* | Registry: *{re_label}*\n"
         f"Amount: {lo_s} – {hi_s} | Sectional: *{sec_label}*\n"
         f"Email: *{email_label}*\n"
+        f"Account: *{CRED_LABELS[_AF_CRED_TYPE]}* (requires a cached, valid login — check 🔒 Token Status)\n"
         f"First run in {interval} min.",
         parse_mode="Markdown",
         reply_markup=_main_menu(),
@@ -467,9 +487,12 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not cfg:
         return
 
-    tokens = _any_valid_tokens()
+    tokens = get_valid_tokens(_AF_CRED_TYPE)
     if not tokens:
-        logger.warning("Auto Fetch job: no valid tokens — skipping cycle.")
+        logger.warning(
+            "Auto Fetch job: no valid %s tokens cached — skipping cycle.",
+            CRED_LABELS[_AF_CRED_TYPE],
+        )
         return
 
     days_back       = cfg.get("days_back", 2)

@@ -103,21 +103,35 @@ class TestAutoFetchJob(unittest.TestCase):
 
     def test_no_schedule_returns_early(self):
         with patch.object(af, "load_auto_fetch_schedule", return_value=None), \
-             patch.object(af, "_any_valid_tokens") as mock_tokens:
+             patch.object(af, "get_valid_tokens") as mock_tokens:
             _run(af._auto_fetch_job(self.context))
         mock_tokens.assert_not_called()
 
     def test_no_tokens_logs_and_returns(self):
         with patch.object(af, "load_auto_fetch_schedule", return_value={"days_back": 2}), \
-             patch.object(af, "_any_valid_tokens", return_value=None), \
+             patch.object(af, "get_valid_tokens", return_value=None), \
              patch.object(af, "_load_fetch_tasks") as mock_fetch:
             _run(af._auto_fetch_job(self.context))
         mock_fetch.assert_not_called()
 
+    def test_always_fetches_the_support_credential_specifically(self):
+        """Regression test: the job used to pick whichever cached credential
+        _any_valid_tokens() found first (staff_valuer before staff2/Support),
+        so it could silently run under a non-Support account and get back an
+        empty result — even though Fetch Tasks worked fine using Support.
+        The job must always request the Support credential by name."""
+        cfg = {"days_back": 2}
+        with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS) as mock_tokens, \
+             patch.object(af, "_load_fetch_tasks", return_value=([], {})):
+            _run(af._auto_fetch_job(self.context))
+        mock_tokens.assert_called_once_with(af._AF_CRED_TYPE)
+        self.assertEqual(af._AF_CRED_TYPE, "staff2")
+
     def test_fetch_failure_returns_without_persisting(self):
         cfg = {"days_back": 2}
         with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
-             patch.object(af, "_any_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", side_effect=RuntimeError("down")), \
              patch.object(af, "persist_af_result") as mock_persist:
             _run(af._auto_fetch_job(self.context))
@@ -127,7 +141,7 @@ class TestAutoFetchJob(unittest.TestCase):
         cfg = {"days_back": 2, "county_filter": "nairobi"}
         tasks = [_task(county="Nairobi"), _task(ref="R2", county="Mombasa")]
         with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
-             patch.object(af, "_any_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
              patch.object(af, "load_dlv_batch", return_value=[]), \
              patch.object(af, "load_sectional_config", return_value=None), \
@@ -143,7 +157,7 @@ class TestAutoFetchJob(unittest.TestCase):
         cfg = {"days_back": 2}
         tasks = [_task(ref="REG/TSFR/ABC123")]
         with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
-             patch.object(af, "_any_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
              patch.object(af, "load_dlv_batch", return_value=[{"ref": "REG/TSFR/ABC123"}]), \
              patch.object(af, "load_sectional_config", return_value=None), \
@@ -156,7 +170,7 @@ class TestAutoFetchJob(unittest.TestCase):
         cfg = {"days_back": 2, "county_filter": "mombasa"}
         tasks = [_task(county="Nairobi")]
         with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
-             patch.object(af, "_any_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
              patch.object(af, "load_dlv_batch", return_value=[]), \
              patch.object(af, "load_sectional_config", return_value=None), \
@@ -169,7 +183,7 @@ class TestAutoFetchJob(unittest.TestCase):
         cfg = {"days_back": 2, "email": "ops@example.com"}
         tasks = [_task()]
         with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
-             patch.object(af, "_any_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
              patch.object(af, "load_dlv_batch", return_value=[]), \
              patch.object(af, "load_sectional_config", return_value=None), \
@@ -191,7 +205,7 @@ class TestAutoFetchJob(unittest.TestCase):
         tasks = [_task(ref="REG/TSFR/AAA111", county="Mombasa", registry="Coast",
                         parcel_number="MOMBASA/BLOCK5/9", assessor="John Assessor")]
         with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
-             patch.object(af, "_any_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
              patch.object(af, "load_dlv_batch", return_value=[]), \
              patch.object(af, "load_sectional_config", return_value=None), \
@@ -213,7 +227,7 @@ class TestAutoFetchJob(unittest.TestCase):
         cfg = {"days_back": 2, "email": "ops@example.com"}
         tasks = [_task()]
         with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
-             patch.object(af, "_any_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
              patch.object(af, "load_dlv_batch", return_value=[]), \
              patch.object(af, "load_sectional_config", return_value=None), \
@@ -239,7 +253,6 @@ class TestAutoFetchJob(unittest.TestCase):
         fake_session = MagicMock()
         fake_session.put.return_value = MagicMock(status_code=200)
         with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
-             patch.object(af, "_any_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", return_value=([sectional_task], {})), \
              patch.object(af, "load_dlv_batch", return_value=[]), \
              patch.object(af, "load_sectional_config", return_value=sc_cfg), \
@@ -344,6 +357,41 @@ class TestRegisterRestoresSchedule(unittest.TestCase):
         with patch.object(af, "load_auto_fetch_schedule", return_value=None):
             _run(self._register(app))
         app.job_queue.run_repeating.assert_not_called()
+
+
+class TestRecvAfEmail(unittest.TestCase):
+    """recv_af_email validates the address, saves the schedule, and confirms
+    which account the background job will run under."""
+
+    def setUp(self):
+        self.update = MagicMock()
+        self.update.message.reply_text = AsyncMock()
+        self.ctx = MagicMock()
+        self.ctx.user_data = {}
+
+    def test_invalid_email_reprompts(self):
+        self.update.message.text = "not-an-email"
+        result = _run(af.recv_af_email(self.update, self.ctx))
+        self.assertEqual(result, af.AF.EMAIL)
+        self.assertIn("Invalid email", self.update.message.reply_text.call_args[0][0])
+
+    def test_valid_submission_confirms_the_support_credential(self):
+        """Regression test: the confirmation used to say nothing about which
+        account runs the job, hiding the fact it always needs a valid cached
+        Support Reg login regardless of what credential you used elsewhere."""
+        self.update.message.text = "ops@example.com"
+        with patch.object(af, "save_auto_fetch_schedule") as mock_save:
+            result = _run(af.recv_af_email(self.update, self.ctx))
+        self.assertEqual(result, af.ConversationHandler.END)
+        mock_save.assert_called_once()
+        text = self.update.message.reply_text.call_args[0][0]
+        self.assertIn(af.CRED_LABELS[af._AF_CRED_TYPE], text)
+
+    def test_skip_saves_schedule_with_no_email(self):
+        self.update.message.text = "skip"
+        with patch.object(af, "save_auto_fetch_schedule") as mock_save:
+            _run(af.recv_af_email(self.update, self.ctx))
+        self.assertEqual(mock_save.call_args[0][0]["email"], "")
 
 
 if __name__ == "__main__":
