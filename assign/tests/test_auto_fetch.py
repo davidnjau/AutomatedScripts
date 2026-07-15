@@ -293,5 +293,32 @@ class TestRecvAfResultDetail(unittest.TestCase):
         update.callback_query.message.reply_text.assert_called_once()
 
 
+class TestRegisterRestoresSchedule(unittest.TestCase):
+    """register() restores a saved Auto Fetch schedule on startup — regression
+    test for a bug where the first run after every restart waited a full
+    interval, starving the job if restarts happened more often than that."""
+
+    async def _register(self, app):
+        # ConversationHandler's construction needs a running event loop
+        # (asyncio.Lock() binds to it), so register() must run inside one.
+        af.register(app)
+
+    def test_restored_first_run_is_soon_not_a_full_interval(self):
+        app = MagicMock()
+        cfg = {"interval_minutes": 120}
+        with patch.object(af, "load_auto_fetch_schedule", return_value=cfg):
+            _run(self._register(app))
+        _, kwargs = app.job_queue.run_repeating.call_args
+        self.assertEqual(kwargs["interval"], 120 * 60)
+        self.assertEqual(kwargs["first"], af._AF_RESTORE_FIRST_RUN_DELAY)
+        self.assertLess(af._AF_RESTORE_FIRST_RUN_DELAY, 120 * 60)
+
+    def test_no_saved_schedule_does_not_register_job(self):
+        app = MagicMock()
+        with patch.object(af, "load_auto_fetch_schedule", return_value=None):
+            _run(self._register(app))
+        app.job_queue.run_repeating.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

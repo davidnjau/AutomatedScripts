@@ -93,6 +93,13 @@ class AF(Enum):
 # Auto Fetch — scheduled periodic fetch + notify
 # ──────────────────────────────────────────────────────────
 
+# Restoring a saved schedule on startup used to wait a full interval before
+# the first run — every container restart pushed the next run out by up to
+# the whole configured interval, which starved the job if restarts happened
+# more often than that. Run soon after startup instead; later runs still
+# follow the configured interval.
+_AF_RESTORE_FIRST_RUN_DELAY = 60   # seconds
+
 _AF_INTERVALS = [
     ("15 min",  15),
     ("30 min",  30),
@@ -796,7 +803,10 @@ def register(app: Application) -> None:
         app.job_queue.run_repeating(
             _auto_fetch_job,
             interval=interval_secs,
-            first=interval_secs,
+            first=_AF_RESTORE_FIRST_RUN_DELAY,
             name="auto_fetch_job",
         )
-        logger.info("Auto Fetch schedule restored: every %d min", cfg.get("interval_minutes"))
+        logger.info(
+            "Auto Fetch schedule restored: every %d min (first run in %ds)",
+            cfg.get("interval_minutes"), _AF_RESTORE_FIRST_RUN_DELAY,
+        )
