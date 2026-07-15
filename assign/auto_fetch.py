@@ -2,11 +2,19 @@
 """
 auto_fetch.py
 ===============
-Auto Fetch — scheduled periodic Fetch Tasks with Telegram/email
-notification (⏰ Auto Fetch button / /autofetch), plus the bundled
-"AF Results" run-history viewer (🗂 AF Results button). Bundled together
-since AF Results only ever displays what Auto Fetch's own background job
+Auto Fetch — any number of independently-configured scheduled periodic
+Fetch Tasks runs, each with its own interval/filters/delivery (Telegram
+and/or its own email address), via the ⏰ Auto Fetch button / /autofetch.
+Bundled with the "AF Results" run-history viewer (🗂 AF Results button)
+since AF Results only ever displays what Auto Fetch's own background jobs
 persisted.
+
+Each schedule is a dict with its own generated "id", stored as a list in
+saved_auto_fetch.json (see load_auto_fetch_schedules/add_auto_fetch_schedule/
+remove_auto_fetch_schedule), and gets its own repeating PTB job — named
+f"auto_fetch_job:{schedule_id}" and tagged with that id via the job's
+`data` param — so schedules run, expire, and get removed independently of
+one another.
 
 Depends on fetch_tasks.py's _load_fetch_tasks for the actual live fetch and
 _ft_format_task_block for the email body's per-task layout (shared since
@@ -23,8 +31,7 @@ credential interactively, but only the Support one reliably returns
 results for this reason.
 
 Call register(app) from bot.py's main() to wire this feature in (this
-also restores the repeating job on startup if a prior run left one
-scheduled).
+also restores one repeating job per saved schedule on startup).
 """
 
 import json
@@ -88,6 +95,8 @@ SAVED_AF_RESULTS_FILE = os.path.join(DATA_DIR, "saved_af_results.json")
 # States — Auto Fetch schedule conversation
 # ──────────────────────────────────────────────────────────
 class AF(Enum):
+    MENU        = auto()   # list existing schedules; choose Add / Remove
+    REMOVE_PICK = auto()   # pick which schedule to remove
     INTERVAL    = auto()   # choose how often to run
     DAYS_BACK   = auto()   # choose days back
     COUNTY      = auto()   # county filter
@@ -132,23 +141,69 @@ _AF_INTERVALS = [
 ]
 
 
-def load_auto_fetch_schedule() -> Optional[Dict]:
+def load_auto_fetch_schedules() -> List[Dict]:
+    """Load every saved Auto Fetch schedule. A pre-multi-schedule file holds a
+    single dict rather than a list — migrate it in place (generate an id,
+    wrap in a list, persist) the first time it's read, so old deployments
+    don't need a manual step."""
     try:
         with open(SAVED_AUTO_FETCH_FILE) as f:
-            return json.load(f)
+            data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return None
+        return []
+    if isinstance(data, dict):
+        data = [{**data, "id": str(uuid.uuid4())[:8]}]
+        save_auto_fetch_schedules(data)
+    return data
 
 
-def save_auto_fetch_schedule(cfg: Dict) -> None:
-    _atomic_json_write(SAVED_AUTO_FETCH_FILE, cfg, indent=2)
+def save_auto_fetch_schedules(schedules: List[Dict]) -> None:
+    _atomic_json_write(SAVED_AUTO_FETCH_FILE, schedules, indent=2)
 
 
-def clear_auto_fetch_schedule() -> None:
-    try:
-        os.remove(SAVED_AUTO_FETCH_FILE)
-    except FileNotFoundError:
-        pass
+def get_auto_fetch_schedule(schedule_id: str) -> Optional[Dict]:
+    """Look up a single saved schedule by id."""
+    return next((s for s in load_auto_fetch_schedules() if s.get("id") == schedule_id), None)
+
+
+def add_auto_fetch_schedule(cfg: Dict) -> str:
+    """Assign a new id to cfg, append it to the saved list, and return the id."""
+    schedule_id = str(uuid.uuid4())[:8]
+    schedules = load_auto_fetch_schedules()
+    schedules.append({**cfg, "id": schedule_id})
+    save_auto_fetch_schedules(schedules)
+    return schedule_id
+
+
+def remove_auto_fetch_schedule(schedule_id: str) -> bool:
+    """Delete a schedule by id. Returns False if no schedule had that id."""
+    schedules = load_auto_fetch_schedules()
+    remaining = [s for s in schedules if s.get("id") != schedule_id]
+    if len(remaining) == len(schedules):
+        return False
+    save_auto_fetch_schedules(remaining)
+    return True
+
+
+def _af_format_schedule_summary(cfg: Dict) -> str:
+    """One-line summary of a schedule's settings, used in the schedule list
+    and the remove picker."""
+    mins    = cfg.get("interval_minutes", 0)
+    lo      = cfg.get("amount_min")
+    hi      = cfg.get("amount_max")
+    lo_s    = f"KES {int(lo):,}" if lo is not None else "0"
+    hi_s    = f"KES {int(hi):,}" if hi is not None else "∞"
+    county  = cfg.get("county_filter", "") or "All"
+    reg     = cfg.get("registry_filter", "") or "All"
+    days    = cfg.get("days_back", 2)
+    sec     = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(
+                  cfg.get("sectional_filter", "exclude"), "Exclude Sectional")
+    email_s = cfg.get("email") or "Telegram only"
+    return (
+        f"📧 *{email_s}* — every {mins} min, days back: {days}\n"
+        f"   County: {county.title()} | Registry: {reg.title()}\n"
+        f"   Amount: {lo_s} – {hi_s} | {sec}"
+    )
 
 
 # ── Auto Fetch result history ──────────────────────────────
@@ -167,9 +222,11 @@ def persist_af_result(run_id: str, run_at: str, tasks: List[Dict], cfg: Dict) ->
     _ensure_data_dir()
     results = load_af_results()
     results.append({
-        "run_id":   run_id,
-        "run_at":   run_at,
-        "count":    len(tasks),
+        "run_id":        run_id,
+        "run_at":        run_at,
+        "count":         len(tasks),
+        "schedule_id":   cfg.get("id", ""),
+        "schedule_label": cfg.get("email") or "Telegram only",
         "filters": {
             "county":           cfg.get("county_filter", ""),
             "registry":         cfg.get("registry_filter", ""),
@@ -208,47 +265,104 @@ def _af_interval_keyboard() -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("❌ Cancel / Stop schedule", callback_data="af:cancel")])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="af:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _af_menu_keyboard(has_schedules: bool) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("➕ Add Schedule", callback_data="af_menu:add")]]
+    if has_schedules:
+        rows.append([InlineKeyboardButton("🗑 Remove Schedule", callback_data="af_menu:remove")])
+    rows.append([InlineKeyboardButton("🛑 Close", callback_data="af_menu:close")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _af_remove_keyboard(schedules: List[Dict]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(
+            f"🗑 {cfg.get('email') or 'Telegram only'} (every {cfg.get('interval_minutes', '?')} min)",
+            callback_data=f"af_remove:{cfg['id']}",
+        )]
+        for cfg in schedules
+    ]
+    rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="af_remove:cancel")])
     return InlineKeyboardMarkup(rows)
 
 
 async def cmd_auto_fetch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
 
-    cfg = load_auto_fetch_schedule()
-    if cfg:
-        mins    = cfg.get("interval_minutes", 0)
-        lo      = cfg.get("amount_min")
-        hi      = cfg.get("amount_max")
-        lo_s    = f"KES {int(lo):,}" if lo is not None else "0"
-        hi_s    = f"KES {int(hi):,}" if hi is not None else "∞"
-        county    = cfg.get("county_filter", "") or "All"
-        reg       = cfg.get("registry_filter", "") or "All"
-        days      = cfg.get("days_back", 2)
-        sec       = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(
-                        cfg.get("sectional_filter", "exclude"), "Exclude Sectional")
-        email_s   = cfg.get("email") or "Telegram only"
-        status  = (
-            f"⏰ *Auto Fetch is active*\n"
-            f"Interval: every {mins} min | Days back: {days}\n"
-            f"County: {county.title()} | Registry: {reg.title()}\n"
-            f"Amount: {lo_s} – {hi_s} | Sectional: {sec}\n"
-            f"Email: {email_s}\n\n"
-            f"Choose a new interval to update, or cancel to stop."
-        )
+    schedules = load_auto_fetch_schedules()
+    if schedules:
+        lines = [f"⏰ *Auto Fetch* — {len(schedules)} active schedule(s)\n"]
+        lines += [f"{i}. {_af_format_schedule_summary(cfg)}" for i, cfg in enumerate(schedules, 1)]
+        status = "\n".join(lines)
     else:
         status = (
             "⏰ *Auto Fetch*\n\n"
             "Periodically fetches tasks and sends results here.\n"
-            "Choose how often to run:"
+            "No schedules yet — tap ➕ Add Schedule to create one."
         )
 
     await update.message.reply_text(
         status,
         parse_mode="Markdown",
+        reply_markup=_af_menu_keyboard(bool(schedules)),
+    )
+    return AF.MENU
+
+
+async def recv_af_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":")[1]   # "add" | "remove" | "close"
+
+    if action == "close":
+        await query.edit_message_reply_markup(reply_markup=None)
+        return ConversationHandler.END
+
+    if action == "remove":
+        schedules = load_auto_fetch_schedules()
+        if not schedules:
+            await query.edit_message_text("ℹ️ No schedules to remove.")
+            await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+            return ConversationHandler.END
+        await query.edit_message_text(
+            "🗑 *Remove which schedule?*",
+            parse_mode="Markdown",
+            reply_markup=_af_remove_keyboard(schedules),
+        )
+        return AF.REMOVE_PICK
+
+    # action == "add"
+    await query.edit_message_text(
+        "➕ *New Auto Fetch schedule*\n\nHow often should it run?",
+        parse_mode="Markdown",
         reply_markup=_af_interval_keyboard(),
     )
     return AF.INTERVAL
+
+
+async def recv_af_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    schedule_id = query.data.split(":", 1)[1]
+
+    if schedule_id == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    cfg = get_auto_fetch_schedule(schedule_id)
+    for job in ctx.job_queue.get_jobs_by_name(f"auto_fetch_job:{schedule_id}"):
+        job.schedule_removal()
+    removed = remove_auto_fetch_schedule(schedule_id)
+
+    label = (cfg or {}).get("email") or "Telegram only"
+    msg = f"🗑 Removed the schedule for *{label}*." if removed else "⚠️ That schedule was already removed."
+    await query.edit_message_text(msg, parse_mode="Markdown")
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    return ConversationHandler.END
 
 
 async def recv_af_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -256,10 +370,7 @@ async def recv_af_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "af:cancel":
-        for job in ctx.job_queue.get_jobs_by_name("auto_fetch_job"):
-            job.schedule_removal()
-        clear_auto_fetch_schedule()
-        await query.edit_message_text("🛑 Auto Fetch schedule cancelled.")
+        await query.edit_message_text("❌ Cancelled — no schedule created.")
         await query.message.reply_text("Main menu:", reply_markup=_main_menu())
         return ConversationHandler.END
 
@@ -403,16 +514,9 @@ async def recv_af_sectional(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ctx.user_data["af_sectional"] = query.data.split(":")[1]  # "exclude" | "only" | "all"
 
-    existing_email = ""
-    cfg = load_auto_fetch_schedule()
-    if cfg:
-        existing_email = cfg.get("email", "")
-
-    hint = f"Current: `{existing_email}`\n\n" if existing_email else ""
     await query.edit_message_text(
-        f"📧 *Send results to email?*\n\n"
-        f"{hint}"
-        f"Enter an email address, or send `skip` to notify via Telegram only.",
+        "📧 *Send results to email?*\n\n"
+        "Enter an email address, or send `skip` to notify via Telegram only.",
         parse_mode="Markdown",
     )
     return AF.EMAIL
@@ -450,15 +554,13 @@ async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "sectional_filter": sectional,
         "email":            email,
     }
-    save_auto_fetch_schedule(cfg)
-
-    for job in ctx.job_queue.get_jobs_by_name("auto_fetch_job"):
-        job.schedule_removal()
+    schedule_id = add_auto_fetch_schedule(cfg)
     ctx.job_queue.run_repeating(
         _auto_fetch_job,
         interval=interval * 60,
         first=interval * 60,
-        name="auto_fetch_job",
+        name=f"auto_fetch_job:{schedule_id}",
+        data=schedule_id,
     )
 
     lo_s      = f"KES {int(amount_min):,}" if amount_min is not None else "0"
@@ -468,7 +570,7 @@ async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sec_label = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(sectional, sectional)
     email_label = email or "Telegram only"
     await update.message.reply_text(
-        f"✅ *Auto Fetch scheduled*\n"
+        f"✅ *Auto Fetch schedule added*\n"
         f"Every *{interval} min* | Days back: *{days}*\n"
         f"County: *{co_label}* | Registry: *{re_label}*\n"
         f"Amount: {lo_s} – {hi_s} | Sectional: *{sec_label}*\n"
@@ -482,9 +584,17 @@ async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Background job: fetch tasks with saved schedule settings and notify."""
-    cfg = load_auto_fetch_schedule()
+    """Background job for one schedule: fetch tasks with that schedule's
+    settings and notify. Each schedule gets its own repeating job, tagged
+    with its id via job_queue's `data` param (see recv_af_email/register);
+    re-reading the schedule fresh each cycle (rather than closing over it)
+    means an edit or removal takes effect on the very next run — if this
+    schedule was removed since the job last fired, cancel the job itself
+    instead of just skipping the cycle."""
+    schedule_id = context.job.data
+    cfg = get_auto_fetch_schedule(schedule_id)
     if not cfg:
+        context.job.schedule_removal()
         return
 
     tokens = get_valid_tokens(_AF_CRED_TYPE)
@@ -689,7 +799,9 @@ async def cmd_af_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Show last 10 runs as inline buttons (newest first)
     rows = []
     for r in reversed(results[-10:]):
-        label = f"{r['run_at']}  ({r['count']} task{'s' if r['count'] != 1 else ''})"
+        sched_label = r.get("schedule_label", "")
+        prefix = f"[{sched_label}] " if sched_label else ""
+        label = f"{prefix}{r['run_at']}  ({r['count']} task{'s' if r['count'] != 1 else ''})"
         rows.append([InlineKeyboardButton(label, callback_data=f"af_result:{r['run_id']}")])
 
     await update.message.reply_text(
@@ -722,6 +834,7 @@ async def recv_af_result_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     header = (
         f"🗂 *AF Run — {run['run_at']}*\n"
+        f"Schedule: *{run.get('schedule_label', 'Telegram only')}*\n"
         f"Tasks found: *{run['count']}*\n"
         f"Filters: County={f.get('county','All') or 'All'} | Registry={f.get('registry','All') or 'All'}\n"
         f"Amount: {lo_s}–{hi_s} | {sec_label}\n\n"
@@ -772,14 +885,16 @@ async def recv_af_result_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def register(app: Application) -> None:
     """Wire the Auto Fetch conversation + AF Results viewer into the given
-    Application, and restore the repeating job on startup if a prior run
-    left a schedule configured."""
+    Application, and restore one repeating job per saved schedule on
+    startup."""
     af_conv = ConversationHandler(
         entry_points=[
             CommandHandler("autofetch", cmd_auto_fetch),
             MessageHandler(filters.Regex(f"^{re.escape(BTN_AUTO_FETCH)}$"), cmd_auto_fetch),
         ],
         states={
+            AF.MENU:        [CallbackQueryHandler(recv_af_menu,         pattern=r"^af_menu:")],
+            AF.REMOVE_PICK: [CallbackQueryHandler(recv_af_remove,       pattern=r"^af_remove:")],
             AF.INTERVAL:    [CallbackQueryHandler(recv_af_interval,     pattern=r"^af:")],
             AF.DAYS_BACK:   [CallbackQueryHandler(recv_af_days,         pattern=r"^af_days:")],
             AF.COUNTY:      [CallbackQueryHandler(recv_af_county,       pattern=r"^ft_county:")],
@@ -802,16 +917,21 @@ def register(app: Application) -> None:
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_AF_RESULTS)}$"), cmd_af_results))
     app.add_handler(CallbackQueryHandler(recv_af_result_detail, pattern=r"^af_result:"))
 
-    cfg = load_auto_fetch_schedule()
-    if cfg:
+    schedules = load_auto_fetch_schedules()
+    for cfg in schedules:
+        schedule_id = cfg.get("id", "")
+        if not schedule_id:
+            continue   # shouldn't happen post-migration, but don't crash startup over it
         interval_secs = cfg.get("interval_minutes", 60) * 60
         app.job_queue.run_repeating(
             _auto_fetch_job,
             interval=interval_secs,
             first=_AF_RESTORE_FIRST_RUN_DELAY,
-            name="auto_fetch_job",
+            name=f"auto_fetch_job:{schedule_id}",
+            data=schedule_id,
         )
+    if schedules:
         logger.info(
-            "Auto Fetch schedule restored: every %d min (first run in %ds)",
-            cfg.get("interval_minutes"), _AF_RESTORE_FIRST_RUN_DELAY,
+            "Auto Fetch: restored %d schedule(s) (first run in %ds each)",
+            len(schedules), _AF_RESTORE_FIRST_RUN_DELAY,
         )

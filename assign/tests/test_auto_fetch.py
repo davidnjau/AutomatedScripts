@@ -8,6 +8,7 @@ Run with: python3 -m unittest discover -s assign/tests -v
 """
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -37,6 +38,9 @@ def _task(ref="REG/TSFR/ABC123", **overrides):
 
 
 class TestSchedulePersistence(unittest.TestCase):
+    """load/add/get/remove_auto_fetch_schedule(s) — the multi-schedule
+    persistence layer, plus migration from the old single-dict file format."""
+
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.sched_file = os.path.join(self.tmpdir.name, "saved_auto_fetch.json")
@@ -47,21 +51,59 @@ class TestSchedulePersistence(unittest.TestCase):
         self._patch.stop()
         self.tmpdir.cleanup()
 
-    def test_load_missing_file_returns_none(self):
-        self.assertIsNone(af.load_auto_fetch_schedule())
+    def test_load_missing_file_returns_empty_list(self):
+        self.assertEqual(af.load_auto_fetch_schedules(), [])
 
-    def test_save_then_load_roundtrip(self):
-        af.save_auto_fetch_schedule({"interval_minutes": 60, "email": "a@b.com"})
-        cfg = af.load_auto_fetch_schedule()
-        self.assertEqual(cfg["interval_minutes"], 60)
+    def test_add_then_load_roundtrip(self):
+        schedule_id = af.add_auto_fetch_schedule({"interval_minutes": 60, "email": "a@b.com"})
+        schedules = af.load_auto_fetch_schedules()
+        self.assertEqual(len(schedules), 1)
+        self.assertEqual(schedules[0]["interval_minutes"], 60)
+        self.assertEqual(schedules[0]["id"], schedule_id)
 
-    def test_clear_removes_file(self):
-        af.save_auto_fetch_schedule({"interval_minutes": 60})
-        af.clear_auto_fetch_schedule()
-        self.assertIsNone(af.load_auto_fetch_schedule())
+    def test_add_multiple_schedules_get_distinct_ids(self):
+        id1 = af.add_auto_fetch_schedule({"interval_minutes": 60, "email": "abc@gmail.com"})
+        id2 = af.add_auto_fetch_schedule({"interval_minutes": 120, "email": "123@gmail.com"})
+        self.assertNotEqual(id1, id2)
+        schedules = af.load_auto_fetch_schedules()
+        self.assertEqual(len(schedules), 2)
+        self.assertEqual({s["email"] for s in schedules}, {"abc@gmail.com", "123@gmail.com"})
 
-    def test_clear_missing_file_is_noop(self):
-        af.clear_auto_fetch_schedule()  # should not raise
+    def test_get_auto_fetch_schedule_finds_by_id(self):
+        schedule_id = af.add_auto_fetch_schedule({"interval_minutes": 60, "email": "a@b.com"})
+        cfg = af.get_auto_fetch_schedule(schedule_id)
+        self.assertEqual(cfg["email"], "a@b.com")
+
+    def test_get_auto_fetch_schedule_returns_none_when_missing(self):
+        self.assertIsNone(af.get_auto_fetch_schedule("no-such-id"))
+
+    def test_remove_auto_fetch_schedule_deletes_only_that_one(self):
+        id1 = af.add_auto_fetch_schedule({"interval_minutes": 60, "email": "abc@gmail.com"})
+        id2 = af.add_auto_fetch_schedule({"interval_minutes": 120, "email": "123@gmail.com"})
+        removed = af.remove_auto_fetch_schedule(id1)
+        self.assertTrue(removed)
+        remaining = af.load_auto_fetch_schedules()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["id"], id2)
+
+    def test_remove_missing_schedule_returns_false(self):
+        self.assertFalse(af.remove_auto_fetch_schedule("no-such-id"))
+
+    def test_legacy_single_dict_file_migrates_to_a_list(self):
+        """A pre-multi-schedule deployment's saved_auto_fetch.json holds a
+        bare dict, not a list — must not crash, and must self-heal on read."""
+        with open(self.sched_file, "w") as f:
+            json.dump({"interval_minutes": 60, "email": "legacy@example.com"}, f)
+
+        schedules = af.load_auto_fetch_schedules()
+        self.assertEqual(len(schedules), 1)
+        self.assertEqual(schedules[0]["email"], "legacy@example.com")
+        self.assertIn("id", schedules[0])
+
+        # migration is persisted — a second load sees the already-migrated list
+        with open(self.sched_file) as f:
+            on_disk = json.load(f)
+        self.assertIsInstance(on_disk, list)
 
 
 class TestAfResultsPersistence(unittest.TestCase):
@@ -95,20 +137,42 @@ class TestAfResultsPersistence(unittest.TestCase):
         # oldest runs should have been dropped, newest kept
         self.assertEqual(results[-1]["run_id"], f"r{af._AF_RESULTS_KEEP + 4}")
 
+    def test_persist_records_which_schedule_the_run_came_from(self):
+        """With multiple schedules, runs must be distinguishable in AF Results."""
+        cfg = {"id": "sched-abc", "email": "abc@gmail.com"}
+        af.persist_af_result("r1", "2026-07-10 10:00:00", [], cfg)
+        result = af.load_af_results()[0]
+        self.assertEqual(result["schedule_id"], "sched-abc")
+        self.assertEqual(result["schedule_label"], "abc@gmail.com")
+
+    def test_persist_labels_telegram_only_when_no_email(self):
+        af.persist_af_result("r1", "2026-07-10 10:00:00", [], {"id": "sched-abc"})
+        result = af.load_af_results()[0]
+        self.assertEqual(result["schedule_label"], "Telegram only")
+
 
 class TestAutoFetchJob(unittest.TestCase):
+    """_auto_fetch_job runs for exactly one schedule per invocation — the id
+    it operates on comes from context.job.data (see recv_af_email/register,
+    which tag each schedule's repeating job with its own id)."""
+
     def setUp(self):
         self.context = MagicMock()
         self.context.bot.send_message = AsyncMock()
+        self.context.job.data = "sched-1"
 
-    def test_no_schedule_returns_early(self):
-        with patch.object(af, "load_auto_fetch_schedule", return_value=None), \
+    def test_schedule_removed_since_last_run_cancels_the_job(self):
+        """If this schedule was deleted (via Remove Schedule) since the job
+        last fired, don't just skip the cycle — cancel the job itself so it
+        stops trying, instead of forever finding nothing every interval."""
+        with patch.object(af, "get_auto_fetch_schedule", return_value=None), \
              patch.object(af, "get_valid_tokens") as mock_tokens:
             _run(af._auto_fetch_job(self.context))
         mock_tokens.assert_not_called()
+        self.context.job.schedule_removal.assert_called_once()
 
     def test_no_tokens_logs_and_returns(self):
-        with patch.object(af, "load_auto_fetch_schedule", return_value={"days_back": 2}), \
+        with patch.object(af, "get_auto_fetch_schedule", return_value={"days_back": 2}), \
              patch.object(af, "get_valid_tokens", return_value=None), \
              patch.object(af, "_load_fetch_tasks") as mock_fetch:
             _run(af._auto_fetch_job(self.context))
@@ -121,16 +185,24 @@ class TestAutoFetchJob(unittest.TestCase):
         empty result — even though Fetch Tasks worked fine using Support.
         The job must always request the Support credential by name."""
         cfg = {"days_back": 2}
-        with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
              patch.object(af, "get_valid_tokens", return_value=TOKENS) as mock_tokens, \
              patch.object(af, "_load_fetch_tasks", return_value=([], {})):
             _run(af._auto_fetch_job(self.context))
         mock_tokens.assert_called_once_with(af._AF_CRED_TYPE)
         self.assertEqual(af._AF_CRED_TYPE, "staff2")
 
+    def test_looks_up_the_schedule_tagged_on_its_own_job(self):
+        self.context.job.data = "sched-xyz"
+        with patch.object(af, "get_auto_fetch_schedule", return_value={"days_back": 2}) as mock_get, \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=([], {})):
+            _run(af._auto_fetch_job(self.context))
+        mock_get.assert_called_once_with("sched-xyz")
+
     def test_fetch_failure_returns_without_persisting(self):
         cfg = {"days_back": 2}
-        with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
              patch.object(af, "get_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", side_effect=RuntimeError("down")), \
              patch.object(af, "persist_af_result") as mock_persist:
@@ -140,7 +212,7 @@ class TestAutoFetchJob(unittest.TestCase):
     def test_county_filter_excludes_non_matching_and_persists(self):
         cfg = {"days_back": 2, "county_filter": "nairobi"}
         tasks = [_task(county="Nairobi"), _task(ref="R2", county="Mombasa")]
-        with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
              patch.object(af, "get_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
              patch.object(af, "load_dlv_batch", return_value=[]), \
@@ -156,7 +228,7 @@ class TestAutoFetchJob(unittest.TestCase):
     def test_already_queued_refs_excluded(self):
         cfg = {"days_back": 2}
         tasks = [_task(ref="REG/TSFR/ABC123")]
-        with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
              patch.object(af, "get_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
              patch.object(af, "load_dlv_batch", return_value=[{"ref": "REG/TSFR/ABC123"}]), \
@@ -169,7 +241,7 @@ class TestAutoFetchJob(unittest.TestCase):
     def test_no_tasks_after_filters_does_not_send(self):
         cfg = {"days_back": 2, "county_filter": "mombasa"}
         tasks = [_task(county="Nairobi")]
-        with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
              patch.object(af, "get_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
              patch.object(af, "load_dlv_batch", return_value=[]), \
@@ -182,7 +254,7 @@ class TestAutoFetchJob(unittest.TestCase):
     def test_email_sent_when_configured(self):
         cfg = {"days_back": 2, "email": "ops@example.com"}
         tasks = [_task()]
-        with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
              patch.object(af, "get_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
              patch.object(af, "load_dlv_batch", return_value=[]), \
@@ -204,7 +276,7 @@ class TestAutoFetchJob(unittest.TestCase):
         cfg = {"days_back": 2, "email": "ops@example.com"}
         tasks = [_task(ref="REG/TSFR/AAA111", county="Mombasa", registry="Coast",
                         parcel_number="MOMBASA/BLOCK5/9", assessor="John Assessor")]
-        with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
              patch.object(af, "get_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
              patch.object(af, "load_dlv_batch", return_value=[]), \
@@ -226,7 +298,7 @@ class TestAutoFetchJob(unittest.TestCase):
         so a broken server-side email config looked identical to success."""
         cfg = {"days_back": 2, "email": "ops@example.com"}
         tasks = [_task()]
-        with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
              patch.object(af, "get_valid_tokens", return_value=TOKENS), \
              patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
              patch.object(af, "load_dlv_batch", return_value=[]), \
@@ -252,7 +324,7 @@ class TestAutoFetchJob(unittest.TestCase):
         }
         fake_session = MagicMock()
         fake_session.put.return_value = MagicMock(status_code=200)
-        with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
              patch.object(af, "_load_fetch_tasks", return_value=([sectional_task], {})), \
              patch.object(af, "load_dlv_batch", return_value=[]), \
              patch.object(af, "load_sectional_config", return_value=sc_cfg), \
@@ -333,9 +405,10 @@ class TestRecvAfResultDetail(unittest.TestCase):
 
 
 class TestRegisterRestoresSchedule(unittest.TestCase):
-    """register() restores a saved Auto Fetch schedule on startup — regression
-    test for a bug where the first run after every restart waited a full
-    interval, starving the job if restarts happened more often than that."""
+    """register() restores every saved Auto Fetch schedule on startup, each
+    as its own job — regression test for a bug where the first run after
+    every restart waited a full interval, starving the job if restarts
+    happened more often than that."""
 
     async def _register(self, app):
         # ConversationHandler's construction needs a running event loop
@@ -344,19 +417,33 @@ class TestRegisterRestoresSchedule(unittest.TestCase):
 
     def test_restored_first_run_is_soon_not_a_full_interval(self):
         app = MagicMock()
-        cfg = {"interval_minutes": 120}
-        with patch.object(af, "load_auto_fetch_schedule", return_value=cfg):
+        cfg = {"id": "sched-1", "interval_minutes": 120}
+        with patch.object(af, "load_auto_fetch_schedules", return_value=[cfg]):
             _run(self._register(app))
         _, kwargs = app.job_queue.run_repeating.call_args
         self.assertEqual(kwargs["interval"], 120 * 60)
         self.assertEqual(kwargs["first"], af._AF_RESTORE_FIRST_RUN_DELAY)
         self.assertLess(af._AF_RESTORE_FIRST_RUN_DELAY, 120 * 60)
+        self.assertEqual(kwargs["name"], "auto_fetch_job:sched-1")
+        self.assertEqual(kwargs["data"], "sched-1")
 
-    def test_no_saved_schedule_does_not_register_job(self):
+    def test_no_saved_schedules_does_not_register_any_job(self):
         app = MagicMock()
-        with patch.object(af, "load_auto_fetch_schedule", return_value=None):
+        with patch.object(af, "load_auto_fetch_schedules", return_value=[]):
             _run(self._register(app))
         app.job_queue.run_repeating.assert_not_called()
+
+    def test_restores_one_job_per_schedule(self):
+        app = MagicMock()
+        schedules = [
+            {"id": "sched-1", "interval_minutes": 60},
+            {"id": "sched-2", "interval_minutes": 120},
+        ]
+        with patch.object(af, "load_auto_fetch_schedules", return_value=schedules):
+            _run(self._register(app))
+        self.assertEqual(app.job_queue.run_repeating.call_count, 2)
+        names = {c.kwargs["name"] for c in app.job_queue.run_repeating.call_args_list}
+        self.assertEqual(names, {"auto_fetch_job:sched-1", "auto_fetch_job:sched-2"})
 
 
 class TestRecvAfEmail(unittest.TestCase):
@@ -380,18 +467,162 @@ class TestRecvAfEmail(unittest.TestCase):
         account runs the job, hiding the fact it always needs a valid cached
         Support Reg login regardless of what credential you used elsewhere."""
         self.update.message.text = "ops@example.com"
-        with patch.object(af, "save_auto_fetch_schedule") as mock_save:
+        with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1") as mock_add:
             result = _run(af.recv_af_email(self.update, self.ctx))
         self.assertEqual(result, af.ConversationHandler.END)
-        mock_save.assert_called_once()
+        mock_add.assert_called_once()
+        self.assertEqual(mock_add.call_args[0][0]["email"], "ops@example.com")
         text = self.update.message.reply_text.call_args[0][0]
         self.assertIn(af.CRED_LABELS[af._AF_CRED_TYPE], text)
 
+    def test_valid_submission_schedules_a_job_tagged_with_the_new_id(self):
+        self.update.message.text = "ops@example.com"
+        with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1"):
+            _run(af.recv_af_email(self.update, self.ctx))
+        _, kwargs = self.ctx.job_queue.run_repeating.call_args
+        self.assertEqual(kwargs["name"], "auto_fetch_job:sched-1")
+        self.assertEqual(kwargs["data"], "sched-1")
+
     def test_skip_saves_schedule_with_no_email(self):
         self.update.message.text = "skip"
-        with patch.object(af, "save_auto_fetch_schedule") as mock_save:
+        with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1") as mock_add:
             _run(af.recv_af_email(self.update, self.ctx))
-        self.assertEqual(mock_save.call_args[0][0]["email"], "")
+        self.assertEqual(mock_add.call_args[0][0]["email"], "")
+
+
+class TestAfFormatScheduleSummary(unittest.TestCase):
+    """_af_format_schedule_summary — one-line-ish summary used in the
+    schedule list and the remove picker."""
+
+    def test_summary_includes_email_and_filters(self):
+        cfg = {
+            "interval_minutes": 60, "days_back": 3, "county_filter": "nairobi",
+            "registry_filter": "central", "amount_min": 1_000_000, "amount_max": 5_000_000,
+            "sectional_filter": "exclude", "email": "abc@gmail.com",
+        }
+        summary = af._af_format_schedule_summary(cfg)
+        self.assertIn("abc@gmail.com", summary)
+        self.assertIn("every 60 min", summary)
+        self.assertIn("Nairobi", summary)
+        self.assertIn("Central", summary)
+        self.assertIn("KES 1,000,000", summary)
+        self.assertIn("KES 5,000,000", summary)
+
+    def test_summary_labels_telegram_only_when_no_email(self):
+        summary = af._af_format_schedule_summary({"interval_minutes": 30})
+        self.assertIn("Telegram only", summary)
+
+
+class TestCmdAutoFetch(unittest.TestCase):
+    """cmd_auto_fetch lists existing schedules (if any) and shows Add/Remove."""
+
+    def setUp(self):
+        self.update = MagicMock()
+        self.update.message.reply_text = AsyncMock()
+        self.ctx = MagicMock()
+
+    def _button_texts(self):
+        markup = self.update.message.reply_text.call_args[1]["reply_markup"]
+        return [b.text for row in markup.inline_keyboard for b in row]
+
+    def test_no_schedules_shows_add_only_keyboard(self):
+        with patch.object(af, "allowed", return_value=True), \
+             patch.object(af, "load_auto_fetch_schedules", return_value=[]):
+            result = _run(af.cmd_auto_fetch(self.update, self.ctx))
+        self.assertEqual(result, af.AF.MENU)
+        self.assertIn("No schedules yet", self.update.message.reply_text.call_args[0][0])
+        self.assertIn("➕ Add Schedule", self._button_texts())
+        self.assertNotIn("🗑 Remove Schedule", self._button_texts())
+
+    def test_existing_schedules_are_listed_with_remove_option(self):
+        schedules = [{"interval_minutes": 60, "email": "abc@gmail.com"}]
+        with patch.object(af, "allowed", return_value=True), \
+             patch.object(af, "load_auto_fetch_schedules", return_value=schedules):
+            _run(af.cmd_auto_fetch(self.update, self.ctx))
+        self.assertIn("abc@gmail.com", self.update.message.reply_text.call_args[0][0])
+        self.assertIn("🗑 Remove Schedule", self._button_texts())
+
+
+class TestRecvAfMenu(unittest.TestCase):
+    """recv_af_menu — Add / Remove / Close from the schedule list."""
+
+    def _make_query(self, data):
+        update = MagicMock()
+        query = update.callback_query
+        query.data = data
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        query.edit_message_reply_markup = AsyncMock()
+        query.message.reply_text = AsyncMock()
+        return update
+
+    def test_close_ends_conversation_and_clears_markup(self):
+        update = self._make_query("af_menu:close")
+        result = _run(af.recv_af_menu(update, MagicMock()))
+        self.assertEqual(result, af.ConversationHandler.END)
+        update.callback_query.edit_message_reply_markup.assert_called_once_with(reply_markup=None)
+
+    def test_remove_with_no_schedules_ends_conversation(self):
+        update = self._make_query("af_menu:remove")
+        with patch.object(af, "load_auto_fetch_schedules", return_value=[]):
+            result = _run(af.recv_af_menu(update, MagicMock()))
+        self.assertEqual(result, af.ConversationHandler.END)
+
+    def test_remove_with_schedules_shows_picker(self):
+        update = self._make_query("af_menu:remove")
+        schedules = [{"id": "sched-1", "email": "abc@gmail.com", "interval_minutes": 60}]
+        with patch.object(af, "load_auto_fetch_schedules", return_value=schedules):
+            result = _run(af.recv_af_menu(update, MagicMock()))
+        self.assertEqual(result, af.AF.REMOVE_PICK)
+
+    def test_add_moves_to_interval_step(self):
+        update = self._make_query("af_menu:add")
+        result = _run(af.recv_af_menu(update, MagicMock()))
+        self.assertEqual(result, af.AF.INTERVAL)
+
+
+class TestRecvAfRemove(unittest.TestCase):
+    """recv_af_remove — delete a schedule by id and cancel its running job."""
+
+    def _make_query(self, data):
+        update = MagicMock()
+        query = update.callback_query
+        query.data = data
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        query.message.reply_text = AsyncMock()
+        return update
+
+    def test_cancel_ends_without_removing(self):
+        update = self._make_query("af_remove:cancel")
+        with patch.object(af, "remove_auto_fetch_schedule") as mock_remove:
+            result = _run(af.recv_af_remove(update, MagicMock()))
+        self.assertEqual(result, af.ConversationHandler.END)
+        mock_remove.assert_not_called()
+
+    def test_removes_schedule_and_cancels_its_job(self):
+        update = self._make_query("af_remove:sched-1")
+        ctx = MagicMock()
+        fake_job = MagicMock()
+        ctx.job_queue.get_jobs_by_name.return_value = [fake_job]
+        with patch.object(af, "get_auto_fetch_schedule",
+                           return_value={"id": "sched-1", "email": "abc@gmail.com"}), \
+             patch.object(af, "remove_auto_fetch_schedule", return_value=True) as mock_remove:
+            result = _run(af.recv_af_remove(update, ctx))
+        self.assertEqual(result, af.ConversationHandler.END)
+        ctx.job_queue.get_jobs_by_name.assert_called_once_with("auto_fetch_job:sched-1")
+        fake_job.schedule_removal.assert_called_once()
+        mock_remove.assert_called_once_with("sched-1")
+        self.assertIn("abc@gmail.com", update.callback_query.edit_message_text.call_args[0][0])
+
+    def test_already_removed_shows_warning(self):
+        update = self._make_query("af_remove:sched-1")
+        ctx = MagicMock()
+        ctx.job_queue.get_jobs_by_name.return_value = []
+        with patch.object(af, "get_auto_fetch_schedule", return_value=None), \
+             patch.object(af, "remove_auto_fetch_schedule", return_value=False):
+            _run(af.recv_af_remove(update, ctx))
+        self.assertIn("already removed", update.callback_query.edit_message_text.call_args[0][0])
 
 
 if __name__ == "__main__":

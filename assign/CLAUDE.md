@@ -187,6 +187,8 @@ JSON files in `./data/` (mounted as Docker volume `bot_data`):
 - `saved_bulk_export_schedule.json` — the one active repeating Bulk Export schedule (if any)
 - `saved_bulk_export_partial.json` — Bulk Export resume checkpoint (rows + done IDs) saved when tokens get exhausted mid-run
 - `saved_hold_tasks.json` — `[{ref, held_valuer_name, held_valuer_uid, held_at, last_checked, last_error}]` — Hold Tasks' guarded-refs queue
+- `saved_auto_fetch.json` — `[{id, interval_minutes, days_back, county_filter, registry_filter, amount_min, amount_max, sectional_filter, email}]` — every active Auto Fetch schedule; each gets its own repeating job (`auto_fetch_job:{id}`), independently addable/removable via the ⏰ Auto Fetch menu. A pre-multi-schedule file (a bare dict, not a list) is migrated to this shape the first time it's read.
+- `saved_af_results.json` — Auto Fetch run history (last 20 runs across all schedules), each record tagged with `schedule_id`/`schedule_label` so runs from different schedules are distinguishable in 🗂 AF Results
 - `daemon.pid` / `daemon.log` — token refresh daemon process tracking
 
 ## Git Workflow

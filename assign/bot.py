@@ -567,8 +567,8 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  at the point of registration)
 
 
-# (Auto Fetch — _AF_INTERVALS, load_auto_fetch_schedule/
-#  save_auto_fetch_schedule/clear_auto_fetch_schedule, load_af_results/
+# (Auto Fetch — _AF_INTERVALS, load_auto_fetch_schedules/add_auto_fetch_schedule/
+#  remove_auto_fetch_schedule/get_auto_fetch_schedule, load_af_results/
 #  persist_af_result, _af_interval_keyboard, cmd_auto_fetch, recv_af_*,
 #  _auto_fetch_job — all live in auto_fetch.py)
 
