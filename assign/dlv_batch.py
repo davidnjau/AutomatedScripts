@@ -201,9 +201,17 @@ def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth
 
         if node == "VALUATION_STAMP_DUTY_VALUER_REPORT":
             actors = detail.get("actors", [])
-            if actors:
-                actor_name = actors[0].get("user_details", {}).get("names", "Unknown")
-                line = f"📋 `{ref}` — already with *{actor_name}*"
+            vo = next((a for a in actors if a.get("role") == "VALUATION OFFICER"), None)
+            vo_details = (vo.get("user_details") or {}) if vo else {}
+            actor_name = vo_details.get("names", "")
+            actor_uid  = vo_details.get("id", "")
+            if actor_name and str(actor_uid) == str(valuer_uid):
+                # Distinguish "correctly assigned already" from "taken by someone
+                # else" — both used to render identically as "already with X",
+                # which read as a failure even when the intended valuer already had it.
+                line = f"✅ `{ref}` — already correctly assigned to *{valuer_name}*"
+            elif actor_name:
+                line = f"⚠️ `{ref}` — already assigned to *{actor_name}*, not *{valuer_name}* — skipped (not reassigned)"
             else:
                 line = f"📋 `{ref}` — at VALUER_REPORT stage, no actor listed"
             return {"item": item, "keep": False, "line": line, "closed": None}

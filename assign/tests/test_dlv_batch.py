@@ -147,11 +147,11 @@ class TestProcessDlvBatchItem(unittest.TestCase):
         mock_persist.assert_called_once_with("REG/TSFR/ABC123", "Jane Doe", "uid-1")
         self.http_sess.post.assert_called_once()
 
-    def test_already_with_actor_reports_status(self):
+    def test_already_assigned_to_someone_else_reports_and_skips(self):
         with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
              patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={
                  "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
-                 "actors": [{"user_details": {"names": "EXISTING VALUER"}}],
+                 "actors": [{"role": "VALUATION OFFICER", "user_details": {"id": "uid-2", "names": "EXISTING VALUER"}}],
              }), \
              patch.object(dlv_batch, "_classify_dlv_detail", return_value={
                  "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
@@ -160,7 +160,43 @@ class TestProcessDlvBatchItem(unittest.TestCase):
              }):
             result = self._run()
         self.assertFalse(result["keep"])
-        self.assertIn("already with *EXISTING VALUER*", result["line"])
+        self.assertIn("already assigned to *EXISTING VALUER*, not *Jane Doe*", result["line"])
+        self.http_sess.post.assert_not_called()
+
+    def test_already_assigned_to_intended_valuer_reports_success(self):
+        # The item's own valuer_uid ("uid-1") matches the actor's id — this is
+        # the case that used to render identically to "taken by someone else",
+        # reading as a failure even though the intended valuer already has it.
+        with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                 "actors": [{"role": "VALUATION OFFICER", "user_details": {"id": "uid-1", "names": "Jane Doe"}}],
+             }), \
+             patch.object(dlv_batch, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT", "assessor_name": "",
+                 "consideration_amount": "", "currency_code": "", "actor_name": "",
+             }):
+            result = self._run()
+        self.assertFalse(result["keep"])
+        self.assertIn("✅", result["line"])
+        self.assertIn("already correctly assigned to *Jane Doe*", result["line"])
+        self.http_sess.post.assert_not_called()
+
+    def test_no_valuation_officer_actor_reports_no_actor_listed(self):
+        with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                 "actors": [{"role": "ASSESSOR_OF_STAMP_DUTY", "user_details": {"id": "uid-9", "names": "Some Assessor"}}],
+             }), \
+             patch.object(dlv_batch, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT", "assessor_name": "",
+                 "consideration_amount": "", "currency_code": "", "actor_name": "",
+             }):
+            result = self._run()
+        self.assertFalse(result["keep"])
+        self.assertIn("no actor listed", result["line"])
         self.http_sess.post.assert_not_called()
 
     def test_search_exception_is_kept_for_retry(self):
