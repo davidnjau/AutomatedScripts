@@ -240,5 +240,16 @@ class TestDlvQueuePersistence(unittest.TestCase):
         self.assertEqual(refs, {"A", "B"})
 
 
+class TestDlvTags(unittest.TestCase):
+    """DLV_TAGS — the fixed tag vocabulary shared by DLV Batch (sets it) and
+    DLV Tasks' By Tag report (filters on it)."""
+
+    def test_is_a_non_empty_list_of_distinct_strings(self):
+        self.assertIsInstance(dlv_core.DLV_TAGS, list)
+        self.assertTrue(dlv_core.DLV_TAGS)
+        self.assertEqual(len(dlv_core.DLV_TAGS), len(set(dlv_core.DLV_TAGS)))
+        self.assertTrue(all(isinstance(t, str) and t for t in dlv_core.DLV_TAGS))
+
+
 if __name__ == "__main__":
     unittest.main()

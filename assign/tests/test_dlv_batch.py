@@ -7,10 +7,11 @@ the "Query Now" DLV Queue action.
 Run with: python3 -m unittest discover -s assign/tests -v
 """
 
+import asyncio
 import os
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -18,6 +19,22 @@ import dlv_batch
 from ardhisasa_auth import AuthTokens
 
 TOKENS = AuthTokens(access_token="acc", jwt="jwt")
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _make_query_update(data):
+    """A MagicMock update whose callback_query has the given data and mocked
+    async reply methods, matching the shape recv_db_* handlers expect."""
+    update = MagicMock()
+    query = update.callback_query
+    query.data = data
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+    query.message.reply_text = AsyncMock()
+    return update
 
 
 class TestParseBatchInput(unittest.TestCase):
@@ -204,6 +221,197 @@ class TestProcessDlvBatchItem(unittest.TestCase):
             result = self._run()
         self.assertTrue(result["keep"])
         self.assertIn("boom", result["item"]["last_error"])
+
+
+class TestDbFormatBatchSummary(unittest.TestCase):
+    """_db_format_batch_summary — the confirm-step summary, tags annotated per ref."""
+
+    def _sess(self, groups, tag_by_ref=None):
+        sess = dlv_batch.DBSession()
+        sess.groups = groups
+        sess.tag_by_ref = tag_by_ref or {}
+        return sess
+
+    def test_resolved_group_shows_valuer(self):
+        with patch.object(dlv_batch, "_fetch_tasks_log_lookup", return_value=None):
+            sess = self._sess([{"refs": ["REF1"], "valuer_name": "Jane Doe", "status": "resolved"}])
+            summary = dlv_batch._db_format_batch_summary(sess)
+        self.assertIn("REF1", summary)
+        self.assertIn("Jane Doe", summary)
+
+    def test_unresolved_group_flagged_not_found(self):
+        sess = self._sess([{"refs": ["REF1"], "valuer_name": "Ghost", "status": "unresolved"}])
+        summary = dlv_batch._db_format_batch_summary(sess)
+        self.assertIn("NOT FOUND", summary)
+
+    def test_tagged_ref_shows_tag_marker_untagged_does_not(self):
+        with patch.object(dlv_batch, "_fetch_tasks_log_lookup", return_value=None):
+            sess = self._sess(
+                [{"refs": ["REF1", "REF2"], "valuer_name": "Jane Doe", "status": "resolved"}],
+                tag_by_ref={"REF1": "Urgent"},
+            )
+            summary = dlv_batch._db_format_batch_summary(sess)
+        self.assertIn("REF1` 🏷Urgent", summary)
+        self.assertNotIn("REF2` 🏷", summary)
+
+
+class TestDbTagKeyboards(unittest.TestCase):
+    def test_tag_ref_keyboard_shows_tag_or_no_tag(self):
+        markup = dlv_batch._db_tag_ref_keyboard(["REF1", "REF2"], {"REF1": "Urgent"})
+        texts = [b.text for row in markup.inline_keyboard for b in row]
+        self.assertIn("REF1 [🏷 Urgent]", texts)
+        self.assertIn("REF2 — no tag", texts)
+        self.assertIn("✅ Done Tagging", texts)
+
+    def test_tag_value_keyboard_lists_fixed_tags_plus_clear_and_back(self):
+        markup = dlv_batch._db_tag_value_keyboard()
+        texts = [b.text for row in markup.inline_keyboard for b in row]
+        for tag in dlv_batch.DLV_TAGS:
+            self.assertIn(tag, texts)
+        self.assertIn("🚫 Clear tag", texts)
+        self.assertIn("⬅️ Back", texts)
+
+
+class TestRecvDbConfirmTagBranch(unittest.TestCase):
+    """recv_db_confirm's "db:tag" branch — enters Tag Tasks with resolved refs only."""
+
+    def test_tag_branch_moves_to_tag_pick_ref_with_resolved_refs_only(self):
+        update = _make_query_update("db:tag")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = dlv_batch._get_db_sess(ctx)
+        sess.groups = [
+            {"refs": ["REF1", "REF2"], "valuer_name": "Jane", "status": "resolved"},
+            {"refs": ["REF3"], "valuer_name": "Ghost", "status": "unresolved"},
+        ]
+        result = _run(dlv_batch.recv_db_confirm(update, ctx))
+        self.assertEqual(result, dlv_batch.DB.TAG_PICK_REF)
+        self.assertEqual(sess.tag_refs, ["REF1", "REF2"])
+
+    def test_tag_branch_with_no_resolved_refs_ends_conversation(self):
+        update = _make_query_update("db:tag")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = dlv_batch._get_db_sess(ctx)
+        sess.groups = [{"refs": ["REF3"], "valuer_name": "Ghost", "status": "unresolved"}]
+        result = _run(dlv_batch.recv_db_confirm(update, ctx))
+        self.assertEqual(result, dlv_batch.ConversationHandler.END)
+
+
+class TestRecvDbTagRef(unittest.TestCase):
+    """recv_db_tag_ref — the Tag Tasks ref list: cancel/done/pick-a-ref."""
+
+    def setUp(self):
+        self.ctx = MagicMock()
+        self.ctx.user_data = {}
+        self.sess = dlv_batch._get_db_sess(self.ctx)
+        self.sess.tag_refs = ["REF1", "REF2"]
+
+    def test_cancel_ends_conversation(self):
+        update = _make_query_update("db_tagref:cancel")
+        result = _run(dlv_batch.recv_db_tag_ref(update, self.ctx))
+        self.assertEqual(result, dlv_batch.ConversationHandler.END)
+
+    def test_done_returns_to_confirm_with_summary(self):
+        self.sess.groups = [{"refs": ["REF1", "REF2"], "valuer_name": "Jane", "status": "resolved"}]
+        update = _make_query_update("db_tagref:done")
+        with patch.object(dlv_batch, "_fetch_tasks_log_lookup", return_value=None):
+            result = _run(dlv_batch.recv_db_tag_ref(update, self.ctx))
+        self.assertEqual(result, dlv_batch.DB.CONFIRM_BATCH)
+
+    def test_picking_a_ref_opens_its_tag_value_picker(self):
+        update = _make_query_update("db_tagref:0")
+        result = _run(dlv_batch.recv_db_tag_ref(update, self.ctx))
+        self.assertEqual(result, dlv_batch.DB.TAG_PICK_VALUE)
+        self.assertEqual(self.sess.tag_ref_index, 0)
+        self.assertIn("REF1", update.callback_query.edit_message_text.call_args[0][0])
+
+    def test_out_of_range_index_stays_on_ref_list(self):
+        update = _make_query_update("db_tagref:99")
+        result = _run(dlv_batch.recv_db_tag_ref(update, self.ctx))
+        self.assertEqual(result, dlv_batch.DB.TAG_PICK_REF)
+
+
+class TestRecvDbTagValue(unittest.TestCase):
+    """recv_db_tag_value — set/clear/leave-unchanged a ref's tag."""
+
+    def setUp(self):
+        self.ctx = MagicMock()
+        self.ctx.user_data = {}
+        self.sess = dlv_batch._get_db_sess(self.ctx)
+        self.sess.tag_refs = ["REF1", "REF2"]
+        self.sess.tag_ref_index = 0
+
+    def test_picking_a_tag_sets_it_for_the_selected_ref(self):
+        update = _make_query_update("db_tagval:Urgent")
+        result = _run(dlv_batch.recv_db_tag_value(update, self.ctx))
+        self.assertEqual(result, dlv_batch.DB.TAG_PICK_REF)
+        self.assertEqual(self.sess.tag_by_ref["REF1"], "Urgent")
+
+    def test_clear_removes_the_tag(self):
+        self.sess.tag_by_ref["REF1"] = "Urgent"
+        update = _make_query_update("db_tagval:clear")
+        _run(dlv_batch.recv_db_tag_value(update, self.ctx))
+        self.assertNotIn("REF1", self.sess.tag_by_ref)
+
+    def test_back_leaves_tag_unchanged(self):
+        self.sess.tag_by_ref["REF1"] = "Urgent"
+        update = _make_query_update("db_tagval:back")
+        _run(dlv_batch.recv_db_tag_value(update, self.ctx))
+        self.assertEqual(self.sess.tag_by_ref["REF1"], "Urgent")
+
+
+class TestRecvDbConfirmAttachesTag(unittest.TestCase):
+    """recv_db_confirm's "db:confirm" branch — each new queue item carries its tag."""
+
+    def _confirm(self, ctx):
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=[]), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save, \
+             patch.object(dlv_batch, "_fetch_tasks_log_lookup", return_value=None), \
+             patch.object(dlv_batch, "_fetch_tasks_log_remove"), \
+             patch.object(dlv_batch, "_any_valid_tokens", return_value=None):
+            _run(dlv_batch.recv_db_confirm(_make_query_update("db:confirm"), ctx))
+        return mock_save.call_args[0][0]
+
+    def test_tagged_ref_carries_its_tag_onto_the_queue_item(self):
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = dlv_batch._get_db_sess(ctx)
+        sess.groups = [{"refs": ["REF1"], "valuer_name": "Jane", "valuer_uid": "u1",
+                        "valuer_acct": "a1", "status": "resolved"}]
+        sess.tag_by_ref = {"REF1": "Urgent"}
+        saved_items = self._confirm(ctx)
+        self.assertEqual(saved_items[0]["tag"], "Urgent")
+
+    def test_untagged_ref_gets_empty_tag(self):
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = dlv_batch._get_db_sess(ctx)
+        sess.groups = [{"refs": ["REF1"], "valuer_name": "Jane", "valuer_uid": "u1",
+                        "valuer_acct": "a1", "status": "resolved"}]
+        saved_items = self._confirm(ctx)
+        self.assertEqual(saved_items[0]["tag"], "")
+
+
+class TestRecvDbInputResetsTags(unittest.TestCase):
+    """A fresh batch submission must not inherit tags from a prior one."""
+
+    def test_fresh_submission_clears_prior_tags(self):
+        update = MagicMock()
+        update.message.text = "REF1 : Jane Doe"
+        update.message.reply_text = AsyncMock()
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = dlv_batch._get_db_sess(ctx)
+        sess.tag_by_ref = {"OLD_REF": "Urgent"}
+
+        with patch.object(dlv_batch, "_any_valid_tokens", return_value=None), \
+             patch.object(dlv_batch, "_resolve_valuer_from_saved",
+                           return_value={"name": "Jane Doe", "uid": "u1", "account_number": "a1"}), \
+             patch.object(dlv_batch, "_fetch_tasks_log_lookup", return_value=None):
+            _run(dlv_batch.recv_db_input(update, ctx))
+
+        self.assertEqual(sess.tag_by_ref, {})
 
 
 if __name__ == "__main__":
