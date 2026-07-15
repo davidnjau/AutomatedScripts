@@ -189,6 +189,12 @@ JSON files in `./data/` (mounted as Docker volume `bot_data`):
 - `saved_hold_tasks.json` — `[{ref, held_valuer_name, held_valuer_uid, held_at, last_checked, last_error}]` — Hold Tasks' guarded-refs queue
 - `daemon.pid` / `daemon.log` — token refresh daemon process tracking
 
+## Git Workflow
+
+- **Start a new feature branch off `assign` for each new, unrelated task** — don't keep piling unrelated fixes onto whatever branch happens to be checked out. Before starting work, check whether the current branch's existing commits are related to the new request; if they aren't, `git checkout assign && git pull && git checkout -b <type>/<short-task-name>` first. Continuing on the current branch is fine when the new request is a direct follow-up/fix to what that branch is already about (e.g., addressing review feedback on the same feature).
+- PRs land on `assign`, not `main` (see CI note below) — always target `assign` with `gh pr create --base assign`.
+- Name branches `type/short-description` (e.g. `fix/auto-fetch-email-silent-failure`, `feat/dlv-tasks-by-valuer`), matching the conventional-commit type of the primary change.
+
 ## Notes
 
 - Test suite: `tests/` (stdlib `unittest`, no new dependencies). Run with `python3 -m unittest discover -s assign/tests -v`. See [Testing & Documentation Conventions](#testing--documentation-conventions) — every module gets its own test file, kept in sync as the module changes, and every function is commented.
