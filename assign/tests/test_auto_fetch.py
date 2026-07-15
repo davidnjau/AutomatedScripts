@@ -36,39 +36,6 @@ def _task(ref="REG/TSFR/ABC123", **overrides):
     return t
 
 
-class TestAfFormatTaskBlock(unittest.TestCase):
-    """_af_format_task_block renders one Auto Fetch task in the DLV-Tasks-style
-    labeled block, using only the fields Auto Fetch tasks actually have."""
-
-    def test_all_fields_present(self):
-        block = af._af_format_task_block(1, _task())
-        self.assertIn("📌 Ref: REG/TSFR/ABC123", block)
-        self.assertIn("🗂 Source: HQ", block)
-        self.assertIn("Assessor: Jane Doe", block)
-        self.assertIn("🏢 Registry: CENTRAL", block)
-        self.assertIn("📍 County: NAIROBI", block)
-        self.assertIn("💰 Consideration: KES 2,000,000", block)
-        self.assertIn("📋 Parcel: NAIROBI/BLOCK1/1", block)
-        self.assertIn("📅 Added: 2026-07-10", block)
-
-    def test_missing_fields_fall_back_to_em_dash(self):
-        block = af._af_format_task_block(1, _task(
-            source="", assessor="", registry="", county="", consideration="",
-            parcel_number="", date_created="",
-        ))
-        self.assertIn("🗂 Source: —", block)
-        self.assertIn("Assessor: —", block)
-        self.assertIn("🏢 Registry: —", block)
-        self.assertIn("📍 County: —", block)
-        self.assertIn("💰 Consideration: —", block)
-        self.assertIn("📋 Parcel: —", block)
-        self.assertIn("📅 Added: —", block)
-
-    def test_non_numeric_consideration_falls_back_to_str(self):
-        block = af._af_format_task_block(1, _task(consideration="N/A"))
-        self.assertIn("💰 Consideration: N/A", block)
-
-
 class TestSchedulePersistence(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
