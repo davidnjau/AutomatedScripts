@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_c
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
-from typing import List
+from typing import List, Optional
 
 import asyncio
 import openpyxl
@@ -518,46 +518,81 @@ async def _dt_run_tag_select(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TY
     return DT.PICK_TAG
 
 
+def _dt_consideration_value(item: dict) -> Optional[float]:
+    """Numeric consideration for an item, or None if unknown/unparseable.
+    Closed items carry the live-verified "consideration_amount" (set at
+    close time); still-queued items only ever have "consideration" (cached
+    from Fetch Tasks at queue time, since this report avoids live calls)."""
+    raw = item.get("consideration_amount") or item.get("consideration")
+    if not raw:
+        return None
+    try:
+        return float(str(raw).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _dt_sum_consideration(items: List[dict]) -> str:
+    """Formatted sum of every item's consideration in a list (all assumed
+    KES, as everywhere else in this bot — no multi-currency handling)."""
+    values = [v for v in (_dt_consideration_value(i) for i in items) if v is not None]
+    currency = next((i.get("currency_code") for i in items if i.get("currency_code")), "KES")
+    return _format_consideration(str(sum(values)), currency) if values else _format_consideration("0", currency)
+
+
+def _dt_format_report_item_block(i: int, item: dict, show_valuer: bool, is_closed: bool) -> str:
+    """One ref's labeled block for the By Valuer/By Tag reports — Ref,
+    Consideration, Parcel, Assessor, Tag, plus Valuer (By Tag only, since it
+    spans multiple valuers) and either Queued or Closed-with-status."""
+    ref         = item.get("ref") or "—"
+    assessor    = item.get("assessor") or "—"
+    parcel      = item.get("parcel") or "—"
+    consider    = _format_consideration(
+        str(item.get("consideration_amount") or item.get("consideration") or ""),
+        item.get("currency_code", ""),
+    ) or "—"
+
+    lines = [f"  {i}. 📌 *Ref:* `{ref}`"]
+    if show_valuer:
+        lines.append(f"     👤 Valuer: {item.get('valuer_name') or '—'}")
+    lines.append(f"     Assessor: {assessor}")
+    lines.append(f"     💰 Consideration: {consider}")
+    lines.append(f"     📋 Parcel: {parcel}")
+    if is_closed:
+        label_for = {"completed": "✅ Completed", "returned": "↩️ Returned"}
+        status_label = label_for.get(item.get("closed_reason"), "❓ Unknown")
+        lines.append(f"     📅 Closed: {(item.get('closed_at') or '—')[:16]} ({status_label})")
+    else:
+        lines.append(f"     📅 Queued: {(item.get('queued_at') or '—')[:16]}")
+    if item.get("tag"):
+        lines.append(f"     🏷 Tag: {item['tag']}")
+
+    return "\n".join(lines)
+
+
 def _dt_format_report_lines(header: str, queued: List[dict], closed: List[dict], period_label: str,
                              show_valuer: bool = False) -> List[str]:
     """Text lines shared by the By Valuer and By Tag reports: currently-queued
-    refs, then closed history within the chosen look-back period. Uses only
-    fields already stored on the queue/closed items (no live API calls) —
-    ref, assessor, queued_at, closed_at, tag. show_valuer=True adds a Valuer
-    field per line — needed for By Tag, which spans multiple valuers, but
-    redundant for By Valuer, where it's already implied by the header."""
+    refs, then closed history within the chosen look-back period, each ref
+    rendered as its own labeled block (Ref, Consideration, Parcel, Assessor,
+    Tag) rather than a single packed line. Uses only fields already stored
+    on the queue/closed items (no live API calls). show_valuer=True adds a
+    Valuer field per block — needed for By Tag, which spans multiple
+    valuers, but redundant for By Valuer, where it's already implied by the
+    header."""
     lines = [header]
 
-    lines.append(f"\n⏳ *Currently Queued* ({len(queued)})")
+    lines.append(f"⏳ *Currently Queued* ({len(queued)}) — Total: {_dt_sum_consideration(queued)}")
     if not queued:
         lines.append("  _none_")
     for i, item in enumerate(sorted(queued, key=lambda i: i.get("queued_at", "")), start=1):
-        valuer_part = f" | Valuer: {item.get('valuer_name') or '—'}" if show_valuer else ""
-        tag_part    = f" | 🏷 {item['tag']}" if item.get("tag") else ""
-        lines.append(
-            f"  {i}. 📌 `{item.get('ref') or '—'}`"
-            f"{valuer_part}"
-            f" | Assessor: {item.get('assessor') or '—'}"
-            f" | Queued: {(item.get('queued_at') or '—')[:16]}"
-            f"{tag_part}"
-        )
+        lines.append(_dt_format_report_item_block(i, item, show_valuer, is_closed=False))
 
-    lines.append(f"\n📜 *History* ({period_label}) — {len(closed)}")
+    lines.append(f"📜 *History* ({period_label}) — {len(closed)} — Total: {_dt_sum_consideration(closed)}")
     if not closed:
         lines.append("  _none_")
-    label_for = {"completed": "✅ Completed", "returned": "↩️ Returned"}
     for i, item in enumerate(sorted(closed, key=lambda i: i.get("closed_at", ""), reverse=True), start=1):
-        status_label = label_for.get(item.get("closed_reason"), "❓ Unknown")
-        valuer_part  = f" | Valuer: {item.get('valuer_name') or '—'}" if show_valuer else ""
-        tag_part     = f" | 🏷 {item['tag']}" if item.get("tag") else ""
-        lines.append(
-            f"  {i}. 📌 `{item.get('ref') or '—'}`"
-            f"{valuer_part}"
-            f" | Assessor: {item.get('assessor') or '—'}"
-            f" | Queued: {(item.get('queued_at') or '—')[:16]}"
-            f" | {status_label} {(item.get('closed_at') or '—')[:16]}"
-            f"{tag_part}"
-        )
+        lines.append(_dt_format_report_item_block(i, item, show_valuer, is_closed=True))
 
     return lines
 
@@ -580,7 +615,7 @@ async def _dt_send_valuer_report(chat_id: int, valuer_name: str, queued: List[di
     async def _send(text, reply_markup):
         await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
 
-    await _send_chunked_report(_send, lines, join="\n")
+    await _send_chunked_report(_send, lines, join="\n\n")
 
 
 async def _dt_send_tag_report(chat_id: int, tag: str, queued: List[dict], closed: List[dict],
@@ -591,7 +626,7 @@ async def _dt_send_tag_report(chat_id: int, tag: str, queued: List[dict], closed
     async def _send(text, reply_markup):
         await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
 
-    await _send_chunked_report(_send, lines, join="\n")
+    await _send_chunked_report(_send, lines, join="\n\n")
 
 
 async def recv_dt_pick_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

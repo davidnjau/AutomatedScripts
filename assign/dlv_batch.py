@@ -648,8 +648,17 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "tag":         sess.tag_by_ref.get(ref, ""),
                 }
                 cached = _fetch_tasks_log_lookup(ref)
-                if cached and cached.get("assessor"):
-                    new_item["assessor"] = cached["assessor"]
+                if cached:
+                    # Only source for Consideration/Parcel on a still-queued
+                    # item (the By Valuer/By Tag reports deliberately avoid
+                    # live API calls) — captured once here, at queue time.
+                    if cached.get("assessor"):
+                        new_item["assessor"] = cached["assessor"]
+                    if cached.get("parcel"):
+                        new_item["parcel"] = cached["parcel"]
+                    if cached.get("consideration"):
+                        new_item["consideration"]  = cached["consideration"]
+                        new_item["currency_code"]  = cached.get("currency_code", "KES")
                 new_items.append(new_item)
     flat_items = existing + new_items
     save_dlv_batch(flat_items)
