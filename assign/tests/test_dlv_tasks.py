@@ -10,11 +10,12 @@ is a regression test for that class of bug.
 Run with: python3 -m unittest discover -s assign/tests -v
 """
 
+import asyncio
 import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,6 +23,19 @@ import dlv_tasks
 from ardhisasa_auth import AuthTokens
 
 TOKENS = AuthTokens(access_token="acc", jwt="jwt")
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _make_query_update(data):
+    update = MagicMock()
+    query = update.callback_query
+    query.data = data
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+    return update
 
 
 def _batch_item(ref="REG/TSFR/ABC123", **overrides):
@@ -301,6 +315,95 @@ class TestDtFormatValuerReport(unittest.TestCase):
         closed = [{"ref": "REG/A/3", "closed_at": "2026-07-12T11:00:00", "closed_reason": "something_else"}]
         lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", [], closed, "All time"))
         self.assertIn("❓ Unknown", lines)
+
+    def test_tag_rendered_when_present_omitted_when_absent(self):
+        queued = [
+            {"ref": "REG/A/1", "assessor": "A", "queued_at": "t", "tag": "Urgent"},
+            {"ref": "REG/A/2", "assessor": "B", "queued_at": "t"},
+        ]
+        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", queued, [], "All time"))
+        self.assertIn("🏷 Urgent", lines)
+        # only one 🏷 marker — the untagged ref doesn't get one
+        self.assertEqual(lines.count("🏷"), 1)
+
+
+class TestDtFormatTagReport(unittest.TestCase):
+    """_dt_format_tag_report — the By Tag report, spans multiple valuers so
+    each line shows who it's with (unlike By Valuer, where that's implied)."""
+
+    def test_queued_and_closed_show_valuer_per_line(self):
+        queued = [{"ref": "REG/A/1", "valuer_name": "Jane Doe", "assessor": "A1",
+                   "queued_at": "2026-07-10T10:00:00", "tag": "Urgent"}]
+        closed = [{"ref": "REG/A/2", "valuer_name": "John Otieno", "assessor": "A2",
+                   "queued_at": "2026-07-01T09:00:00", "closed_at": "2026-07-12T11:00:00",
+                   "closed_reason": "completed", "tag": "Urgent"}]
+        lines = "\n".join(dlv_tasks._dt_format_tag_report("Urgent", queued, closed, "All time"))
+        self.assertIn("🏷 *DLV Report — Tag: Urgent*", lines)
+        self.assertIn("Valuer: Jane Doe", lines)
+        self.assertIn("Valuer: John Otieno", lines)
+
+    def test_empty_sections_render_none_placeholder(self):
+        lines = "\n".join(dlv_tasks._dt_format_tag_report("Urgent", [], [], "All time"))
+        self.assertEqual(lines.count("_none_"), 2)
+
+
+class TestDtTagKeyboard(unittest.TestCase):
+    def test_lists_every_fixed_tag_plus_cancel(self):
+        markup = dlv_tasks._dt_tag_keyboard()
+        texts = [b.text for row in markup.inline_keyboard for b in row]
+        for tag in dlv_tasks.DLV_TAGS:
+            self.assertIn(tag, texts)
+        self.assertIn("🛑 Cancel", texts)
+
+
+class TestRecvDtPickTag(unittest.TestCase):
+    """recv_dt_pick_tag — By Tag's tag picker, hands off to the shared period step."""
+
+    def test_cancel_ends_conversation(self):
+        update = _make_query_update("dt_picktag_cancel")
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        with patch.object(dlv_tasks, "allowed", return_value=True):
+            result = _run(dlv_tasks.recv_dt_pick_tag(update, ctx))
+        self.assertEqual(result, dlv_tasks.ConversationHandler.END)
+
+    def test_picking_a_tag_sets_report_mode_and_moves_to_period(self):
+        update = _make_query_update("dt_picktag:Urgent")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        with patch.object(dlv_tasks, "allowed", return_value=True):
+            result = _run(dlv_tasks.recv_dt_pick_tag(update, ctx))
+        self.assertEqual(result, dlv_tasks.DT.PICK_PERIOD)
+        sess = dlv_tasks._get_dt_sess(ctx)
+        self.assertEqual(sess.report_mode, "tag")
+        self.assertEqual(sess.selected_tag, "Urgent")
+
+
+class TestRecvDtPeriodTagMode(unittest.TestCase):
+    """recv_dt_period's tag-mode branch — filters the queue/closed store by
+    tag (not valuer) and sends the By Tag report."""
+
+    def test_filters_by_tag_and_sends_tag_report(self):
+        update = _make_query_update("dt_period:0")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        ctx.bot.send_message = AsyncMock()
+        sess = dlv_tasks._get_dt_sess(ctx)
+        sess.report_mode  = "tag"
+        sess.selected_tag = "Urgent"
+
+        queued = [{"ref": "REF1", "tag": "Urgent"}, {"ref": "REF2", "tag": "VIP"}]
+        closed = [{"ref": "REF3", "tag": "Urgent", "closed_at": "2026-07-01"}]
+        with patch.object(dlv_tasks, "allowed", return_value=True), \
+             patch.object(dlv_tasks, "load_dlv_batch", return_value=queued), \
+             patch.object(dlv_tasks, "load_dlv_closed", return_value=closed), \
+             patch.object(dlv_tasks, "_dt_send_tag_report", new_callable=AsyncMock) as mock_send:
+            result = _run(dlv_tasks.recv_dt_period(update, ctx))
+
+        self.assertEqual(result, dlv_tasks.ConversationHandler.END)
+        mock_send.assert_called_once()
+        sent_queued = mock_send.call_args[0][2]
+        self.assertEqual([i["ref"] for i in sent_queued], ["REF1"])
 
 
 if __name__ == "__main__":

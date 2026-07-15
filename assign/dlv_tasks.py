@@ -4,8 +4,9 @@ dlv_tasks.py
 ============
 DLV Tasks — live-check the DLV Batch queue (📋 DLV Tasks button /
 /dlvtasks) and produce an Open/Closed report (Telegram text or Excel),
-a per-valuer report (queued + closed history, filterable by look-back
-period), plus the multi-select bulk-delete flow for the open queue.
+a per-valuer report and a per-tag report (each: queued + closed history,
+filterable by look-back period — see _dt_format_report_lines, shared by
+both), plus the multi-select bulk-delete flow for the open queue.
 
 _dt_fetch_tasks, _dt_build_excel, and _dt_send_telegram are also used by
 Morning Briefing (bot.py), which stays in bot.py for now since it owns its
@@ -53,6 +54,7 @@ from common import (
     not_cancel,
 )
 from dlv_core import (
+    DLV_TAGS,
     _append_dlv_closed,
     _classify_dlv_detail,
     _extract_assessor,
@@ -74,13 +76,14 @@ from telegram_report import _send_chunked_report
 # States — DLV Tasks conversation
 # ──────────────────────────────────────────────────────────
 class DT(Enum):
-    SCOPE           = auto()   # choose Open Tasks vs Closed Tasks vs By Valuer vs Delete Task(s)
+    SCOPE           = auto()   # choose Open Tasks vs Closed Tasks vs By Valuer vs By Tag vs Delete Task(s)
     EXCLUDE_VALUERS = auto()   # toggle which valuers to exclude
     DELIVERY        = auto()   # telegram or email
     EMAIL_INPUT     = auto()   # enter email address
     DELETE_SELECT   = auto()   # multi-select which queued refs to delete
     PICK_VALUER     = auto()   # By Valuer: choose which valuer to report on
-    PICK_PERIOD     = auto()   # By Valuer: choose the history look-back period
+    PICK_TAG        = auto()   # By Tag: choose which tag to report on
+    PICK_PERIOD     = auto()   # By Valuer/By Tag: choose the history look-back period
 
 
 # ── DLV Tasks session ──────────────────────────────────────
@@ -95,6 +98,8 @@ class DTSession:
     delete_selected:  set        = field(default_factory=set)    # refs selected for deletion
     valuer_choices:   List[dict] = field(default_factory=list)   # By Valuer picker: [{key, name}]
     selected_valuer:  dict       = field(default_factory=dict)   # By Valuer: {key, name} chosen
+    report_mode:      str        = "valuer"                      # "valuer" | "tag" — disambiguates PICK_PERIOD
+    selected_tag:     str        = ""                             # By Tag: the chosen tag
 
 
 def _get_dt_sess(ctx: ContextTypes.DEFAULT_TYPE) -> DTSession:
@@ -145,6 +150,7 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
             "consideration": "",   # formatted "KES 1,234.00", or "" if unknown
             "found":         False,   # found anywhere (DLV or still with the assessor)
             "location":      "",      # "dlv" | "assessor"
+            "tag":           item.get("tag", ""),   # optional, set via DLV Batch's Tag Tasks step
             "_closed":       None,
         }
         try:
@@ -343,6 +349,7 @@ async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🔒 Closed Tasks", callback_data="dt_scope:closed"),
             ],
             [InlineKeyboardButton("👤 By Valuer",      callback_data="dt_scope:byvaluer")],
+            [InlineKeyboardButton("🏷 By Tag",         callback_data="dt_scope:bytag")],
             [InlineKeyboardButton("🗑 Delete Task(s)", callback_data="dt_scope:delete")],
         ]),
     )
@@ -417,9 +424,10 @@ async def _dt_send_closed_report(chat_id: int, rows: List[dict], bot) -> None:
             amount     = t.get("consideration_amount") or ""
             amount_str = f" | {currency} {amount}" if amount else ""
             closed_at  = (t.get("closed_at") or "")[:10]
+            tag_str    = f" | 🏷 {t['tag']}" if t.get("tag") else ""
             lines.append(
                 f"  {i}. `{t.get('ref', '—')}` | Valuer: {t.get('valuer_name') or '—'}"
-                f"{amount_str} | Closed: {closed_at or '—'}"
+                f"{amount_str} | Closed: {closed_at or '—'}{tag_str}"
             )
 
     async def _send(text, reply_markup):
@@ -469,9 +477,16 @@ def _dt_valuer_keyboard(valuers: List[dict]) -> InlineKeyboardMarkup:
 
 
 def _dt_period_keyboard() -> InlineKeyboardMarkup:
-    """History look-back period picker shown after a valuer is chosen."""
+    """History look-back period picker shown after a valuer or tag is chosen."""
     row = [InlineKeyboardButton(label, callback_data=f"dt_period:{days}") for label, days in _DT_PERIOD_OPTIONS]
     return InlineKeyboardMarkup([row, [InlineKeyboardButton("🛑 Cancel", callback_data="dt_period_cancel")]])
+
+
+def _dt_tag_keyboard() -> InlineKeyboardMarkup:
+    """Fixed-list tag picker for the By Tag scope."""
+    rows = [[InlineKeyboardButton(t, callback_data=f"dt_picktag:{t}")] for t in DLV_TAGS]
+    rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="dt_picktag_cancel")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def _dt_run_valuer_select(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
@@ -493,20 +508,38 @@ async def _dt_run_valuer_select(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT
     return DT.PICK_VALUER
 
 
-def _dt_format_valuer_report(valuer_name: str, queued: List[dict], closed: List[dict], period_label: str) -> List[str]:
-    """Text lines for one valuer's DLV report: currently-queued refs, then closed
-    history within the chosen look-back period. Uses only fields already stored on
-    the queue/closed items (no live API calls) — ref, assessor, queued_at, closed_at."""
-    lines = [f"👤 *DLV Report — {valuer_name}*"]
+async def _dt_run_tag_select(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show the fixed tag picker for the By Tag scope."""
+    await edit_fn(
+        "🏷 *By Tag* — pick a tag to view its DLV report:",
+        parse_mode="Markdown",
+        reply_markup=_dt_tag_keyboard(),
+    )
+    return DT.PICK_TAG
+
+
+def _dt_format_report_lines(header: str, queued: List[dict], closed: List[dict], period_label: str,
+                             show_valuer: bool = False) -> List[str]:
+    """Text lines shared by the By Valuer and By Tag reports: currently-queued
+    refs, then closed history within the chosen look-back period. Uses only
+    fields already stored on the queue/closed items (no live API calls) —
+    ref, assessor, queued_at, closed_at, tag. show_valuer=True adds a Valuer
+    field per line — needed for By Tag, which spans multiple valuers, but
+    redundant for By Valuer, where it's already implied by the header."""
+    lines = [header]
 
     lines.append(f"\n⏳ *Currently Queued* ({len(queued)})")
     if not queued:
         lines.append("  _none_")
     for i, item in enumerate(sorted(queued, key=lambda i: i.get("queued_at", "")), start=1):
+        valuer_part = f" | Valuer: {item.get('valuer_name') or '—'}" if show_valuer else ""
+        tag_part    = f" | 🏷 {item['tag']}" if item.get("tag") else ""
         lines.append(
             f"  {i}. 📌 `{item.get('ref') or '—'}`"
+            f"{valuer_part}"
             f" | Assessor: {item.get('assessor') or '—'}"
             f" | Queued: {(item.get('queued_at') or '—')[:16]}"
+            f"{tag_part}"
         )
 
     lines.append(f"\n📜 *History* ({period_label}) — {len(closed)}")
@@ -515,20 +548,45 @@ def _dt_format_valuer_report(valuer_name: str, queued: List[dict], closed: List[
     label_for = {"completed": "✅ Completed", "returned": "↩️ Returned"}
     for i, item in enumerate(sorted(closed, key=lambda i: i.get("closed_at", ""), reverse=True), start=1):
         status_label = label_for.get(item.get("closed_reason"), "❓ Unknown")
+        valuer_part  = f" | Valuer: {item.get('valuer_name') or '—'}" if show_valuer else ""
+        tag_part     = f" | 🏷 {item['tag']}" if item.get("tag") else ""
         lines.append(
             f"  {i}. 📌 `{item.get('ref') or '—'}`"
+            f"{valuer_part}"
             f" | Assessor: {item.get('assessor') or '—'}"
             f" | Queued: {(item.get('queued_at') or '—')[:16]}"
             f" | {status_label} {(item.get('closed_at') or '—')[:16]}"
+            f"{tag_part}"
         )
 
     return lines
+
+
+def _dt_format_valuer_report(valuer_name: str, queued: List[dict], closed: List[dict], period_label: str) -> List[str]:
+    """One valuer's DLV report — see _dt_format_report_lines."""
+    return _dt_format_report_lines(f"👤 *DLV Report — {valuer_name}*", queued, closed, period_label)
+
+
+def _dt_format_tag_report(tag: str, queued: List[dict], closed: List[dict], period_label: str) -> List[str]:
+    """One tag's DLV report, spanning every valuer — see _dt_format_report_lines."""
+    return _dt_format_report_lines(f"🏷 *DLV Report — Tag: {tag}*", queued, closed, period_label, show_valuer=True)
 
 
 async def _dt_send_valuer_report(chat_id: int, valuer_name: str, queued: List[dict], closed: List[dict],
                                   period_label: str, bot) -> None:
     """Send the By Valuer DLV report (queued + closed-history) as chunked Telegram messages."""
     lines = _dt_format_valuer_report(valuer_name, queued, closed, period_label)
+
+    async def _send(text, reply_markup):
+        await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
+
+    await _send_chunked_report(_send, lines, join="\n")
+
+
+async def _dt_send_tag_report(chat_id: int, tag: str, queued: List[dict], closed: List[dict],
+                               period_label: str, bot) -> None:
+    """Send the By Tag DLV report (queued + closed-history, spanning every valuer) as chunked Telegram messages."""
+    lines = _dt_format_tag_report(tag, queued, closed, period_label)
 
     async def _send(text, reply_markup):
         await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
@@ -552,6 +610,7 @@ async def recv_dt_pick_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if idx >= len(sess.valuer_choices):
         return DT.PICK_VALUER
     sess.selected_valuer = sess.valuer_choices[idx]
+    sess.report_mode     = "valuer"
 
     await query.edit_message_text(
         f"👤 *{sess.selected_valuer['name']}*\n\nFilter history by period:",
@@ -561,8 +620,34 @@ async def recv_dt_pick_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return DT.PICK_PERIOD
 
 
+async def recv_dt_pick_tag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """By Tag: handle the tag-picker tap, then show the history-period picker."""
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "dt_picktag_cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    sess = _get_dt_sess(ctx)
+    sess.selected_tag = query.data.split(":", 1)[1]
+    sess.report_mode  = "tag"
+
+    await query.edit_message_text(
+        f"🏷 *{sess.selected_tag}*\n\nFilter history by period:",
+        parse_mode="Markdown",
+        reply_markup=_dt_period_keyboard(),
+    )
+    return DT.PICK_PERIOD
+
+
 async def recv_dt_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """By Valuer: handle the period-picker tap, filter, and send the combined report."""
+    """By Valuer/By Tag: handle the period-picker tap, filter, and send the
+    combined report — branches on sess.report_mode set by whichever picker
+    (recv_dt_pick_valuer or recv_dt_pick_tag) led here, since both share this
+    step."""
     if not allowed(update): return await deny(update)
     query = update.callback_query
     await query.answer()
@@ -572,20 +657,30 @@ async def recv_dt_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
         return ConversationHandler.END
 
-    days   = int(query.data.split(":")[1])
-    sess   = _get_dt_sess(ctx)
-    valuer = sess.selected_valuer
-    key    = valuer["key"]
-
-    queued = [i for i in load_dlv_batch() if _dt_valuer_key(i) == key]
-    closed = [c for c in load_dlv_closed() if _dt_valuer_key(c) == key]
-    if days:
-        cutoff = _date_cutoff_str(days)
-        closed = [c for c in closed if _within_days(c.get("closed_at", ""), cutoff)]
-
+    days = int(query.data.split(":")[1])
+    sess = _get_dt_sess(ctx)
     period_label = next((label for label, d in _DT_PERIOD_OPTIONS if d == days), "All time")
-    await query.edit_message_text(f"⏳ Building report for *{valuer['name']}*…", parse_mode="Markdown")
-    await _dt_send_valuer_report(query.message.chat_id, valuer["name"], queued, closed, period_label, ctx.bot)
+
+    if sess.report_mode == "tag":
+        tag    = sess.selected_tag
+        queued = [i for i in load_dlv_batch() if i.get("tag") == tag]
+        closed = [c for c in load_dlv_closed() if c.get("tag") == tag]
+        if days:
+            cutoff = _date_cutoff_str(days)
+            closed = [c for c in closed if _within_days(c.get("closed_at", ""), cutoff)]
+        await query.edit_message_text(f"⏳ Building report for tag *{tag}*…", parse_mode="Markdown")
+        await _dt_send_tag_report(query.message.chat_id, tag, queued, closed, period_label, ctx.bot)
+    else:
+        valuer = sess.selected_valuer
+        key    = valuer["key"]
+        queued = [i for i in load_dlv_batch() if _dt_valuer_key(i) == key]
+        closed = [c for c in load_dlv_closed() if _dt_valuer_key(c) == key]
+        if days:
+            cutoff = _date_cutoff_str(days)
+            closed = [c for c in closed if _within_days(c.get("closed_at", ""), cutoff)]
+        await query.edit_message_text(f"⏳ Building report for *{valuer['name']}*…", parse_mode="Markdown")
+        await _dt_send_valuer_report(query.message.chat_id, valuer["name"], queued, closed, period_label, ctx.bot)
+
     await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
     return ConversationHandler.END
 
@@ -594,10 +689,13 @@ async def recv_dt_scope(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     query = update.callback_query
     await query.answer()
-    scope = query.data.split(":")[1]   # "open" | "closed" | "byvaluer" | "delete"
+    scope = query.data.split(":")[1]   # "open" | "closed" | "byvaluer" | "bytag" | "delete"
 
     if scope == "byvaluer":
         return await _dt_run_valuer_select(query.edit_message_text, query.message.chat_id, ctx)
+
+    if scope == "bytag":
+        return await _dt_run_tag_select(query.edit_message_text, query.message.chat_id, ctx)
 
     if scope == "closed":
         rows = load_dlv_closed()
@@ -798,6 +896,8 @@ def _dt_format_task_block(i: int, t: dict) -> str:
         f"     📋 Parcel: {t.get('parcel') or '—'}\n"
         f"     📅 Added: {t.get('date_created') or '—'}"
     )
+    if t.get("tag"):
+        block += f"\n     🏷 Tag: {t['tag']}"
     if note:
         block += f"\n     {note}"
     return block
@@ -852,6 +952,7 @@ def register(app: Application) -> None:
                 CallbackQueryHandler(recv_dt_delete_confirm, pattern=r"^dt_delconfirm$|^dt_delcancel$"),
             ],
             DT.PICK_VALUER: [CallbackQueryHandler(recv_dt_pick_valuer, pattern=r"^dt_pickvaluer")],
+            DT.PICK_TAG:    [CallbackQueryHandler(recv_dt_pick_tag,    pattern=r"^dt_picktag")],
             DT.PICK_PERIOD: [CallbackQueryHandler(recv_dt_period,     pattern=r"^dt_period")],
         },
         fallbacks=[

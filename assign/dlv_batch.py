@@ -10,6 +10,12 @@ Users send lines like "REF1, REF2 : Valuer Name"; refs are queued into
 saved_dlv_batch.json (via dlv_core) and a repeating background job tries
 to find + assign each one in DLV until it succeeds or closes out.
 
+Before confirming, refs can optionally be tagged (one of dlv_core.DLV_TAGS
+per ref) via the "🏷 Tag Tasks" step — the tag rides along on the queue
+item and, since closed records are built by spreading the item dict,
+carries through to the closed store automatically. DLV Tasks' "By Tag"
+report and the 🔍 DLV Queue viewer both surface it.
+
 Call register(app) from bot.py's main() to wire this feature in.
 """
 
@@ -56,6 +62,7 @@ from common import (
     persist_assignment,
 )
 from dlv_core import (
+    DLV_TAGS,
     _append_dlv_closed,
     _classify_dlv_detail,
     _fetch_ref_detail_dlv,
@@ -71,14 +78,19 @@ from fetch_tasks_cache import _fetch_tasks_log_lookup, _fetch_tasks_log_remove
 # States — DLV Batch conversation
 # ──────────────────────────────────────────────────────────
 class DB(Enum):
-    INPUT_BATCH   = auto()   # waiting for batch text
-    CONFIRM_BATCH = auto()   # waiting for confirm/cancel
+    INPUT_BATCH    = auto()   # waiting for batch text
+    CONFIRM_BATCH  = auto()   # waiting for confirm/cancel/tag
+    TAG_PICK_REF   = auto()   # tagging: pick which ref to tag next
+    TAG_PICK_VALUE = auto()   # tagging: pick a fixed tag value for the selected ref
 
 
 @dataclass
 class DBSession:
     groups: List[Dict] = field(default_factory=list)
     # groups: [{refs, valuer_name, valuer_uid, valuer_acct, status}]
+    tag_refs:      List[str]      = field(default_factory=list)   # resolved refs eligible for tagging
+    tag_by_ref:    Dict[str, str] = field(default_factory=dict)    # ref -> tag, only for tagged refs
+    tag_ref_index: int            = 0                              # which tag_refs[] entry is being tagged
 
 
 def _get_db_sess(ctx: ContextTypes.DEFAULT_TYPE) -> DBSession:
@@ -346,7 +358,10 @@ async def cmd_dlv_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ref         = item.get("ref", "?")
         valuer_name = item.get("valuer_name", "?")
         last_error  = item.get("last_error", "")
+        tag         = item.get("tag", "")
         line = f"• `{ref}` → *{valuer_name}*"
+        if tag:
+            line += f" 🏷 {tag}"
         if last_error:
             line += f"\n  ⚠️ _{last_error}_"
         lines.append(line)
@@ -453,6 +468,68 @@ async def cmd_dlv_batch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return DB.INPUT_BATCH
 
 
+def _db_format_batch_summary(sess: DBSession) -> str:
+    """Build the confirm-step summary text — resolved/unresolved groups, each
+    ref annotated with its tag (if any) from a prior Tag Tasks pass."""
+    lines = ["📋 *Batch Summary — please confirm:*\n"]
+    has_unresolved = False
+    for g in sess.groups:
+        refs_str = ", ".join(
+            f"`{r}`" + (f" 🏷{sess.tag_by_ref[r]}" if sess.tag_by_ref.get(r) else "")
+            for r in g["refs"]
+        )
+        if g["status"] == "resolved":
+            assessors = {
+                a for a in (
+                    (_fetch_tasks_log_lookup(r) or {}).get("assessor", "") for r in g["refs"]
+                ) if a
+            }
+            assessor_note = f"\n   Assessor: {', '.join(sorted(assessors))}" if assessors else ""
+            lines.append(f"✅ {refs_str}\n   → *{g['valuer_name']}*{assessor_note}")
+        else:
+            lines.append(f"⚠️ {refs_str}\n   → _{g['valuer_name']}_ (NOT FOUND — will be skipped)")
+            has_unresolved = True
+
+    if has_unresolved:
+        lines.append("\n_Unresolved valuers will be skipped._")
+
+    msg = "\n".join(lines)
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n…_(truncated)_"
+    return msg
+
+
+def _db_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏷 Tag Tasks", callback_data="db:tag")],
+        [
+            InlineKeyboardButton("✅ Confirm & Run", callback_data="db:confirm"),
+            InlineKeyboardButton("❌ Cancel",        callback_data="db:cancel"),
+        ],
+    ])
+
+
+def _db_tag_ref_keyboard(tag_refs: List[str], tag_by_ref: Dict[str, str]) -> InlineKeyboardMarkup:
+    """One button per resolved ref, showing its current tag (if any); tap to (re)tag it."""
+    rows = []
+    for i, ref in enumerate(tag_refs):
+        tag = tag_by_ref.get(ref, "")
+        label = f"{ref} [🏷 {tag}]" if tag else f"{ref} — no tag"
+        rows.append([InlineKeyboardButton(label, callback_data=f"db_tagref:{i}")])
+    rows.append([
+        InlineKeyboardButton("✅ Done Tagging", callback_data="db_tagref:done"),
+        InlineKeyboardButton("❌ Cancel",       callback_data="db_tagref:cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _db_tag_value_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(t, callback_data=f"db_tagval:{t}")] for t in DLV_TAGS]
+    rows.append([InlineKeyboardButton("🚫 Clear tag", callback_data="db_tagval:clear")])
+    rows.append([InlineKeyboardButton("⬅️ Back",      callback_data="db_tagval:back")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def recv_db_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text   = update.message.text.strip()
     groups = _parse_batch_input(text)
@@ -467,6 +544,7 @@ async def recv_db_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Resolving valuers…")
     tokens  = _any_valid_tokens()
     sess    = _get_db_sess(ctx)
+    sess.tag_by_ref = {}   # fresh batch submission — clear any tags from a prior one
     resolved = []
 
     for group in groups:
@@ -515,37 +593,10 @@ async def recv_db_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     sess.groups = resolved
 
-    # Build confirmation summary
-    lines = ["📋 *Batch Summary — please confirm:*\n"]
-    has_unresolved = False
-    for g in resolved:
-        refs_str = ", ".join(f"`{r}`" for r in g["refs"])
-        if g["status"] == "resolved":
-            assessors = {
-                a for a in (
-                    (_fetch_tasks_log_lookup(r) or {}).get("assessor", "") for r in g["refs"]
-                ) if a
-            }
-            assessor_note = f"\n   Assessor: {', '.join(sorted(assessors))}" if assessors else ""
-            lines.append(f"✅ {refs_str}\n   → *{g['valuer_name']}*{assessor_note}")
-        else:
-            lines.append(f"⚠️ {refs_str}\n   → _{g['valuer_name']}_ (NOT FOUND — will be skipped)")
-            has_unresolved = True
-
-    if has_unresolved:
-        lines.append("\n_Unresolved valuers will be skipped._")
-
-    msg = "\n".join(lines)
-    if len(msg) > 4000:
-        msg = msg[:4000] + "\n…_(truncated)_"
-
     await update.message.reply_text(
-        msg,
+        _db_format_batch_summary(sess),
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Confirm & Run", callback_data="db:confirm"),
-            InlineKeyboardButton("❌ Cancel",        callback_data="db:cancel"),
-        ]]),
+        reply_markup=_db_confirm_keyboard(),
     )
     return DB.CONFIRM_BATCH
 
@@ -559,7 +610,21 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Main menu:", reply_markup=_main_menu())
         return ConversationHandler.END
 
-    sess    = _get_db_sess(ctx)
+    sess = _get_db_sess(ctx)
+
+    if query.data == "db:tag":
+        sess.tag_refs = [ref for g in sess.groups if g["status"] == "resolved" for ref in g["refs"]]
+        if not sess.tag_refs:
+            await query.edit_message_text("⚠️ No resolved refs to tag.")
+            await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+            return ConversationHandler.END
+        await query.edit_message_text(
+            "🏷 *Tag Tasks* — tap a ref to set its tag, then Done.",
+            parse_mode="Markdown",
+            reply_markup=_db_tag_ref_keyboard(sess.tag_refs, sess.tag_by_ref),
+        )
+        return DB.TAG_PICK_REF
+
     to_save = [g for g in sess.groups if g["status"] == "resolved"]
 
     if not to_save:
@@ -580,6 +645,7 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "valuer_uid":  g["valuer_uid"],
                     "valuer_acct": g["valuer_acct"],
                     "queued_at":   datetime.now().isoformat(timespec="seconds"),
+                    "tag":         sess.tag_by_ref.get(ref, ""),
                 }
                 cached = _fetch_tasks_log_lookup(ref)
                 if cached and cached.get("assessor"):
@@ -612,6 +678,62 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def recv_db_tag_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Tag Tasks: handle a ref tap (open its tag picker), Done (back to the
+    confirm summary), or Cancel (abort the whole batch)."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data.split(":", 1)[1]
+    sess = _get_db_sess(ctx)
+
+    if data == "cancel":
+        await query.edit_message_text("❌ DLV Batch cancelled.")
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    if data == "done":
+        await query.edit_message_text(
+            _db_format_batch_summary(sess),
+            parse_mode="Markdown",
+            reply_markup=_db_confirm_keyboard(),
+        )
+        return DB.CONFIRM_BATCH
+
+    idx = int(data)
+    if idx >= len(sess.tag_refs):
+        return DB.TAG_PICK_REF
+    sess.tag_ref_index = idx
+    ref = sess.tag_refs[idx]
+    await query.edit_message_text(
+        f"🏷 Pick a tag for `{ref}`:",
+        parse_mode="Markdown",
+        reply_markup=_db_tag_value_keyboard(),
+    )
+    return DB.TAG_PICK_VALUE
+
+
+async def recv_db_tag_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Tag Tasks: apply/clear the picked tag for the currently-selected ref,
+    then return to the ref list."""
+    query = update.callback_query
+    await query.answer()
+    value = query.data.split(":", 1)[1]
+    sess  = _get_db_sess(ctx)
+    ref   = sess.tag_refs[sess.tag_ref_index]
+
+    if value == "clear":
+        sess.tag_by_ref.pop(ref, None)
+    elif value != "back":
+        sess.tag_by_ref[ref] = value
+
+    await query.edit_message_text(
+        "🏷 *Tag Tasks* — tap a ref to set its tag, then Done.",
+        parse_mode="Markdown",
+        reply_markup=_db_tag_ref_keyboard(sess.tag_refs, sess.tag_by_ref),
+    )
+    return DB.TAG_PICK_REF
+
+
 async def _run_dlv_batch_bg(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, tokens: AuthTokens) -> None:
     """Process the DLV batch queue off the event loop, then message the report back."""
     try:
@@ -639,8 +761,10 @@ def register(app: Application) -> None:
             MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_BATCH)}$"), cmd_dlv_batch),
         ],
         states={
-            DB.INPUT_BATCH:   [MessageHandler(not_cancel, recv_db_input)],
-            DB.CONFIRM_BATCH: [CallbackQueryHandler(recv_db_confirm, pattern=r"^db:")],
+            DB.INPUT_BATCH:    [MessageHandler(not_cancel, recv_db_input)],
+            DB.CONFIRM_BATCH:  [CallbackQueryHandler(recv_db_confirm,   pattern=r"^db:")],
+            DB.TAG_PICK_REF:   [CallbackQueryHandler(recv_db_tag_ref,   pattern=r"^db_tagref:")],
+            DB.TAG_PICK_VALUE: [CallbackQueryHandler(recv_db_tag_value, pattern=r"^db_tagval:")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
