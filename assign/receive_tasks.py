@@ -1049,7 +1049,7 @@ async def recv_rt_amount_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "ft_amount:20m_50m": (20_000_000.0, 50_000_000.0),
         "ft_amount:50m_100m":(50_000_000.0,100_000_000.0),
         "ft_amount:10m_80m": (10_000_000.0, 80_000_000.0),
-        "ft_amount:80m_3b":  (80_000_000.0,  3_000_000_000.0),
+        "ft_amount:50m_3b":  (50_000_000.0,  3_000_000_000.0),
         "ft_amount:all":     (None,           None),
     }
     rt.amount_min, rt.amount_max = ranges.get(choice, (None, None))
