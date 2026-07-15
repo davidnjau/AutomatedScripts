@@ -181,6 +181,26 @@ class TestAutoFetchJob(unittest.TestCase):
         mock_email.assert_called_once()
         self.assertEqual(mock_email.call_args[0][0], "ops@example.com")
 
+    def test_email_failure_notifies_telegram_instead_of_failing_silently(self):
+        """Regression test: an SMTP error used to be swallowed by a log line only,
+        so a broken server-side email config looked identical to success."""
+        cfg = {"days_back": 2, "email": "ops@example.com"}
+        tasks = [_task()]
+        with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "_any_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "persist_af_result"), \
+             patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
+             patch.object(af, "ALLOWED_IDS", {111}), \
+             patch.object(af, "_send_auto_fetch_email", side_effect=RuntimeError("smtp down")):
+            _run(af._auto_fetch_job(self.context))
+        self.context.bot.send_message.assert_any_call(
+            111, "⚠️ Auto Fetch email delivery to *ops@example.com* failed: `smtp down`",
+            parse_mode="Markdown",
+        )
+
     def test_sectional_auto_routes_when_specialist_configured(self):
         # sectional_filter="all" so the earlier main filter step doesn't
         # strip the sectional task before auto-routing gets a chance to see it
