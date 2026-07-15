@@ -729,37 +729,45 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
     return ConversationHandler.END
 
 
+def _ft_format_task_block(i: int, t: dict) -> str:
+    """Format one task in DLV Tasks' labeled per-task block visual (ref,
+    assessor, registry, county, consideration, parcel, added) — shared by
+    Fetch Tasks' own Telegram view and Auto Fetch's email body, since both
+    fetch from _load_fetch_tasks and share the same task schema. Status/Node/
+    Valuer aren't shown since these are pre-assignment tasks and don't have
+    them."""
+    ref      = t.get("reference_number") or "—"
+    source   = t.get("source") or "—"
+    assessor = t.get("assessor") or "—"
+    registry = (t.get("registry") or "—").upper()
+    county   = (t.get("county") or "—").upper()
+    parcel   = t.get("parcel_number") or "—"
+    date     = (t.get("date_created") or "")[:10] or "—"
+    try:
+        raw_cons = t.get("consideration")
+        cons = f"KES {int(float(str(raw_cons).replace(',', '').strip())):,}" if raw_cons else "—"
+    except (ValueError, TypeError):
+        cons = str(t.get("consideration") or "—")
+
+    return (
+        f"  {i}. 📌 Ref: {ref}\n"
+        f"     🗂 Source: {source}\n"
+        f"     Assessor: {assessor}\n"
+        f"     🏢 Registry: {registry}\n"
+        f"     📍 County: {county}\n"
+        f"     💰 Consideration: {cons}\n"
+        f"     📋 Parcel: {parcel}\n"
+        f"     📅 Added: {date}"
+    )
+
+
 async def _ft_show_results(message, tasks: List[Dict]):
     """Send tasks as formatted text, splitting at Telegram's 4096-char limit."""
     if not tasks:
         await message.reply_text("No tasks to display.", reply_markup=_main_menu())
         return
 
-    lines = []
-    for i, t in enumerate(tasks, 1):
-        src    = t.get("source", "")
-        ref    = t.get("reference_number", "—")
-        cnty   = (t.get("county") or "—").upper()
-        reg    = (t.get("registry") or "—").upper()
-        date   = (t.get("date_created") or "")[:10]
-        parcel = t.get("parcel_number") or "—"
-        try:
-            raw_cons = t.get("consideration")
-            cons = f"KES {int(float(str(raw_cons).replace(',', '').strip())):,}" if raw_cons else "—"
-        except (ValueError, TypeError):
-            cons = str(t.get("consideration") or "—")
-        officers_str = ", ".join(
-            f"{o['name']} ({o['role']})" for o in t.get("officers", []) if o.get("name")
-        ) or "none"
-        assessor = t.get("assessor") or "—"
-
-        lines.append(
-            f"{i}. [{src}] {ref}\n"
-            f"   {cnty} / {reg} | {date}\n"
-            f"   {cons} | {parcel}\n"
-            f"   Assessor: {assessor}\n"
-            f"   {officers_str}"
-        )
+    lines = [_ft_format_task_block(i, t) for i, t in enumerate(tasks, 1)]
 
     async def _send(text, reply_markup):
         try:

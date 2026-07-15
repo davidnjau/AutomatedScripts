@@ -25,6 +25,71 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _task(ref="REG/TSFR/ABC123", **overrides):
+    t = {
+        "reference_number": ref, "source": "HQ", "county": "Nairobi", "registry": "Central",
+        "date_created": "2026-07-10", "consideration": "2000000", "parcel_number": "NAIROBI/BLOCK1/1",
+        "assessor": "Jane Doe",
+    }
+    t.update(overrides)
+    return t
+
+
+class TestFtFormatTaskBlock(unittest.TestCase):
+    """_ft_format_task_block renders one task in DLV Tasks' labeled block
+    visual — shared by Fetch Tasks' own view and Auto Fetch's email body."""
+
+    def test_all_fields_present(self):
+        block = ft._ft_format_task_block(1, _task())
+        self.assertIn("📌 Ref: REG/TSFR/ABC123", block)
+        self.assertIn("🗂 Source: HQ", block)
+        self.assertIn("Assessor: Jane Doe", block)
+        self.assertIn("🏢 Registry: CENTRAL", block)
+        self.assertIn("📍 County: NAIROBI", block)
+        self.assertIn("💰 Consideration: KES 2,000,000", block)
+        self.assertIn("📋 Parcel: NAIROBI/BLOCK1/1", block)
+        self.assertIn("📅 Added: 2026-07-10", block)
+
+    def test_missing_fields_fall_back_to_em_dash(self):
+        block = ft._ft_format_task_block(1, _task(
+            source="", assessor="", registry="", county="", consideration="",
+            parcel_number="", date_created="",
+        ))
+        self.assertIn("🗂 Source: —", block)
+        self.assertIn("Assessor: —", block)
+        self.assertIn("🏢 Registry: —", block)
+        self.assertIn("📍 County: —", block)
+        self.assertIn("💰 Consideration: —", block)
+        self.assertIn("📋 Parcel: —", block)
+        self.assertIn("📅 Added: —", block)
+
+    def test_non_numeric_consideration_falls_back_to_str(self):
+        block = ft._ft_format_task_block(1, _task(consideration="N/A"))
+        self.assertIn("💰 Consideration: N/A", block)
+
+
+class TestFtShowResults(unittest.TestCase):
+    """_ft_show_results sends one labeled block per task, DLV-Tasks-style."""
+
+    def test_no_tasks_shows_empty_message(self):
+        message = MagicMock()
+        message.reply_text = AsyncMock()
+        with patch.object(ft, "_main_menu", return_value="menu"):
+            _run(ft._ft_show_results(message, []))
+        message.reply_text.assert_called_once_with("No tasks to display.", reply_markup="menu")
+
+    def test_tasks_rendered_as_labeled_blocks(self):
+        message = MagicMock()
+        message.reply_text = AsyncMock()
+        tasks = [_task(assessor="John Otieno")]
+        with patch.object(ft, "_main_menu", return_value="menu"):
+            _run(ft._ft_show_results(message, tasks))
+        text = message.reply_text.call_args[0][0]
+        self.assertIn("📌 Ref: REG/TSFR/ABC123", text)
+        self.assertIn("Assessor: John Otieno", text)
+        self.assertIn("Total: 1 task(s)", text)
+
+
 class TestHasStampDutyInvoice(unittest.TestCase):
     def test_true_when_stamp_duty_present(self):
         self.assertTrue(ft._has_stamp_duty_invoice([{"payment_for": "Stamp Duty"}]))
