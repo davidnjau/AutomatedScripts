@@ -36,6 +36,39 @@ def _task(ref="REG/TSFR/ABC123", **overrides):
     return t
 
 
+class TestAfFormatTaskBlock(unittest.TestCase):
+    """_af_format_task_block renders one Auto Fetch task in the DLV-Tasks-style
+    labeled block, using only the fields Auto Fetch tasks actually have."""
+
+    def test_all_fields_present(self):
+        block = af._af_format_task_block(1, _task())
+        self.assertIn("📌 Ref: REG/TSFR/ABC123", block)
+        self.assertIn("🗂 Source: HQ", block)
+        self.assertIn("Assessor: Jane Doe", block)
+        self.assertIn("🏢 Registry: CENTRAL", block)
+        self.assertIn("📍 County: NAIROBI", block)
+        self.assertIn("💰 Consideration: KES 2,000,000", block)
+        self.assertIn("📋 Parcel: NAIROBI/BLOCK1/1", block)
+        self.assertIn("📅 Added: 2026-07-10", block)
+
+    def test_missing_fields_fall_back_to_em_dash(self):
+        block = af._af_format_task_block(1, _task(
+            source="", assessor="", registry="", county="", consideration="",
+            parcel_number="", date_created="",
+        ))
+        self.assertIn("🗂 Source: —", block)
+        self.assertIn("Assessor: —", block)
+        self.assertIn("🏢 Registry: —", block)
+        self.assertIn("📍 County: —", block)
+        self.assertIn("💰 Consideration: —", block)
+        self.assertIn("📋 Parcel: —", block)
+        self.assertIn("📅 Added: —", block)
+
+    def test_non_numeric_consideration_falls_back_to_str(self):
+        block = af._af_format_task_block(1, _task(consideration="N/A"))
+        self.assertIn("💰 Consideration: N/A", block)
+
+
 class TestSchedulePersistence(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -180,6 +213,32 @@ class TestAutoFetchJob(unittest.TestCase):
             _run(af._auto_fetch_job(self.context))
         mock_email.assert_called_once()
         self.assertEqual(mock_email.call_args[0][0], "ops@example.com")
+        body = mock_email.call_args[0][2]
+        self.assertIn("Assessor: Jane Doe", body)
+        self.assertIn("Parcel: NAIROBI/BLOCK1/1", body)
+
+    def test_email_body_uses_dlv_tasks_style_block_per_task(self):
+        """The email body should render one labeled block per task (DLV Tasks'
+        visual convention), not the old compact one-line-per-task format."""
+        cfg = {"days_back": 2, "email": "ops@example.com"}
+        tasks = [_task(ref="REG/TSFR/AAA111", county="Mombasa", registry="Coast",
+                        parcel_number="MOMBASA/BLOCK5/9", assessor="John Assessor")]
+        with patch.object(af, "load_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "_any_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "persist_af_result"), \
+             patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
+             patch.object(af, "ALLOWED_IDS", set()), \
+             patch.object(af, "_send_auto_fetch_email") as mock_email:
+            _run(af._auto_fetch_job(self.context))
+        body = mock_email.call_args[0][2]
+        self.assertIn("📌 Ref: REG/TSFR/AAA111", body)
+        self.assertIn("Assessor: John Assessor", body)
+        self.assertIn("🏢 Registry: COAST", body)
+        self.assertIn("📍 County: MOMBASA", body)
+        self.assertIn("📋 Parcel: MOMBASA/BLOCK5/9", body)
 
     def test_email_failure_notifies_telegram_instead_of_failing_silently(self):
         """Regression test: an SMTP error used to be swallowed by a log line only,

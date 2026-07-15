@@ -460,6 +460,37 @@ async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+def _af_format_task_block(i: int, t: dict) -> str:
+    """Format one task for the Auto Fetch email body, matching DLV Tasks'
+    labeled per-task block visual (ref, assessor, registry, county, parcel,
+    etc.) instead of the old compact one-line-per-task format. Auto Fetch
+    tasks are pre-assignment, so status/node/valuer fields (DLV-specific)
+    aren't shown — only fields Auto Fetch actually has are included."""
+    ref      = t.get("reference_number") or "—"
+    source   = t.get("source") or "—"
+    assessor = t.get("assessor") or "—"
+    registry = (t.get("registry") or "—").upper()
+    county   = (t.get("county") or "—").upper()
+    parcel   = t.get("parcel_number") or "—"
+    date     = (t.get("date_created") or "")[:10] or "—"
+    try:
+        raw_cons = t.get("consideration")
+        cons = f"KES {int(float(str(raw_cons).replace(',', '').strip())):,}" if raw_cons else "—"
+    except (ValueError, TypeError):
+        cons = str(t.get("consideration") or "—")
+
+    return (
+        f"  {i}. 📌 Ref: {ref}\n"
+        f"     🗂 Source: {source}\n"
+        f"     Assessor: {assessor}\n"
+        f"     🏢 Registry: {registry}\n"
+        f"     📍 County: {county}\n"
+        f"     💰 Consideration: {cons}\n"
+        f"     📋 Parcel: {parcel}\n"
+        f"     📅 Added: {date}"
+    )
+
+
 async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Background job: fetch tasks with saved schedule settings and notify."""
     cfg = load_auto_fetch_schedule()
@@ -621,31 +652,12 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Email notification
     email = cfg.get("email", "")
     if email:
-        # Build plain-text body (strip Markdown asterisks)
         plain_header = (
             f"Auto Fetch — {len(tasks)} task(s)\n"
             f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | {sec_label}\n"
             + "─" * 60 + "\n\n"
         )
-        plain_lines = []
-        for i, t in enumerate(tasks, 1):
-            src    = t.get("source", "")
-            ref    = t.get("reference_number", "—")
-            cnty   = (t.get("county") or "—").upper()
-            reg    = (t.get("registry") or "—").upper()
-            date   = (t.get("date_created") or "")[:10]
-            parcel = t.get("parcel_number") or "—"
-            try:
-                raw_cons = t.get("consideration")
-                cons = f"KES {int(float(str(raw_cons).replace(',','').strip())):,}" if raw_cons else "—"
-            except (ValueError, TypeError):
-                cons = str(t.get("consideration") or "—")
-            plain_lines.append(
-                f"{i}. [{src}] {ref}\n"
-                f"   {cnty} / {reg} | {date}\n"
-                f"   {cons} | {parcel}"
-            )
-        plain_body   = plain_header + "\n\n".join(plain_lines)
+        plain_body    = plain_header + "\n\n".join(_af_format_task_block(i, t) for i, t in enumerate(tasks, 1))
         email_subject = f"Auto Fetch — {len(tasks)} task(s) found"
         try:
             _send_auto_fetch_email(email, email_subject, plain_body)
