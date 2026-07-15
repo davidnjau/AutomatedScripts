@@ -2,12 +2,16 @@
 """
 fetch_tasks_cache.py
 =====================
-Fetch Tasks log — short-lived assessor cache, keyed by ref.
+Fetch Tasks log — short-lived cache of assessor/parcel/consideration, keyed
+by ref.
 
-Fetch Tasks sees the assessor while a ref is still upstream of DLV; by the
+Fetch Tasks sees this data while a ref is still upstream of DLV; by the
 time a ref is added to the DLV batch (or the DLV Tasks report runs), the
 live assessor/DLV searches sometimes come up empty. Caching what Fetch
-Tasks last saw lets both flows fall back to it instead of showing "—".
+Tasks last saw lets both flows fall back to it instead of showing "—" —
+this is also DLV Batch's only source for a queued item's Consideration/
+Parcel (By Valuer/By Tag report), since that flow deliberately avoids
+live API calls.
 
 Written by Fetch Tasks, read by DLV Batch and DLV Tasks.
 """
@@ -56,6 +60,8 @@ def _log_fetch_tasks(tasks: List[Dict]) -> None:
             "registry":     t.get("registry", ""),
             "county":       t.get("county", ""),
             "date_created": t.get("date_created", ""),
+            "consideration":  t.get("consideration", ""),
+            "currency_code":  t.get("currency_code", ""),
             "cached_at":    now,
         }
     save_fetch_tasks_log(log)
