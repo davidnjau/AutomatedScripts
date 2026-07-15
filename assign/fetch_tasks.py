@@ -729,28 +729,46 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
     return ConversationHandler.END
 
 
-def _ft_format_task_block(i: int, t: dict) -> str:
+def _ft_format_task_block(i: int, t: dict, markdown: bool = False) -> str:
     """Format one task in DLV Tasks' labeled per-task block visual (ref,
     assessor, registry, county, consideration, parcel, added) — shared by
     Fetch Tasks' own Telegram view and Auto Fetch's email body, since both
     fetch from _load_fetch_tasks and share the same task schema. Status/Node/
     Valuer aren't shown since these are pre-assignment tasks and don't have
-    them."""
+    them.
+
+    markdown=True wraps the ref in backticks (tap-to-copy in Telegram) and
+    bolds its label; markdown=False (default, used by Auto Fetch's plain-text
+    email) leaves it unadorned since email doesn't parse Markdown.
+
+    If _extract_assessor didn't find an ASSESSOR_OF_STAMP_DUTY match, falls
+    back to listing whoever IS in the officers list rather than showing a
+    bare dash — the old view showed this raw list unconditionally; losing it
+    entirely made the assessor's name disappear whenever extraction missed."""
     ref      = t.get("reference_number") or "—"
     source   = t.get("source") or "—"
-    assessor = t.get("assessor") or "—"
     registry = (t.get("registry") or "—").upper()
     county   = (t.get("county") or "—").upper()
     parcel   = t.get("parcel_number") or "—"
     date     = (t.get("date_created") or "")[:10] or "—"
+
+    assessor = t.get("assessor") or ""
+    if not assessor:
+        officers = t.get("officers") or []
+        assessor = ", ".join(
+            f"{o.get('name', '')} ({o.get('role', '')})" for o in officers if o.get("name")
+        ) or "—"
+
     try:
         raw_cons = t.get("consideration")
         cons = f"KES {int(float(str(raw_cons).replace(',', '').strip())):,}" if raw_cons else "—"
     except (ValueError, TypeError):
         cons = str(t.get("consideration") or "—")
 
+    ref_line = f"  {i}. 📌 *Ref:* `{ref}`" if markdown else f"  {i}. 📌 Ref: {ref}"
+
     return (
-        f"  {i}. 📌 Ref: {ref}\n"
+        f"{ref_line}\n"
         f"     🗂 Source: {source}\n"
         f"     Assessor: {assessor}\n"
         f"     🏢 Registry: {registry}\n"
@@ -767,11 +785,11 @@ async def _ft_show_results(message, tasks: List[Dict]):
         await message.reply_text("No tasks to display.", reply_markup=_main_menu())
         return
 
-    lines = [_ft_format_task_block(i, t) for i, t in enumerate(tasks, 1)]
+    lines = [_ft_format_task_block(i, t, markdown=True) for i, t in enumerate(tasks, 1)]
 
     async def _send(text, reply_markup):
         try:
-            await message.reply_text(text, reply_markup=reply_markup)
+            await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
             logger.warning("_ft_show_results send failed: %s", e)
             await message.reply_text(text[:4000], reply_markup=reply_markup)
