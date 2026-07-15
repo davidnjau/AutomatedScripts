@@ -45,6 +45,8 @@ class TestFetchTasksCache(unittest.TestCase):
             "registry": "NAIROBI",
             "county": "NAIROBI",
             "date_created": "2026-07-10",
+            "consideration": "6000000",
+            "currency_code": "KES",
         }]
         ftc._log_fetch_tasks(tasks)
         entry = ftc._fetch_tasks_log_lookup("REG/TSFR/ABC123")
@@ -54,6 +56,8 @@ class TestFetchTasksCache(unittest.TestCase):
         self.assertEqual(entry["registry"], "NAIROBI")
         self.assertEqual(entry["county"], "NAIROBI")
         self.assertEqual(entry["date_created"], "2026-07-10")
+        self.assertEqual(entry["consideration"], "6000000")
+        self.assertEqual(entry["currency_code"], "KES")
         self.assertIn("cached_at", entry)
 
     def test_log_fetch_tasks_skips_tasks_without_ref(self):

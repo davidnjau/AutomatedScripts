@@ -393,6 +393,48 @@ class TestRecvDbConfirmAttachesTag(unittest.TestCase):
         self.assertEqual(saved_items[0]["tag"], "")
 
 
+class TestRecvDbConfirmCachesParcelAndConsideration(unittest.TestCase):
+    """recv_db_confirm's "db:confirm" branch — Consideration/Parcel for a
+    still-queued item can only come from the Fetch Tasks cache (this flow
+    avoids live API calls), so pull them in alongside assessor if present."""
+
+    def _confirm(self, ctx, cached):
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=[]), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save, \
+             patch.object(dlv_batch, "_fetch_tasks_log_lookup", return_value=cached), \
+             patch.object(dlv_batch, "_fetch_tasks_log_remove"), \
+             patch.object(dlv_batch, "_any_valid_tokens", return_value=None):
+            _run(dlv_batch.recv_db_confirm(_make_query_update("db:confirm"), ctx))
+        return mock_save.call_args[0][0]
+
+    def _ctx_with_one_resolved_ref(self):
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = dlv_batch._get_db_sess(ctx)
+        sess.groups = [{"refs": ["REF1"], "valuer_name": "Jane", "valuer_uid": "u1",
+                        "valuer_acct": "a1", "status": "resolved"}]
+        return ctx
+
+    def test_parcel_and_consideration_pulled_from_cache(self):
+        cached = {"assessor": "Jane Assessor", "parcel": "NAIROBI/BLOCK1/1",
+                  "consideration": "6000000", "currency_code": "KES"}
+        saved_items = self._confirm(self._ctx_with_one_resolved_ref(), cached)
+        self.assertEqual(saved_items[0]["parcel"], "NAIROBI/BLOCK1/1")
+        self.assertEqual(saved_items[0]["consideration"], "6000000")
+        self.assertEqual(saved_items[0]["currency_code"], "KES")
+
+    def test_missing_cache_entry_leaves_parcel_and_consideration_unset(self):
+        saved_items = self._confirm(self._ctx_with_one_resolved_ref(), None)
+        self.assertNotIn("parcel", saved_items[0])
+        self.assertNotIn("consideration", saved_items[0])
+
+    def test_cache_entry_without_consideration_leaves_it_unset(self):
+        cached = {"assessor": "Jane Assessor", "parcel": "NAIROBI/BLOCK1/1"}
+        saved_items = self._confirm(self._ctx_with_one_resolved_ref(), cached)
+        self.assertEqual(saved_items[0]["parcel"], "NAIROBI/BLOCK1/1")
+        self.assertNotIn("consideration", saved_items[0])
+
+
 class TestRecvDbInputResetsTags(unittest.TestCase):
     """A fresh batch submission must not inherit tags from a prior one."""
 

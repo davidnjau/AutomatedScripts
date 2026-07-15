@@ -243,6 +243,38 @@ class TestDtFormatTaskBlock(unittest.TestCase):
         self.assertIn("⏳ _still with Assessor, not yet in DLV_", block)
 
 
+class TestDtConsiderationValue(unittest.TestCase):
+    """_dt_consideration_value — numeric consideration, preferring the
+    closed-record field over the queue-time-cached one."""
+
+    def test_prefers_consideration_amount_when_both_present(self):
+        item = {"consideration_amount": "5000000", "consideration": "1"}
+        self.assertEqual(dlv_tasks._dt_consideration_value(item), 5000000.0)
+
+    def test_falls_back_to_consideration_when_no_amount_field(self):
+        self.assertEqual(dlv_tasks._dt_consideration_value({"consideration": "2000000"}), 2000000.0)
+
+    def test_missing_returns_none(self):
+        self.assertIsNone(dlv_tasks._dt_consideration_value({}))
+
+    def test_unparseable_returns_none(self):
+        self.assertIsNone(dlv_tasks._dt_consideration_value({"consideration": "N/A"}))
+
+
+class TestDtSumConsideration(unittest.TestCase):
+    def test_sums_parseable_values_only(self):
+        items = [{"consideration": "1000000", "currency_code": "KES"},
+                 {"consideration": "N/A"},
+                 {"consideration_amount": "2000000", "currency_code": "KES"}]
+        self.assertEqual(dlv_tasks._dt_sum_consideration(items), "KES 3,000,000.00")
+
+    def test_empty_list_sums_to_zero(self):
+        self.assertEqual(dlv_tasks._dt_sum_consideration([]), "KES 0.00")
+
+    def test_defaults_currency_to_kes_when_unset(self):
+        self.assertEqual(dlv_tasks._dt_sum_consideration([{"consideration": "100"}]), "KES 100.00")
+
+
 class TestDtValuerKey(unittest.TestCase):
     """_dt_valuer_key prefers valuer_uid, falls back to valuer_name, else empty."""
 
@@ -290,20 +322,43 @@ class TestDtCollectValuers(unittest.TestCase):
 
 
 class TestDtFormatValuerReport(unittest.TestCase):
-    """_dt_format_valuer_report renders queued + period-filtered closed history for one valuer."""
+    """_dt_format_valuer_report renders queued + period-filtered closed history
+    for one valuer, each ref as its own labeled block (not a packed one-liner)."""
 
     def test_queued_and_closed_sections_render_expected_fields(self):
-        queued = [{"ref": "REG/A/1", "assessor": "Assessor A", "queued_at": "2026-07-10T10:00:00"}]
+        queued = [{"ref": "REG/A/1", "assessor": "Assessor A", "queued_at": "2026-07-10T10:00:00",
+                   "consideration": "6000000", "currency_code": "KES", "parcel": "NAIROBI/BLOCK1/1"}]
         closed = [{"ref": "REG/A/2", "assessor": "Assessor B", "queued_at": "2026-07-01T09:00:00",
-                   "closed_at": "2026-07-12T11:00:00", "closed_reason": "completed"}]
+                   "closed_at": "2026-07-12T11:00:00", "closed_reason": "completed",
+                   "consideration_amount": "4000000", "currency_code": "KES", "parcel": "NAIROBI/BLOCK2/2"}]
         lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", queued, closed, "1 week"))
         self.assertIn("👤 *DLV Report — Jane Doe*", lines)
         self.assertIn("⏳ *Currently Queued* (1)", lines)
         self.assertIn("`REG/A/1`", lines)
         self.assertIn("Assessor: Assessor A", lines)
+        self.assertIn("💰 Consideration: KES 6,000,000.00", lines)
+        self.assertIn("📋 Parcel: NAIROBI/BLOCK1/1", lines)
         self.assertIn("📜 *History* (1 week) — 1", lines)
         self.assertIn("`REG/A/2`", lines)
+        self.assertIn("💰 Consideration: KES 4,000,000.00", lines)
+        self.assertIn("📋 Parcel: NAIROBI/BLOCK2/2", lines)
         self.assertIn("✅ Completed", lines)
+
+    def test_section_headers_show_consideration_totals(self):
+        queued = [
+            {"ref": "REG/A/1", "consideration": "1000000", "currency_code": "KES", "queued_at": "t"},
+            {"ref": "REG/A/2", "consideration": "2000000", "currency_code": "KES", "queued_at": "t"},
+        ]
+        closed = [{"ref": "REG/A/3", "consideration_amount": "500000", "currency_code": "KES",
+                   "closed_at": "t", "closed_reason": "completed"}]
+        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", queued, closed, "All time"))
+        self.assertIn("⏳ *Currently Queued* (2) — Total: KES 3,000,000.00", lines)
+        self.assertIn("📜 *History* (All time) — 1 — Total: KES 500,000.00", lines)
+
+    def test_totals_are_zero_with_no_parseable_consideration(self):
+        lines = "\n".join(dlv_tasks._dt_format_valuer_report(
+            "Jane Doe", [{"ref": "REG/A/1", "queued_at": "t"}], [], "All time"))
+        self.assertIn("Total: KES 0.00", lines)
 
     def test_empty_sections_render_none_placeholder(self):
         lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", [], [], "All time"))
@@ -322,9 +377,15 @@ class TestDtFormatValuerReport(unittest.TestCase):
             {"ref": "REG/A/2", "assessor": "B", "queued_at": "t"},
         ]
         lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", queued, [], "All time"))
-        self.assertIn("🏷 Urgent", lines)
+        self.assertIn("🏷 Tag: Urgent", lines)
         # only one 🏷 marker — the untagged ref doesn't get one
         self.assertEqual(lines.count("🏷"), 1)
+
+    def test_missing_consideration_and_parcel_fall_back_to_em_dash(self):
+        lines = "\n".join(dlv_tasks._dt_format_valuer_report(
+            "Jane Doe", [{"ref": "REG/A/1", "queued_at": "t"}], [], "All time"))
+        self.assertIn("💰 Consideration: —", lines)
+        self.assertIn("📋 Parcel: —", lines)
 
 
 class TestDtFormatTagReport(unittest.TestCase):
@@ -333,14 +394,22 @@ class TestDtFormatTagReport(unittest.TestCase):
 
     def test_queued_and_closed_show_valuer_per_line(self):
         queued = [{"ref": "REG/A/1", "valuer_name": "Jane Doe", "assessor": "A1",
-                   "queued_at": "2026-07-10T10:00:00", "tag": "Urgent"}]
+                   "queued_at": "2026-07-10T10:00:00", "tag": "Urgent",
+                   "consideration": "3000000", "currency_code": "KES", "parcel": "NAIROBI/BLOCK1/1"}]
         closed = [{"ref": "REG/A/2", "valuer_name": "John Otieno", "assessor": "A2",
                    "queued_at": "2026-07-01T09:00:00", "closed_at": "2026-07-12T11:00:00",
-                   "closed_reason": "completed", "tag": "Urgent"}]
+                   "closed_reason": "completed", "tag": "Urgent",
+                   "consideration_amount": "2000000", "currency_code": "KES", "parcel": "NAIROBI/BLOCK2/2"}]
         lines = "\n".join(dlv_tasks._dt_format_tag_report("Urgent", queued, closed, "All time"))
         self.assertIn("🏷 *DLV Report — Tag: Urgent*", lines)
         self.assertIn("Valuer: Jane Doe", lines)
         self.assertIn("Valuer: John Otieno", lines)
+        self.assertIn("💰 Consideration: KES 3,000,000.00", lines)
+        self.assertIn("📋 Parcel: NAIROBI/BLOCK1/1", lines)
+        self.assertIn("💰 Consideration: KES 2,000,000.00", lines)
+        self.assertIn("📋 Parcel: NAIROBI/BLOCK2/2", lines)
+        self.assertIn("⏳ *Currently Queued* (1) — Total: KES 3,000,000.00", lines)
+        self.assertIn("📜 *History* (All time) — 1 — Total: KES 2,000,000.00", lines)
 
     def test_empty_sections_render_none_placeholder(self):
         lines = "\n".join(dlv_tasks._dt_format_tag_report("Urgent", [], [], "All time"))
