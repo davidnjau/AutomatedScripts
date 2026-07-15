@@ -248,18 +248,18 @@ class TestDbFormatBatchSummary(unittest.TestCase):
         with patch.object(dlv_batch, "_fetch_tasks_log_lookup", return_value=None):
             sess = self._sess(
                 [{"refs": ["REF1", "REF2"], "valuer_name": "Jane Doe", "status": "resolved"}],
-                tag_by_ref={"REF1": "Urgent"},
+                tag_by_ref={"REF1": "Queue"},
             )
             summary = dlv_batch._db_format_batch_summary(sess)
-        self.assertIn("REF1` 🏷Urgent", summary)
+        self.assertIn("REF1` 🏷Queue", summary)
         self.assertNotIn("REF2` 🏷", summary)
 
 
 class TestDbTagKeyboards(unittest.TestCase):
     def test_tag_ref_keyboard_shows_tag_or_no_tag(self):
-        markup = dlv_batch._db_tag_ref_keyboard(["REF1", "REF2"], {"REF1": "Urgent"})
+        markup = dlv_batch._db_tag_ref_keyboard(["REF1", "REF2"], {"REF1": "Queue"})
         texts = [b.text for row in markup.inline_keyboard for b in row]
-        self.assertIn("REF1 [🏷 Urgent]", texts)
+        self.assertIn("REF1 [🏷 Queue]", texts)
         self.assertIn("REF2 — no tag", texts)
         self.assertIn("✅ Done Tagging", texts)
 
@@ -343,22 +343,22 @@ class TestRecvDbTagValue(unittest.TestCase):
         self.sess.tag_ref_index = 0
 
     def test_picking_a_tag_sets_it_for_the_selected_ref(self):
-        update = _make_query_update("db_tagval:Urgent")
+        update = _make_query_update("db_tagval:Queue")
         result = _run(dlv_batch.recv_db_tag_value(update, self.ctx))
         self.assertEqual(result, dlv_batch.DB.TAG_PICK_REF)
-        self.assertEqual(self.sess.tag_by_ref["REF1"], "Urgent")
+        self.assertEqual(self.sess.tag_by_ref["REF1"], "Queue")
 
     def test_clear_removes_the_tag(self):
-        self.sess.tag_by_ref["REF1"] = "Urgent"
+        self.sess.tag_by_ref["REF1"] = "Queue"
         update = _make_query_update("db_tagval:clear")
         _run(dlv_batch.recv_db_tag_value(update, self.ctx))
         self.assertNotIn("REF1", self.sess.tag_by_ref)
 
     def test_back_leaves_tag_unchanged(self):
-        self.sess.tag_by_ref["REF1"] = "Urgent"
+        self.sess.tag_by_ref["REF1"] = "Queue"
         update = _make_query_update("db_tagval:back")
         _run(dlv_batch.recv_db_tag_value(update, self.ctx))
-        self.assertEqual(self.sess.tag_by_ref["REF1"], "Urgent")
+        self.assertEqual(self.sess.tag_by_ref["REF1"], "Queue")
 
 
 class TestRecvDbConfirmAttachesTag(unittest.TestCase):
@@ -379,9 +379,9 @@ class TestRecvDbConfirmAttachesTag(unittest.TestCase):
         sess = dlv_batch._get_db_sess(ctx)
         sess.groups = [{"refs": ["REF1"], "valuer_name": "Jane", "valuer_uid": "u1",
                         "valuer_acct": "a1", "status": "resolved"}]
-        sess.tag_by_ref = {"REF1": "Urgent"}
+        sess.tag_by_ref = {"REF1": "Queue"}
         saved_items = self._confirm(ctx)
-        self.assertEqual(saved_items[0]["tag"], "Urgent")
+        self.assertEqual(saved_items[0]["tag"], "Queue")
 
     def test_untagged_ref_gets_empty_tag(self):
         ctx = MagicMock()
@@ -445,7 +445,7 @@ class TestRecvDbInputResetsTags(unittest.TestCase):
         ctx = MagicMock()
         ctx.user_data = {}
         sess = dlv_batch._get_db_sess(ctx)
-        sess.tag_by_ref = {"OLD_REF": "Urgent"}
+        sess.tag_by_ref = {"OLD_REF": "Queue"}
 
         with patch.object(dlv_batch, "_any_valid_tokens", return_value=None), \
              patch.object(dlv_batch, "_resolve_valuer_from_saved",

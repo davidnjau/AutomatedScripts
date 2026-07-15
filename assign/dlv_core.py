@@ -44,7 +44,7 @@ SAVED_DLV_CLOSED_FILE = os.path.join(DATA_DIR, "saved_dlv_closed.json")
 # closed list (rather than free text) so tags stay consistent and filterable.
 # Shared here since both DLV Batch (sets the tag) and DLV Tasks (reports on
 # it) need the same vocabulary.
-DLV_TAGS = ["Urgent", "Follow-up", "VIP", "Dispute"]
+DLV_TAGS = ["Queue", "Direct"]
 
 
 # ──────────────────────────────────────────────────────────
