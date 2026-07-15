@@ -8,6 +8,7 @@ Run with: python3 -m unittest discover -s assign/tests -v
 """
 
 import os
+import smtplib
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
@@ -82,6 +83,48 @@ class TestSendAutoFetchEmail(unittest.TestCase):
         raw_msg = fake_server.sendmail.call_args[0][2]
         self.assertIn("&lt;", raw_msg)
         self.assertIn("&amp;", raw_msg)
+
+
+class TestCheckSmtpConnection(unittest.TestCase):
+    """check_smtp_connection — the standalone connectivity smoke test."""
+
+    def test_raises_without_smtp_credentials(self):
+        with patch.object(es, "SMTP_USER", ""), patch.object(es, "SMTP_PASS", ""):
+            with self.assertRaises(RuntimeError):
+                es.check_smtp_connection()
+
+    def test_success_connects_starttls_and_logs_in(self):
+        fake_server = MagicMock()
+        fake_smtp_cm = MagicMock()
+        fake_smtp_cm.__enter__.return_value = fake_server
+        with patch.object(es, "SMTP_USER", "bot@example.com"), \
+             patch.object(es, "SMTP_PASS", "secret"), \
+             patch.object(es.smtplib, "SMTP", return_value=fake_smtp_cm) as mock_smtp:
+            es.check_smtp_connection()
+
+        mock_smtp.assert_called_once_with(es.SMTP_HOST, es.SMTP_PORT, timeout=15)
+        fake_server.ehlo.assert_called_once()
+        fake_server.starttls.assert_called_once()
+        fake_server.login.assert_called_once_with("bot@example.com", "secret")
+        fake_server.sendmail.assert_not_called()
+
+    def test_propagates_connection_errors(self):
+        with patch.object(es, "SMTP_USER", "bot@example.com"), \
+             patch.object(es, "SMTP_PASS", "secret"), \
+             patch.object(es.smtplib, "SMTP", side_effect=OSError("connection timed out")):
+            with self.assertRaises(OSError):
+                es.check_smtp_connection()
+
+    def test_propagates_login_errors(self):
+        fake_server = MagicMock()
+        fake_server.login.side_effect = smtplib.SMTPAuthenticationError(535, b"bad creds")
+        fake_smtp_cm = MagicMock()
+        fake_smtp_cm.__enter__.return_value = fake_server
+        with patch.object(es, "SMTP_USER", "bot@example.com"), \
+             patch.object(es, "SMTP_PASS", "wrong"), \
+             patch.object(es.smtplib, "SMTP", return_value=fake_smtp_cm):
+            with self.assertRaises(smtplib.SMTPAuthenticationError):
+                es.check_smtp_connection()
 
 
 if __name__ == "__main__":
