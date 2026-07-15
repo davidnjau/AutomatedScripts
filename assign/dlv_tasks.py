@@ -4,7 +4,8 @@ dlv_tasks.py
 ============
 DLV Tasks — live-check the DLV Batch queue (📋 DLV Tasks button /
 /dlvtasks) and produce an Open/Closed report (Telegram text or Excel),
-plus the multi-select bulk-delete flow for the open queue.
+a per-valuer report (queued + closed history, filterable by look-back
+period), plus the multi-select bulk-delete flow for the open queue.
 
 _dt_fetch_tasks, _dt_build_excel, and _dt_send_telegram are also used by
 Morning Briefing (bot.py), which stays in bot.py for now since it owns its
@@ -40,8 +41,10 @@ from common import (
     BTN_DLV_TASKS,
     _any_valid_tokens,
     _CANCEL_FILTER,
+    _date_cutoff_str,
     _main_menu,
     _NODE_LABELS,
+    _within_days,
     allowed,
     cmd_cancel,
     deny,
@@ -71,11 +74,13 @@ from telegram_report import _send_chunked_report
 # States — DLV Tasks conversation
 # ──────────────────────────────────────────────────────────
 class DT(Enum):
-    SCOPE           = auto()   # choose Open Tasks vs Closed Tasks vs Delete Task(s)
+    SCOPE           = auto()   # choose Open Tasks vs Closed Tasks vs By Valuer vs Delete Task(s)
     EXCLUDE_VALUERS = auto()   # toggle which valuers to exclude
     DELIVERY        = auto()   # telegram or email
     EMAIL_INPUT     = auto()   # enter email address
     DELETE_SELECT   = auto()   # multi-select which queued refs to delete
+    PICK_VALUER     = auto()   # By Valuer: choose which valuer to report on
+    PICK_PERIOD     = auto()   # By Valuer: choose the history look-back period
 
 
 # ── DLV Tasks session ──────────────────────────────────────
@@ -88,6 +93,8 @@ class DTSession:
     email:            str        = ""
     delete_items:     List[dict] = field(default_factory=list)   # open queue snapshot for deletion
     delete_selected:  set        = field(default_factory=set)    # refs selected for deletion
+    valuer_choices:   List[dict] = field(default_factory=list)   # By Valuer picker: [{key, name}]
+    selected_valuer:  dict       = field(default_factory=dict)   # By Valuer: {key, name} chosen
 
 
 def _get_dt_sess(ctx: ContextTypes.DEFAULT_TYPE) -> DTSession:
@@ -335,6 +342,7 @@ async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("📂 Open Tasks",   callback_data="dt_scope:open"),
                 InlineKeyboardButton("🔒 Closed Tasks", callback_data="dt_scope:closed"),
             ],
+            [InlineKeyboardButton("👤 By Valuer",      callback_data="dt_scope:byvaluer")],
             [InlineKeyboardButton("🗑 Delete Task(s)", callback_data="dt_scope:delete")],
         ]),
     )
@@ -420,11 +428,176 @@ async def _dt_send_closed_report(chat_id: int, rows: List[dict], bot) -> None:
     await _send_chunked_report(_send, lines, join="\n")
 
 
+# ──────────────────────────────────────────────────────────
+# DLV Tasks — By Valuer (queued + closed history for one valuer)
+# ──────────────────────────────────────────────────────────
+
+_DT_PERIOD_OPTIONS = [("All time", 0), ("1 week", 7), ("2 weeks", 14), ("1 month", 30)]
+
+
+def _dt_valuer_key(item: dict) -> str:
+    """Stable identity for grouping/matching an item's valuer — uid if present, else the raw name."""
+    return item.get("valuer_uid") or item.get("valuer_name") or ""
+
+
+def _dt_collect_valuers() -> List[dict]:
+    """Dedup, name-sorted list of every valuer seen in either the open queue or closed
+    history, for the By Valuer picker: [{"key": uid-or-name, "name": display name}]."""
+    seen: dict = {}
+    for item in load_dlv_batch() + load_dlv_closed():
+        key = _dt_valuer_key(item)
+        if not key or key in seen:
+            continue
+        seen[key] = item.get("valuer_name") or "Unassigned"
+    return sorted(
+        ({"key": k, "name": n} for k, n in seen.items()),
+        key=lambda v: v["name"],
+    )
+
+
+def _dt_valuer_keyboard(valuers: List[dict]) -> InlineKeyboardMarkup:
+    """Two-per-row picker of valuer names, each tap selecting that valuer by index."""
+    rows = []
+    for i in range(0, len(valuers), 2):
+        pair = valuers[i:i + 2]
+        rows.append([
+            InlineKeyboardButton(v["name"], callback_data=f"dt_pickvaluer:{i + j}")
+            for j, v in enumerate(pair)
+        ])
+    rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="dt_pickvaluer_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _dt_period_keyboard() -> InlineKeyboardMarkup:
+    """History look-back period picker shown after a valuer is chosen."""
+    row = [InlineKeyboardButton(label, callback_data=f"dt_period:{days}") for label, days in _DT_PERIOD_OPTIONS]
+    return InlineKeyboardMarkup([row, [InlineKeyboardButton("🛑 Cancel", callback_data="dt_period_cancel")]])
+
+
+async def _dt_run_valuer_select(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show the valuer picker built from everyone currently queued or in closed history."""
+    valuers = _dt_collect_valuers()
+    if not valuers:
+        await edit_fn("ℹ️ No queued or historical DLV tasks yet — nothing to report on.")
+        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    sess = _get_dt_sess(ctx)
+    sess.valuer_choices = valuers
+
+    await edit_fn(
+        "👤 *By Valuer* — pick a valuer to view their DLV report:",
+        parse_mode="Markdown",
+        reply_markup=_dt_valuer_keyboard(valuers),
+    )
+    return DT.PICK_VALUER
+
+
+def _dt_format_valuer_report(valuer_name: str, queued: List[dict], closed: List[dict], period_label: str) -> List[str]:
+    """Text lines for one valuer's DLV report: currently-queued refs, then closed
+    history within the chosen look-back period. Uses only fields already stored on
+    the queue/closed items (no live API calls) — ref, assessor, queued_at, closed_at."""
+    lines = [f"👤 *DLV Report — {valuer_name}*"]
+
+    lines.append(f"\n⏳ *Currently Queued* ({len(queued)})")
+    if not queued:
+        lines.append("  _none_")
+    for i, item in enumerate(sorted(queued, key=lambda i: i.get("queued_at", "")), start=1):
+        lines.append(
+            f"  {i}. 📌 `{item.get('ref') or '—'}`"
+            f" | Assessor: {item.get('assessor') or '—'}"
+            f" | Queued: {(item.get('queued_at') or '—')[:16]}"
+        )
+
+    lines.append(f"\n📜 *History* ({period_label}) — {len(closed)}")
+    if not closed:
+        lines.append("  _none_")
+    label_for = {"completed": "✅ Completed", "returned": "↩️ Returned"}
+    for i, item in enumerate(sorted(closed, key=lambda i: i.get("closed_at", ""), reverse=True), start=1):
+        status_label = label_for.get(item.get("closed_reason"), "❓ Unknown")
+        lines.append(
+            f"  {i}. 📌 `{item.get('ref') or '—'}`"
+            f" | Assessor: {item.get('assessor') or '—'}"
+            f" | Queued: {(item.get('queued_at') or '—')[:16]}"
+            f" | {status_label} {(item.get('closed_at') or '—')[:16]}"
+        )
+
+    return lines
+
+
+async def _dt_send_valuer_report(chat_id: int, valuer_name: str, queued: List[dict], closed: List[dict],
+                                  period_label: str, bot) -> None:
+    """Send the By Valuer DLV report (queued + closed-history) as chunked Telegram messages."""
+    lines = _dt_format_valuer_report(valuer_name, queued, closed, period_label)
+
+    async def _send(text, reply_markup):
+        await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
+
+    await _send_chunked_report(_send, lines, join="\n")
+
+
+async def recv_dt_pick_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """By Valuer: handle the valuer-picker tap, then show the history-period picker."""
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "dt_pickvaluer_cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    sess = _get_dt_sess(ctx)
+    idx  = int(query.data.split(":")[1])
+    if idx >= len(sess.valuer_choices):
+        return DT.PICK_VALUER
+    sess.selected_valuer = sess.valuer_choices[idx]
+
+    await query.edit_message_text(
+        f"👤 *{sess.selected_valuer['name']}*\n\nFilter history by period:",
+        parse_mode="Markdown",
+        reply_markup=_dt_period_keyboard(),
+    )
+    return DT.PICK_PERIOD
+
+
+async def recv_dt_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """By Valuer: handle the period-picker tap, filter, and send the combined report."""
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "dt_period_cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    days   = int(query.data.split(":")[1])
+    sess   = _get_dt_sess(ctx)
+    valuer = sess.selected_valuer
+    key    = valuer["key"]
+
+    queued = [i for i in load_dlv_batch() if _dt_valuer_key(i) == key]
+    closed = [c for c in load_dlv_closed() if _dt_valuer_key(c) == key]
+    if days:
+        cutoff = _date_cutoff_str(days)
+        closed = [c for c in closed if _within_days(c.get("closed_at", ""), cutoff)]
+
+    period_label = next((label for label, d in _DT_PERIOD_OPTIONS if d == days), "All time")
+    await query.edit_message_text(f"⏳ Building report for *{valuer['name']}*…", parse_mode="Markdown")
+    await _dt_send_valuer_report(query.message.chat_id, valuer["name"], queued, closed, period_label, ctx.bot)
+    await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+    return ConversationHandler.END
+
+
 async def recv_dt_scope(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     query = update.callback_query
     await query.answer()
-    scope = query.data.split(":")[1]   # "open" | "closed" | "delete"
+    scope = query.data.split(":")[1]   # "open" | "closed" | "byvaluer" | "delete"
+
+    if scope == "byvaluer":
+        return await _dt_run_valuer_select(query.edit_message_text, query.message.chat_id, ctx)
 
     if scope == "closed":
         rows = load_dlv_closed()
@@ -678,6 +851,8 @@ def register(app: Application) -> None:
                 CallbackQueryHandler(recv_dt_delete_toggle,  pattern=r"^dt_deltoggle:"),
                 CallbackQueryHandler(recv_dt_delete_confirm, pattern=r"^dt_delconfirm$|^dt_delcancel$"),
             ],
+            DT.PICK_VALUER: [CallbackQueryHandler(recv_dt_pick_valuer, pattern=r"^dt_pickvaluer")],
+            DT.PICK_PERIOD: [CallbackQueryHandler(recv_dt_period,     pattern=r"^dt_period")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),

@@ -229,5 +229,79 @@ class TestDtFormatTaskBlock(unittest.TestCase):
         self.assertIn("⏳ _still with Assessor, not yet in DLV_", block)
 
 
+class TestDtValuerKey(unittest.TestCase):
+    """_dt_valuer_key prefers valuer_uid, falls back to valuer_name, else empty."""
+
+    def test_uses_uid_when_present(self):
+        self.assertEqual(dlv_tasks._dt_valuer_key({"valuer_uid": "uid-1", "valuer_name": "Jane"}), "uid-1")
+
+    def test_falls_back_to_name_when_uid_missing(self):
+        self.assertEqual(dlv_tasks._dt_valuer_key({"valuer_uid": "", "valuer_name": "Jane"}), "Jane")
+
+    def test_empty_when_neither_present(self):
+        self.assertEqual(dlv_tasks._dt_valuer_key({}), "")
+
+
+class TestDtCollectValuers(unittest.TestCase):
+    """_dt_collect_valuers dedups by key across open + closed, sorted by name."""
+
+    def test_dedupes_across_open_and_closed_and_sorts_by_name(self):
+        with patch.object(dlv_tasks, "load_dlv_batch", return_value=[
+                {"valuer_uid": "u2", "valuer_name": "Zed Valuer"},
+                {"valuer_uid": "u1", "valuer_name": "Amos Valuer"},
+             ]), \
+             patch.object(dlv_tasks, "load_dlv_closed", return_value=[
+                {"valuer_uid": "u1", "valuer_name": "Amos Valuer"},   # same key — should not duplicate
+                {"valuer_uid": "u3", "valuer_name": "Beth Valuer"},
+             ]):
+            valuers = dlv_tasks._dt_collect_valuers()
+        self.assertEqual(
+            valuers,
+            [
+                {"key": "u1", "name": "Amos Valuer"},
+                {"key": "u3", "name": "Beth Valuer"},
+                {"key": "u2", "name": "Zed Valuer"},
+            ],
+        )
+
+    def test_empty_when_no_items_anywhere(self):
+        with patch.object(dlv_tasks, "load_dlv_batch", return_value=[]), \
+             patch.object(dlv_tasks, "load_dlv_closed", return_value=[]):
+            self.assertEqual(dlv_tasks._dt_collect_valuers(), [])
+
+    def test_items_without_uid_or_name_are_skipped(self):
+        with patch.object(dlv_tasks, "load_dlv_batch", return_value=[{"valuer_uid": "", "valuer_name": ""}]), \
+             patch.object(dlv_tasks, "load_dlv_closed", return_value=[]):
+            self.assertEqual(dlv_tasks._dt_collect_valuers(), [])
+
+
+class TestDtFormatValuerReport(unittest.TestCase):
+    """_dt_format_valuer_report renders queued + period-filtered closed history for one valuer."""
+
+    def test_queued_and_closed_sections_render_expected_fields(self):
+        queued = [{"ref": "REG/A/1", "assessor": "Assessor A", "queued_at": "2026-07-10T10:00:00"}]
+        closed = [{"ref": "REG/A/2", "assessor": "Assessor B", "queued_at": "2026-07-01T09:00:00",
+                   "closed_at": "2026-07-12T11:00:00", "closed_reason": "completed"}]
+        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", queued, closed, "1 week"))
+        self.assertIn("👤 *DLV Report — Jane Doe*", lines)
+        self.assertIn("⏳ *Currently Queued* (1)", lines)
+        self.assertIn("`REG/A/1`", lines)
+        self.assertIn("Assessor: Assessor A", lines)
+        self.assertIn("📜 *History* (1 week) — 1", lines)
+        self.assertIn("`REG/A/2`", lines)
+        self.assertIn("✅ Completed", lines)
+
+    def test_empty_sections_render_none_placeholder(self):
+        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", [], [], "All time"))
+        self.assertIn("⏳ *Currently Queued* (0)", lines)
+        self.assertIn("📜 *History* (All time) — 0", lines)
+        self.assertEqual(lines.count("_none_"), 2)
+
+    def test_unknown_closed_reason_labeled_unknown(self):
+        closed = [{"ref": "REG/A/3", "closed_at": "2026-07-12T11:00:00", "closed_reason": "something_else"}]
+        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", [], closed, "All time"))
+        self.assertIn("❓ Unknown", lines)
+
+
 if __name__ == "__main__":
     unittest.main()

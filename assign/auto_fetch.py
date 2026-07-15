@@ -325,7 +325,7 @@ async def recv_af_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "ft_amount:20m_50m": (20_000_000.0, 50_000_000.0),
         "ft_amount:50m_100m":(50_000_000.0,100_000_000.0),
         "ft_amount:10m_80m": (10_000_000.0, 80_000_000.0),
-        "ft_amount:80m_3b":  (80_000_000.0,  3_000_000_000.0),
+        "ft_amount:50m_3b":  (50_000_000.0,  3_000_000_000.0),
         "ft_amount:all":     (None,           None),
     }
     amount_min, amount_max = ranges.get(choice, (None, None))
@@ -644,7 +644,20 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             _send_auto_fetch_email(email, email_subject, plain_body)
             logger.info("Auto Fetch email sent to %s", email)
         except Exception as e:
+            # Unlike the Telegram summary above, this used to fail silently —
+            # only a log line, nothing surfaced — so a broken SMTP config on
+            # the server looked identical to "no email configured" from the
+            # user's side. Notify the same way Bulk Export/DLV Tasks/Morning
+            # Briefing already do on email failure.
             logger.warning("Auto Fetch email failed: %s", e)
+            for chat_id in ALLOWED_IDS:
+                try:
+                    await context.bot.send_message(
+                        chat_id, f"⚠️ Auto Fetch email delivery to *{email}* failed: `{e}`",
+                        parse_mode="Markdown",
+                    )
+                except Exception as notify_err:
+                    logger.warning("Auto Fetch email-failure notify error for %s: %s", chat_id, notify_err)
 
 
 # ──────────────────────────────────────────────────────────
