@@ -39,6 +39,13 @@ from endpoints import (
 SAVED_DLV_BATCH_FILE  = os.path.join(DATA_DIR, "saved_dlv_batch.json")
 SAVED_DLV_CLOSED_FILE = os.path.join(DATA_DIR, "saved_dlv_closed.json")
 
+# Fixed tag vocabulary — DLV Batch lets you tag each queued ref with one of
+# these (optional), and DLV Tasks' "By Tag" report filters on it. Kept as a
+# closed list (rather than free text) so tags stay consistent and filterable.
+# Shared here since both DLV Batch (sets the tag) and DLV Tasks (reports on
+# it) need the same vocabulary.
+DLV_TAGS = ["Urgent", "Follow-up", "VIP", "Dispute"]
+
 
 # ──────────────────────────────────────────────────────────
 # DLV Batch — persistent queue helpers
