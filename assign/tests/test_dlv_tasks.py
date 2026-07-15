@@ -373,11 +373,11 @@ class TestDtFormatValuerReport(unittest.TestCase):
 
     def test_tag_rendered_when_present_omitted_when_absent(self):
         queued = [
-            {"ref": "REG/A/1", "assessor": "A", "queued_at": "t", "tag": "Urgent"},
+            {"ref": "REG/A/1", "assessor": "A", "queued_at": "t", "tag": "Queue"},
             {"ref": "REG/A/2", "assessor": "B", "queued_at": "t"},
         ]
         lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", queued, [], "All time"))
-        self.assertIn("🏷 Tag: Urgent", lines)
+        self.assertIn("🏷 Tag: Queue", lines)
         # only one 🏷 marker — the untagged ref doesn't get one
         self.assertEqual(lines.count("🏷"), 1)
 
@@ -394,14 +394,14 @@ class TestDtFormatTagReport(unittest.TestCase):
 
     def test_queued_and_closed_show_valuer_per_line(self):
         queued = [{"ref": "REG/A/1", "valuer_name": "Jane Doe", "assessor": "A1",
-                   "queued_at": "2026-07-10T10:00:00", "tag": "Urgent",
+                   "queued_at": "2026-07-10T10:00:00", "tag": "Queue",
                    "consideration": "3000000", "currency_code": "KES", "parcel": "NAIROBI/BLOCK1/1"}]
         closed = [{"ref": "REG/A/2", "valuer_name": "John Otieno", "assessor": "A2",
                    "queued_at": "2026-07-01T09:00:00", "closed_at": "2026-07-12T11:00:00",
-                   "closed_reason": "completed", "tag": "Urgent",
+                   "closed_reason": "completed", "tag": "Queue",
                    "consideration_amount": "2000000", "currency_code": "KES", "parcel": "NAIROBI/BLOCK2/2"}]
-        lines = "\n".join(dlv_tasks._dt_format_tag_report("Urgent", queued, closed, "All time"))
-        self.assertIn("🏷 *DLV Report — Tag: Urgent*", lines)
+        lines = "\n".join(dlv_tasks._dt_format_tag_report("Queue", queued, closed, "All time"))
+        self.assertIn("🏷 *DLV Report — Tag: Queue*", lines)
         self.assertIn("Valuer: Jane Doe", lines)
         self.assertIn("Valuer: John Otieno", lines)
         self.assertIn("💰 Consideration: KES 3,000,000.00", lines)
@@ -412,7 +412,7 @@ class TestDtFormatTagReport(unittest.TestCase):
         self.assertIn("📜 *History* (All time) — 1 — Total: KES 2,000,000.00", lines)
 
     def test_empty_sections_render_none_placeholder(self):
-        lines = "\n".join(dlv_tasks._dt_format_tag_report("Urgent", [], [], "All time"))
+        lines = "\n".join(dlv_tasks._dt_format_tag_report("Queue", [], [], "All time"))
         self.assertEqual(lines.count("_none_"), 2)
 
 
@@ -437,7 +437,7 @@ class TestRecvDtPickTag(unittest.TestCase):
         self.assertEqual(result, dlv_tasks.ConversationHandler.END)
 
     def test_picking_a_tag_sets_report_mode_and_moves_to_period(self):
-        update = _make_query_update("dt_picktag:Urgent")
+        update = _make_query_update("dt_picktag:Queue")
         ctx = MagicMock()
         ctx.user_data = {}
         with patch.object(dlv_tasks, "allowed", return_value=True):
@@ -445,7 +445,7 @@ class TestRecvDtPickTag(unittest.TestCase):
         self.assertEqual(result, dlv_tasks.DT.PICK_PERIOD)
         sess = dlv_tasks._get_dt_sess(ctx)
         self.assertEqual(sess.report_mode, "tag")
-        self.assertEqual(sess.selected_tag, "Urgent")
+        self.assertEqual(sess.selected_tag, "Queue")
 
 
 class TestRecvDtPeriodTagMode(unittest.TestCase):
@@ -459,10 +459,10 @@ class TestRecvDtPeriodTagMode(unittest.TestCase):
         ctx.bot.send_message = AsyncMock()
         sess = dlv_tasks._get_dt_sess(ctx)
         sess.report_mode  = "tag"
-        sess.selected_tag = "Urgent"
+        sess.selected_tag = "Queue"
 
-        queued = [{"ref": "REF1", "tag": "Urgent"}, {"ref": "REF2", "tag": "VIP"}]
-        closed = [{"ref": "REF3", "tag": "Urgent", "closed_at": "2026-07-01"}]
+        queued = [{"ref": "REF1", "tag": "Queue"}, {"ref": "REF2", "tag": "Direct"}]
+        closed = [{"ref": "REF3", "tag": "Queue", "closed_at": "2026-07-01"}]
         with patch.object(dlv_tasks, "allowed", return_value=True), \
              patch.object(dlv_tasks, "load_dlv_batch", return_value=queued), \
              patch.object(dlv_tasks, "load_dlv_closed", return_value=closed), \
