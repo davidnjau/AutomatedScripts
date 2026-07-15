@@ -67,6 +67,38 @@ class TestFtFormatTaskBlock(unittest.TestCase):
         block = ft._ft_format_task_block(1, _task(consideration="N/A"))
         self.assertIn("💰 Consideration: N/A", block)
 
+    def test_markdown_wraps_ref_in_backticks_for_tap_to_copy(self):
+        block = ft._ft_format_task_block(1, _task(), markdown=True)
+        self.assertIn("📌 *Ref:* `REG/TSFR/ABC123`", block)
+
+    def test_markdown_false_by_default_leaves_ref_plain(self):
+        """Default is plain (no backticks) since Auto Fetch's plain-text email
+        doesn't parse Markdown — backticks would show as literal characters."""
+        block = ft._ft_format_task_block(1, _task())
+        self.assertIn("📌 Ref: REG/TSFR/ABC123", block)
+        self.assertNotIn("`", block)
+
+    def test_blank_assessor_falls_back_to_officers_list(self):
+        """Regression test: the old view always showed the raw officers list,
+        so an assessor name that _extract_assessor missed was still visible
+        there. Dropping that list entirely made it vanish outright — this
+        fallback restores it, but only when the dedicated field is empty."""
+        block = ft._ft_format_task_block(1, _task(
+            assessor="", officers=[{"name": "John Otieno", "role": "SOME_OTHER_ROLE"}],
+        ))
+        self.assertIn("Assessor: John Otieno (SOME_OTHER_ROLE)", block)
+
+    def test_blank_assessor_and_no_officers_falls_back_to_em_dash(self):
+        block = ft._ft_format_task_block(1, _task(assessor="", officers=[]))
+        self.assertIn("Assessor: —", block)
+
+    def test_assessor_field_takes_priority_over_officers_list(self):
+        block = ft._ft_format_task_block(1, _task(
+            assessor="Jane Doe", officers=[{"name": "Someone Else", "role": "OTHER"}],
+        ))
+        self.assertIn("Assessor: Jane Doe", block)
+        self.assertNotIn("Someone Else", block)
+
 
 class TestFtShowResults(unittest.TestCase):
     """_ft_show_results sends one labeled block per task, DLV-Tasks-style."""
@@ -78,16 +110,17 @@ class TestFtShowResults(unittest.TestCase):
             _run(ft._ft_show_results(message, []))
         message.reply_text.assert_called_once_with("No tasks to display.", reply_markup="menu")
 
-    def test_tasks_rendered_as_labeled_blocks(self):
+    def test_tasks_rendered_as_labeled_blocks_with_copyable_ref(self):
         message = MagicMock()
         message.reply_text = AsyncMock()
         tasks = [_task(assessor="John Otieno")]
         with patch.object(ft, "_main_menu", return_value="menu"):
             _run(ft._ft_show_results(message, tasks))
         text = message.reply_text.call_args[0][0]
-        self.assertIn("📌 Ref: REG/TSFR/ABC123", text)
+        self.assertIn("📌 *Ref:* `REG/TSFR/ABC123`", text)
         self.assertIn("Assessor: John Otieno", text)
         self.assertIn("Total: 1 task(s)", text)
+        self.assertEqual(message.reply_text.call_args[1].get("parse_mode"), "Markdown")
 
 
 class TestHasStampDutyInvoice(unittest.TestCase):
