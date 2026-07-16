@@ -112,7 +112,7 @@ class TestProcessDlvBatchItem(unittest.TestCase):
         with patch.object(dlv_batch, "_search_ref_dlv", return_value=None):
             result = self._run()
         self.assertTrue(result["keep"])
-        self.assertIsNone(result["line"])
+        self.assertIsNone(result["outcome"])
         self.assertEqual(result["item"]["last_error"], "Not found in DLV endpoint")
 
     def test_empty_detail_is_kept_for_retry(self):
@@ -133,7 +133,7 @@ class TestProcessDlvBatchItem(unittest.TestCase):
         self.assertFalse(result["keep"])
         self.assertIsNotNone(result["closed"])
         self.assertEqual(result["closed"]["closed_reason"], "completed")
-        self.assertIn("Closed (Completed)", result["line"])
+        self.assertIn("Closed (Completed)", result["outcome"]["status"])
 
     def test_returned_closes_the_item(self):
         with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
@@ -144,7 +144,7 @@ class TestProcessDlvBatchItem(unittest.TestCase):
                  "currency_code": "", "actor_name": "",
              }):
             result = self._run()
-        self.assertIn("Closed (Returned)", result["line"])
+        self.assertIn("Closed (Returned)", result["outcome"]["status"])
         self.assertEqual(result["closed"]["closed_reason"], "returned")
 
     def test_open_created_node_assigns(self):
@@ -159,7 +159,7 @@ class TestProcessDlvBatchItem(unittest.TestCase):
             self.http_sess.post.return_value = MagicMock(raise_for_status=lambda: None)
             result = self._run()
         self.assertFalse(result["keep"])
-        self.assertIn("assigned to", result["line"])
+        self.assertIn("Assigned", result["outcome"]["status"])
         self.assertEqual(result["item"]["assessor"], "Jane Assessor")
         mock_persist.assert_called_once_with("REG/TSFR/ABC123", "Jane Doe", "uid-1")
         self.http_sess.post.assert_called_once()
@@ -177,7 +177,9 @@ class TestProcessDlvBatchItem(unittest.TestCase):
              }):
             result = self._run()
         self.assertFalse(result["keep"])
-        self.assertIn("already assigned to *EXISTING VALUER*, not *Jane Doe*", result["line"])
+        self.assertIn("Taken by another valuer", result["outcome"]["status"])
+        self.assertEqual(result["outcome"]["held_by"], "EXISTING VALUER")
+        self.assertEqual(result["outcome"]["valuer_name"], "Jane Doe")
         self.http_sess.post.assert_not_called()
 
     def test_already_assigned_to_intended_valuer_reports_success(self):
@@ -196,8 +198,9 @@ class TestProcessDlvBatchItem(unittest.TestCase):
              }):
             result = self._run()
         self.assertFalse(result["keep"])
-        self.assertIn("✅", result["line"])
-        self.assertIn("already correctly assigned to *Jane Doe*", result["line"])
+        self.assertIn("✅", result["outcome"]["status"])
+        self.assertIn("Already correctly assigned", result["outcome"]["status"])
+        self.assertEqual(result["outcome"]["valuer_name"], "Jane Doe")
         self.http_sess.post.assert_not_called()
 
     def test_no_valuation_officer_actor_reports_no_actor_listed(self):
@@ -213,7 +216,7 @@ class TestProcessDlvBatchItem(unittest.TestCase):
              }):
             result = self._run()
         self.assertFalse(result["keep"])
-        self.assertIn("no actor listed", result["line"])
+        self.assertIn("no actor listed", result["outcome"]["status"])
         self.http_sess.post.assert_not_called()
 
     def test_search_exception_is_kept_for_retry(self):
@@ -221,6 +224,135 @@ class TestProcessDlvBatchItem(unittest.TestCase):
             result = self._run()
         self.assertTrue(result["keep"])
         self.assertIn("boom", result["item"]["last_error"])
+
+
+class TestDbFormatOutcomeBlock(unittest.TestCase):
+    """_db_format_outcome_block — see task_block.format_labeled_block for
+    the shared visual; Status (+ Valuer, + who currently holds it when
+    that's why it was skipped) is genuinely all this report has to say."""
+
+    def test_status_and_valuer_shown(self):
+        outcome = {"ref": "REG/TSFR/ABC123", "status": "✅ Assigned", "valuer_name": "Jane Doe", "held_by": ""}
+        block = dlv_batch._db_format_outcome_block(1, outcome)
+        self.assertEqual(
+            block,
+            "  1. 📌 *Ref:* `REG/TSFR/ABC123`\n"
+            "     📊 Status: ✅ Assigned\n"
+            "     👤 Valuer: Jane Doe",
+        )
+
+    def test_held_by_shown_only_when_present(self):
+        outcome = {"ref": "REF1", "status": "⚠️ Taken by another valuer — skipped (not reassigned)",
+                   "valuer_name": "Jane Doe", "held_by": "EXISTING VALUER"}
+        block = dlv_batch._db_format_outcome_block(1, outcome)
+        self.assertIn("👤 Valuer: Jane Doe", block)
+        self.assertIn("🔒 Currently held by: EXISTING VALUER", block)
+
+    def test_no_valuer_field_when_empty(self):
+        outcome = {"ref": "REF1", "status": "🔒 Closed (Completed)", "valuer_name": "", "held_by": ""}
+        block = dlv_batch._db_format_outcome_block(1, outcome)
+        self.assertNotIn("👤 Valuer", block)
+        self.assertNotIn("🔒 Currently held by", block)
+
+
+class TestProcessDlvBatchItems(unittest.TestCase):
+    """_process_dlv_batch_items — aggregates per-ref outcomes into a list of
+    numbered blocks (for _send_chunked_report, no manual truncation)."""
+
+    def _item(self, ref, valuer_name="Jane Doe"):
+        return {"ref": ref, "valuer_name": valuer_name, "valuer_uid": "uid-1"}
+
+    def test_empty_queue_returns_empty_list(self):
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=[]):
+            self.assertEqual(dlv_batch._process_dlv_batch_items(TOKENS), [])
+
+    def test_completed_outcomes_become_numbered_blocks(self):
+        items = [self._item("REF1"), self._item("REF2")]
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
+             patch.object(dlv_batch, "save_dlv_batch"), \
+             patch.object(dlv_batch, "build_session", return_value=MagicMock()), \
+             patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={"node": "VALUATION_STAMP_DUTY_CREATED"}), \
+             patch.object(dlv_batch, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+                 "node": "VALUATION_STAMP_DUTY_CREATED", "assessor_name": "", "consideration_amount": "",
+                 "currency_code": "", "actor_name": "",
+             }), \
+             patch.object(dlv_batch, "persist_assignment"):
+            lines = dlv_batch._process_dlv_batch_items(TOKENS)
+        self.assertEqual(len(lines), 2)
+        refs_in_lines = {l.split("`")[1] for l in lines}
+        self.assertEqual(refs_in_lines, {"REF1", "REF2"})
+        for line in lines:
+            self.assertIn("📊 Status: ✅ Assigned", line)
+            self.assertIn("👤 Valuer: Jane Doe", line)
+
+    def test_still_pending_refs_appended_as_final_line(self):
+        items = [self._item("REF1")]
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
+             patch.object(dlv_batch, "save_dlv_batch"), \
+             patch.object(dlv_batch, "build_session", return_value=MagicMock()), \
+             patch.object(dlv_batch, "_search_ref_dlv", return_value=None):
+            lines = dlv_batch._process_dlv_batch_items(TOKENS)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Still pending", lines[0])
+        self.assertIn("REF1", lines[0])
+
+
+class TestDlvBatchJob(unittest.TestCase):
+    """_dlv_batch_job — the 5-minute repeating job; must use
+    _send_chunked_report rather than manually truncating at 4000 chars,
+    since blocks are now much taller than the old one-liner."""
+
+    def test_no_items_does_nothing(self):
+        ctx = MagicMock()
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=[]):
+            _run(dlv_batch._dlv_batch_job(ctx))
+        ctx.bot.send_message.assert_not_called()
+
+    def test_completed_outcomes_are_sent_as_blocks(self):
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        outcome_lines = ["  1. 📌 *Ref:* `REF1`\n     📊 Status: ✅ Assigned"]
+        with patch.object(dlv_batch, "load_dlv_batch", side_effect=[[{"ref": "REF1"}], []]), \
+             patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
+             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=outcome_lines), \
+             patch.object(dlv_batch, "ALLOWED_IDS", {111}):
+            _run(dlv_batch._dlv_batch_job(ctx))
+        sent = "\n".join(c.args[1] for c in ctx.bot.send_message.call_args_list)
+        self.assertIn("📋 *DLV Batch (auto)*", sent)
+        self.assertIn("📌 *Ref:* `REF1`", sent)
+
+
+class TestRunDlvBatchBg(unittest.TestCase):
+    """_run_dlv_batch_bg — the post-confirm background processor; same
+    chunked-sending requirement as the periodic job."""
+
+    def test_empty_report_sends_batch_already_empty_message(self):
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        with patch.object(dlv_batch, "_process_dlv_batch_items", return_value=[]):
+            _run(dlv_batch._run_dlv_batch_bg(ctx, 111, TOKENS))
+        ctx.bot.send_message.assert_called_once()
+        self.assertIn("already empty", ctx.bot.send_message.call_args[0][1])
+
+    def test_outcome_blocks_sent_via_chunked_report(self):
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        outcome_lines = ["  1. 📌 *Ref:* `REF1`\n     📊 Status: ✅ Assigned"]
+        with patch.object(dlv_batch, "_process_dlv_batch_items", return_value=outcome_lines):
+            _run(dlv_batch._run_dlv_batch_bg(ctx, 111, TOKENS))
+        sent = "\n".join(c.args[1] for c in ctx.bot.send_message.call_args_list)
+        self.assertIn("📋 *DLV Batch Report*", sent)
+        self.assertIn("📌 *Ref:* `REF1`", sent)
+
+    def test_processing_exception_reports_failure(self):
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        with patch.object(dlv_batch, "_process_dlv_batch_items", side_effect=RuntimeError("boom")):
+            _run(dlv_batch._run_dlv_batch_bg(ctx, 111, TOKENS))
+        ctx.bot.send_message.assert_called_once()
+        self.assertIn("processing failed", ctx.bot.send_message.call_args[0][1])
 
 
 class TestDbFormatBatchSummary(unittest.TestCase):

@@ -192,22 +192,6 @@ class TestDtFetchTasksPriorityOrder(unittest.TestCase):
         mock_search.assert_not_called()
 
 
-class TestFormatConsideration(unittest.TestCase):
-    """_format_consideration turns a raw amount + currency into 'KES 1,234.00'."""
-
-    def test_formats_amount_with_currency(self):
-        self.assertEqual(dlv_tasks._format_consideration("6000000", "KES"), "KES 6,000,000.00")
-
-    def test_defaults_currency_to_kes_when_missing(self):
-        self.assertEqual(dlv_tasks._format_consideration("100", ""), "KES 100.00")
-
-    def test_empty_amount_returns_empty_string(self):
-        self.assertEqual(dlv_tasks._format_consideration("", "KES"), "")
-
-    def test_non_numeric_amount_falls_back_to_str(self):
-        self.assertEqual(dlv_tasks._format_consideration("N/A", "KES"), "N/A")
-
-
 class TestDtRowConsiderationValue(unittest.TestCase):
     """_dt_row_consideration_value — parses the already-formatted
     "KES 1,234.00" string back to a number for Excel-export sorting."""
@@ -247,30 +231,6 @@ class TestDtBuildExcelSortOrder(unittest.TestCase):
         ]
         xlsx_bytes = dlv_tasks._dt_build_excel(rows)
         self.assertEqual(self._refs_in_sheet_order(xlsx_bytes), ["HAS_AMOUNT", "NO_AMOUNT"])
-
-
-class TestDtFormatLabeledBlock(unittest.TestCase):
-    """_dt_format_labeled_block — the one shared visual behind every DLV
-    Tasks report; only the ref/fields passed in differ per report."""
-
-    def test_renders_numbered_ref_header_and_each_field_indented(self):
-        block = dlv_tasks._dt_format_labeled_block(
-            3, "REG/TSFR/ABC123", [("💰 Consideration", "KES 1,000.00"), ("📋 Parcel", "P1")],
-        )
-        self.assertEqual(
-            block,
-            "  3. 📌 *Ref:* `REG/TSFR/ABC123`\n"
-            "     💰 Consideration: KES 1,000.00\n"
-            "     📋 Parcel: P1",
-        )
-
-    def test_missing_ref_falls_back_to_em_dash(self):
-        block = dlv_tasks._dt_format_labeled_block(1, "", [])
-        self.assertIn("*Ref:* `—`", block)
-
-    def test_no_fields_is_just_the_ref_header(self):
-        block = dlv_tasks._dt_format_labeled_block(1, "REF1", [])
-        self.assertEqual(block, "  1. 📌 *Ref:* `REF1`")
 
 
 class TestDtFormatTaskBlock(unittest.TestCase):

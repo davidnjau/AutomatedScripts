@@ -46,7 +46,7 @@ class TestFtFormatTaskBlock(unittest.TestCase):
         self.assertIn("Assessor: Jane Doe", block)
         self.assertIn("🏢 Registry: CENTRAL", block)
         self.assertIn("📍 County: NAIROBI", block)
-        self.assertIn("💰 Consideration: KES 2,000,000", block)
+        self.assertIn("💰 Consideration: KES 2,000,000.00", block)
         self.assertIn("📋 Parcel: NAIROBI/BLOCK1/1", block)
         self.assertIn("📅 Added: 2026-07-10", block)
 

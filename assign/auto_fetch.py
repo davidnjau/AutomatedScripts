@@ -92,6 +92,7 @@ from dlv_core import load_dlv_batch
 from email_service import _send_auto_fetch_email
 from endpoints import STAMP_DUTY_FIX_APPLICATION_URL
 from fetch_tasks import _ft_format_task_block, _load_fetch_tasks
+from task_block import assessor_field, consideration_field, format_labeled_block, parcel_field
 from telegram_report import _send_chunked_report
 
 SAVED_AUTO_FETCH_FILE     = os.path.join(DATA_DIR, "saved_auto_fetch.json")
@@ -766,24 +767,7 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | {sec_label}\n\n"
     )
 
-    lines = []
-    for i, t in enumerate(tasks, 1):
-        src    = t.get("source", "")
-        ref    = t.get("reference_number", "—")
-        cnty   = (t.get("county") or "—").upper()
-        reg    = (t.get("registry") or "—").upper()
-        date   = (t.get("date_created") or "")[:10]
-        parcel = t.get("parcel_number") or "—"
-        try:
-            raw_cons = t.get("consideration")
-            cons = f"KES {int(float(str(raw_cons).replace(',','').strip())):,}" if raw_cons else "—"
-        except (ValueError, TypeError):
-            cons = str(t.get("consideration") or "—")
-        lines.append(
-            f"{i}. [{src}] {ref}\n"
-            f"   {cnty} / {reg} | {date}\n"
-            f"   {cons} | {parcel}"
-        )
+    lines = [_ft_format_task_block(i, t, markdown=True) for i, t in enumerate(tasks, 1)]
 
     for chat_id in ALLOWED_IDS:
         async def _send(text, reply_markup, chat_id=chat_id):
@@ -904,29 +888,24 @@ async def recv_af_result_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = []
     pending = 0
     for i, t in enumerate(tasks, 1):
-        ref    = t.get("ref", "—")
-        parcel = t.get("parcel", "—")
-        cnty   = (t.get("county") or "—").upper()
-        reg    = (t.get("registry") or "—").upper()
-        date   = t.get("date_created", "")
-        try:
-            raw = t.get("consideration")
-            cons = f"KES {int(float(str(raw).replace(',','').strip())):,}" if raw else "—"
-        except (ValueError, TypeError):
-            cons = str(t.get("consideration") or "—")
-
+        ref = t.get("ref", "—")
         if ref in assigned:
             status = f"✅ assigned to {assigned[ref].get('valuer_name', '?')}"
         else:
             status = "⏳ pending"
             pending += 1
 
-        assessor = t.get("assessor") or "—"
-        lines.append(
-            f"{i}. `{ref}` — {status}\n"
-            f"   {cnty}/{reg} | {date} | {cons}\n"
-            f"   {parcel} | Assessor: {assessor}"
-        )
+        fields = [
+            ("📊 Status", status),
+            ("🗂 Source", t.get("source") or "—"),
+            assessor_field(t),
+            consideration_field(t),
+            parcel_field(t),
+            ("🏢 Registry", (t.get("registry") or "—").upper()),
+            ("📍 County", (t.get("county") or "—").upper()),
+            ("📅 Added", t.get("date_created") or "—"),
+        ]
+        lines.append(format_labeled_block(i, ref, fields, markdown=True))
 
     summary_line = f"*Pending: {pending}  |  Assigned: {len(tasks) - pending}*\n\n"
 
