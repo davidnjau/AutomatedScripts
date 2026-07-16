@@ -72,6 +72,8 @@ from dlv_core import (
 )
 from endpoints import ACCOUNTS_LIST_URL, STAMP_DUTY_FIX_APPLICATION_URL
 from fetch_tasks_cache import _fetch_tasks_log_lookup, _fetch_tasks_log_remove
+from task_block import format_labeled_block
+from telegram_report import _send_chunked_report
 
 
 # ──────────────────────────────────────────────────────────
@@ -149,8 +151,13 @@ def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth
     """
     Process a single queued ref: search + detail-view + classify, then either
     assign, report on an existing assignment, or close it out. Returns
-    {"item", "keep", "line", "closed"} — pure w.r.t. shared state, so callers
-    can run this across worker threads and merge results afterwards.
+    {"item", "keep", "outcome", "closed"} — pure w.r.t. shared state, so
+    callers can run this across worker threads and merge results afterwards.
+    "outcome" (None if kept for retry with nothing to report yet) is a
+    {"ref", "status", "valuer_name", "held_by"} dict — structured rather
+    than a pre-rendered line, since concurrent completion order means the
+    caller (not this function) knows each outcome's final position in the
+    report and can number the blocks correctly.
     """
     ref         = item.get("ref", "")
     valuer_name = item.get("valuer_name", "")
@@ -161,19 +168,20 @@ def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth
         if not task:
             # Not in DLV yet — keep for retry
             item["last_error"] = "Not found in DLV endpoint"
-            return {"item": item, "keep": True, "line": None, "closed": None}
+            return {"item": item, "keep": True, "outcome": None, "closed": None}
 
         detail = _fetch_ref_detail_dlv(tokens, task["id"])
         if not detail:
             # Transient failure — keep for retry
             item["last_error"] = "Detail fetch returned empty response"
-            return {"item": item, "keep": True, "line": None, "closed": None}
+            return {"item": item, "keep": True, "outcome": None, "closed": None}
 
         info = _classify_dlv_detail(detail)
 
         if info["bucket"] == "closed":
             # No longer available for reallocation — move out of the active
             # queue into the closed store instead of dropping it silently.
+            closed_valuer = info["actor_name"] or valuer_name
             closed_record = {
                 **item,
                 "last_error":           None,
@@ -183,11 +191,12 @@ def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth
                 "request_type":         task.get("_request_type", ""),
                 "consideration_amount": info["consideration_amount"],
                 "currency_code":        info["currency_code"],
-                "valuer_name":          info["actor_name"] or valuer_name,
+                "valuer_name":          closed_valuer,
                 "closed_at":            datetime.now().isoformat(timespec="seconds"),
             }
             label = "Completed" if info["closed_reason"] == "completed" else "Returned"
-            return {"item": item, "keep": False, "line": f"🔒 `{ref}` — Closed ({label})", "closed": closed_record}
+            outcome = {"ref": ref, "status": f"🔒 Closed ({label})", "valuer_name": closed_valuer, "held_by": ""}
+            return {"item": item, "keep": False, "outcome": outcome, "closed": closed_record}
 
         item["assessor"] = info["assessor_name"]
         node = info["node"]
@@ -209,7 +218,8 @@ def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth
                 persist_assignment(ref, valuer_name, valuer_uid)
             except Exception as _pe:
                 logger.error("persist_assignment failed for %s: %s", ref, _pe)
-            return {"item": item, "keep": False, "line": f"✅ `{ref}` — assigned to *{valuer_name}*", "closed": None}
+            outcome = {"ref": ref, "status": "✅ Assigned", "valuer_name": valuer_name, "held_by": ""}
+            return {"item": item, "keep": False, "outcome": outcome, "closed": None}
 
         if node == "VALUATION_STAMP_DUTY_VALUER_REPORT":
             actors = detail.get("actors", [])
@@ -221,33 +231,53 @@ def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth
                 # Distinguish "correctly assigned already" from "taken by someone
                 # else" — both used to render identically as "already with X",
                 # which read as a failure even when the intended valuer already had it.
-                line = f"✅ `{ref}` — already correctly assigned to *{valuer_name}*"
+                outcome = {"ref": ref, "status": "✅ Already correctly assigned",
+                           "valuer_name": valuer_name, "held_by": ""}
             elif actor_name:
-                line = f"⚠️ `{ref}` — already assigned to *{actor_name}*, not *{valuer_name}* — skipped (not reassigned)"
+                outcome = {"ref": ref, "status": "⚠️ Taken by another valuer — skipped (not reassigned)",
+                           "valuer_name": valuer_name, "held_by": actor_name}
             else:
-                line = f"📋 `{ref}` — at VALUER_REPORT stage, no actor listed"
-            return {"item": item, "keep": False, "line": line, "closed": None}
+                outcome = {"ref": ref, "status": "📋 At valuer-report stage, no actor listed",
+                           "valuer_name": valuer_name, "held_by": ""}
+            return {"item": item, "keep": False, "outcome": outcome, "closed": None}
 
-        return {"item": item, "keep": False, "line": f"❓ `{ref}` — unexpected node: `{node}`", "closed": None}
+        outcome = {"ref": ref, "status": f"❓ Unexpected node: {node}", "valuer_name": valuer_name, "held_by": ""}
+        return {"item": item, "keep": False, "outcome": outcome, "closed": None}
 
     except Exception as e:
         # Keep for retry on error
         item["last_error"] = str(e)[:120]
         logger.warning("DLV batch error for %s: %s", ref, e)
-        return {"item": item, "keep": True, "line": None, "closed": None}
+        return {"item": item, "keep": True, "outcome": None, "closed": None}
 
 
-def _process_dlv_batch_items(tokens: AuthTokens) -> str:
+def _db_format_outcome_block(i: int, outcome: Dict) -> str:
+    """One ref's DLV Batch processing-outcome block — Status (+ Valuer, and
+    who currently holds it when that's the reason it was skipped) is
+    genuinely all this report has to say about a ref; see
+    task_block.format_labeled_block for the shared visual every report in
+    the bot uses."""
+    fields = [("📊 Status", outcome["status"])]
+    if outcome.get("valuer_name"):
+        fields.append(("👤 Valuer", outcome["valuer_name"]))
+    if outcome.get("held_by"):
+        fields.append(("🔒 Currently held by", outcome["held_by"]))
+    return format_labeled_block(i, outcome["ref"], fields)
+
+
+def _process_dlv_batch_items(tokens: AuthTokens) -> List[str]:
     """
     Process the flat batch queue (list of {ref, valuer_name, valuer_uid, valuer_acct})
     across worker threads — each ref's search/detail-view/assign calls are
     independent I/O, same as the parallel fetch used elsewhere (e.g. Fetch Tasks).
     Refs not found in DLV are kept in the queue for the next 5-minute retry cycle.
-    Returns a report string of completed items only, or "" if nothing was processed.
+    Returns a list of report lines/blocks for completed items only (for
+    _send_chunked_report — callers must not manually truncate this), or []
+    if nothing was processed.
     """
     items = load_dlv_batch()
     if not items:
-        return ""
+        return []
 
     http_sess = build_session()
     assign_url = STAMP_DUTY_FIX_APPLICATION_URL
@@ -256,9 +286,9 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> str:
         "JWTAUTH":       f"Bearer {tokens.jwt}",
     }
 
-    completed_lines: List[str] = []
-    remaining:       List[Dict] = []
-    closed_items:    List[Dict] = []
+    outcomes:     List[Dict] = []
+    remaining:    List[Dict] = []
+    closed_items: List[Dict] = []
 
     with ThreadPoolExecutor(max_workers=_DLV_BATCH_WORKERS) as pool:
         fut_map = {
@@ -267,8 +297,8 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> str:
         }
         for fut in _futures_as_completed(fut_map):
             result = fut.result()
-            if result["line"]:
-                completed_lines.append(result["line"])
+            if result["outcome"]:
+                outcomes.append(result["outcome"])
             if result["keep"]:
                 remaining.append(result["item"])
             if result["closed"]:
@@ -279,11 +309,13 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> str:
     for closed_record in closed_items:
         _append_dlv_closed(closed_record)
 
+    completed_lines = [_db_format_outcome_block(i, o) for i, o in enumerate(outcomes, 1)]
+
     if remaining:
         pending_refs = ", ".join(f"`{i['ref']}`" for i in remaining)
-        completed_lines.append(f"\n⏳ Still pending (retry in 5 min): {pending_refs}")
+        completed_lines.append(f"⏳ Still pending (retry in 5 min): {pending_refs}")
 
-    return "\n".join(completed_lines)
+    return completed_lines
 
 
 async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -298,19 +330,18 @@ async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     before_count = len(items)
-    report = await asyncio.to_thread(_process_dlv_batch_items, tokens)
+    report_lines = await asyncio.to_thread(_process_dlv_batch_items, tokens)
     after_count  = len(load_dlv_batch())
 
     # Only notify if something was actually completed (queue shrank)
-    if report and after_count < before_count:
-        msg = f"📋 *DLV Batch (auto)*\n{report}"
-        if len(msg) > 4000:
-            msg = msg[:4000] + "\n…_(truncated)_"
+    if report_lines and after_count < before_count:
         for chat_id in ALLOWED_IDS:
-            try:
-                await context.bot.send_message(chat_id, msg, parse_mode="Markdown")
-            except Exception as e:
-                logger.warning("DLV batch job notify error for %s: %s", chat_id, e)
+            async def _send(text, reply_markup, chat_id=chat_id):
+                try:
+                    await context.bot.send_message(chat_id, text, parse_mode="Markdown")
+                except Exception as e:
+                    logger.warning("DLV batch job notify error for %s: %s", chat_id, e)
+            await _send_chunked_report(_send, ["📋 *DLV Batch (auto)*"] + report_lines, join="\n\n")
 
 
 # ──────────────────────────────────────────────────────────
@@ -404,14 +435,27 @@ async def recv_dlv_queue_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("✅ Queue is empty — nothing to process.")
             return
         await query.edit_message_text(f"⏳ Processing {len(items_before)} ref(s), please wait…")
-        report = await asyncio.to_thread(_process_dlv_batch_items, tokens)
+        report_lines = await asyncio.to_thread(_process_dlv_batch_items, tokens)
         remaining = load_dlv_batch()
-        msg = f"📋 *DLV Queue — Query Result*\n{report}" if report else "ℹ️ Nothing processed."
+
+        if not report_lines:
+            await query.edit_message_text("ℹ️ Nothing processed.")
+            return
+
         if remaining:
-            msg += f"\n\n⏳ *{len(remaining)} ref(s) still pending*"
-        if len(msg) > 4000:
-            msg = msg[:4000] + "\n…_(truncated)_"
-        await query.edit_message_text(msg, parse_mode="Markdown")
+            report_lines = report_lines + [f"⏳ *{len(remaining)} ref(s) still pending*"]
+
+        first_chunk_done = False
+
+        async def _send(text, reply_markup):
+            nonlocal first_chunk_done
+            if not first_chunk_done:
+                first_chunk_done = True
+                await query.edit_message_text(text, parse_mode="Markdown")
+            else:
+                await query.message.reply_text(text, parse_mode="Markdown")
+
+        await _send_chunked_report(_send, ["📋 *DLV Queue — Query Result*"] + report_lines, join="\n\n")
         return
 
     if data.startswith("dlvq:interval:"):
@@ -746,15 +790,20 @@ async def recv_db_tag_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _run_dlv_batch_bg(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, tokens: AuthTokens) -> None:
     """Process the DLV batch queue off the event loop, then message the report back."""
     try:
-        report = await asyncio.to_thread(_process_dlv_batch_items, tokens)
+        report_lines = await asyncio.to_thread(_process_dlv_batch_items, tokens)
     except Exception as e:
         logger.error("DLV batch background processing failed: %s", e, exc_info=True)
         await ctx.bot.send_message(chat_id, f"❌ DLV Batch processing failed: `{e}`", parse_mode="Markdown")
         return
-    msg = f"📋 *DLV Batch Report*\n{report}" if report else "ℹ️ Batch was already empty."
-    if len(msg) > 4000:
-        msg = msg[:4000] + "\n…_(truncated)_"
-    await ctx.bot.send_message(chat_id, msg, parse_mode="Markdown")
+
+    if not report_lines:
+        await ctx.bot.send_message(chat_id, "ℹ️ Batch was already empty.", parse_mode="Markdown")
+        return
+
+    async def _send(text, reply_markup):
+        await ctx.bot.send_message(chat_id, text, parse_mode="Markdown")
+
+    await _send_chunked_report(_send, ["📋 *DLV Batch Report*"] + report_lines, join="\n\n")
 
 
 # ──────────────────────────────────────────────────────────

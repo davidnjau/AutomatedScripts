@@ -8,6 +8,10 @@ login step, then days-back/county/registry/amount/sectional filters,
 then a live two-stage fetch (list + per-task detail) against the
 stampdutyservice/registrationservice endpoints.
 
+_ft_format_task_block (shared with Auto Fetch's email body) is built from
+task_block.py's shared field builders and rendered via its
+format_labeled_block — the one visual every report in the bot uses.
+
 Call register(app) from bot.py's main() to wire this feature in.
 """
 
@@ -62,6 +66,7 @@ from endpoints import (
     COUNTY_TRANSFER_DETAIL_URL,
 )
 from fetch_tasks_cache import _log_fetch_tasks
+from task_block import consideration_field, format_labeled_block, parcel_field, tag_field
 from telegram_report import _send_chunked_report
 
 
@@ -730,12 +735,11 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
 
 
 def _ft_format_task_block(i: int, t: dict, markdown: bool = False) -> str:
-    """Format one task in DLV Tasks' labeled per-task block visual (ref,
-    assessor, registry, county, consideration, parcel, added) — shared by
-    Fetch Tasks' own Telegram view and Auto Fetch's email body, since both
-    fetch from _load_fetch_tasks and share the same task schema. Status/Node/
-    Valuer aren't shown since these are pre-assignment tasks and don't have
-    them.
+    """Fetch Tasks/Auto Fetch's task block (source, assessor, registry,
+    county, consideration, parcel, added) — see task_block.format_labeled_block
+    for the shared visual every report in the bot uses; only these fields
+    differ. Status/Node/Valuer aren't shown since these are pre-assignment
+    tasks and don't have them.
 
     markdown=True wraps the ref in backticks (tap-to-copy in Telegram) and
     bolds its label; markdown=False (default, used by Auto Fetch's plain-text
@@ -745,11 +749,9 @@ def _ft_format_task_block(i: int, t: dict, markdown: bool = False) -> str:
     back to listing whoever IS in the officers list rather than showing a
     bare dash — the old view showed this raw list unconditionally; losing it
     entirely made the assessor's name disappear whenever extraction missed."""
-    ref      = t.get("reference_number") or "—"
     source   = t.get("source") or "—"
     registry = (t.get("registry") or "—").upper()
     county   = (t.get("county") or "—").upper()
-    parcel   = t.get("parcel_number") or "—"
     date     = (t.get("date_created") or "")[:10] or "—"
 
     assessor = t.get("assessor") or ""
@@ -759,24 +761,20 @@ def _ft_format_task_block(i: int, t: dict, markdown: bool = False) -> str:
             f"{o.get('name', '')} ({o.get('role', '')})" for o in officers if o.get("name")
         ) or "—"
 
-    try:
-        raw_cons = t.get("consideration")
-        cons = f"KES {int(float(str(raw_cons).replace(',', '').strip())):,}" if raw_cons else "—"
-    except (ValueError, TypeError):
-        cons = str(t.get("consideration") or "—")
+    fields = [
+        ("🗂 Source", source),
+        ("Assessor", assessor),
+        consideration_field(t),
+        parcel_field(t),
+        ("🏢 Registry", registry),
+        ("📍 County", county),
+        ("📅 Added", date),
+    ]
+    tag = tag_field(t)
+    if tag:
+        fields.append(tag)
 
-    ref_line = f"  {i}. 📌 *Ref:* `{ref}`" if markdown else f"  {i}. 📌 Ref: {ref}"
-
-    return (
-        f"{ref_line}\n"
-        f"     🗂 Source: {source}\n"
-        f"     Assessor: {assessor}\n"
-        f"     🏢 Registry: {registry}\n"
-        f"     📍 County: {county}\n"
-        f"     💰 Consideration: {cons}\n"
-        f"     📋 Parcel: {parcel}\n"
-        f"     📅 Added: {date}"
-    )
+    return format_labeled_block(i, t.get("reference_number"), fields, markdown=markdown)
 
 
 async def _ft_show_results(message, tasks: List[Dict]):
