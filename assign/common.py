@@ -152,14 +152,21 @@ def load_saved_assignments() -> Dict:
         return {}
 
 
-def persist_assignment(ref: str, valuer_name: str, valuer_uid: str):
+def persist_assignment(ref: str, valuer_name: str, valuer_uid: str, extra: Optional[Dict] = None):
+    """Record ref → valuer in saved_assignments.json. extra merges in any
+    additional context the caller already has on hand (e.g. DLV Batch's
+    queue item — parcel/consideration/tag/etc.) rather than losing it once
+    the ref moves out of its source's own tracking."""
     with _ASSIGN_LOCK:
         assignments = load_saved_assignments()
-        assignments[ref] = {
+        record = {
             "valuer_name": valuer_name,
             "valuer_uid":  valuer_uid,
             "assigned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        if extra:
+            record.update(extra)
+        assignments[ref] = record
         # Keep only the most recent 500 assignments to prevent unbounded growth
         if len(assignments) > 500:
             assignments = dict(list(assignments.items())[-500:])

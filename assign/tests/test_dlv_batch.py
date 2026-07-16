@@ -161,7 +161,34 @@ class TestProcessDlvBatchItem(unittest.TestCase):
         self.assertFalse(result["keep"])
         self.assertIn("Assigned", result["outcome"]["status"])
         self.assertEqual(result["item"]["assessor"], "Jane Assessor")
-        mock_persist.assert_called_once_with("REG/TSFR/ABC123", "Jane Doe", "uid-1")
+        mock_persist.assert_called_once_with("REG/TSFR/ABC123", "Jane Doe", "uid-1", extra={
+            "valuer_acct": "", "tag": "", "assessor": "Jane Assessor", "parcel": "",
+            "consideration": "", "currency_code": "", "queued_at": "",
+        })
+
+    def test_assign_persists_the_queue_items_own_context(self):
+        """Once assigned, the ref drops out of saved_dlv_batch.json for good —
+        persist_assignment's extra is the only place its parcel/consideration/
+        tag/valuer_acct survive to."""
+        self.item = {
+            "ref": "CNTYINV/X4LNTSVRPT", "valuer_name": "Jane Doe", "valuer_uid": "uid-1",
+            "valuer_acct": "SE0C17N708", "queued_at": "2026-07-16T11:34:41", "tag": "Queue",
+            "parcel": "I.R 81948", "consideration": "40000000.000", "currency_code": "KES",
+        }
+        with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={"node": "VALUATION_STAMP_DUTY_CREATED"}), \
+             patch.object(dlv_batch, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+                 "node": "VALUATION_STAMP_DUTY_CREATED", "assessor_name": "",
+                 "consideration_amount": "", "currency_code": "", "actor_name": "",
+             }), \
+             patch.object(dlv_batch, "persist_assignment") as mock_persist:
+            self.http_sess.post.return_value = MagicMock(raise_for_status=lambda: None)
+            self._run()
+        mock_persist.assert_called_once_with("CNTYINV/X4LNTSVRPT", "Jane Doe", "uid-1", extra={
+            "valuer_acct": "SE0C17N708", "tag": "Queue", "assessor": "", "parcel": "I.R 81948",
+            "consideration": "40000000.000", "currency_code": "KES", "queued_at": "2026-07-16T11:34:41",
+        })
         self.http_sess.post.assert_called_once()
 
     def test_already_assigned_to_someone_else_reports_and_skips(self):

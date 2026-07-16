@@ -214,8 +214,19 @@ def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth
             r.raise_for_status()
             # Persist before reporting success; if disk write fails, log it but
             # still report the correct outcome — the API assignment did succeed.
+            # Carries the queue item's own context along, since once "keep" is
+            # False the ref drops out of saved_dlv_batch.json for good — this
+            # is the only place left this data survives to.
             try:
-                persist_assignment(ref, valuer_name, valuer_uid)
+                persist_assignment(ref, valuer_name, valuer_uid, extra={
+                    "valuer_acct":   item.get("valuer_acct", ""),
+                    "tag":           item.get("tag", ""),
+                    "assessor":      item.get("assessor", ""),
+                    "parcel":        item.get("parcel", ""),
+                    "consideration": item.get("consideration", ""),
+                    "currency_code": item.get("currency_code", ""),
+                    "queued_at":     item.get("queued_at", ""),
+                })
             except Exception as _pe:
                 logger.error("persist_assignment failed for %s: %s", ref, _pe)
             outcome = {"ref": ref, "status": "✅ Assigned", "valuer_name": valuer_name, "held_by": ""}
