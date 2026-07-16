@@ -183,6 +183,22 @@ class TestLoadFetchTasks(unittest.TestCase):
             tasks, stats = ft._load_fetch_tasks(TOKENS, 5)
         self.assertEqual(tasks, [])
 
+    def test_hq_task_assessor_falls_back_to_officer_role_when_no_strict_match(self):
+        """Regression test: a County-registrar-only officer list used to
+        leave "assessor" blank, which then got cached and copied onto DLV
+        Batch queue items as blank too — surfacing as a missing Assessor in
+        the DLV Report even though Auto Fetch's own view showed a name
+        (its display-time-only fallback masked the same underlying gap)."""
+        hq_candidates = [{"id": "1", "application_id": "app-1", "reference_number": "R1",
+                           "date_created": "2026-07-10", "parcel_number": "P1"}]
+        hq_2a = {"stamp_duty_status": "SENT_TO_COLLECTOR", "application_status": "ongoing",
+                 "invoices": [], "county": "NAIROBI", "registry": "NAIROBI"}
+        hq_2b = {"details": {"officers": [{"names": "REDEMPTA AKOTH OKWANY", "role": "COUNTY_REGISTRAR"}]}}
+        patches = self._patches(hq_candidates=hq_candidates, hq_2a=hq_2a, hq_2b=hq_2b)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+            tasks, stats = ft._load_fetch_tasks(TOKENS, 5)
+        self.assertEqual(tasks[0]["assessor"], "REDEMPTA AKOTH OKWANY (COUNTY_REGISTRAR)")
+
     def test_county_task_kept_when_node_matches(self):
         county_candidates = [{"id": "1", "reference_number": "R2", "date_created": "2026-07-10"}]
         county_detail = {"details": {
@@ -198,6 +214,20 @@ class TestLoadFetchTasks(unittest.TestCase):
         self.assertEqual(len(tasks), 1)
         self.assertEqual(tasks[0]["source"], "County")
         self.assertEqual(stats["county_kept"], 1)
+
+    def test_county_task_assessor_falls_back_to_officer_role_when_no_strict_match(self):
+        county_candidates = [{"id": "1", "reference_number": "CNTYINV/IAJK47SO25", "date_created": "2026-07-14"}]
+        county_detail = {"details": {
+            "node": "STAMP_DUTY_PAYMENT_DEFINITION", "application_status": "ONGOING",
+            "reference_number": "CNTYINV/IAJK47SO25", "county": "NAIROBI", "registry": "CENTRAL",
+            "external_process_details": {"consideration_amount": "11500000", "currency_code": "KES",
+                                          "invoice": [], "process_type": "TRANSFER", "parcel_number": "LR NO.4859/80"},
+            "officers": [{"names": "REDEMPTA AKOTH OKWANY", "role": "COUNTY_REGISTRAR"}],
+        }}
+        patches = self._patches(county_candidates=county_candidates, county_detail=county_detail)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+            tasks, stats = ft._load_fetch_tasks(TOKENS, 5)
+        self.assertEqual(tasks[0]["assessor"], "REDEMPTA AKOTH OKWANY (COUNTY_REGISTRAR)")
 
     def test_county_task_skipped_when_wrong_node(self):
         county_candidates = [{"id": "1", "reference_number": "R2", "date_created": "2026-07-10"}]

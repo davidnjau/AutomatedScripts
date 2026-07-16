@@ -239,3 +239,22 @@ def _extract_assessor(officers: List[Dict]) -> str:
         (o.get("name", "") for o in officers if o.get("role") == "ASSESSOR_OF_STAMP_DUTY"),
         "",
     )
+
+
+def _resolve_assessor(officers: List[Dict]) -> str:
+    """Prefer the ASSESSOR_OF_STAMP_DUTY officer's name (_extract_assessor);
+    if no officer holds that exact role — e.g. a County ref's officer is a
+    COUNTY_REGISTRAR instead — fall back to listing whoever IS in the
+    officers list as "Name (ROLE)", rather than reporting a known name as
+    unknown just because the role label didn't match.
+
+    This is the single source of truth for a task's "assessor" field: it
+    must be resolved here, at data-fetch time (fetch_tasks.py's
+    _load_fetch_tasks), not at display time — the resolved value gets
+    cached (fetch_tasks_cache.py) and copied onto DLV Batch queue items,
+    and neither of those downstream consumers has access to the raw
+    officers list to fall back on later."""
+    assessor = _extract_assessor(officers)
+    if assessor:
+        return assessor
+    return ", ".join(f"{o.get('name', '')} ({o.get('role', '')})" for o in officers if o.get("name"))

@@ -96,6 +96,19 @@ class TestDtFetchTasksPriorityOrder(unittest.TestCase):
         self.assertTrue(row["found"])
         self.assertEqual(row["status"], "ONGOING")
 
+    def test_assessor_stage_falls_back_to_officer_role_when_no_strict_match(self):
+        """Regression test: a County ref's officer holds COUNTY_REGISTRAR,
+        not ASSESSOR_OF_STAMP_DUTY — strict extraction used to leave this
+        blank in the live Open Tasks report too."""
+        assessor_task = {"id": "1", "parcel_number": "P1", "registry": "NAIROBI", "county": "NAIROBI",
+                          "date_created": "2026-07-10"}
+        with patch.object(dlv_tasks, "_fetch_stampduty_detail",
+                           return_value={"application_status": "ONGOING",
+                                         "officers": [{"names": "REDEMPTA AKOTH OKWANY",
+                                                       "role": "COUNTY_REGISTRAR"}]}):
+            row = self._run(_batch_item(), _search_ref_stampduty=assessor_task)
+        self.assertEqual(row["assessor"], "REDEMPTA AKOTH OKWANY (COUNTY_REGISTRAR)")
+
     def test_dlv_found_with_assessor_takes_priority_over_item_field(self):
         dlv_task = {"id": "1", "parcel_number": "P1", "registry": "NAIROBI", "county": "NAIROBI",
                     "date_created": "2026-07-10", "_request_type": "STAMP_DUTY"}
