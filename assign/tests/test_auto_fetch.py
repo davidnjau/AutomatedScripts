@@ -281,6 +281,29 @@ class TestAutoFetchJob(unittest.TestCase):
             _run(af._auto_fetch_job(self.context))
         mock_send.assert_not_called()
 
+    def test_telegram_summary_uses_shared_labeled_block_format(self):
+        """The Telegram summary shares Fetch Tasks' _ft_format_task_block —
+        same visual as the email body, not its own bespoke one-liner."""
+        cfg = {"days_back": 2}
+        tasks = [_task(ref="REG/TSFR/AAA111", county="Mombasa", registry="Coast",
+                        parcel_number="MOMBASA/BLOCK5/9", assessor="John Assessor")]
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "persist_af_result"), \
+             patch.object(af, "ALLOWED_IDS", {111}):
+            _run(af._auto_fetch_job(self.context))
+        sent = "\n".join(c.args[1] for c in self.context.bot.send_message.call_args_list)
+        self.assertIn("📌 *Ref:* `REG/TSFR/AAA111`", sent)
+        self.assertIn("🗂 Source: HQ", sent)
+        self.assertIn("Assessor: John Assessor", sent)
+        self.assertIn("🏢 Registry: COAST", sent)
+        self.assertIn("📍 County: MOMBASA", sent)
+        self.assertIn("📋 Parcel: MOMBASA/BLOCK5/9", sent)
+        self.assertIn("💰 Consideration: KES 2,000,000.00", sent)
+
     def test_email_sent_when_configured(self):
         cfg = {"days_back": 2, "email": "ops@example.com"}
         tasks = [_task()]
@@ -512,13 +535,38 @@ class TestRecvAfResultDetail(unittest.TestCase):
             "run_id": "r1", "run_at": "t", "count": 1,
             "tasks": [{"ref": "REG/TSFR/X", "parcel": "P1", "county": "NAIROBI",
                        "registry": "CENTRAL", "date_created": "2026-07-10",
-                       "consideration": "1000", "assessor": "Jane"}],
+                       "consideration": "1000", "assessor": "Jane", "source": "HQ"}],
             "filters": {},
         }
         with patch.object(af, "load_af_results", return_value=[run]), \
              patch.object(af, "load_saved_assignments", return_value={}):
             _run(af.recv_af_result_detail(update, ctx))
         update.callback_query.message.reply_text.assert_called_once()
+        text = update.callback_query.message.reply_text.call_args[0][0]
+        self.assertIn("📌 *Ref:* `REG/TSFR/X`", text)
+        self.assertIn("🗂 Source: HQ", text)
+        self.assertIn("Assessor: Jane", text)
+        self.assertIn("💰 Consideration: KES 1,000.00", text)
+        self.assertIn("📋 Parcel: P1", text)
+        self.assertIn("🏢 Registry: CENTRAL", text)
+        self.assertIn("📍 County: NAIROBI", text)
+        self.assertIn("📅 Added: 2026-07-10", text)
+        self.assertIn("📊 Status: ⏳ pending", text)
+
+    def test_assigned_ref_shows_valuer_name_in_status(self):
+        update = self._make_query("r1")
+        ctx = MagicMock()
+        run = {
+            "run_id": "r1", "run_at": "t", "count": 1,
+            "tasks": [{"ref": "REG/TSFR/X", "assessor": "Jane"}],
+            "filters": {},
+        }
+        with patch.object(af, "load_af_results", return_value=[run]), \
+             patch.object(af, "load_saved_assignments",
+                           return_value={"REG/TSFR/X": {"valuer_name": "Byron"}}):
+            _run(af.recv_af_result_detail(update, ctx))
+        text = update.callback_query.message.reply_text.call_args[0][0]
+        self.assertIn("📊 Status: ✅ assigned to Byron", text)
 
 
 class TestRegisterRestoresSchedule(unittest.TestCase):
