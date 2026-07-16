@@ -53,7 +53,7 @@ from common import (
     not_cancel,
     persist_tokens,
 )
-from dlv_core import _extract_assessor, load_dlv_batch
+from dlv_core import _resolve_assessor, load_dlv_batch
 from endpoints import (
     ASSESSOR_STAGE_DETAIL_URL,
     ASSESSOR_STAGE_LIST_URL,
@@ -306,7 +306,7 @@ def _load_fetch_tasks(tokens: AuthTokens, days_back: int) -> Tuple[List[Dict], D
                 "currency_code":      d2a.get("currency_code", "KES"),
                 "parcel_number":      t.get("parcel_number", ""),
                 "officers":           officers,
-                "assessor":           _extract_assessor(officers),
+                "assessor":           _resolve_assessor(officers),
             })
             stats["hq_kept"] += 1
 
@@ -344,7 +344,7 @@ def _load_fetch_tasks(tokens: AuthTokens, days_back: int) -> Tuple[List[Dict], D
                     "currency_code":      ext.get("currency_code", "KES"),
                     "parcel_number":      ext.get("parcel_number") or t.get("parcel_number", ""),
                     "officers":           officers,
-                    "assessor":           _extract_assessor(officers),
+                    "assessor":           _resolve_assessor(officers),
                 })
                 stats["county_kept"] += 1
 

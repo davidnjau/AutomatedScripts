@@ -71,6 +71,34 @@ class TestExtractAssessor(unittest.TestCase):
         self.assertEqual(dlv_core._extract_assessor([]), "")
 
 
+class TestResolveAssessor(unittest.TestCase):
+    """_resolve_assessor — regression test for a real bug: a County ref's
+    officer holds COUNTY_REGISTRAR, not ASSESSOR_OF_STAMP_DUTY, so strict
+    extraction returned "" and the name was lost by the time it reached the
+    DLV Report (Auto Fetch's own display-time fallback masked the same gap
+    in its own view, so it looked fine there while being blank everywhere
+    that read the stored value instead)."""
+
+    def test_prefers_strict_assessor_role(self):
+        officers = [
+            {"name": "JOHN DOE", "role": "COUNTY_REGISTRAR"},
+            {"name": "JANE SMITH", "role": "ASSESSOR_OF_STAMP_DUTY"},
+        ]
+        self.assertEqual(dlv_core._resolve_assessor(officers), "JANE SMITH")
+
+    def test_falls_back_to_any_named_officer_when_no_strict_match(self):
+        officers = [{"name": "REDEMPTA AKOTH OKWANY", "role": "COUNTY_REGISTRAR"}]
+        self.assertEqual(
+            dlv_core._resolve_assessor(officers), "REDEMPTA AKOTH OKWANY (COUNTY_REGISTRAR)",
+        )
+
+    def test_empty_officers_returns_empty(self):
+        self.assertEqual(dlv_core._resolve_assessor([]), "")
+
+    def test_officer_without_a_name_is_skipped(self):
+        self.assertEqual(dlv_core._resolve_assessor([{"name": "", "role": "COUNTY_REGISTRAR"}]), "")
+
+
 class TestClassifyDlvDetail(unittest.TestCase):
     def test_completed_is_closed(self):
         detail = {

@@ -57,9 +57,9 @@ from dlv_core import (
     DLV_TAGS,
     _append_dlv_closed,
     _classify_dlv_detail,
-    _extract_assessor,
     _fetch_ref_detail_dlv,
     _fetch_stampduty_detail,
+    _resolve_assessor,
     _search_ref_dlv,
     _search_ref_stampduty,
     load_dlv_batch,
@@ -169,7 +169,7 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
 
                 det = _fetch_stampduty_detail(tokens, assessor_task["id"])
                 if det:
-                    row["assessor"] = _extract_assessor([
+                    row["assessor"] = _resolve_assessor([
                         {"name": o.get("names", ""), "role": o.get("role", "")}
                         for o in det.get("officers", [])
                     ])
