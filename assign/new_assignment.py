@@ -79,7 +79,7 @@ from endpoints import (
     AUTH_OTP_VERIFY_URL,
     STAMP_DUTY_FIX_APPLICATION_URL,
 )
-from lookup_reference import _lu_fetch_detail, _lu_format_result, _lu_search_ref
+from lookup_reference import _lu_extract_context, _lu_fetch_detail, _lu_format_result, _lu_search_ref
 from telegram_report import _send_chunked_report
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -787,30 +787,35 @@ async def recv_valuer_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────
 # Post-assignment verification — built on Lookup Reference's primitives
 # ──────────────────────────────────────────────────────────
-def _lookup_one_ref(tokens: AuthTokens, ref: str) -> str:
-    """Search + detail-fetch for a single ref. Returns a formatted result string."""
+def _lookup_one_ref(tokens: AuthTokens, ref: str) -> Tuple[str, Dict]:
+    """Search + detail-fetch for a single ref. Returns (formatted result
+    string for display, raw context dict for persist_assignment enrichment)."""
     item = _lu_search_ref(tokens, ref)
     if not item:
-        return f"⚠️ `{ref}` — not found in post-assignment lookup"
+        return f"⚠️ `{ref}` — not found in post-assignment lookup", {}
     detail = _lu_fetch_detail(tokens, item["id"])
-    return _lu_format_result(ref, item, detail)
+    return _lu_format_result(ref, item, detail), _lu_extract_context(item, detail)
 
 
-def _post_assignment_report(tokens: AuthTokens, ok_refs: List[str]) -> List[str]:
+def _post_assignment_report(tokens: AuthTokens, ok_refs: List[str]) -> Tuple[List[str], Dict[str, Dict]]:
     """
-    Run lookups for all successfully assigned refs in parallel and return a
-    list of message strings (each ≤ 4000 chars) ready to send to Telegram.
+    Run lookups for all successfully assigned refs in parallel. Returns
+    (chunked message pages ready for Telegram, each ok ref's raw
+    parcel/consideration/registry/county context for enriching its
+    saved_assignments.json record — see recv_confirm).
     """
     results: Dict[str, str] = {}
+    extras:  Dict[str, Dict] = {}
     workers = min(len(ok_refs), 10)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         fut_map = {pool.submit(_lookup_one_ref, tokens, ref): ref for ref in ok_refs}
         for fut in _futures_as_completed(fut_map):
             ref = fut_map[fut]
             try:
-                results[ref] = fut.result()
+                results[ref], extras[ref] = fut.result()
             except Exception as e:
                 results[ref] = f"⚠️ `{ref}` — lookup error: {e}"
+                extras[ref] = {}
 
     # Build paginated messages — start each page with the header
     header    = "📋 *Post-Assignment Verification*\n"
@@ -830,7 +835,8 @@ def _post_assignment_report(tokens: AuthTokens, ok_refs: List[str]) -> List[str]
     if current.strip() and current.strip() != header.strip():
         messages.append(current.rstrip())
 
-    return messages if messages else [header + "\nNo results returned."]
+    pages = messages if messages else [header + "\nNo results returned."]
+    return pages, extras
 
 
 # ──────────────────────────────────────────────────────────
@@ -891,7 +897,7 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if ok_refs:
         persist_valuer(name, uid, acct)          # auto-save valuer for future assignments
         for ref in ok_refs:
-            persist_assignment(ref, name, uid)   # record ref → valuer mapping
+            persist_assignment(ref, name, uid, extra={"valuer_acct": acct})   # record ref → valuer mapping
 
     header = (
         f"🏁 *Assignment Complete*\n\n"
@@ -913,10 +919,23 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if ok_refs:
         await query.message.reply_text("🔍 Fetching post-assignment status…", parse_mode="Markdown")
-        pages = await asyncio.to_thread(_post_assignment_report, sess.tokens, ok_refs)
+        pages, extras = await asyncio.to_thread(_post_assignment_report, sess.tokens, ok_refs)
         for i, page in enumerate(pages):
             markup = _main_menu() if i == len(pages) - 1 else None
             await query.message.reply_text(page, parse_mode="Markdown", reply_markup=markup)
+
+        # Enrich each already-persisted assignment with parcel/consideration/
+        # registry/county now that the post-assignment lookup has them —
+        # best-effort, so a lookup/write hiccup here doesn't affect the
+        # assignment itself, which was already recorded above.
+        for ref in ok_refs:
+            ctx_extra = extras.get(ref)
+            if not ctx_extra:
+                continue
+            try:
+                persist_assignment(ref, name, uid, extra={"valuer_acct": acct, **ctx_extra})
+            except Exception as e:
+                logger.error("persist_assignment enrichment failed for %s: %s", ref, e)
 
     return ConversationHandler.END
 

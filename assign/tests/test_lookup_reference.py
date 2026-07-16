@@ -100,6 +100,35 @@ class TestLuFormatResult(unittest.TestCase):
         self.assertIn("Unassigned", result)   # node label lookup
 
 
+class TestLuExtractContext(unittest.TestCase):
+    """_lu_extract_context — the raw-value counterpart to _lu_format_result,
+    for callers (new_assignment.py) that persist rather than display it."""
+
+    def test_no_detail_falls_back_to_item_fields(self):
+        item = {"registry": "NAIROBI", "county": "NAIROBI", "parcel_number": "P1"}
+        ctx = lu._lu_extract_context(item, None)
+        self.assertEqual(ctx["registry"], "NAIROBI")
+        self.assertEqual(ctx["county"], "NAIROBI")
+        self.assertEqual(ctx["parcel"], "P1")
+        self.assertEqual(ctx["consideration"], "")
+        self.assertEqual(ctx["currency_code"], "KES")
+
+    def test_detail_fields_take_priority_over_item(self):
+        item = {"registry": "MOMBASA", "county": "MOMBASA"}
+        detail = {
+            "registry": "NAIROBI", "county": "NAIROBI",
+            "external_process_details": {
+                "consideration_amount": "500000", "currency_code": "KES", "parcel_number": "NEW",
+            },
+        }
+        ctx = lu._lu_extract_context(item, detail)
+        self.assertEqual(ctx["registry"], "NAIROBI")
+        self.assertEqual(ctx["county"], "NAIROBI")
+        self.assertEqual(ctx["parcel"], "NEW")
+        self.assertEqual(ctx["consideration"], "500000")
+        self.assertEqual(ctx["currency_code"], "KES")
+
+
 class TestCmdLookup(unittest.TestCase):
     def test_no_valid_tokens_ends_conversation(self):
         update = _make_update_with_message()
