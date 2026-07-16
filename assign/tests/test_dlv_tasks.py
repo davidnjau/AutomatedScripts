@@ -11,11 +11,14 @@ Run with: python3 -m unittest discover -s assign/tests -v
 """
 
 import asyncio
+import io
 import os
 import sys
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import openpyxl
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -190,6 +193,47 @@ class TestFormatConsideration(unittest.TestCase):
 
     def test_non_numeric_amount_falls_back_to_str(self):
         self.assertEqual(dlv_tasks._format_consideration("N/A", "KES"), "N/A")
+
+
+class TestDtRowConsiderationValue(unittest.TestCase):
+    """_dt_row_consideration_value — parses the already-formatted
+    "KES 1,234.00" string back to a number for Excel-export sorting."""
+
+    def test_parses_formatted_string(self):
+        self.assertEqual(dlv_tasks._dt_row_consideration_value({"consideration": "KES 6,000,000.00"}), 6000000.0)
+
+    def test_missing_sorts_last(self):
+        self.assertEqual(dlv_tasks._dt_row_consideration_value({}), -1.0)
+
+    def test_unparseable_sorts_last(self):
+        self.assertEqual(dlv_tasks._dt_row_consideration_value({"consideration": "N/A"}), -1.0)
+
+
+class TestDtBuildExcelSortOrder(unittest.TestCase):
+    """_dt_build_excel — only ever used for email delivery, so sorting rows
+    here highest-consideration-first affects just the emailed file."""
+
+    def _refs_in_sheet_order(self, xlsx_bytes):
+        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
+        ws = wb.active
+        return [row[0] for row in ws.iter_rows(min_row=2, values_only=True)]
+
+    def test_rows_ordered_highest_consideration_first(self):
+        rows = [
+            {"ref": "LOW", "consideration": "KES 1,000,000.00"},
+            {"ref": "HIGH", "consideration": "KES 9,000,000.00"},
+            {"ref": "MID", "consideration": "KES 5,000,000.00"},
+        ]
+        xlsx_bytes = dlv_tasks._dt_build_excel(rows)
+        self.assertEqual(self._refs_in_sheet_order(xlsx_bytes), ["HIGH", "MID", "LOW"])
+
+    def test_missing_consideration_sorts_after_real_amounts(self):
+        rows = [
+            {"ref": "NO_AMOUNT"},
+            {"ref": "HAS_AMOUNT", "consideration": "KES 1,000,000.00"},
+        ]
+        xlsx_bytes = dlv_tasks._dt_build_excel(rows)
+        self.assertEqual(self._refs_in_sheet_order(xlsx_bytes), ["HAS_AMOUNT", "NO_AMOUNT"])
 
 
 class TestDtFormatTaskBlock(unittest.TestCase):

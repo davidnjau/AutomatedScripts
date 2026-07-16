@@ -32,6 +32,13 @@ results for this reason.
 
 Call register(app) from bot.py's main() to wire this feature in (this
 also restores one repeating job per saved schedule on startup).
+
+Email delivery is deduplicated per schedule: saved_af_email_state.json
+(load_af_email_state/save_af_email_state) tracks the ref set actually
+emailed last cycle, keyed by schedule id. A cycle whose current ref set
+matches exactly is skipped — the Telegram summary still sends every cycle
+regardless. Any difference (new/dropped ref) sends the full current list,
+not just the delta, and updates the stored set.
 """
 
 import json
@@ -87,8 +94,9 @@ from endpoints import STAMP_DUTY_FIX_APPLICATION_URL
 from fetch_tasks import _ft_format_task_block, _load_fetch_tasks
 from telegram_report import _send_chunked_report
 
-SAVED_AUTO_FETCH_FILE = os.path.join(DATA_DIR, "saved_auto_fetch.json")
-SAVED_AF_RESULTS_FILE = os.path.join(DATA_DIR, "saved_af_results.json")
+SAVED_AUTO_FETCH_FILE     = os.path.join(DATA_DIR, "saved_auto_fetch.json")
+SAVED_AF_RESULTS_FILE     = os.path.join(DATA_DIR, "saved_af_results.json")
+SAVED_AF_EMAIL_STATE_FILE = os.path.join(DATA_DIR, "saved_af_email_state.json")
 
 
 # ──────────────────────────────────────────────────────────
@@ -255,6 +263,23 @@ def persist_af_result(run_id: str, run_at: str, tasks: List[Dict], cfg: Dict) ->
     _atomic_json_write(SAVED_AF_RESULTS_FILE, results, indent=2)
 
 
+# ── Auto Fetch email dedup — skip re-sending an unchanged task list ──────
+
+def load_af_email_state() -> Dict[str, List[str]]:
+    """{schedule_id: [ref, ...]} — the ref set actually emailed last time,
+    per schedule. Used so a cycle with the exact same tasks as last time
+    doesn't re-send the identical email."""
+    try:
+        with open(SAVED_AF_EMAIL_STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_af_email_state(state: Dict[str, List[str]]) -> None:
+    _atomic_json_write(SAVED_AF_EMAIL_STATE_FILE, state, indent=2)
+
+
 def _af_interval_keyboard() -> InlineKeyboardMarkup:
     rows = []
     row  = []
@@ -357,6 +382,10 @@ async def recv_af_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for job in ctx.job_queue.get_jobs_by_name(f"auto_fetch_job:{schedule_id}"):
         job.schedule_removal()
     removed = remove_auto_fetch_schedule(schedule_id)
+
+    email_state = load_af_email_state()
+    if email_state.pop(schedule_id, None) is not None:
+        save_af_email_state(email_state)
 
     label = (cfg or {}).get("email") or "Telegram only"
     msg = f"🗑 Removed the schedule for *{label}*." if removed else "⚠️ That schedule was already removed."
@@ -583,6 +612,18 @@ async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+def _af_consideration_value(t: dict) -> float:
+    """Numeric consideration for sorting the email body highest-to-lowest;
+    missing/unparseable sorts last (below every real amount, which is >= 0)."""
+    raw = t.get("consideration")
+    if not raw:
+        return -1.0
+    try:
+        return float(str(raw).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return -1.0
+
+
 async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Background job for one schedule: fetch tasks with that schedule's
     settings and notify. Each schedule gets its own repeating job, tagged
@@ -752,19 +793,35 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.warning("Auto Fetch notify error for %s: %s", chat_id, e)
         await _send_chunked_report(_send, [header] + lines, join="\n\n")
 
-    # Email notification
+    # Email notification — skipped if this schedule's current ref set is
+    # identical to what was actually emailed last cycle (same tasks, same
+    # filters, nothing new). Any difference (a new ref, a dropped one) sends
+    # the full current list, not just the delta.
     email = cfg.get("email", "")
     if email:
+        schedule_id  = cfg.get("id", "")
+        current_refs = sorted(t.get("reference_number", "") for t in tasks)
+        email_state  = load_af_email_state()
+        if current_refs == email_state.get(schedule_id):
+            logger.info(
+                "Auto Fetch email skipped for %s — same %d task(s) as last send.",
+                email, len(current_refs),
+            )
+            return
+
         plain_header = (
             f"Auto Fetch — {len(tasks)} task(s)\n"
             f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | {sec_label}\n"
             + "─" * 60 + "\n\n"
         )
-        plain_body    = plain_header + "\n\n".join(_ft_format_task_block(i, t) for i, t in enumerate(tasks, 1))
+        email_tasks   = sorted(tasks, key=_af_consideration_value, reverse=True)
+        plain_body    = plain_header + "\n\n".join(_ft_format_task_block(i, t) for i, t in enumerate(email_tasks, 1))
         email_subject = f"Auto Fetch — {len(tasks)} task(s) found"
         try:
             _send_auto_fetch_email(email, email_subject, plain_body)
             logger.info("Auto Fetch email sent to %s", email)
+            email_state[schedule_id] = current_refs
+            save_af_email_state(email_state)
         except Exception as e:
             # Unlike the Telegram summary above, this used to fail silently —
             # only a log line, nothing surfaced — so a broken SMTP config on

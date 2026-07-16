@@ -433,6 +433,16 @@ def _be_extract_row(detail: dict) -> dict:
     }
 
 
+def _be_land_value(r: dict) -> float:
+    """Numeric land value for sorting highest-to-lowest; missing/unparseable
+    sorts last (below every real amount, which is >= 0)."""
+    raw = r.get("Valuer Total Land Value (KES)", "")
+    try:
+        return float(str(raw).replace(",", "").strip()) if raw else -1.0
+    except (ValueError, TypeError):
+        return -1.0
+
+
 def _be_build_excel(rows: List[dict]) -> bytes:
     """Build the formatted Excel workbook and return the raw bytes."""
     wb = openpyxl.Workbook()
@@ -763,9 +773,9 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop,
                 )
                 return
 
-        # ── Step 3: sort final rows by date, build Excel, send ────
+        # ── Step 3: sort final rows by land value (highest first), build Excel, send ────
         _set_status(phase="building excel")
-        rows.sort(key=lambda r: (r.get("Application Date Created") or ""))
+        rows.sort(key=_be_land_value, reverse=True)
 
         clear_be_partial()
         rtype_label = "Ardhisasa" if report_type == "ardhisasa" else "Ardhipay"

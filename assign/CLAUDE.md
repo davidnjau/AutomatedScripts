@@ -190,6 +190,7 @@ JSON files in `./data/` (mounted as Docker volume `bot_data`):
 - `saved_dlv_batch.json` / `saved_dlv_closed.json` — the DLV Batch active queue and closed store (`[{ref, valuer_name, valuer_uid, valuer_acct, queued_at, assessor, tag, last_error}]`); `tag` is optional, set via DLV Batch's "🏷 Tag Tasks" step from `dlv_core.DLV_TAGS`, and carries through to the closed record automatically
 - `saved_auto_fetch.json` — `[{id, interval_minutes, days_back, county_filter, registry_filter, amount_min, amount_max, sectional_filter, email}]` — every active Auto Fetch schedule; each gets its own repeating job (`auto_fetch_job:{id}`), independently addable/removable via the ⏰ Auto Fetch menu. A pre-multi-schedule file (a bare dict, not a list) is migrated to this shape the first time it's read.
 - `saved_af_results.json` — Auto Fetch run history (last 20 runs across all schedules), each record tagged with `schedule_id`/`schedule_label` so runs from different schedules are distinguishable in 🗂 AF Results
+- `saved_af_email_state.json` — `{schedule_id: [ref, ...]}`, the ref set actually emailed last cycle per Auto Fetch schedule; a cycle whose current ref set matches exactly is skipped rather than re-sending an identical email (the Telegram summary still sends every cycle regardless) — cleared for a schedule when it's removed via 🗑 Remove Schedule
 - `daemon.pid` / `daemon.log` — token refresh daemon process tracking
 
 ## Git Workflow

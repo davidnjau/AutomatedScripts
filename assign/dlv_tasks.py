@@ -309,7 +309,24 @@ async def _dt_run_delete_select(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT
     return DT.DELETE_SELECT
 
 
+def _dt_row_consideration_value(r: dict) -> float:
+    """Numeric consideration for sorting the Excel export highest-to-lowest.
+    The row's "consideration" field is already formatted ("KES 1,234.00" by
+    _format_consideration), so strip everything but digits/decimal point
+    before parsing. Missing/unparseable sorts last (below every real
+    amount, which is >= 0)."""
+    digits = re.sub(r"[^\d.]", "", r.get("consideration") or "")
+    try:
+        return float(digits) if digits else -1.0
+    except ValueError:
+        return -1.0
+
+
 def _dt_build_excel(rows: List[dict]) -> bytes:
+    """Build the DLV Tasks Excel export — only ever used for email delivery
+    (Telegram delivery goes through _dt_send_telegram instead), so sorting
+    rows here highest-consideration-first affects only the emailed file."""
+    rows = sorted(rows, key=_dt_row_consideration_value, reverse=True)
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "DLV Tasks"
