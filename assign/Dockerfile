@@ -12,6 +12,7 @@ COPY common.py .
 COPY endpoints.py .
 COPY dlv_core.py .
 COPY fetch_tasks_cache.py .
+COPY task_block.py .
 COPY dlv_batch.py .
 COPY dlv_tasks.py .
 COPY hold_tasks.py .

@@ -8,6 +8,13 @@ a per-valuer report and a per-tag report (each: queued + closed history,
 filterable by look-back period — see _dt_format_report_lines, shared by
 both), plus the multi-select bulk-delete flow for the open queue.
 
+Every report's per-task block (_dt_format_task_block for Open Tasks,
+_dt_format_report_item_block for Closed/By Valuer/By Tag) is built from
+task_block.py's shared field builders and rendered via its
+format_labeled_block — the one visual every report in the bot uses
+(Fetch Tasks' own view and Auto Fetch's email included). Only which
+fields get passed in differs per report.
+
 _dt_fetch_tasks, _dt_build_excel, and _dt_send_telegram are also used by
 Morning Briefing (bot.py), which stays in bot.py for now since it owns its
 own conversation/job but depends on this feature's report-building.
@@ -69,6 +76,14 @@ from dlv_core import (
 from email_service import _send_bulk_export_email
 from excel_report import autofit_columns, style_header_row
 from fetch_tasks_cache import _fetch_tasks_log_lookup
+from task_block import (
+    assessor_field,
+    consideration_field,
+    format_consideration,
+    format_labeled_block,
+    parcel_field,
+    tag_field,
+)
 from telegram_report import _send_chunked_report
 
 
@@ -111,16 +126,6 @@ def _get_dt_sess(ctx: ContextTypes.DEFAULT_TYPE) -> DTSession:
 # ──────────────────────────────────────────────────────────
 # DLV Tasks — fetch and enrich ongoing tasks
 # ──────────────────────────────────────────────────────────
-
-def _format_consideration(amount: str, currency: str) -> str:
-    """Format a raw consideration amount + currency code as 'KES 6,000,000.00', or '' if amount is empty."""
-    if not amount:
-        return ""
-    try:
-        return f"{currency or 'KES'} {float(amount):,.2f}"
-    except (ValueError, TypeError):
-        return str(amount)
-
 
 def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
     """
@@ -206,7 +211,7 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
                         row["assessor"]      = info["assessor_name"]
                         row["status"]        = info["application_status"]
                         row["node"]          = info["node"]
-                        row["consideration"] = _format_consideration(
+                        row["consideration"] = format_consideration(
                             info["consideration_amount"], info["currency_code"]
                         )
         except Exception as e:
@@ -549,47 +554,33 @@ def _dt_sum_consideration(items: List[dict]) -> str:
     KES, as everywhere else in this bot — no multi-currency handling)."""
     values = [v for v in (_dt_consideration_value(i) for i in items) if v is not None]
     currency = next((i.get("currency_code") for i in items if i.get("currency_code")), "KES")
-    return _format_consideration(str(sum(values)), currency) if values else _format_consideration("0", currency)
-
-
-def _dt_format_labeled_block(i: int, ref: str, fields: List[Tuple[str, str]]) -> str:
-    """The one shared visual — a numbered block, a bold/backticked Ref
-    header (tap-to-copy in Telegram), then each (label, value) pair on its
-    own indented line — used by every DLV Tasks report (Open Tasks, Closed
-    Tasks, By Valuer, By Tag). Only the ref and which fields get passed in
-    differ per report; the layout itself is identical everywhere."""
-    lines = [f"  {i}. 📌 *Ref:* `{ref or '—'}`"]
-    lines += [f"     {label}: {value}" for label, value in fields]
-    return "\n".join(lines)
+    return format_consideration(str(sum(values)), currency) if values else format_consideration("0", currency)
 
 
 def _dt_format_report_item_block(i: int, item: dict, show_valuer: bool, is_closed: bool) -> str:
-    """One ref's labeled block for the By Valuer/By Tag reports — Ref,
-    Consideration, Parcel, Assessor, Tag, plus Valuer (By Tag only, since it
-    spans multiple valuers) and either Queued or Closed-with-status."""
-    assessor = item.get("assessor") or "—"
-    parcel   = item.get("parcel") or "—"
-    consider = _format_consideration(
-        str(item.get("consideration_amount") or item.get("consideration") or ""),
-        item.get("currency_code", ""),
-    ) or "—"
-
+    """One ref's labeled block for the Closed/By Valuer/By Tag reports —
+    Assessor, Consideration, Parcel (task_block.py's shared field
+    builders), plus Valuer (By Tag/Closed only, since both span multiple
+    valuers) and either Queued or Closed-with-status. See
+    task_block.format_labeled_block for the shared visual every report in
+    the bot uses — only these fields differ."""
     fields: List[Tuple[str, str]] = []
     if show_valuer:
         fields.append(("👤 Valuer", item.get("valuer_name") or "—"))
-    fields.append(("Assessor", assessor))
-    fields.append(("💰 Consideration", consider))
-    fields.append(("📋 Parcel", parcel))
+    fields.append(assessor_field(item))
+    fields.append(consideration_field(item))
+    fields.append(parcel_field(item))
     if is_closed:
         label_for = {"completed": "✅ Completed", "returned": "↩️ Returned"}
         status_label = label_for.get(item.get("closed_reason"), "❓ Unknown")
         fields.append(("📅 Closed", f"{(item.get('closed_at') or '—')[:16]} ({status_label})"))
     else:
         fields.append(("📅 Queued", (item.get("queued_at") or "—")[:16]))
-    if item.get("tag"):
-        fields.append(("🏷 Tag", item["tag"]))
+    tag = tag_field(item)
+    if tag:
+        fields.append(tag)
 
-    return _dt_format_labeled_block(i, item.get("ref"), fields)
+    return format_labeled_block(i, item.get("ref"), fields)
 
 
 def _dt_format_report_lines(header: str, queued: List[dict], closed: List[dict], period_label: str,
@@ -931,8 +922,8 @@ async def recv_dt_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 def _dt_format_task_block(i: int, t: dict) -> str:
     """Open Tasks' full detail block (status, node, valuer, assessor,
     registry, county, consideration, parcel, added) — see
-    _dt_format_labeled_block for the shared visual every DLV Tasks report
-    uses; only the fields differ per report."""
+    task_block.format_labeled_block for the shared visual every report in
+    the bot uses; only these fields differ."""
     node_label = _NODE_LABELS.get(t.get("node", ""), t.get("node") or "—")
     location   = t.get("location", "")
     if location == "assessor":
@@ -946,17 +937,18 @@ def _dt_format_task_block(i: int, t: dict) -> str:
         ("📊 Status", t.get("status") or "—"),
         ("🔄 Node", node_label),
         ("👤 Valuer", t.get("valuer_name") or "—"),
-        ("Assessor", t.get("assessor") or "—"),
+        assessor_field(t),
         ("🏢 Registry", t.get("registry") or "—"),
         ("📍 County", t.get("county") or "—"),
-        ("💰 Consideration", t.get("consideration") or "—"),
-        ("📋 Parcel", t.get("parcel") or "—"),
+        consideration_field(t),
+        parcel_field(t),
         ("📅 Added", t.get("date_created") or "—"),
     ]
-    if t.get("tag"):
-        fields.append(("🏷 Tag", t["tag"]))
+    tag = tag_field(t)
+    if tag:
+        fields.append(tag)
 
-    block = _dt_format_labeled_block(i, t.get("ref"), fields)
+    block = format_labeled_block(i, t.get("ref"), fields)
     if note:
         block += f"\n     {note}"
     return block
