@@ -293,6 +293,27 @@ class TestAutoFetchJob(unittest.TestCase):
         self.assertIn("📍 County: MOMBASA", body)
         self.assertIn("📋 Parcel: MOMBASA/BLOCK5/9", body)
 
+    def test_email_body_lists_tasks_highest_consideration_first(self):
+        cfg = {"days_back": 2, "email": "ops@example.com"}
+        tasks = [
+            _task(ref="LOW", consideration="1000000"),
+            _task(ref="HIGH", consideration="9000000"),
+            _task(ref="MID", consideration="5000000"),
+        ]
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "persist_af_result"), \
+             patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
+             patch.object(af, "ALLOWED_IDS", set()), \
+             patch.object(af, "_send_auto_fetch_email") as mock_email:
+            _run(af._auto_fetch_job(self.context))
+        body = mock_email.call_args[0][2]
+        self.assertLess(body.index("Ref: HIGH"), body.index("Ref: MID"))
+        self.assertLess(body.index("Ref: MID"), body.index("Ref: LOW"))
+
     def test_email_failure_notifies_telegram_instead_of_failing_silently(self):
         """Regression test: an SMTP error used to be swallowed by a log line only,
         so a broken server-side email config looked identical to success."""
@@ -488,6 +509,23 @@ class TestRecvAfEmail(unittest.TestCase):
         with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1") as mock_add:
             _run(af.recv_af_email(self.update, self.ctx))
         self.assertEqual(mock_add.call_args[0][0]["email"], "")
+
+
+class TestAfConsiderationValue(unittest.TestCase):
+    """_af_consideration_value — sort key for the email body, missing/
+    unparseable amounts sort last (below every real amount)."""
+
+    def test_parses_numeric_string(self):
+        self.assertEqual(af._af_consideration_value({"consideration": "2000000"}), 2000000.0)
+
+    def test_strips_commas(self):
+        self.assertEqual(af._af_consideration_value({"consideration": "2,000,000"}), 2000000.0)
+
+    def test_missing_sorts_last(self):
+        self.assertEqual(af._af_consideration_value({}), -1.0)
+
+    def test_unparseable_sorts_last(self):
+        self.assertEqual(af._af_consideration_value({"consideration": "N/A"}), -1.0)
 
 
 class TestAfFormatScheduleSummary(unittest.TestCase):

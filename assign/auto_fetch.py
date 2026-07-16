@@ -583,6 +583,18 @@ async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+def _af_consideration_value(t: dict) -> float:
+    """Numeric consideration for sorting the email body highest-to-lowest;
+    missing/unparseable sorts last (below every real amount, which is >= 0)."""
+    raw = t.get("consideration")
+    if not raw:
+        return -1.0
+    try:
+        return float(str(raw).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return -1.0
+
+
 async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Background job for one schedule: fetch tasks with that schedule's
     settings and notify. Each schedule gets its own repeating job, tagged
@@ -760,7 +772,8 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | {sec_label}\n"
             + "─" * 60 + "\n\n"
         )
-        plain_body    = plain_header + "\n\n".join(_ft_format_task_block(i, t) for i, t in enumerate(tasks, 1))
+        email_tasks   = sorted(tasks, key=_af_consideration_value, reverse=True)
+        plain_body    = plain_header + "\n\n".join(_ft_format_task_block(i, t) for i, t in enumerate(email_tasks, 1))
         email_subject = f"Auto Fetch — {len(tasks)} task(s) found"
         try:
             _send_auto_fetch_email(email, email_subject, plain_body)
