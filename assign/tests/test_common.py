@@ -60,6 +60,41 @@ class TestSectionalConfigPersistence(unittest.TestCase):
         self.assertEqual(cfg["cred_type"], "staff2")
 
 
+class TestPersistAssignment(unittest.TestCase):
+    """persist_assignment — ref -> valuer_name/valuer_uid/assigned_at, plus
+    whatever extra context a caller passes (e.g. DLV Batch's queue item)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.assign_file = os.path.join(self.tmpdir.name, "saved_assignments.json")
+        self._patch = patch.object(common, "SAVED_ASSIGNMENTS_FILE", self.assign_file)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self.tmpdir.cleanup()
+
+    def test_basic_fields_saved_without_extra(self):
+        common.persist_assignment("REF1", "Jane Doe", "uid-1")
+        record = common.load_saved_assignments()["REF1"]
+        self.assertEqual(record["valuer_name"], "Jane Doe")
+        self.assertEqual(record["valuer_uid"], "uid-1")
+        self.assertIn("assigned_at", record)
+
+    def test_extra_fields_merged_in(self):
+        common.persist_assignment("REF1", "Jane Doe", "uid-1", extra={
+            "tag": "Queue", "parcel": "P1", "consideration": "1000000", "currency_code": "KES",
+        })
+        record = common.load_saved_assignments()["REF1"]
+        self.assertEqual(record["tag"], "Queue")
+        self.assertEqual(record["parcel"], "P1")
+        self.assertEqual(record["consideration"], "1000000")
+        self.assertEqual(record["currency_code"], "KES")
+        # core fields still present alongside extra
+        self.assertEqual(record["valuer_name"], "Jane Doe")
+
+
+
 class TestBeCredKeyboard(unittest.TestCase):
     def test_no_valid_tokens_returns_none(self):
         with patch.object(common, "get_valid_tokens", return_value=None):
