@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_c
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import asyncio
 import openpyxl
@@ -423,34 +423,29 @@ async def _dt_run_open_tasks(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TY
 
 
 async def _dt_send_closed_report(chat_id: int, rows: List[dict], bot) -> None:
-    """Send the Closed DLV Tasks list (Completed + Returned), grouped by reason."""
+    """Send the Closed DLV Tasks list (Completed + Returned), grouped by
+    reason, each task rendered as the same labeled block every other DLV
+    Tasks report uses (see _dt_format_report_item_block) instead of a
+    packed one-liner."""
     from collections import defaultdict
     groups: dict = defaultdict(list)
     for r in rows:
         groups[r.get("closed_reason") or "unknown"].append(r)
 
     label_for = {"completed": "✅ Completed", "returned": "↩️ Returned", "unknown": "❓ Unknown"}
-    lines = [f"🔒 *Closed DLV Tasks* — {len(rows)} task(s)\n"]
+    lines = [f"🔒 *Closed DLV Tasks* — {len(rows)} task(s)"]
     for reason in ("completed", "returned", "unknown"):
         tasks = groups.get(reason)
         if not tasks:
             continue
-        lines.append(f"\n{label_for[reason]} ({len(tasks)})")
+        lines.append(f"{label_for[reason]} ({len(tasks)})")
         for i, t in enumerate(tasks, start=1):
-            currency   = t.get("currency_code") or ""
-            amount     = t.get("consideration_amount") or ""
-            amount_str = f" | {currency} {amount}" if amount else ""
-            closed_at  = (t.get("closed_at") or "")[:10]
-            tag_str    = f" | 🏷 {t['tag']}" if t.get("tag") else ""
-            lines.append(
-                f"  {i}. `{t.get('ref', '—')}` | Valuer: {t.get('valuer_name') or '—'}"
-                f"{amount_str} | Closed: {closed_at or '—'}{tag_str}"
-            )
+            lines.append(_dt_format_report_item_block(i, t, show_valuer=True, is_closed=True))
 
     async def _send(text, reply_markup):
         await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
 
-    await _send_chunked_report(_send, lines, join="\n")
+    await _send_chunked_report(_send, lines, join="\n\n")
 
 
 # ──────────────────────────────────────────────────────────
@@ -557,34 +552,44 @@ def _dt_sum_consideration(items: List[dict]) -> str:
     return _format_consideration(str(sum(values)), currency) if values else _format_consideration("0", currency)
 
 
+def _dt_format_labeled_block(i: int, ref: str, fields: List[Tuple[str, str]]) -> str:
+    """The one shared visual — a numbered block, a bold/backticked Ref
+    header (tap-to-copy in Telegram), then each (label, value) pair on its
+    own indented line — used by every DLV Tasks report (Open Tasks, Closed
+    Tasks, By Valuer, By Tag). Only the ref and which fields get passed in
+    differ per report; the layout itself is identical everywhere."""
+    lines = [f"  {i}. 📌 *Ref:* `{ref or '—'}`"]
+    lines += [f"     {label}: {value}" for label, value in fields]
+    return "\n".join(lines)
+
+
 def _dt_format_report_item_block(i: int, item: dict, show_valuer: bool, is_closed: bool) -> str:
     """One ref's labeled block for the By Valuer/By Tag reports — Ref,
     Consideration, Parcel, Assessor, Tag, plus Valuer (By Tag only, since it
     spans multiple valuers) and either Queued or Closed-with-status."""
-    ref         = item.get("ref") or "—"
-    assessor    = item.get("assessor") or "—"
-    parcel      = item.get("parcel") or "—"
-    consider    = _format_consideration(
+    assessor = item.get("assessor") or "—"
+    parcel   = item.get("parcel") or "—"
+    consider = _format_consideration(
         str(item.get("consideration_amount") or item.get("consideration") or ""),
         item.get("currency_code", ""),
     ) or "—"
 
-    lines = [f"  {i}. 📌 *Ref:* `{ref}`"]
+    fields: List[Tuple[str, str]] = []
     if show_valuer:
-        lines.append(f"     👤 Valuer: {item.get('valuer_name') or '—'}")
-    lines.append(f"     Assessor: {assessor}")
-    lines.append(f"     💰 Consideration: {consider}")
-    lines.append(f"     📋 Parcel: {parcel}")
+        fields.append(("👤 Valuer", item.get("valuer_name") or "—"))
+    fields.append(("Assessor", assessor))
+    fields.append(("💰 Consideration", consider))
+    fields.append(("📋 Parcel", parcel))
     if is_closed:
         label_for = {"completed": "✅ Completed", "returned": "↩️ Returned"}
         status_label = label_for.get(item.get("closed_reason"), "❓ Unknown")
-        lines.append(f"     📅 Closed: {(item.get('closed_at') or '—')[:16]} ({status_label})")
+        fields.append(("📅 Closed", f"{(item.get('closed_at') or '—')[:16]} ({status_label})"))
     else:
-        lines.append(f"     📅 Queued: {(item.get('queued_at') or '—')[:16]}")
+        fields.append(("📅 Queued", (item.get("queued_at") or "—")[:16]))
     if item.get("tag"):
-        lines.append(f"     🏷 Tag: {item['tag']}")
+        fields.append(("🏷 Tag", item["tag"]))
 
-    return "\n".join(lines)
+    return _dt_format_labeled_block(i, item.get("ref"), fields)
 
 
 def _dt_format_report_lines(header: str, queued: List[dict], closed: List[dict], period_label: str,
@@ -924,9 +929,10 @@ async def recv_dt_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
 
 def _dt_format_task_block(i: int, t: dict) -> str:
-    """Format one task's full detail block (ref, status, node, valuer, assessor, registry,
-    county, consideration, parcel, added), matching Lookup Reference's field layout while
-    keeping every field the old one-line format showed (assessor, added-date, not-found note)."""
+    """Open Tasks' full detail block (status, node, valuer, assessor,
+    registry, county, consideration, parcel, added) — see
+    _dt_format_labeled_block for the shared visual every DLV Tasks report
+    uses; only the fields differ per report."""
     node_label = _NODE_LABELS.get(t.get("node", ""), t.get("node") or "—")
     location   = t.get("location", "")
     if location == "assessor":
@@ -936,20 +942,21 @@ def _dt_format_task_block(i: int, t: dict) -> str:
     else:
         note = ""
 
-    block = (
-        f"  {i}. 📌 *Ref:* `{t.get('ref') or '—'}`\n"
-        f"     📊 Status: {t.get('status') or '—'}\n"
-        f"     🔄 Node: {node_label}\n"
-        f"     👤 Valuer: {t.get('valuer_name') or '—'}\n"
-        f"     Assessor: {t.get('assessor') or '—'}\n"
-        f"     🏢 Registry: {t.get('registry') or '—'}\n"
-        f"     📍 County: {t.get('county') or '—'}\n"
-        f"     💰 Consideration: {t.get('consideration') or '—'}\n"
-        f"     📋 Parcel: {t.get('parcel') or '—'}\n"
-        f"     📅 Added: {t.get('date_created') or '—'}"
-    )
+    fields: List[Tuple[str, str]] = [
+        ("📊 Status", t.get("status") or "—"),
+        ("🔄 Node", node_label),
+        ("👤 Valuer", t.get("valuer_name") or "—"),
+        ("Assessor", t.get("assessor") or "—"),
+        ("🏢 Registry", t.get("registry") or "—"),
+        ("📍 County", t.get("county") or "—"),
+        ("💰 Consideration", t.get("consideration") or "—"),
+        ("📋 Parcel", t.get("parcel") or "—"),
+        ("📅 Added", t.get("date_created") or "—"),
+    ]
     if t.get("tag"):
-        block += f"\n     🏷 Tag: {t['tag']}"
+        fields.append(("🏷 Tag", t["tag"]))
+
+    block = _dt_format_labeled_block(i, t.get("ref"), fields)
     if note:
         block += f"\n     {note}"
     return block
