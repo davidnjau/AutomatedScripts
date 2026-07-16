@@ -249,6 +249,30 @@ class TestDtBuildExcelSortOrder(unittest.TestCase):
         self.assertEqual(self._refs_in_sheet_order(xlsx_bytes), ["HAS_AMOUNT", "NO_AMOUNT"])
 
 
+class TestDtFormatLabeledBlock(unittest.TestCase):
+    """_dt_format_labeled_block — the one shared visual behind every DLV
+    Tasks report; only the ref/fields passed in differ per report."""
+
+    def test_renders_numbered_ref_header_and_each_field_indented(self):
+        block = dlv_tasks._dt_format_labeled_block(
+            3, "REG/TSFR/ABC123", [("💰 Consideration", "KES 1,000.00"), ("📋 Parcel", "P1")],
+        )
+        self.assertEqual(
+            block,
+            "  3. 📌 *Ref:* `REG/TSFR/ABC123`\n"
+            "     💰 Consideration: KES 1,000.00\n"
+            "     📋 Parcel: P1",
+        )
+
+    def test_missing_ref_falls_back_to_em_dash(self):
+        block = dlv_tasks._dt_format_labeled_block(1, "", [])
+        self.assertIn("*Ref:* `—`", block)
+
+    def test_no_fields_is_just_the_ref_header(self):
+        block = dlv_tasks._dt_format_labeled_block(1, "REF1", [])
+        self.assertEqual(block, "  1. 📌 *Ref:* `REF1`")
+
+
 class TestDtFormatTaskBlock(unittest.TestCase):
     """_dt_format_task_block renders one task's full Lookup-Reference-style detail block."""
 
@@ -471,6 +495,37 @@ class TestDtFormatTagReport(unittest.TestCase):
     def test_empty_sections_render_none_placeholder(self):
         lines = "\n".join(dlv_tasks._dt_format_tag_report("Queue", [], [], "All time"))
         self.assertEqual(lines.count("_none_"), 2)
+
+
+class TestDtSendClosedReport(unittest.TestCase):
+    """_dt_send_closed_report — Closed Tasks grouped by reason, each task
+    rendered as the same labeled block every other DLV Tasks report uses
+    (via _dt_format_report_item_block), not the old packed one-liner."""
+
+    def test_tasks_rendered_as_labeled_blocks_grouped_by_reason(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        rows = [
+            {"ref": "REG/A/1", "valuer_name": "Jane Doe", "assessor": "A1",
+             "consideration_amount": "6000000", "currency_code": "KES", "parcel": "P1",
+             "closed_at": "2026-07-12T11:00:00", "closed_reason": "completed", "tag": "Queue"},
+            {"ref": "REG/A/2", "valuer_name": "John Otieno",
+             "closed_at": "2026-07-13T09:00:00", "closed_reason": "returned"},
+        ]
+        _run(dlv_tasks._dt_send_closed_report(123, rows, bot))
+        text = bot.send_message.call_args[0][1]
+        self.assertIn("🔒 *Closed DLV Tasks* — 2 task(s)", text)
+        self.assertIn("✅ Completed (1)", text)
+        self.assertIn("📌 *Ref:* `REG/A/1`", text)
+        self.assertIn("👤 Valuer: Jane Doe", text)
+        self.assertIn("💰 Consideration: KES 6,000,000.00", text)
+        self.assertIn("📋 Parcel: P1", text)
+        self.assertIn("🏷 Tag: Queue", text)
+        self.assertIn("↩️ Returned (1)", text)
+        self.assertIn("📌 *Ref:* `REG/A/2`", text)
+        # old one-liner format must be gone
+        self.assertNotIn("| Valuer:", text)
+        self.assertNotIn("| Closed:", text)
 
 
 class TestDtTagKeyboard(unittest.TestCase):
