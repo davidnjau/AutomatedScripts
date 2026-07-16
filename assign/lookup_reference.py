@@ -140,6 +140,23 @@ def _lu_fetch_detail(tokens: AuthTokens, app_id: str) -> Optional[Dict]:
         return None
 
 
+def _lu_extract_context(item: Dict, detail: Optional[Dict]) -> Dict:
+    """Pull registry/county/parcel/consideration/currency out of a search
+    item + detail-view pair as raw values — the same fields
+    _lu_format_result renders, but for callers that persist them (e.g.
+    new_assignment.py enriching saved_assignments.json) rather than
+    display them."""
+    ext = (detail or {}).get("external_process_details") or {}
+    return {
+        "registry":       (detail or item).get("registry") or item.get("registry") or "",
+        "county":         (detail or item).get("county") or item.get("county") or "",
+        "parcel":         (detail or item).get("parcel_number") or item.get("parcel_number") or
+                          ext.get("parcel_number") or "",
+        "consideration":  ext.get("consideration_amount", "") or "",
+        "currency_code":  ext.get("currency_code", "KES"),
+    }
+
+
 def _lu_format_result(ref: str, item: Dict, detail: Optional[Dict]) -> str:
     """Build the lookup result message from list-item + detail-view data."""
     status = (item.get("application_status") or item.get("status") or "—").upper()

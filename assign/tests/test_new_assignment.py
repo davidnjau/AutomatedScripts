@@ -181,9 +181,24 @@ class TestRecvConfirm(unittest.TestCase):
         ctx.user_data = {"session": sess}
         with patch.object(na, "persist_valuer"), \
              patch.object(na, "persist_assignment"), \
-             patch.object(na.asyncio, "to_thread", new=AsyncMock(return_value=[])):
+             patch.object(na.asyncio, "to_thread", new=AsyncMock(return_value=([], {}))):
             result = _run(na.recv_confirm(update, ctx))
         self.assertEqual(result, na.ConversationHandler.END)
+
+    def test_assignment_tagged_direct(self):
+        """New Assignment always assigns immediately (never via a queue like
+        DLV Batch), so every record it persists is tagged "Direct"."""
+        update = _make_update_with_callback("confirm:yes")
+        ctx = MagicMock()
+        sess = na.Session(refs=["R1"], tokens=TOKENS, saved_valuer={"name": "Jane", "uid": "1", "account_number": "A1"})
+        sess.session = MagicMock()
+        sess.session.post.return_value = MagicMock(raise_for_status=lambda: None)
+        ctx.user_data = {"session": sess}
+        with patch.object(na, "persist_valuer"), \
+             patch.object(na, "persist_assignment") as mock_persist, \
+             patch.object(na.asyncio, "to_thread", new=AsyncMock(return_value=([], {}))):
+            _run(na.recv_confirm(update, ctx))
+        mock_persist.assert_called_once_with("R1", "Jane", "1", extra={"valuer_acct": "A1", "tag": "Direct"})
 
     def test_large_result_set_paginates_instead_of_truncating(self):
         """A large batch must be split across multiple messages, not truncated."""
@@ -196,12 +211,99 @@ class TestRecvConfirm(unittest.TestCase):
         ctx.user_data = {"session": sess}
         with patch.object(na, "persist_valuer"), \
              patch.object(na, "persist_assignment"), \
-             patch.object(na.asyncio, "to_thread", new=AsyncMock(return_value=[])):
+             patch.object(na.asyncio, "to_thread", new=AsyncMock(return_value=([], {}))):
             _run(na.recv_confirm(update, ctx))
         sent_texts = [c.args[0] for c in update.callback_query.message.reply_text.call_args_list]
         self.assertGreater(len(sent_texts), 1)
         for ref in many_refs:
             self.assertTrue(any(ref in t for t in sent_texts), f"{ref} missing from any sent chunk")
+
+
+class TestLookupOneRef(unittest.TestCase):
+    """_lookup_one_ref — returns (formatted string, raw context dict), the
+    latter feeding recv_confirm's post-assignment persist_assignment enrichment."""
+
+    def test_ref_not_found_returns_empty_context(self):
+        with patch.object(na, "_lu_search_ref", return_value=None):
+            text, ctx = na._lookup_one_ref(TOKENS, "R1")
+        self.assertIn("not found", text)
+        self.assertEqual(ctx, {})
+
+    def test_ref_found_returns_formatted_text_and_context(self):
+        item = {"id": "app-1", "reference_number": "R1", "registry": "NAIROBI", "county": "NAIROBI"}
+        with patch.object(na, "_lu_search_ref", return_value=item), \
+             patch.object(na, "_lu_fetch_detail", return_value=None):
+            text, ctx = na._lookup_one_ref(TOKENS, "R1")
+        self.assertIn("R1", text)
+        self.assertEqual(ctx["registry"], "NAIROBI")
+        self.assertEqual(ctx["county"], "NAIROBI")
+
+
+class TestPostAssignmentReport(unittest.TestCase):
+    """_post_assignment_report — returns (pages, extras), extras keyed per
+    ref for recv_confirm to merge into saved_assignments.json afterward."""
+
+    def test_returns_pages_and_per_ref_extras(self):
+        def fake_lookup(tokens, ref):
+            return f"result for {ref}", {"parcel": f"P-{ref}"}
+        with patch.object(na, "_lookup_one_ref", side_effect=fake_lookup):
+            pages, extras = na._post_assignment_report(TOKENS, ["R1", "R2"])
+        self.assertTrue(any("R1" in p or "result for R1" in p for p in pages))
+        self.assertEqual(extras["R1"]["parcel"], "P-R1")
+        self.assertEqual(extras["R2"]["parcel"], "P-R2")
+
+    def test_lookup_exception_yields_empty_extra_for_that_ref(self):
+        def fake_lookup(tokens, ref):
+            if ref == "R1":
+                raise RuntimeError("boom")
+            return "ok", {"parcel": "P2"}
+        with patch.object(na, "_lookup_one_ref", side_effect=fake_lookup):
+            pages, extras = na._post_assignment_report(TOKENS, ["R1", "R2"])
+        self.assertEqual(extras["R1"], {})
+        self.assertEqual(extras["R2"]["parcel"], "P2")
+
+
+class TestRecvConfirmPersistsLookupContext(unittest.TestCase):
+    """recv_confirm's post-lookup enrichment step — merges _post_assignment_report's
+    per-ref extra context into the already-persisted assignment record."""
+
+    def test_enriches_assignment_with_post_assignment_context(self):
+        update = _make_update_with_callback("confirm:yes")
+        ctx = MagicMock()
+        sess = na.Session(refs=["R1"], tokens=TOKENS, saved_valuer={"name": "Jane", "uid": "1", "account_number": "A1"})
+        sess.session = MagicMock()
+        sess.session.post.return_value = MagicMock(raise_for_status=lambda: None)
+        ctx.user_data = {"session": sess}
+        fake_report = AsyncMock(return_value=(["page1"], {"R1": {"parcel": "P1", "consideration": "500000"}}))
+        with patch.object(na, "persist_valuer"), \
+             patch.object(na, "persist_assignment") as mock_persist, \
+             patch.object(na.asyncio, "to_thread", new=fake_report):
+            _run(na.recv_confirm(update, ctx))
+        calls = mock_persist.call_args_list
+        self.assertEqual(len(calls), 2)   # immediate call, then the enrichment call
+        enrich_call = calls[-1]
+        self.assertEqual(enrich_call.args, ("R1", "Jane", "1"))
+        self.assertEqual(enrich_call.kwargs["extra"]["parcel"], "P1")
+        self.assertEqual(enrich_call.kwargs["extra"]["consideration"], "500000")
+        self.assertEqual(enrich_call.kwargs["extra"]["valuer_acct"], "A1")
+        self.assertEqual(enrich_call.kwargs["extra"]["tag"], "Direct")
+
+        immediate_call = calls[0]
+        self.assertEqual(immediate_call.kwargs["extra"]["tag"], "Direct")
+
+    def test_empty_extra_skips_enrichment_call(self):
+        update = _make_update_with_callback("confirm:yes")
+        ctx = MagicMock()
+        sess = na.Session(refs=["R1"], tokens=TOKENS, saved_valuer={"name": "Jane", "uid": "1", "account_number": "A1"})
+        sess.session = MagicMock()
+        sess.session.post.return_value = MagicMock(raise_for_status=lambda: None)
+        ctx.user_data = {"session": sess}
+        fake_report = AsyncMock(return_value=(["page1"], {"R1": {}}))
+        with patch.object(na, "persist_valuer"), \
+             patch.object(na, "persist_assignment") as mock_persist, \
+             patch.object(na.asyncio, "to_thread", new=fake_report):
+            _run(na.recv_confirm(update, ctx))
+        self.assertEqual(len(mock_persist.call_args_list), 1)   # only the immediate call
 
 
 class TestCmdAssignments(unittest.TestCase):
