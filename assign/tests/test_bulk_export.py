@@ -132,6 +132,35 @@ class TestBeExtractRow(unittest.TestCase):
         self.assertEqual(row["Document URL"], "fallback-url")
 
 
+class TestBeLandValue(unittest.TestCase):
+    """_be_land_value — sort key used to order the export highest-to-lowest."""
+
+    def test_parses_numeric_string(self):
+        self.assertEqual(be._be_land_value({"Valuer Total Land Value (KES)": "6000000"}), 6000000.0)
+
+    def test_strips_commas(self):
+        self.assertEqual(be._be_land_value({"Valuer Total Land Value (KES)": "6,000,000"}), 6000000.0)
+
+    def test_missing_sorts_last(self):
+        self.assertEqual(be._be_land_value({}), -1.0)
+
+    def test_unparseable_sorts_last(self):
+        self.assertEqual(be._be_land_value({"Valuer Total Land Value (KES)": "N/A"}), -1.0)
+
+    def test_rows_sort_highest_first(self):
+        rows = [
+            {"Valuer Total Land Value (KES)": "1000000"},
+            {"Valuer Total Land Value (KES)": "9000000"},
+            {},
+            {"Valuer Total Land Value (KES)": "5000000"},
+        ]
+        rows.sort(key=be._be_land_value, reverse=True)
+        self.assertEqual(
+            [r.get("Valuer Total Land Value (KES)") for r in rows],
+            ["9000000", "5000000", "1000000", None],
+        )
+
+
 class TestPersistence(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
