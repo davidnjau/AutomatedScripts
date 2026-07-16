@@ -317,13 +317,21 @@ class TestDtSumConsideration(unittest.TestCase):
 
 
 class TestDtValuerKey(unittest.TestCase):
-    """_dt_valuer_key prefers valuer_uid, falls back to valuer_name, else empty."""
+    """_dt_valuer_key prefers valuer_uid, falls back to a normalized name, else empty."""
 
     def test_uses_uid_when_present(self):
         self.assertEqual(dlv_tasks._dt_valuer_key({"valuer_uid": "uid-1", "valuer_name": "Jane"}), "uid-1")
 
     def test_falls_back_to_name_when_uid_missing(self):
-        self.assertEqual(dlv_tasks._dt_valuer_key({"valuer_uid": "", "valuer_name": "Jane"}), "Jane")
+        self.assertEqual(dlv_tasks._dt_valuer_key({"valuer_uid": "", "valuer_name": "Jane"}), "JANE")
+
+    def test_name_fallback_is_case_and_whitespace_insensitive(self):
+        """A queued item's Title-Case name and a closed record's ALL-CAPS
+        actor_name (common API casing) must resolve to the same key, or
+        that valuer's history splits into two unmatched buckets."""
+        queued = {"valuer_uid": "", "valuer_name": "Newton Muchemi Wambugu"}
+        closed = {"valuer_uid": "", "valuer_name": "  NEWTON MUCHEMI WAMBUGU  "}
+        self.assertEqual(dlv_tasks._dt_valuer_key(queued), dlv_tasks._dt_valuer_key(closed))
 
     def test_empty_when_neither_present(self):
         self.assertEqual(dlv_tasks._dt_valuer_key({}), "")
