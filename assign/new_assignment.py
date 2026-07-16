@@ -897,7 +897,10 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if ok_refs:
         persist_valuer(name, uid, acct)          # auto-save valuer for future assignments
         for ref in ok_refs:
-            persist_assignment(ref, name, uid, extra={"valuer_acct": acct})   # record ref → valuer mapping
+            # "Direct" distinguishes this from DLV Batch's queue-assigned refs
+            # (tagged "Queue" or a user-chosen dlv_core.DLV_TAGS value) — New
+            # Assignment always assigns immediately, never via a queue.
+            persist_assignment(ref, name, uid, extra={"valuer_acct": acct, "tag": "Direct"})
 
     header = (
         f"🏁 *Assignment Complete*\n\n"
@@ -933,7 +936,11 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not ctx_extra:
                 continue
             try:
-                persist_assignment(ref, name, uid, extra={"valuer_acct": acct, **ctx_extra})
+                # Re-passes valuer_acct/tag since persist_assignment rebuilds
+                # the record from scratch each call rather than merging with
+                # what's already saved — this second call would otherwise
+                # drop them.
+                persist_assignment(ref, name, uid, extra={"valuer_acct": acct, "tag": "Direct", **ctx_extra})
             except Exception as e:
                 logger.error("persist_assignment enrichment failed for %s: %s", ref, e)
 

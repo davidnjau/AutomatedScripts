@@ -185,6 +185,21 @@ class TestRecvConfirm(unittest.TestCase):
             result = _run(na.recv_confirm(update, ctx))
         self.assertEqual(result, na.ConversationHandler.END)
 
+    def test_assignment_tagged_direct(self):
+        """New Assignment always assigns immediately (never via a queue like
+        DLV Batch), so every record it persists is tagged "Direct"."""
+        update = _make_update_with_callback("confirm:yes")
+        ctx = MagicMock()
+        sess = na.Session(refs=["R1"], tokens=TOKENS, saved_valuer={"name": "Jane", "uid": "1", "account_number": "A1"})
+        sess.session = MagicMock()
+        sess.session.post.return_value = MagicMock(raise_for_status=lambda: None)
+        ctx.user_data = {"session": sess}
+        with patch.object(na, "persist_valuer"), \
+             patch.object(na, "persist_assignment") as mock_persist, \
+             patch.object(na.asyncio, "to_thread", new=AsyncMock(return_value=([], {}))):
+            _run(na.recv_confirm(update, ctx))
+        mock_persist.assert_called_once_with("R1", "Jane", "1", extra={"valuer_acct": "A1", "tag": "Direct"})
+
     def test_large_result_set_paginates_instead_of_truncating(self):
         """A large batch must be split across multiple messages, not truncated."""
         update = _make_update_with_callback("confirm:yes")
@@ -271,6 +286,10 @@ class TestRecvConfirmPersistsLookupContext(unittest.TestCase):
         self.assertEqual(enrich_call.kwargs["extra"]["parcel"], "P1")
         self.assertEqual(enrich_call.kwargs["extra"]["consideration"], "500000")
         self.assertEqual(enrich_call.kwargs["extra"]["valuer_acct"], "A1")
+        self.assertEqual(enrich_call.kwargs["extra"]["tag"], "Direct")
+
+        immediate_call = calls[0]
+        self.assertEqual(immediate_call.kwargs["extra"]["tag"], "Direct")
 
     def test_empty_extra_skips_enrichment_call(self):
         update = _make_update_with_callback("confirm:yes")
