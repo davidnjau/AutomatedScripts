@@ -677,19 +677,20 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     # Flatten groups to individual ref+valuer items for per-ref retry tracking
-    existing     = load_dlv_batch()
-    existing_refs = {item["ref"] for item in existing}
+    existing      = load_dlv_batch()
+    existing_by_ref = {item["ref"]: item for item in existing}
     new_items = []
     for g in to_save:
         for ref in g["refs"]:
-            if ref not in existing_refs:
+            tag = sess.tag_by_ref.get(ref, "")
+            if ref not in existing_by_ref:
                 new_item = {
                     "ref":         ref,
                     "valuer_name": g["valuer_name"],
                     "valuer_uid":  g["valuer_uid"],
                     "valuer_acct": g["valuer_acct"],
                     "queued_at":   datetime.now().isoformat(timespec="seconds"),
-                    "tag":         sess.tag_by_ref.get(ref, ""),
+                    "tag":         tag,
                 }
                 cached = _fetch_tasks_log_lookup(ref)
                 if cached:
@@ -704,6 +705,10 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         new_item["consideration"]  = cached["consideration"]
                         new_item["currency_code"]  = cached.get("currency_code", "KES")
                 new_items.append(new_item)
+            elif tag:
+                # Ref was already queued (e.g. re-submitted just to tag it) —
+                # apply the tag in place rather than silently dropping it.
+                existing_by_ref[ref]["tag"] = tag
     flat_items = existing + new_items
     save_dlv_batch(flat_items)
     # The Fetch Tasks cache has now been folded into the batch item itself —

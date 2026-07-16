@@ -461,8 +461,14 @@ _DT_PERIOD_OPTIONS = [("All time", 0), ("1 week", 7), ("2 weeks", 14), ("1 month
 
 
 def _dt_valuer_key(item: dict) -> str:
-    """Stable identity for grouping/matching an item's valuer — uid if present, else the raw name."""
-    return item.get("valuer_uid") or item.get("valuer_name") or ""
+    """Stable identity for grouping/matching an item's valuer — uid if
+    present, else the name, normalized (stripped + uppercased) so a queued
+    item's Title-Case name and a closed record's actor_name (often returned
+    in a different case by the API) still resolve to the same valuer."""
+    uid = item.get("valuer_uid")
+    if uid:
+        return uid
+    return (item.get("valuer_name") or "").strip().upper()
 
 
 def _dt_collect_valuers() -> List[dict]:
