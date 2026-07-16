@@ -524,6 +524,29 @@ class TestRecvDbConfirmAttachesTag(unittest.TestCase):
         saved_items = self._confirm(ctx)
         self.assertEqual(saved_items[0]["tag"], "")
 
+    def test_retagging_an_already_queued_ref_updates_it_in_place(self):
+        """Resubmitting a ref that's already in the queue just to tag it must
+        not be silently dropped — it should update the existing item's tag
+        without re-queuing it or losing its original queued_at."""
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = dlv_batch._get_db_sess(ctx)
+        sess.groups = [{"refs": ["REF1"], "valuer_name": "Jane", "valuer_uid": "u1",
+                        "valuer_acct": "a1", "status": "resolved"}]
+        sess.tag_by_ref = {"REF1": "Queue"}
+        existing_item = {"ref": "REF1", "valuer_name": "Jane", "valuer_uid": "u1",
+                          "valuer_acct": "a1", "queued_at": "2026-07-01T09:00:00", "tag": ""}
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=[existing_item]), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save, \
+             patch.object(dlv_batch, "_fetch_tasks_log_lookup", return_value=None), \
+             patch.object(dlv_batch, "_fetch_tasks_log_remove"), \
+             patch.object(dlv_batch, "_any_valid_tokens", return_value=None):
+            _run(dlv_batch.recv_db_confirm(_make_query_update("db:confirm"), ctx))
+        saved_items = mock_save.call_args[0][0]
+        self.assertEqual(len(saved_items), 1)
+        self.assertEqual(saved_items[0]["tag"], "Queue")
+        self.assertEqual(saved_items[0]["queued_at"], "2026-07-01T09:00:00")
+
 
 class TestRecvDbConfirmCachesParcelAndConsideration(unittest.TestCase):
     """recv_db_confirm's "db:confirm" branch — Consideration/Parcel for a
