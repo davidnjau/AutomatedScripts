@@ -122,6 +122,17 @@ class TestRunMorningBriefing(unittest.TestCase):
         mock_email.assert_called_once()
         self.assertIn("emailed to *ops@example.com*", mock_send.call_args[0][1])
 
+    def test_email_delivery_success_escapes_special_chars(self):
+        """Regression: an unescaped '_' in the email raised
+        telegram.error.BadRequest ("can't find end of the entity")."""
+        with patch.object(mb, "_any_valid_tokens", return_value=TOKENS), \
+             patch("asyncio.to_thread", new_callable=AsyncMock, return_value=[{"ref": "A"}]), \
+             patch.object(mb, "_dt_build_excel", return_value=b"xlsx"), \
+             patch.object(mb, "_send_bulk_export_email"), \
+             patch.object(mb, "_send_briefing", new_callable=AsyncMock) as mock_send:
+            _run(mb._run_morning_briefing(self.context, "email", "john_doe@example.com"))
+        self.assertIn("emailed to *john\\_doe@example.com*", mock_send.call_args[0][1])
+
     def test_email_delivery_failure_reports_error(self):
         with patch.object(mb, "_any_valid_tokens", return_value=TOKENS), \
              patch("asyncio.to_thread", new_callable=AsyncMock, return_value=[{"ref": "A"}]), \
@@ -146,6 +157,24 @@ class TestRunMorningBriefing(unittest.TestCase):
              patch.object(mb, "_send_briefing", new_callable=AsyncMock):
             _run(mb._run_morning_briefing(self.context, "telegram", ""))
         self.assertEqual(mock_dt_send.call_count, 2)
+
+
+class TestRecvMbEmail(unittest.TestCase):
+    """recv_mb_email — validates the address, saves config, confirms enablement."""
+
+    def test_email_with_special_chars_is_escaped_in_confirmation(self):
+        """Regression: an unescaped '_' in the email raised
+        telegram.error.BadRequest ("can't find end of the entity")."""
+        update = MagicMock()
+        update.message.text = "john_doe@example.com"
+        update.message.reply_text = AsyncMock()
+        ctx = MagicMock()
+        with patch.object(mb, "allowed", return_value=True), \
+             patch.object(mb, "save_briefing_config"), \
+             patch.object(mb, "_schedule_morning_briefing"):
+            _run(mb.recv_mb_email(update, ctx))
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("john\\_doe@example.com", text)
 
 
 if __name__ == "__main__":

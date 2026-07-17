@@ -91,6 +91,19 @@ class TestCheckAssignmentsAndProceed(unittest.TestCase):
         self.assertEqual(result, na.S.REASSIGN_CONFIRM)
         self.assertEqual(sess.already_assigned[0]["ref"], "R1")
 
+    def test_existing_valuer_name_with_markdown_chars_is_escaped(self):
+        """Regression: an unescaped '_'/'*' in a saved assignment's valuer
+        name crashes the reassign-confirm send with telegram.error.BadRequest
+        ("can't find end of the entity"). See common.md_escape."""
+        message = MagicMock()
+        message.reply_text = AsyncMock()
+        sess = na.Session(refs=["R1"])
+        existing = {"R1": {"valuer_name": "Jane_Doe", "assigned_at": "2026-01-01"}}
+        with patch.object(na, "load_saved_assignments", return_value=existing):
+            _run(na._check_assignments_and_proceed(message, sess))
+        sent_text = message.reply_text.call_args[0][0]
+        self.assertIn("Jane\\_Doe", sent_text)
+
 
 class TestProceedToValuerPick(unittest.TestCase):
     def test_saved_valuers_show_pick_source(self):
@@ -261,6 +274,29 @@ class TestPostAssignmentReport(unittest.TestCase):
             pages, extras = na._post_assignment_report(TOKENS, ["R1", "R2"])
         self.assertEqual(extras["R1"], {})
         self.assertEqual(extras["R2"]["parcel"], "P2")
+
+
+class TestRecvConfirmMarkdownEscaping(unittest.TestCase):
+    """recv_confirm's "Assigning *{name}*…" and "*Valuer:* {name}" messages —
+    regression for telegram.error.BadRequest ("can't find end of the
+    entity") when a valuer name contains a raw '_'/'*'. See common.md_escape."""
+
+    def test_assigning_message_and_summary_escape_valuer_name(self):
+        update = _make_update_with_callback("confirm:yes")
+        ctx = MagicMock()
+        sess = na.Session(refs=["R1"], tokens=TOKENS,
+                           saved_valuer={"name": "Jane_Doe", "uid": "1", "account_number": "A1"})
+        sess.session = MagicMock()
+        sess.session.post.return_value = MagicMock(raise_for_status=lambda: None)
+        ctx.user_data = {"session": sess}
+        with patch.object(na, "persist_valuer"), \
+             patch.object(na, "persist_assignment"), \
+             patch.object(na.asyncio, "to_thread", new=AsyncMock(return_value=([], {}))):
+            _run(na.recv_confirm(update, ctx))
+        assigning_text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Jane\\_Doe", assigning_text)
+        summary_texts = [c.args[0] for c in update.callback_query.message.reply_text.call_args_list]
+        self.assertTrue(any("Jane\\_Doe" in t for t in summary_texts))
 
 
 class TestRecvConfirmPersistsLookupContext(unittest.TestCase):

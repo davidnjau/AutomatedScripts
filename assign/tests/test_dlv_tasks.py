@@ -465,6 +465,18 @@ class TestDtFormatTagReport(unittest.TestCase):
         self.assertEqual(lines.count("_none_"), 2)
 
 
+class TestDtSendTelegram(unittest.TestCase):
+    """_dt_send_telegram — Open Tasks' Telegram delivery, grouped by valuer."""
+
+    def test_valuer_group_header_with_special_chars_is_escaped(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        rows = [{"ref": "REF1", "valuer_name": "Jane_Doe"}]
+        _run(dlv_tasks._dt_send_telegram(123, rows, bot))
+        text = bot.send_message.call_args[0][1]
+        self.assertIn("👤 *Jane\\_Doe*", text)
+
+
 class TestDtSendClosedReport(unittest.TestCase):
     """_dt_send_closed_report — Closed Tasks grouped by reason, each task
     rendered as the same labeled block every other DLV Tasks report uses
@@ -528,6 +540,24 @@ class TestRecvDtPickTag(unittest.TestCase):
         self.assertEqual(sess.selected_tag, "Queue")
 
 
+class TestRecvDtPickValuer(unittest.TestCase):
+    """recv_dt_pick_valuer — By Valuer's valuer picker."""
+
+    def test_valuer_name_with_special_chars_is_escaped(self):
+        """Regression: an unescaped '_' in a valuer name raised
+        telegram.error.BadRequest ("can't find end of the entity"). See
+        common.md_escape."""
+        update = _make_query_update("dt_pickvaluer:0")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = dlv_tasks._get_dt_sess(ctx)
+        sess.valuer_choices = [{"key": "u1", "name": "Jane_Doe"}]
+        with patch.object(dlv_tasks, "allowed", return_value=True):
+            _run(dlv_tasks.recv_dt_pick_valuer(update, ctx))
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Jane\\_Doe", text)
+
+
 class TestRecvDtPeriodTagMode(unittest.TestCase):
     """recv_dt_period's tag-mode branch — filters the queue/closed store by
     tag (not valuer) and sends the By Tag report."""
@@ -553,6 +583,22 @@ class TestRecvDtPeriodTagMode(unittest.TestCase):
         mock_send.assert_called_once()
         sent_queued = mock_send.call_args[0][2]
         self.assertEqual([i["ref"] for i in sent_queued], ["REF1"])
+
+    def test_valuer_mode_building_report_message_escapes_name(self):
+        update = _make_query_update("dt_period:0")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        ctx.bot.send_message = AsyncMock()
+        sess = dlv_tasks._get_dt_sess(ctx)
+        sess.report_mode      = "valuer"
+        sess.selected_valuer  = {"key": "u1", "name": "Jane_Doe"}
+        with patch.object(dlv_tasks, "allowed", return_value=True), \
+             patch.object(dlv_tasks, "load_dlv_batch", return_value=[]), \
+             patch.object(dlv_tasks, "load_dlv_closed", return_value=[]), \
+             patch.object(dlv_tasks, "_dt_send_valuer_report", new_callable=AsyncMock):
+            _run(dlv_tasks.recv_dt_period(update, ctx))
+        building_text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Jane\\_Doe", building_text)
 
 
 if __name__ == "__main__":

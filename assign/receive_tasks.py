@@ -54,6 +54,7 @@ from common import (
     get_valid_tokens,
     load_saved_valuers,
     logger,
+    md_escape,
     not_cancel,
     persist_assignment,
     persist_tokens,
@@ -387,7 +388,7 @@ async def _do_assign_tasks(
 
     header = (
         f"🏁 *Receive Tasks Complete*\n\n"
-        f"*Valuer:* {staff_name}\n"
+        f"*Valuer:* {md_escape(staff_name)}\n"
         f"*Assigned:* {len(ok_refs)} / {len(tasks)}\n"
         f"*Failed:*   {len(fail_refs)} / {len(tasks)}\n"
     )
@@ -549,7 +550,7 @@ async def _rt_resolve_saved_valuer(message, rt: RTSession) -> int:
         results = resp.json().get("results", [])
     except Exception as e:
         await message.reply_text(
-            f"❌ Could not fetch profile for *{sv['name']}*: `{e}`",
+            f"❌ Could not fetch profile for *{md_escape(sv['name'])}*: `{e}`",
             parse_mode="Markdown", reply_markup=_main_menu(),
         )
         return ConversationHandler.END
@@ -562,7 +563,7 @@ async def _rt_resolve_saved_valuer(message, rt: RTSession) -> int:
     )
     if not match:
         await message.reply_text(
-            f"⚠️ Could not uniquely identify *{sv['name']}* from search results.\n"
+            f"⚠️ Could not uniquely identify *{md_escape(sv['name'])}* from search results.\n"
             "Use 🔍 Search new valuer to select manually.",
             parse_mode="Markdown", reply_markup=_main_menu(),
         )
@@ -642,7 +643,7 @@ async def _rt_do_staff_search(message, rt: RTSession) -> int:
 
     if not results:
         await message.reply_text(
-            f"⚠️ No staff found matching *{rt.staff_name}*.",
+            f"⚠️ No staff found matching *{md_escape(rt.staff_name)}*.",
             parse_mode="Markdown", reply_markup=_main_menu(),
         )
         return ConversationHandler.END
@@ -807,7 +808,7 @@ async def recv_rt_pick_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rt.staff_name   = sv["name"]
 
     await query.edit_message_text(
-        f"👤 Selected: *{sv['name']}*\n\n"
+        f"👤 Selected: *{md_escape(sv['name'])}*\n\n"
         "Step 2 — Choose *credential profile*:",
         parse_mode="Markdown",
         reply_markup=_cred_keyboard(),
@@ -819,7 +820,7 @@ async def recv_rt_staff_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rt = _get_rt(ctx)
     rt.staff_name = update.message.text.strip()
     await update.message.reply_text(
-        f"🔍 Searching for: *{rt.staff_name}*\n\n"
+        f"🔍 Searching for: *{md_escape(rt.staff_name)}*\n\n"
         "Step 2 — Choose *credential profile*:",
         parse_mode="Markdown",
         reply_markup=_cred_keyboard(),
@@ -843,13 +844,13 @@ async def recv_rt_cred_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if rt.saved_valuer:
             await query.edit_message_text(
                 f"🔑 Cached login: *{CRED_LABELS[cred_type]}*\n\n"
-                f"🔍 Fetching profile for *{rt.saved_valuer['name']}*…",
+                f"🔍 Fetching profile for *{md_escape(rt.saved_valuer['name'])}*…",
                 parse_mode="Markdown",
             )
             return await _rt_resolve_saved_valuer(query.message, rt)
         await query.edit_message_text(
             f"🔑 Cached login: *{CRED_LABELS[cred_type]}*\n\n"
-            f"🔍 Searching for *{rt.staff_name}*…",
+            f"🔍 Searching for *{md_escape(rt.staff_name)}*…",
             parse_mode="Markdown",
         )
         return await _rt_do_staff_search(query.message, rt)
@@ -936,7 +937,7 @@ async def recv_rt_select_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sd   = list_entry.get("staff_details", {})
     name = " ".join(filter(None, [sd.get("firstname"), sd.get("middlename"), sd.get("lastname")]))
 
-    await query.edit_message_text(f"🔍 Fetching full profile for *{name}*…", parse_mode="Markdown")
+    await query.edit_message_text(f"🔍 Fetching full profile for *{md_escape(name)}*…", parse_mode="Markdown")
     user_data = _fetch_staff_detail(rt, list_entry)
 
     ok, err_msg, task_type, registry, county = _validate_staff(user_data)
@@ -1149,7 +1150,7 @@ async def recv_rt_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = sd.get("user_id", rt.staff_data.get("id", "?"))
 
     await query.edit_message_text(
-        f"⚙️ Assigning *{len(rt.matched_tasks)}* task(s) to *{name}*…",
+        f"⚙️ Assigning *{len(rt.matched_tasks)}* task(s) to *{md_escape(name)}*…",
         parse_mode="Markdown",
     )
 
@@ -1213,7 +1214,7 @@ async def cmd_schedules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if s.get("amount_min") is not None else "any amount"
         )
         lines.append(
-            f"• *{s['staff_name']}* — every *{s['interval_minutes']}min*\n"
+            f"• *{md_escape(s['staff_name'])}* — every *{s['interval_minutes']}min*\n"
             f"  Tasks: {s['task_count']} | {s['task_type']} | {range_str}\n"
             f"  ID: `{s['schedule_id'][:8]}…`"
         )
@@ -1237,7 +1238,7 @@ async def cmd_task_batches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = []
     for b in batches[-10:]:   # most recent 10
         lines.append(
-            f"• *{b['staff_name']}*  —  {b['created_at']}\n"
+            f"• *{md_escape(b['staff_name'])}*  —  {b['created_at']}\n"
             f"  Assigned: {len(b['tasks'])}  |  Failed: {len(b.get('failed', []))}"
         )
     await update.message.reply_text(

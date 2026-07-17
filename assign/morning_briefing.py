@@ -44,6 +44,7 @@ from common import (
     deny,
     fallback,
     logger,
+    md_escape,
     not_cancel,
 )
 from dlv_tasks import _dt_build_excel, _dt_fetch_tasks, _dt_send_telegram
@@ -117,7 +118,7 @@ async def _run_morning_briefing(context: ContextTypes.DEFAULT_TYPE, delivery: st
             return
         await _send_briefing(
             context,
-            f"🌅 *Morning Briefing — {today}*\n📧 {len(rows)} Open Task(s) emailed to *{email}*.",
+            f"🌅 *Morning Briefing — {today}*\n📧 {len(rows)} Open Task(s) emailed to *{md_escape(email)}*.",
         )
         return
 
@@ -255,7 +256,7 @@ async def recv_mb_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_briefing_config({"enabled": True, "delivery": "email", "email": email})
     _schedule_morning_briefing(ctx.job_queue)
     await update.message.reply_text(
-        f"🌅 *Morning Briefing enabled* — Open Tasks emailed to *{email}*, daily at 7 AM EAT.\n"
+        f"🌅 *Morning Briefing enabled* — Open Tasks emailed to *{md_escape(email)}*, daily at 7 AM EAT.\n"
         "Use /briefing again to disable.",
         parse_mode="Markdown",
         reply_markup=_main_menu(),

@@ -65,6 +65,7 @@ from common import (
     deny,
     load_saved_valuers,
     logger,
+    md_escape,
 )
 import auto_fetch
 import bulk_export
@@ -190,7 +191,7 @@ async def cmd_valuers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
     lines = [
-        f"{i+1}. *{v['name']}* — ID: `{v['uid']}` | Acct: `{v['account_number']}`"
+        f"{i+1}. *{md_escape(v['name'])}* — ID: `{v['uid']}` | Acct: `{v['account_number']}`"
         for i, v in enumerate(valuers)
     ]
     await update.message.reply_text(
@@ -235,7 +236,7 @@ async def recv_delete_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     removed = valuers.pop(idx)
     _atomic_json_write(SAVED_VALUERS_FILE, valuers, indent=2)
     await query.edit_message_text(
-        f"🗑 Removed *{removed['name']}* from saved valuers.", parse_mode="Markdown"
+        f"🗑 Removed *{md_escape(removed['name'])}* from saved valuers.", parse_mode="Markdown"
     )
 
 
