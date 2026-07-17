@@ -70,6 +70,7 @@ from common import (
 import auto_fetch
 import bulk_export
 import dlv_batch
+import dlv_incremental
 import dlv_report_schedule
 import dlv_tasks
 import hold_tasks
@@ -730,6 +731,7 @@ def main():
     sectional_properties.register(app)
     morning_briefing.register(app)
     hold_tasks.register(app)
+    dlv_incremental.register(app)
     dlv_report_schedule.register(app)
 
     # Button handlers outside an active conversation
