@@ -628,6 +628,44 @@ class TestRecvDtPickValuer(unittest.TestCase):
         self.assertIn("Jane\\_Doe", text)
 
 
+class TestDtGatherReportData(unittest.TestCase):
+    """_dt_gather_report_data — the data-gathering half of recv_dt_period,
+    factored out so dlv_report_schedule.py's background job can reuse it."""
+
+    def test_valuer_scope_filters_and_excludes_closed_from_desk(self):
+        queued = [{"ref": "REF1", "valuer_uid": "u1"}]
+        closed = [{"ref": "REF2", "valuer_uid": "u1", "closed_at": "2026-07-01"}]
+        assignments = {
+            "REF2": {"valuer_uid": "u1", "assigned_at": "2026-06-30 09:00:00"},   # already closed
+            "REF3": {"valuer_uid": "u1", "assigned_at": "2026-07-10 09:00:00"},   # at desk
+        }
+        with patch.object(dlv_tasks, "load_dlv_batch", return_value=queued), \
+             patch.object(dlv_tasks, "load_dlv_closed", return_value=closed), \
+             patch.object(dlv_tasks, "load_saved_assignments", return_value=assignments):
+            q, d, c = dlv_tasks._dt_gather_report_data("valuer", "u1", 0)
+        self.assertEqual([i["ref"] for i in q], ["REF1"])
+        self.assertEqual([i["ref"] for i in d], ["REF3"])
+        self.assertEqual([i["ref"] for i in c], ["REF2"])
+
+    def test_tag_scope_filters_by_tag(self):
+        queued = [{"ref": "REF1", "tag": "Queue"}, {"ref": "REF2", "tag": "Direct"}]
+        with patch.object(dlv_tasks, "load_dlv_batch", return_value=queued), \
+             patch.object(dlv_tasks, "load_dlv_closed", return_value=[]), \
+             patch.object(dlv_tasks, "load_saved_assignments", return_value={}):
+            q, d, c = dlv_tasks._dt_gather_report_data("tag", "Queue", 0)
+        self.assertEqual([i["ref"] for i in q], ["REF1"])
+
+    def test_period_filters_closed_and_desk_by_date(self):
+        closed = [{"ref": "REF1", "valuer_uid": "u1", "closed_at": "2020-01-01"}]
+        assignments = {"REF2": {"valuer_uid": "u1", "assigned_at": "2020-01-01 09:00:00"}}
+        with patch.object(dlv_tasks, "load_dlv_batch", return_value=[]), \
+             patch.object(dlv_tasks, "load_dlv_closed", return_value=closed), \
+             patch.object(dlv_tasks, "load_saved_assignments", return_value=assignments):
+            q, d, c = dlv_tasks._dt_gather_report_data("valuer", "u1", 7)
+        self.assertEqual(d, [])
+        self.assertEqual(c, [])
+
+
 class TestRecvDtPeriodTagMode(unittest.TestCase):
     """recv_dt_period's tag-mode branch — filters the queue/closed store by
     tag (not valuer) and sends the By Tag report."""
