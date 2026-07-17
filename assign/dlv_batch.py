@@ -58,6 +58,7 @@ from common import (
     fallback,
     load_saved_valuers,
     logger,
+    md_escape,
     not_cancel,
     persist_assignment,
 )
@@ -539,10 +540,10 @@ def _db_format_batch_summary(sess: DBSession) -> str:
                     (_fetch_tasks_log_lookup(r) or {}).get("assessor", "") for r in g["refs"]
                 ) if a
             }
-            assessor_note = f"\n   Assessor: {', '.join(sorted(assessors))}" if assessors else ""
-            lines.append(f"✅ {refs_str}\n   → *{g['valuer_name']}*{assessor_note}")
+            assessor_note = f"\n   Assessor: {md_escape(', '.join(sorted(assessors)))}" if assessors else ""
+            lines.append(f"✅ {refs_str}\n   → *{md_escape(g['valuer_name'])}*{assessor_note}")
         else:
-            lines.append(f"⚠️ {refs_str}\n   → _{g['valuer_name']}_ (NOT FOUND — will be skipped)")
+            lines.append(f"⚠️ {refs_str}\n   → _{md_escape(g['valuer_name'])}_ (NOT FOUND — will be skipped)")
             has_unresolved = True
 
     if has_unresolved:

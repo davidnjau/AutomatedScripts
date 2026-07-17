@@ -39,6 +39,27 @@ class TestSafeErr(unittest.TestCase):
         self.assertNotIn("secret detail", common._safe_err(RuntimeError("secret detail")))
 
 
+class TestMdEscape(unittest.TestCase):
+    """md_escape — escapes legacy Telegram Markdown's special characters
+    (_, *, `, [) so untrusted text can't break parse_mode="Markdown"."""
+
+    def test_escapes_underscore(self):
+        self.assertEqual(common.md_escape("Jane_Doe"), "Jane\\_Doe")
+
+    def test_escapes_asterisk(self):
+        self.assertEqual(common.md_escape("Jane*Doe"), "Jane\\*Doe")
+
+    def test_escapes_backtick_and_bracket(self):
+        self.assertEqual(common.md_escape("a`b[c"), "a\\`b\\[c")
+
+    def test_plain_text_unchanged(self):
+        self.assertEqual(common.md_escape("Jane Doe"), "Jane Doe")
+
+    def test_empty_or_none_returns_empty_string(self):
+        self.assertEqual(common.md_escape(""), "")
+        self.assertEqual(common.md_escape(None), "")
+
+
 class TestSectionalConfigPersistence(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
