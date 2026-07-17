@@ -368,7 +368,7 @@ class TestAutoFetchJob(unittest.TestCase):
         self.assertLess(body.index("Ref: MID"), body.index("Ref: LOW"))
 
     def test_excel_format_sends_attachment_not_block_email(self):
-        cfg = {"days_back": 2, "email": "ops@example.com", "email_format": "excel"}
+        cfg = {"days_back": 2, "email": "ops@example.com", "report_format": "excel"}
         tasks = [_task()]
         with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
              patch.object(af, "get_valid_tokens", return_value=TOKENS), \
@@ -386,9 +386,9 @@ class TestAutoFetchJob(unittest.TestCase):
         self.assertEqual(mock_excel_email.call_args[0][0], "ops@example.com")
         self.assertTrue(mock_excel_email.call_args[0][1].endswith(".xlsx"))
 
-    def test_missing_email_format_defaults_to_block(self):
-        """Old schedules saved before email_format existed must still work."""
-        cfg = {"days_back": 2, "email": "ops@example.com"}   # no "email_format" key
+    def test_missing_report_format_defaults_to_block(self):
+        """Old schedules saved before report_format existed must still work."""
+        cfg = {"days_back": 2, "email": "ops@example.com"}   # no "report_format" key
         tasks = [_task()]
         with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
              patch.object(af, "get_valid_tokens", return_value=TOKENS), \
@@ -403,6 +403,66 @@ class TestAutoFetchJob(unittest.TestCase):
             _run(af._auto_fetch_job(self.context))
         mock_block_email.assert_called_once()
         mock_excel_email.assert_not_called()
+
+    def test_legacy_email_format_key_still_honored(self):
+        """Schedules saved back when the field was still called
+        "email_format" (before it also governed Telegram) must keep working."""
+        cfg = {"days_back": 2, "email": "ops@example.com", "email_format": "excel"}
+        tasks = [_task()]
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "persist_af_result"), \
+             patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
+             patch.object(af, "ALLOWED_IDS", set()), \
+             patch.object(af, "_send_auto_fetch_email") as mock_block_email, \
+             patch.object(af, "_send_bulk_export_email") as mock_excel_email:
+            _run(af._auto_fetch_job(self.context))
+        mock_block_email.assert_not_called()
+        mock_excel_email.assert_called_once()
+
+    def test_excel_format_sends_telegram_document_not_chunked_text(self):
+        """report_format="excel" governs the Telegram delivery too — it
+        should send an Excel document, not the usual chunked text blocks."""
+        cfg = {"days_back": 2, "report_format": "excel"}   # no email — Telegram only
+        tasks = [_task()]
+        ctx = MagicMock()
+        ctx.job.data = "sched-1"
+        ctx.bot.send_document = AsyncMock()
+        ctx.bot.send_message = AsyncMock()
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "persist_af_result"), \
+             patch.object(af, "ALLOWED_IDS", {111}):
+            _run(af._auto_fetch_job(ctx))
+        ctx.bot.send_document.assert_called_once()
+        ctx.bot.send_message.assert_not_called()
+        call = ctx.bot.send_document.call_args
+        self.assertEqual(call.args[0], 111)
+        self.assertTrue(call.kwargs["filename"].endswith(".xlsx"))
+
+    def test_block_format_still_sends_telegram_chunked_text(self):
+        cfg = {"days_back": 2, "report_format": "block"}
+        tasks = [_task()]
+        ctx = MagicMock()
+        ctx.job.data = "sched-1"
+        ctx.bot.send_document = AsyncMock()
+        ctx.bot.send_message = AsyncMock()
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "persist_af_result"), \
+             patch.object(af, "ALLOWED_IDS", {111}):
+            _run(af._auto_fetch_job(ctx))
+        ctx.bot.send_document.assert_not_called()
+        ctx.bot.send_message.assert_called()
 
     def _run_email_cycle(self, cfg, tasks):
         with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
@@ -697,28 +757,28 @@ class TestRecvAfEmail(unittest.TestCase):
         self.assertEqual(result, af.AF.EMAIL)
         self.assertIn("Invalid email", self.update.message.reply_text.call_args[0][0])
 
-    def test_valid_email_moves_to_email_format_step(self):
-        """A real email defers finalizing until the block/Excel format is
-        chosen next — only `skip` finalizes immediately."""
+    def test_valid_email_moves_to_report_format_step(self):
+        """A real email defers finalizing until the report format is chosen
+        next — governs Telegram delivery too, so it's asked unconditionally."""
         self.update.message.text = "ops@example.com"
         result = _run(af.recv_af_email(self.update, self.ctx))
-        self.assertEqual(result, af.AF.EMAIL_FORMAT)
+        self.assertEqual(result, af.AF.REPORT_FORMAT)
         self.assertEqual(self.ctx.user_data["af_email"], "ops@example.com")
         text = self.update.message.reply_text.call_args[0][0]
-        self.assertIn("How should this email look", text)
+        self.assertIn("Which format", text)
 
-    def test_skip_saves_schedule_with_no_email(self):
+    def test_skip_also_moves_to_report_format_step(self):
+        """skip (Telegram-only) still needs a format choice, since it now
+        governs the periodic Telegram delivery regardless of email."""
         self.update.message.text = "skip"
-        with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1") as mock_add:
-            result = _run(af.recv_af_email(self.update, self.ctx))
-        self.assertEqual(result, af.ConversationHandler.END)
-        self.assertEqual(mock_add.call_args[0][0]["email"], "")
-        self.assertEqual(mock_add.call_args[0][0]["email_format"], "block")
+        result = _run(af.recv_af_email(self.update, self.ctx))
+        self.assertEqual(result, af.AF.REPORT_FORMAT)
+        self.assertEqual(self.ctx.user_data["af_email"], "")
 
 
-class TestRecvAfEmailFormat(unittest.TestCase):
-    """recv_af_email_format — the block/Excel choice, which finalizes the
-    schedule (only reached when a real email was entered)."""
+class TestRecvAfReportFormat(unittest.TestCase):
+    """recv_af_report_format — the block/Excel choice, always reached
+    (whether or not an email was entered), which finalizes the schedule."""
 
     def _make_query(self, data):
         update = MagicMock()
@@ -737,9 +797,9 @@ class TestRecvAfEmailFormat(unittest.TestCase):
         """Regression test: the confirmation used to say nothing about which
         account runs the job, hiding the fact it always needs a valid cached
         Support Reg login regardless of what credential you used elsewhere."""
-        update = self._make_query("af_emailfmt:block")
+        update = self._make_query("af_reportfmt:block")
         with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1") as mock_add:
-            result = _run(af.recv_af_email_format(update, self.ctx))
+            result = _run(af.recv_af_report_format(update, self.ctx))
         self.assertEqual(result, af.ConversationHandler.END)
         mock_add.assert_called_once()
         self.assertEqual(mock_add.call_args[0][0]["email"], "ops@example.com")
@@ -748,35 +808,46 @@ class TestRecvAfEmailFormat(unittest.TestCase):
 
     def test_email_with_special_chars_is_escaped_in_confirmation(self):
         self.ctx.user_data["af_email"] = "john_doe@example.com"
-        update = self._make_query("af_emailfmt:block")
+        update = self._make_query("af_reportfmt:block")
         with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1"):
-            _run(af.recv_af_email_format(update, self.ctx))
+            _run(af.recv_af_report_format(update, self.ctx))
         text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("john\\_doe@example.com", text)
 
     def test_valid_submission_schedules_a_job_tagged_with_the_new_id(self):
-        update = self._make_query("af_emailfmt:block")
+        update = self._make_query("af_reportfmt:block")
         with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1"):
-            _run(af.recv_af_email_format(update, self.ctx))
+            _run(af.recv_af_report_format(update, self.ctx))
         _, kwargs = self.ctx.job_queue.run_repeating.call_args
         self.assertEqual(kwargs["name"], "auto_fetch_job:sched-1")
         self.assertEqual(kwargs["data"], "sched-1")
 
     def test_block_format_saved_and_shown_in_confirmation(self):
-        update = self._make_query("af_emailfmt:block")
+        update = self._make_query("af_reportfmt:block")
         with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1") as mock_add:
-            _run(af.recv_af_email_format(update, self.ctx))
-        self.assertEqual(mock_add.call_args[0][0]["email_format"], "block")
+            _run(af.recv_af_report_format(update, self.ctx))
+        self.assertEqual(mock_add.call_args[0][0]["report_format"], "block")
         text = update.callback_query.edit_message_text.call_args[0][0]
-        self.assertIn("(Block)", text)
+        self.assertIn("Text blocks", text)
 
     def test_excel_format_saved_and_shown_in_confirmation(self):
-        update = self._make_query("af_emailfmt:excel")
+        update = self._make_query("af_reportfmt:excel")
         with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1") as mock_add:
-            _run(af.recv_af_email_format(update, self.ctx))
-        self.assertEqual(mock_add.call_args[0][0]["email_format"], "excel")
+            _run(af.recv_af_report_format(update, self.ctx))
+        self.assertEqual(mock_add.call_args[0][0]["report_format"], "excel")
         text = update.callback_query.edit_message_text.call_args[0][0]
-        self.assertIn("(Excel attachment)", text)
+        self.assertIn("Excel", text)
+
+    def test_report_format_shown_even_without_email(self):
+        """Unlike the old email-only format label, the Format line always
+        shows now, since it governs Telegram delivery regardless of email."""
+        self.ctx.user_data["af_email"] = ""
+        update = self._make_query("af_reportfmt:excel")
+        with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1"):
+            _run(af.recv_af_report_format(update, self.ctx))
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Format: *Excel*", text)
+        self.assertIn("Telegram only", text)
 
 
 class TestAfBuildExcel(unittest.TestCase):
@@ -831,6 +902,25 @@ class TestAfConsiderationValue(unittest.TestCase):
 
     def test_unparseable_sorts_last(self):
         self.assertEqual(af._af_consideration_value({"consideration": "N/A"}), -1.0)
+
+
+class TestAfGetReportFormat(unittest.TestCase):
+    """_af_get_report_format — reads "report_format", falling back to the
+    older "email_format" key for schedules saved before it covered Telegram."""
+
+    def test_reads_report_format_when_present(self):
+        self.assertEqual(af._af_get_report_format({"report_format": "excel"}), "excel")
+
+    def test_falls_back_to_legacy_email_format(self):
+        self.assertEqual(af._af_get_report_format({"email_format": "excel"}), "excel")
+
+    def test_report_format_takes_priority_over_legacy_key(self):
+        self.assertEqual(
+            af._af_get_report_format({"report_format": "block", "email_format": "excel"}), "block",
+        )
+
+    def test_defaults_to_block_when_neither_present(self):
+        self.assertEqual(af._af_get_report_format({}), "block")
 
 
 class TestAfFormatScheduleSummary(unittest.TestCase):

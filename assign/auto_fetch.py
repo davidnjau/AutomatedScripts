@@ -40,15 +40,22 @@ matches exactly is skipped — the Telegram summary still sends every cycle
 regardless. Any difference (new/dropped ref) sends the full current list,
 not just the delta, and updates the stored set.
 
-A schedule's email (if any) picks one of two formats, asked right after a
-real email address is entered (skip has nothing to format, so it's not
-asked): "block" (default, the plain-text _ft_format_task_block body via
-_send_auto_fetch_email — unchanged from before this option existed) or
-"excel" (_af_build_excel's single-sheet workbook, sent as an attachment
-via email_service._send_bulk_export_email — the same attachment-based
-sender DLV Report Schedule's own emailed reports use). Old schedules
-saved before this existed have no "email_format" key and default to
-"block".
+Each schedule picks one report_format ("block" or "excel", asked
+unconditionally right after the email step — see recv_af_email/
+recv_af_report_format), which governs BOTH the periodic Telegram delivery
+and the email (if one is configured), rather than each channel having its
+own separate choice:
+- "block" (default) — the plain-text/Markdown _ft_format_task_block body,
+  sent via context.bot.send_message (Telegram, chunked) or
+  email_service._send_auto_fetch_email (email) — unchanged from before
+  this option existed.
+- "excel" — _af_build_excel's single-sheet workbook, sent via
+  context.bot.send_document (Telegram) or
+  email_service._send_bulk_export_email (email, the same attachment-based
+  sender DLV Report Schedule's own emailed reports use).
+_af_get_report_format(cfg) reads the current field, falling back to the
+older single-purpose "email_format" key for schedules saved before this
+choice covered Telegram too.
 """
 
 import io
@@ -130,7 +137,7 @@ class AF(Enum):
     AMOUNT_TEXT = auto()   # custom amount text entry
     SECTIONAL   = auto()   # exclude / only / all sectional
     EMAIL       = auto()   # optional recipient email address
-    EMAIL_FORMAT = auto()  # block (text) or Excel attachment — only asked when an email was entered
+    REPORT_FORMAT = auto()  # block (text) or Excel — asked unconditionally, governs Telegram + email alike
 
 
 # ──────────────────────────────────────────────────────────
@@ -569,16 +576,23 @@ async def recv_af_sectional(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return AF.EMAIL
 
 
-def _af_email_format_keyboard() -> InlineKeyboardMarkup:
-    """Choose how a schedule's email should look — only shown when an email
-    address was actually entered (Telegram-only schedules skip this)."""
+def _af_report_format_keyboard() -> InlineKeyboardMarkup:
+    """Choose how this schedule's reports should look — governs both the
+    periodic Telegram delivery and the email (if one is configured)."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📄 Block (text email)", callback_data="af_emailfmt:block")],
-        [InlineKeyboardButton("📊 Excel attachment",    callback_data="af_emailfmt:excel")],
+        [InlineKeyboardButton("📄 Text blocks", callback_data="af_reportfmt:block")],
+        [InlineKeyboardButton("📊 Excel",       callback_data="af_reportfmt:excel")],
     ])
 
 
-def _af_create_schedule(ctx: ContextTypes.DEFAULT_TYPE, email: str, email_format: str) -> Tuple[str, Dict]:
+def _af_get_report_format(cfg: Dict) -> str:
+    """This schedule's chosen report format ("block" or "excel"), covering
+    both Telegram delivery and email. Falls back to the old "email_format"
+    key for schedules saved before this choice covered Telegram too."""
+    return cfg.get("report_format") or cfg.get("email_format", "block")
+
+
+def _af_create_schedule(ctx: ContextTypes.DEFAULT_TYPE, email: str, report_format: str) -> Tuple[str, Dict]:
     """Persist a new Auto Fetch schedule from the just-completed setup flow
     and register its repeating job. Returns (schedule_id, cfg)."""
     interval   = ctx.user_data.get("af_interval_minutes", 60)
@@ -598,7 +612,7 @@ def _af_create_schedule(ctx: ContextTypes.DEFAULT_TYPE, email: str, email_format
         "amount_max":       amount_max,
         "sectional_filter": sectional,
         "email":            email,
-        "email_format":     email_format,
+        "report_format":    report_format,
     }
     schedule_id = add_auto_fetch_schedule(cfg)
     ctx.job_queue.run_repeating(
@@ -622,54 +636,53 @@ def _af_schedule_created_text(cfg: Dict) -> str:
     sec_label = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(
         cfg.get("sectional_filter", "exclude"), cfg.get("sectional_filter", "exclude"),
     )
-    email        = cfg.get("email") or ""
-    email_label  = email or "Telegram only"
-    format_label = " (Excel attachment)" if cfg.get("email_format") == "excel" else " (Block)"
+    email_label  = cfg.get("email") or "Telegram only"
+    format_label = "Excel" if _af_get_report_format(cfg) == "excel" else "Text blocks"
     interval     = cfg.get("interval_minutes", 60)
     return (
         f"✅ *Auto Fetch schedule added*\n"
         f"Every *{interval} min* | Days back: *{cfg.get('days_back', 2)}*\n"
         f"County: *{co_label}* | Registry: *{re_label}*\n"
         f"Amount: {lo_s} – {hi_s} | Sectional: *{sec_label}*\n"
-        f"Email: *{md_escape(email_label)}*{format_label if email else ''}\n"
+        f"Email: *{md_escape(email_label)}*\n"
+        f"Format: *{format_label}*\n"
         f"Account: *{CRED_LABELS[_AF_CRED_TYPE]}* (requires a cached, valid login — check 🔒 Token Status)\n"
         f"First run in {interval} min."
     )
 
 
 async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Parse the entered email (or `skip`). A real email defers finalizing
-    the schedule until the format (block vs Excel) is chosen next; `skip`
-    finalizes immediately since there's no email to format."""
+    """Parse the entered email (or `skip`), then always ask for the report
+    format next — it governs the periodic Telegram delivery regardless of
+    whether an email was configured, so it's never skipped."""
     text = update.message.text.strip()
 
     if text.lower() == "skip":
-        _, cfg = _af_create_schedule(ctx, "", "block")
-        await update.message.reply_text(
-            _af_schedule_created_text(cfg), parse_mode="Markdown", reply_markup=_main_menu(),
-        )
-        return ConversationHandler.END
+        ctx.user_data["af_email"] = ""
+    else:
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}", text):
+            await update.message.reply_text(
+                "❌ Invalid email address. Enter a valid email (e.g. `user@example.com`) or send `skip`.",
+                parse_mode="Markdown",
+            )
+            return AF.EMAIL
+        ctx.user_data["af_email"] = text
 
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}", text):
-        await update.message.reply_text(
-            "❌ Invalid email address. Enter a valid email (e.g. `user@example.com`) or send `skip`.",
-            parse_mode="Markdown",
-        )
-        return AF.EMAIL
-
-    ctx.user_data["af_email"] = text
-    await update.message.reply_text("📧 How should this email look?", reply_markup=_af_email_format_keyboard())
-    return AF.EMAIL_FORMAT
+    await update.message.reply_text(
+        "📊 Which format do you want for this schedule's reports (Telegram and email alike)?",
+        reply_markup=_af_report_format_keyboard(),
+    )
+    return AF.REPORT_FORMAT
 
 
-async def recv_af_email_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def recv_af_report_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle the block/Excel choice, then finalize the schedule."""
     query = update.callback_query
     await query.answer()
-    email_format = query.data.split(":", 1)[1]
+    report_format = query.data.split(":", 1)[1]
     email = ctx.user_data.get("af_email", "")
 
-    _, cfg = _af_create_schedule(ctx, email, email_format)
+    _, cfg = _af_create_schedule(ctx, email, report_format)
     await query.edit_message_text(_af_schedule_created_text(cfg), parse_mode="Markdown")
     await query.message.reply_text("Main menu:", reply_markup=_main_menu())
     return ConversationHandler.END
@@ -864,15 +877,28 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | {sec_label}\n\n"
     )
 
-    lines = [_ft_format_task_block(i, t, markdown=True) for i, t in enumerate(tasks, 1)]
+    report_format = _af_get_report_format(cfg)
 
-    for chat_id in ALLOWED_IDS:
-        async def _send(text, reply_markup, chat_id=chat_id):
+    if report_format == "excel":
+        xlsx_bytes = _af_build_excel(tasks)
+        filename   = f"auto_fetch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        for chat_id in ALLOWED_IDS:
             try:
-                await context.bot.send_message(chat_id, text, parse_mode="Markdown")
+                await context.bot.send_document(
+                    chat_id, document=io.BytesIO(xlsx_bytes), filename=filename,
+                    caption=header.strip(), parse_mode="Markdown",
+                )
             except Exception as e:
                 logger.warning("Auto Fetch notify error for %s: %s", chat_id, e)
-        await _send_chunked_report(_send, [header] + lines, join="\n\n")
+    else:
+        lines = [_ft_format_task_block(i, t, markdown=True) for i, t in enumerate(tasks, 1)]
+        for chat_id in ALLOWED_IDS:
+            async def _send(text, reply_markup, chat_id=chat_id):
+                try:
+                    await context.bot.send_message(chat_id, text, parse_mode="Markdown")
+                except Exception as e:
+                    logger.warning("Auto Fetch notify error for %s: %s", chat_id, e)
+            await _send_chunked_report(_send, [header] + lines, join="\n\n")
 
     # Email notification — skipped if this schedule's current ref set is
     # identical to what was actually emailed last cycle (same tasks, same
@@ -890,9 +916,8 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-        email_format = cfg.get("email_format", "block")
         try:
-            if email_format == "excel":
+            if report_format == "excel":
                 xlsx_bytes = _af_build_excel(tasks)
                 filename   = f"auto_fetch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                 _send_bulk_export_email(email, filename, xlsx_bytes)
@@ -908,7 +933,7 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 email_subject = f"Auto Fetch — {len(tasks)} task(s) found"
                 _send_auto_fetch_email(email, email_subject, plain_body)
-            logger.info("Auto Fetch email (%s) sent to %s", email_format, email)
+            logger.info("Auto Fetch email (%s) sent to %s", report_format, email)
             email_state[schedule_id] = current_refs
             save_af_email_state(email_state)
         except Exception as e:
@@ -1044,7 +1069,7 @@ def register(app: Application) -> None:
             AF.AMOUNT_TEXT: [MessageHandler(not_cancel, recv_af_amount_text)],
             AF.SECTIONAL:   [CallbackQueryHandler(recv_af_sectional,    pattern=r"^ft_sectional:")],
             AF.EMAIL:       [MessageHandler(not_cancel, recv_af_email)],
-            AF.EMAIL_FORMAT: [CallbackQueryHandler(recv_af_email_format, pattern=r"^af_emailfmt:")],
+            AF.REPORT_FORMAT: [CallbackQueryHandler(recv_af_report_format, pattern=r"^af_reportfmt:")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
