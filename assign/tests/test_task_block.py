@@ -44,6 +44,20 @@ class TestFormatLabeledBlock(unittest.TestCase):
         self.assertNotIn("`", block)
         self.assertNotIn("*", block)
 
+    def test_field_value_with_markdown_special_chars_is_escaped(self):
+        """Regression: an unescaped '_'/'*' in a field value (assessor,
+        valuer, etc. — user input or external API data) raised
+        telegram.error.BadRequest ("can't find end of the entity") and
+        crashed the whole send. See common.md_escape."""
+        block = tb.format_labeled_block(1, "REF1", [("Assessor", "John_Doe *Senior*")])
+        self.assertIn("John\\_Doe \\*Senior\\*", block)
+
+    def test_markdown_false_does_not_escape_field_values(self):
+        """Plain-text email doesn't parse Markdown, so escaping would just
+        show literal backslashes to the reader."""
+        block = tb.format_labeled_block(1, "REF1", [("Assessor", "John_Doe")], markdown=False)
+        self.assertIn("Assessor: John_Doe", block)
+
 
 class TestFormatConsideration(unittest.TestCase):
     """format_consideration turns a raw amount + currency into 'KES 1,234.00'."""

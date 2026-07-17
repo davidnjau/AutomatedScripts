@@ -272,6 +272,24 @@ class TestRecvBeEmail(unittest.TestCase):
         self.assertEqual(ctx.user_data["be_session"].email, "jane@example.com")
 
 
+class TestRecvBeSchedule(unittest.TestCase):
+    """recv_be_schedule — the pre-run confirm summary, including the
+    Destination line built from the user-typed email."""
+
+    def test_email_with_special_chars_is_escaped_in_summary(self):
+        """Regression: an unescaped '_' in the destination email raised
+        telegram.error.BadRequest ("can't find end of the entity")."""
+        update = _make_update_with_callback("be_sched:0")
+        ctx = MagicMock()
+        sess = be.BESession(email="john_doe@example.com", county="nairobi", registries=["central"])
+        ctx.user_data = {"be_session": sess}
+        with patch.object(be, "allowed", return_value=True), \
+             patch.object(be, "get_valid_tokens", return_value=TOKENS):
+            _run(be.recv_be_schedule(update, ctx))
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("john\\_doe@example.com", text)
+
+
 class TestCmdExportStatus(unittest.TestCase):
     def test_no_status_shows_info_message(self):
         update = _make_update_with_message()

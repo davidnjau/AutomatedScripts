@@ -40,6 +40,7 @@ from common import (
     fallback,
     load_sectional_config,
     logger,
+    md_escape,
     not_cancel,
     save_sectional_config,
 )
@@ -70,7 +71,7 @@ async def cmd_sectional(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if specialist:
         status = (
             f"🔲 *Sectional Properties*\n\n"
-            f"Specialist: *{specialist['name']}*\n"
+            f"Specialist: *{md_escape(specialist['name'])}*\n"
             f"Auto-routing: {'✅ On' if auto_route else '❌ Off'}\n"
             f"Credential: {CRED_LABELS.get(cred_type, cred_type) if cred_type else '—'}\n\n"
             f"Choose an action:"
@@ -187,7 +188,7 @@ async def recv_sc_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for key, label in CRED_LABELS.items()
     ])
     await query.edit_message_text(
-        f"Selected: *{name}*\n\nWhich credential to use for auto-assignment?",
+        f"Selected: *{md_escape(name)}*\n\nWhich credential to use for auto-assignment?",
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
@@ -208,7 +209,7 @@ async def recv_sc_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_sectional_config(cfg)
     await query.edit_message_text(
         f"✅ *Sectional specialist set*\n"
-        f"Name: *{specialist.get('name')}*\n"
+        f"Name: *{md_escape(specialist.get('name'))}*\n"
         f"Credential: *{CRED_LABELS.get(cred_type, cred_type)}*\n\n"
         f"Use /sectional to toggle auto-routing.",
         parse_mode="Markdown",

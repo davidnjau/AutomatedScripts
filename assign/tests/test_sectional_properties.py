@@ -61,6 +61,17 @@ class TestCmdSectional(unittest.TestCase):
         self.assertEqual(result, sp.SC.ACTION)
         self.assertIn("Jane Doe", update.message.reply_text.call_args[0][0])
 
+    def test_specialist_name_with_special_chars_is_escaped(self):
+        """Regression: an unescaped '_' in the specialist name raised
+        telegram.error.BadRequest ("can't find end of the entity")."""
+        update = _make_update_with_message()
+        ctx = MagicMock()
+        cfg = {"specialist": {"name": "Jane_Doe"}, "auto_route": True, "cred_type": "staff"}
+        with patch.object(sp, "allowed", return_value=True), \
+             patch.object(sp, "load_sectional_config", return_value=cfg):
+            _run(sp.cmd_sectional(update, ctx))
+        self.assertIn("Jane\\_Doe", update.message.reply_text.call_args[0][0])
+
 
 class TestRecvScAction(unittest.TestCase):
     def test_toggle_route_flips_and_saves(self):
@@ -155,6 +166,16 @@ class TestRecvScSelect(unittest.TestCase):
         self.assertEqual(result, sp.SC.CRED)
         self.assertEqual(ctx.user_data["sc_specialist"]["name"], "Jane Doe")
 
+    def test_name_with_special_chars_is_escaped_in_confirmation(self):
+        """Regression: an unescaped '_' in the name raised
+        telegram.error.BadRequest ("can't find end of the entity")."""
+        update = _make_update_with_callback("sc_pick:0")
+        ctx = MagicMock()
+        ctx.user_data = {"sc_results": [{"id": "1", "first_name": "Jane_Under", "last_name": "Doe", "account_number": "A1"}]}
+        _run(sp.recv_sc_select(update, ctx))
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Jane\\_Under Doe", text)
+
 
 class TestRecvScCred(unittest.TestCase):
     def test_saves_specialist_and_credential(self):
@@ -170,6 +191,16 @@ class TestRecvScCred(unittest.TestCase):
             "cred_type": "staff2",
         })
         self.assertEqual(result, sp.ConversationHandler.END)
+
+    def test_name_with_special_chars_is_escaped_in_confirmation(self):
+        update = _make_update_with_callback("sc_cred:staff2")
+        ctx = MagicMock()
+        ctx.user_data = {"sc_specialist": {"name": "Jane_Doe", "uid": "1", "account_number": "A1"}}
+        with patch.object(sp, "load_sectional_config", return_value={"auto_route": True}), \
+             patch.object(sp, "save_sectional_config"):
+            _run(sp.recv_sc_cred(update, ctx))
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Jane\\_Doe", text)
 
 
 if __name__ == "__main__":

@@ -26,17 +26,28 @@ than a full task report.
 
 from typing import Dict, List, Optional, Tuple
 
+from common import md_escape
+
 
 def format_labeled_block(i: int, ref: str, fields: List[Tuple[str, str]], markdown: bool = True) -> str:
     """Render one item as a numbered, labeled multi-line block: a bold/
     backticked Ref header (tap-to-copy in Telegram), then each (label,
-    value) pair on its own indented line. `fields` values are used as-is —
-    callers are responsible for their own "—" fallback and formatting.
-    markdown=False (Auto Fetch's plain-text email) leaves the ref
-    unadorned, since email doesn't parse Markdown."""
-    ref_line = f"  {i}. 📌 *Ref:* `{ref or '—'}`" if markdown else f"  {i}. 📌 Ref: {ref or '—'}"
-    lines = [ref_line]
-    lines += [f"     {label}: {value}" for label, value in fields]
+    value) pair on its own indented line. `fields` values are used as-is
+    content-wise — callers are responsible for their own "—" fallback and
+    formatting — but each value is Markdown-escaped (md_escape) before
+    interpolation, since assessor/valuer/parcel names come from user input
+    or an external API and an unescaped '_'/'*' crashes the whole send with
+    telegram.error.BadRequest. markdown=False (Auto Fetch's plain-text
+    email) skips escaping and leaves the ref unadorned, since email doesn't
+    parse Markdown."""
+    if markdown:
+        ref_line = f"  {i}. 📌 *Ref:* `{ref or '—'}`"
+        lines = [ref_line]
+        lines += [f"     {label}: {md_escape(str(value))}" for label, value in fields]
+    else:
+        ref_line = f"  {i}. 📌 Ref: {ref or '—'}"
+        lines = [ref_line]
+        lines += [f"     {label}: {value}" for label, value in fields]
     return "\n".join(lines)
 
 

@@ -67,6 +67,7 @@ from common import (
     fallback,
     get_valid_tokens,
     logger,
+    md_escape,
     not_cancel,
 )
 from email_service import _send_bulk_export_email
@@ -797,7 +798,7 @@ def _bulk_export_run(tokens: AuthTokens, chat_id: int, email: str, bot, loop,
         if email:
             try:
                 _send_bulk_export_email(email, filename, xlsx_bytes)
-                _tg(f"📧 File also sent to *{email}*.")
+                _tg(f"📧 File also sent to *{md_escape(email)}*.")
             except Exception as exc:
                 logger.warning("Bulk export email failed: %s", exc)
                 _tg(f"⚠️ Email delivery failed: `{exc}`")
@@ -1055,7 +1056,7 @@ async def recv_be_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"• Filter: *Completed*\n"
         f"• Schedule: *{sched_label}*\n"
         f"• Account: *{cred_label}*\n"
-        f"• Destination: *{email_label}*\n\n"
+        f"• Destination: *{md_escape(email_label)}*\n\n"
         "Tap *Run Export* to start.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[

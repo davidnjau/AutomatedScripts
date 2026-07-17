@@ -68,6 +68,7 @@ from common import (
     load_saved_assignments,
     load_saved_valuers,
     logger,
+    md_escape,
     not_cancel,
     persist_assignment,
     persist_tokens,
@@ -446,7 +447,7 @@ async def _check_assignments_and_proceed(message, sess: Session) -> int:
         sess.already_assigned = already
 
         already_lines = "\n".join(
-            f"  • `{a['ref']}` → *{a['valuer_name']}* _(on {a['assigned_at']})_"
+            f"  • `{a['ref']}` → *{md_escape(a['valuer_name'])}* _(on {a['assigned_at']})_"
             for a in already
         )
         new_lines = ("\n".join(f"  • `{r}`" for r in new_refs)) if new_refs else "_None_"
@@ -562,7 +563,7 @@ async def recv_valuer_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sv = saved[idx]
         sess.saved_valuer = sv
         await query.edit_message_text(
-            f"✅ Valuer: *{sv['name']}*\n\n"
+            f"✅ Valuer: *{md_escape(sv['name'])}*\n\n"
             "Step 3 — Choose *credential profile*:",
             parse_mode="Markdown",
             reply_markup=_cred_keyboard(),
@@ -577,7 +578,7 @@ async def recv_valuer_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess = get_sess(ctx)
     sess.valuer_name = update.message.text.strip()
     await update.message.reply_text(
-        f"✅ Searching for: *{sess.valuer_name}*\n\n"
+        f"✅ Searching for: *{md_escape(sess.valuer_name)}*\n\n"
         "Step 3 — Choose *credential profile*:",
         parse_mode="Markdown",
         reply_markup=_cred_keyboard(),
@@ -611,7 +612,7 @@ async def recv_cred_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"🔑 Cached login: *{CRED_LABELS[cred_type]}*\n\n"
                 f"📋 *Assignment Summary*\n\n"
-                f"*Valuer:* {sv['name']}\n"
+                f"*Valuer:* {md_escape(sv['name'])}\n"
                 f"*User ID:* `{sv['uid']}`\n\n"
                 f"*References ({len(sess.refs)}):*\n{refs_list}\n\n"
                 f"Proceed?",
@@ -623,7 +624,7 @@ async def recv_cred_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # Cached tokens + new search → search valuers
             await query.edit_message_text(
                 f"🔑 Cached login: *{CRED_LABELS[cred_type]}*\n\n"
-                f"🔍 Searching for valuer *{sess.valuer_name}*…",
+                f"🔍 Searching for valuer *{md_escape(sess.valuer_name)}*…",
                 parse_mode="Markdown",
             )
             results = await _do_valuer_search(query.message, sess)
@@ -634,7 +635,7 @@ async def recv_cred_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return ConversationHandler.END
             if not results:
                 await query.message.reply_text(
-                    f"⚠️ No valuers found matching *{sess.valuer_name}*.",
+                    f"⚠️ No valuers found matching *{md_escape(sess.valuer_name)}*.",
                     parse_mode="Markdown",
                     reply_markup=_main_menu(),
                 )
@@ -728,7 +729,7 @@ async def recv_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         refs_list = "\n".join(f"  • `{r}`" for r in sess.refs)
         await update.message.reply_text(
             f"📋 *Assignment Summary*\n\n"
-            f"*Valuer:* {sv['name']}\n"
+            f"*Valuer:* {md_escape(sv['name'])}\n"
             f"*User ID:* `{sv['uid']}`\n\n"
             f"*References ({len(sess.refs)}):*\n{refs_list}\n\n"
             f"Proceed?",
@@ -738,7 +739,7 @@ async def recv_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return S.CONFIRM
 
     await update.message.reply_text(
-        f"🔍 Searching for valuer *{sess.valuer_name}*…", parse_mode="Markdown"
+        f"🔍 Searching for valuer *{md_escape(sess.valuer_name)}*…", parse_mode="Markdown"
     )
     results = await _do_valuer_search(update.message, sess)
     if results is None:
@@ -748,7 +749,7 @@ async def recv_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     if not results:
         await update.message.reply_text(
-            f"⚠️ No valuers found matching *{sess.valuer_name}*.",
+            f"⚠️ No valuers found matching *{md_escape(sess.valuer_name)}*.",
             parse_mode="Markdown",
             reply_markup=_main_menu(),
         )
@@ -774,7 +775,7 @@ async def recv_valuer_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     refs_list = "\n".join(f"  • `{r}`" for r in sess.refs)
     await query.edit_message_text(
         f"📋 *Assignment Summary*\n\n"
-        f"*Valuer:* {name}\n"
+        f"*Valuer:* {md_escape(name)}\n"
         f"*User ID:* `{uid}`\n\n"
         f"*References ({len(sess.refs)}):*\n{refs_list}\n\n"
         f"Proceed?",
@@ -866,7 +867,7 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         acct = v.get("account_number", "?")
 
     await query.edit_message_text(
-        f"⚙️ Assigning *{name}* to {len(sess.refs)} reference(s)…",
+        f"⚙️ Assigning *{md_escape(name)}* to {len(sess.refs)} reference(s)…",
         parse_mode="Markdown",
     )
 
@@ -904,7 +905,7 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     header = (
         f"🏁 *Assignment Complete*\n\n"
-        f"*Valuer:* {name}\n"
+        f"*Valuer:* {md_escape(name)}\n"
         f"*Success:* {len(ok_refs)} / {len(sess.refs)}\n"
         f"*Failed:*  {len(fail_refs)} / {len(sess.refs)}\n"
     )

@@ -54,6 +54,7 @@ from common import (
     get_valid_tokens,
     load_saved_assignments,
     logger,
+    md_escape,
 )
 from dlv_core import _classify_dlv_detail, _fetch_ref_detail_dlv, _search_ref_dlv
 from endpoints import (
@@ -308,7 +309,8 @@ def _process_hold_item(tokens: AuthTokens, http_sess: requests.Session, item: Di
             item["last_error"]   = ""
             return {
                 "item": item, "keep": True,
-                "line": f"🔁 `{ref}` — taken over by *{other_name}*, reverted back to *{held_valuer_name}*",
+                "line": f"🔁 `{ref}` — taken over by *{md_escape(other_name)}*, "
+                        f"reverted back to *{md_escape(held_valuer_name)}*",
             }
 
         # action == "keep"
@@ -625,7 +627,7 @@ async def _ht_show_queue(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) 
 
     lines = [f"✋ *Held Tasks* — {len(items)} task(s)\n"]
     for item in items:
-        line = f"• `{item.get('ref', '?')}` → *{item.get('held_valuer_name', '?')}*"
+        line = f"• `{item.get('ref', '?')}` → *{md_escape(item.get('held_valuer_name', '?'))}*"
         if item.get("last_error"):
             line += f"\n  ⚠️ _{item['last_error']}_"
         lines.append(line)
