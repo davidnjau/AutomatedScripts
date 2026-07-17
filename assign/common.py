@@ -414,6 +414,7 @@ BTN_BRIEFING      = "🌅 Morning Briefing"
 BTN_SECTIONAL     = "🔲 Sectional"
 BTN_HOLD_TASKS    = "✋ Hold Tasks"
 BTN_INCREMENTAL   = "🔢 Incremental"
+BTN_DLV_REPORT_SCHEDULE = "📧 DLV Report Schedule"
 
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
@@ -425,7 +426,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_EXPORT_STATUS)}|{re.escape(BTN_JOB_DIST)}|{re.escape(BTN_LOOKUP)}"
     f"|{re.escape(BTN_VALUER_TASKS)}"
     f"|{re.escape(BTN_DLV_TASKS)}|{re.escape(BTN_BRIEFING)}|{re.escape(BTN_SECTIONAL)}"
-    f"|{re.escape(BTN_HOLD_TASKS)}|{re.escape(BTN_INCREMENTAL)}"
+    f"|{re.escape(BTN_HOLD_TASKS)}|{re.escape(BTN_INCREMENTAL)}|{re.escape(BTN_DLV_REPORT_SCHEDULE)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -447,6 +448,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(BTN_BRIEFING)],
             [KeyboardButton(BTN_HOLD_TASKS)],
             [KeyboardButton(BTN_INCREMENTAL)],
+            [KeyboardButton(BTN_DLV_REPORT_SCHEDULE)],
             # ── Lookup ──────────────────────────────────────
             [KeyboardButton(BTN_LOOKUP)],
             [KeyboardButton(BTN_AUTH),           KeyboardButton(BTN_TOKEN_STATUS)],

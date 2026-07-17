@@ -16,6 +16,7 @@ COPY task_block.py .
 COPY dlv_batch.py .
 COPY dlv_incremental.py .
 COPY dlv_tasks.py .
+COPY dlv_report_schedule.py .
 COPY hold_tasks.py .
 COPY morning_briefing.py .
 COPY fetch_tasks.py .
