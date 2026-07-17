@@ -121,6 +121,18 @@ def _safe_err(e: Exception) -> str:
     return "unexpected error — check logs"
 
 
+_MD_SPECIAL_CHARS = re.compile(r"([_*`\[])")
+
+
+def md_escape(text: str) -> str:
+    """Escape characters (_, *, `, [) that break Telegram's legacy Markdown
+    parser when interpolating untrusted text — a valuer/assessor name from
+    user input or an external API — into a parse_mode="Markdown" message.
+    Without this, a name containing e.g. a stray underscore raises
+    telegram.error.BadRequest and the whole handler crashes."""
+    return _MD_SPECIAL_CHARS.sub(r"\\\1", text or "")
+
+
 # ── Valuers ───────────────────────────────────────────────
 
 def load_saved_valuers() -> List[Dict]:
