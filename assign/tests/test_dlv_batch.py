@@ -413,6 +413,22 @@ class TestDbFormatBatchSummary(unittest.TestCase):
         self.assertIn("REF1` 🏷Queue", summary)
         self.assertNotIn("REF2` 🏷", summary)
 
+    def test_valuer_name_with_markdown_special_chars_is_escaped(self):
+        """Regression: an unescaped '_'/'*' in a valuer or assessor name
+        raised telegram.error.BadRequest ("can't find end of the entity")
+        and crashed recv_db_input — see common.md_escape."""
+        with patch.object(dlv_batch, "_fetch_tasks_log_lookup",
+                           return_value={"assessor": "John_Doe"}):
+            sess = self._sess([{"refs": ["REF1"], "valuer_name": "Jane_Doe", "status": "resolved"}])
+            summary = dlv_batch._db_format_batch_summary(sess)
+        self.assertIn("Jane\\_Doe", summary)
+        self.assertIn("John\\_Doe", summary)
+
+    def test_unresolved_valuer_name_with_special_chars_is_escaped(self):
+        sess = self._sess([{"refs": ["REF1"], "valuer_name": "Ghost_Name", "status": "unresolved"}])
+        summary = dlv_batch._db_format_batch_summary(sess)
+        self.assertIn("Ghost\\_Name", summary)
+
 
 class TestDbTagKeyboards(unittest.TestCase):
     def test_tag_ref_keyboard_shows_tag_or_no_tag(self):
