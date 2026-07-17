@@ -4,13 +4,16 @@ dlv_incremental.py
 ===================
 Incremental tagging — a third DLV Batch tag option (alongside the fixed
 dlv_core.DLV_TAGS "Queue"/"Direct") that auto-assigns a sequential
-"B{batch}-T{task}" label instead of a picked fixed value. Batches are 6
-tasks wide: tapping "🔢 Incremental" in DLV Batch's Tag Tasks step always
-consumes the next slot in a persisted (batch_number, task_number) counter
-(saved_incremental_counter.json) — task_number 1..6 within a batch, then
-batch_number advances and task_number wraps back to 1. The counter has no
-built-in starting point (real-world usage rarely starts at batch 1 task
-1) — seed it once via this feature's ⚙️ Set Counter action.
+"B{batch}-T{task}" label instead of a picked fixed value. Tapping "🔢
+Incremental" in DLV Batch's Tag Tasks step always consumes the next slot
+in a persisted (batch_number, task_number, batch_size) counter
+(saved_incremental_counter.json) — task_number 1..batch_size within a
+batch, then batch_number advances and task_number wraps back to 1.
+batch_size defaults to 6 but, along with the counter's starting
+batch_number/task_number, has no other built-in value (real-world usage
+rarely starts at batch 1 task 1) — configure both together in one flow
+via this feature's ⚙️ Set Counter action (get_batch_size() reads the
+current size back out for anything that needs it).
 
 The counter is only consumed at DLV Batch confirm time (dlv_batch.py's
 recv_db_confirm resolves any INCREMENTAL_TAG_SENTINEL value in
@@ -20,20 +23,22 @@ counter slot for a tag that was never actually persisted.
 
 Reports here are deliberately separate from DLV Tasks' own By
 Valuer/By Tag reports (which assume a small fixed tag vocabulary for
-their picker) since incremental tags are unique per ref:
+their picker) since incremental tags are unique per ref. Both always use
+the CURRENT batch_size setting, even for batches created under a
+different size before it was last changed:
 
 - 📦 By Batch — every incremental-tagged ref, grouped by its original
   batch_number, sourced from saved_dlv_batch.json ("queued") and
   saved_assignments.json ("cleared") only — deliberately not
   saved_dlv_closed.json, since "cleared" here means "assigned", not
   "DLV-completed". A batch auto-closes (a persisted status flag, not a
-  data move) the moment all 6 of its task slots are found cleared; ✋ Close
+  data move) the moment all of its task slots are found cleared; ✋ Close
   Batch offers the same action manually for anyone impatient to see it
   reflected without waiting for the next report view.
 - ✅ Cleared — every cleared (assigned) incremental-tagged ref, sorted by
-  assigned_at and chunked into groups of 6 in clearance order (First
-  Cleared, Second Cleared, ...) — independent of original batch number,
-  since tasks from different batches can clear in any order.
+  assigned_at and chunked into groups of batch_size in clearance order
+  (First Cleared, Second Cleared, ...) — independent of original batch
+  number, since tasks from different batches can clear in any order.
 
 Call register(app) from bot.py's main() to wire this feature in.
 """
@@ -81,7 +86,7 @@ SAVED_INCREMENTAL_CLOSED_FILE  = os.path.join(DATA_DIR, "saved_incremental_close
 INCREMENTAL_TAG_SENTINEL = "__incremental__"
 
 _INCREMENTAL_TAG_RE = re.compile(r"^B(\d+)-T(\d+)$")
-_BATCH_SIZE = 6
+_DEFAULT_BATCH_SIZE = 6
 
 _ORDINALS = ["First", "Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh", "Eighth", "Ninth", "Tenth"]
 
@@ -90,36 +95,52 @@ _ORDINALS = ["First", "Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh", 
 # Counter persistence
 # ──────────────────────────────────────────────────────────
 def load_incremental_counter() -> Dict:
-    """Current (batch_number, task_number) position — defaults to batch 1, task 1."""
+    """Current (batch_number, task_number, batch_size) position — defaults
+    to batch 1, task 1, batch_size 6. batch_size defaults in for files
+    saved before it existed, rather than requiring a migration step."""
     try:
         with open(SAVED_INCREMENTAL_COUNTER_FILE) as f:
-            return json.load(f)
+            cfg = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"batch_number": 1, "task_number": 1}
+        return {"batch_number": 1, "task_number": 1, "batch_size": _DEFAULT_BATCH_SIZE}
+    cfg.setdefault("batch_size", _DEFAULT_BATCH_SIZE)
+    return cfg
 
 
 def save_incremental_counter(cfg: Dict) -> None:
     _atomic_json_write(SAVED_INCREMENTAL_COUNTER_FILE, cfg, indent=2)
 
 
-def set_incremental_counter(batch_number: int, task_number: int) -> None:
-    """Manually seed the counter to match real-world state (e.g. a batch
-    already partway used before this feature existed)."""
-    save_incremental_counter({"batch_number": batch_number, "task_number": task_number})
+def get_batch_size() -> int:
+    """Current tasks-per-batch setting."""
+    return load_incremental_counter().get("batch_size", _DEFAULT_BATCH_SIZE)
+
+
+def set_incremental_counter(batch_number: int, task_number: int, batch_size: Optional[int] = None) -> None:
+    """Manually seed the counter's position to match real-world state (e.g.
+    a batch already partway used before this feature existed), and
+    optionally the tasks-per-batch size — left unchanged if not given."""
+    current = load_incremental_counter()
+    save_incremental_counter({
+        "batch_number": batch_number,
+        "task_number":  task_number,
+        "batch_size":   batch_size if batch_size is not None else current.get("batch_size", _DEFAULT_BATCH_SIZE),
+    })
 
 
 def next_incremental_tag() -> str:
     """Consume and return the next "B{batch}-T{task}" tag, advancing the
     persisted counter — task_number wraps to 1 and batch_number advances
-    once task 6 is consumed."""
+    once the configured batch_size is reached."""
     cfg   = load_incremental_counter()
     batch = cfg.get("batch_number", 1)
     task  = cfg.get("task_number", 1)
+    size  = cfg.get("batch_size", _DEFAULT_BATCH_SIZE)
     tag   = f"B{batch}-T{task}"
-    if task >= _BATCH_SIZE:
-        save_incremental_counter({"batch_number": batch + 1, "task_number": 1})
+    if task >= size:
+        save_incremental_counter({"batch_number": batch + 1, "task_number": 1, "batch_size": size})
     else:
-        save_incremental_counter({"batch_number": batch, "task_number": task + 1})
+        save_incremental_counter({"batch_number": batch, "task_number": task + 1, "batch_size": size})
     return tag
 
 
@@ -190,21 +211,24 @@ def _ic_group_by_batch(items: List[Dict]) -> Dict[int, List[Dict]]:
     return groups
 
 
-def _ic_eligible_batches(grouped: Dict[int, List[Dict]]) -> List[int]:
-    """Batch numbers where all 6 task slots (T1-T6) are present and every one is cleared."""
+def _ic_eligible_batches(grouped: Dict[int, List[Dict]], batch_size: int) -> List[int]:
+    """Batch numbers where all task slots (T1-T{batch_size}) are present
+    and every one is cleared. Uses the CURRENT batch_size setting for
+    every batch checked — if batch_size was changed after some batches
+    were created, older batches are judged against the new size too."""
     eligible = []
     for batch_number, items in grouped.items():
         task_numbers = {i["task_number"] for i in items}
-        if task_numbers == set(range(1, _BATCH_SIZE + 1)) and all(i["status"] == "cleared" for i in items):
+        if task_numbers == set(range(1, batch_size + 1)) and all(i["status"] == "cleared" for i in items):
             eligible.append(batch_number)
     return sorted(eligible)
 
 
-def _ic_auto_close(grouped: Dict[int, List[Dict]]) -> List[int]:
+def _ic_auto_close(grouped: Dict[int, List[Dict]], batch_size: int) -> List[int]:
     """Auto-flag any newly-eligible batch as closed. Returns the batch
     numbers newly closed this call (already-closed ones excluded)."""
     closed   = set(load_closed_batches())
-    eligible = set(_ic_eligible_batches(grouped))
+    eligible = set(_ic_eligible_batches(grouped, batch_size))
     newly_closed = sorted(eligible - closed)
     if newly_closed:
         save_closed_batches(sorted(closed | eligible))
@@ -214,7 +238,7 @@ def _ic_auto_close(grouped: Dict[int, List[Dict]]) -> List[int]:
 # ──────────────────────────────────────────────────────────
 # Report formatting
 # ──────────────────────────────────────────────────────────
-def _ic_format_by_batch_report(grouped: Dict[int, List[Dict]], closed_batches: List[int]) -> List[str]:
+def _ic_format_by_batch_report(grouped: Dict[int, List[Dict]], closed_batches: List[int], batch_size: int) -> List[str]:
     """📦 By Batch — one section per original batch number, each task
     slot's ref/status/valuer, flagging closed batches."""
     lines = ["📦 *Incremental Report — By Batch*\n"]
@@ -225,7 +249,7 @@ def _ic_format_by_batch_report(grouped: Dict[int, List[Dict]], closed_batches: L
     for batch_number in sorted(grouped):
         items = grouped[batch_number]
         status_note = " ✅ CLOSED" if batch_number in closed_set else ""
-        lines.append(f"*Batch {batch_number}*{status_note} — {len(items)}/{_BATCH_SIZE} tagged")
+        lines.append(f"*Batch {batch_number}*{status_note} — {len(items)}/{batch_size} tagged")
         for item in items:
             status_icon = "✅" if item["status"] == "cleared" else "⏳"
             valuer = md_escape(item.get("valuer_name") or "—")
@@ -233,20 +257,20 @@ def _ic_format_by_batch_report(grouped: Dict[int, List[Dict]], closed_batches: L
     return lines
 
 
-def _ic_format_cleared_report(items: List[Dict]) -> List[str]:
+def _ic_format_cleared_report(items: List[Dict], batch_size: int) -> List[str]:
     """✅ Cleared — cleared items only, sorted by clearance (assigned_at)
-    order and chunked into groups of 6 regardless of original batch."""
+    order and chunked into groups of batch_size regardless of original batch."""
     cleared = [i for i in items if i["status"] == "cleared"]
     cleared.sort(key=lambda i: i.get("assigned_at", ""))
     lines = ["✅ *Incremental Report — Cleared*\n"]
     if not cleared:
         lines.append("_No cleared incremental-tagged tasks yet._")
         return lines
-    for group_idx in range(0, len(cleared), _BATCH_SIZE):
-        group = cleared[group_idx:group_idx + _BATCH_SIZE]
-        ordinal_idx = group_idx // _BATCH_SIZE
+    for group_idx in range(0, len(cleared), batch_size):
+        group = cleared[group_idx:group_idx + batch_size]
+        ordinal_idx = group_idx // batch_size
         ordinal = f"{_ORDINALS[ordinal_idx]} Cleared" if ordinal_idx < len(_ORDINALS) else f"Cleared Group {ordinal_idx + 1}"
-        lines.append(f"*{ordinal}* ({len(group)}/{_BATCH_SIZE})")
+        lines.append(f"*{ordinal}* ({len(group)}/{batch_size})")
         for item in group:
             valuer = md_escape(item.get("valuer_name") or "—")
             lines.append(f"  B{item['batch_number']}-T{item['task_number']}: `{item['ref']}` — {valuer}")
@@ -258,6 +282,7 @@ def _ic_format_cleared_report(items: List[Dict]) -> List[str]:
 # ──────────────────────────────────────────────────────────
 class IC(Enum):
     MENU       = auto()   # By Batch / Cleared / Set Counter / Close Batch
+    SET_SIZE   = auto()   # enter tasks-per-batch (or skip to keep current)
     SET_BATCH  = auto()   # enter the batch number to seed
     SET_TASK   = auto()   # enter the task number to seed
     CLOSE_PICK = auto()   # pick which eligible-but-unclosed batch to manually close
@@ -287,7 +312,7 @@ async def cmd_incremental(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg = load_incremental_counter()
     await update.message.reply_text(
         f"🔢 *Incremental Report*\n\nCurrent position: *Batch {cfg.get('batch_number', 1)}, "
-        f"Task {cfg.get('task_number', 1)}*",
+        f"Task {cfg.get('task_number', 1)}* (batch size: {cfg.get('batch_size', _DEFAULT_BATCH_SIZE)})",
         parse_mode="Markdown",
         reply_markup=_ic_menu_keyboard(),
     )
@@ -307,15 +332,20 @@ async def recv_ic_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if action == "setcounter":
-        await query.edit_message_text("Enter the batch number to set:")
-        return IC.SET_BATCH
+        await query.edit_message_text(
+            f"Enter the number of tasks per batch (current: {get_batch_size()}), "
+            "or send `skip` to keep it unchanged:",
+            parse_mode="Markdown",
+        )
+        return IC.SET_SIZE
 
-    items   = _ic_gather_items()
-    grouped = _ic_group_by_batch(items)
+    batch_size = get_batch_size()
+    items      = _ic_gather_items()
+    grouped    = _ic_group_by_batch(items)
 
     if action == "bybatch":
-        _ic_auto_close(grouped)
-        lines = _ic_format_by_batch_report(grouped, load_closed_batches())
+        _ic_auto_close(grouped, batch_size)
+        lines = _ic_format_by_batch_report(grouped, load_closed_batches(), batch_size)
         await query.edit_message_text("⏳ Building report…")
 
         async def _send(text, reply_markup):
@@ -324,7 +354,7 @@ async def recv_ic_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if action == "cleared":
-        lines = _ic_format_cleared_report(items)
+        lines = _ic_format_cleared_report(items, batch_size)
         await query.edit_message_text("⏳ Building report…")
 
         async def _send(text, reply_markup):
@@ -333,8 +363,8 @@ async def recv_ic_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     # action == "closebatch"
-    _ic_auto_close(grouped)   # catch up first, so the picker only ever shows genuinely-manual cases
-    eligible = set(_ic_eligible_batches(grouped)) - set(load_closed_batches())
+    _ic_auto_close(grouped, batch_size)   # catch up first, so the picker only ever shows genuinely-manual cases
+    eligible = set(_ic_eligible_batches(grouped, batch_size)) - set(load_closed_batches())
     if not eligible:
         await query.edit_message_text("ℹ️ No batch is fully cleared and still open.")
         await query.message.reply_text("Main menu:", reply_markup=_main_menu())
@@ -362,6 +392,23 @@ async def recv_ic_close_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def recv_ic_set_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Parse the entered tasks-per-batch size (or `skip` to keep the
+    current one), then ask for the starting batch number."""
+    if not allowed(update): return await deny(update)
+    text = update.message.text.strip()
+    if text.lower() == "skip":
+        ctx.user_data["ic_set_size"] = get_batch_size()
+    else:
+        if not text.isdigit() or int(text) < 1:
+            await update.message.reply_text("❌ Enter a positive whole number, or `skip` to keep the current size.",
+                                             parse_mode="Markdown")
+            return IC.SET_SIZE
+        ctx.user_data["ic_set_size"] = int(text)
+    await update.message.reply_text("Enter the batch number to start at:")
+    return IC.SET_BATCH
+
+
 async def recv_ic_set_batch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Parse the entered batch number, then ask for the task number."""
     if not allowed(update): return await deny(update)
@@ -370,23 +417,26 @@ async def recv_ic_set_batch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Enter a positive whole number for the batch.")
         return IC.SET_BATCH
     ctx.user_data["ic_set_batch"] = int(text)
-    await update.message.reply_text(f"Batch set to *{text}*.\n\nEnter the task number (1-{_BATCH_SIZE}):",
+    size = ctx.user_data.get("ic_set_size", _DEFAULT_BATCH_SIZE)
+    await update.message.reply_text(f"Batch set to *{text}*.\n\nEnter the task number (1-{size}):",
                                      parse_mode="Markdown")
     return IC.SET_TASK
 
 
 async def recv_ic_set_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Parse the entered task number and finalize the counter seed."""
+    """Parse the entered task number and finalize the counter seed
+    (position + batch size, set together as one configuration)."""
     if not allowed(update): return await deny(update)
     text = update.message.text.strip()
-    if not text.isdigit() or not (1 <= int(text) <= _BATCH_SIZE):
-        await update.message.reply_text(f"❌ Enter a whole number from 1 to {_BATCH_SIZE}.")
+    size = ctx.user_data.get("ic_set_size", _DEFAULT_BATCH_SIZE)
+    if not text.isdigit() or not (1 <= int(text) <= size):
+        await update.message.reply_text(f"❌ Enter a whole number from 1 to {size}.")
         return IC.SET_TASK
     batch_number = ctx.user_data.get("ic_set_batch", 1)
     task_number  = int(text)
-    set_incremental_counter(batch_number, task_number)
+    set_incremental_counter(batch_number, task_number, size)
     await update.message.reply_text(
-        f"✅ Counter set to *Batch {batch_number}, Task {task_number}*. "
+        f"✅ Counter set to *Batch {batch_number}, Task {task_number}* (batch size: {size}). "
         f"The next 🔢 Incremental tag will be `B{batch_number}-T{task_number}`.",
         parse_mode="Markdown",
         reply_markup=_main_menu(),
@@ -406,6 +456,7 @@ def register(app: Application) -> None:
         ],
         states={
             IC.MENU:       [CallbackQueryHandler(recv_ic_menu, pattern=r"^ic_menu:")],
+            IC.SET_SIZE:   [MessageHandler(not_cancel, recv_ic_set_size)],
             IC.SET_BATCH:  [MessageHandler(not_cancel, recv_ic_set_batch)],
             IC.SET_TASK:   [MessageHandler(not_cancel, recv_ic_set_task)],
             IC.CLOSE_PICK: [CallbackQueryHandler(recv_ic_close_pick, pattern=r"^ic_close:")],

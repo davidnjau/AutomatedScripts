@@ -51,30 +51,47 @@ class TestCounterPersistence(unittest.TestCase):
         self._patch.stop()
         self.tmpdir.cleanup()
 
-    def test_missing_file_defaults_to_batch_1_task_1(self):
-        self.assertEqual(ic.load_incremental_counter(), {"batch_number": 1, "task_number": 1})
+    def test_missing_file_defaults_to_batch_1_task_1_size_6(self):
+        self.assertEqual(ic.load_incremental_counter(), {"batch_number": 1, "task_number": 1, "batch_size": 6})
 
-    def test_set_incremental_counter_seeds_state(self):
+    def test_set_incremental_counter_seeds_state_keeping_batch_size(self):
         ic.set_incremental_counter(2, 2)
-        self.assertEqual(ic.load_incremental_counter(), {"batch_number": 2, "task_number": 2})
+        self.assertEqual(ic.load_incremental_counter(),
+                          {"batch_number": 2, "task_number": 2, "batch_size": 6})
+
+    def test_set_incremental_counter_can_also_change_batch_size(self):
+        ic.set_incremental_counter(2, 2, batch_size=4)
+        self.assertEqual(ic.load_incremental_counter(),
+                          {"batch_number": 2, "task_number": 2, "batch_size": 4})
+        self.assertEqual(ic.get_batch_size(), 4)
 
     def test_next_tag_advances_task_number(self):
         ic.set_incremental_counter(2, 2)
         tag = ic.next_incremental_tag()
         self.assertEqual(tag, "B2-T2")
-        self.assertEqual(ic.load_incremental_counter(), {"batch_number": 2, "task_number": 3})
+        self.assertEqual(ic.load_incremental_counter(),
+                          {"batch_number": 2, "task_number": 3, "batch_size": 6})
 
-    def test_next_tag_wraps_batch_after_task_6(self):
+    def test_next_tag_wraps_batch_after_last_task_of_configured_size(self):
         ic.set_incremental_counter(2, 6)
         tag = ic.next_incremental_tag()
         self.assertEqual(tag, "B2-T6")
-        self.assertEqual(ic.load_incremental_counter(), {"batch_number": 3, "task_number": 1})
+        self.assertEqual(ic.load_incremental_counter(),
+                          {"batch_number": 3, "task_number": 1, "batch_size": 6})
+
+    def test_smaller_batch_size_wraps_sooner(self):
+        ic.set_incremental_counter(2, 4, batch_size=4)
+        tag = ic.next_incremental_tag()
+        self.assertEqual(tag, "B2-T4")
+        self.assertEqual(ic.load_incremental_counter(),
+                          {"batch_number": 3, "task_number": 1, "batch_size": 4})
 
     def test_sequential_calls_walk_through_a_full_batch(self):
         ic.set_incremental_counter(2, 2)
         tags = [ic.next_incremental_tag() for _ in range(5)]
         self.assertEqual(tags, ["B2-T2", "B2-T3", "B2-T4", "B2-T5", "B2-T6"])
-        self.assertEqual(ic.load_incremental_counter(), {"batch_number": 3, "task_number": 1})
+        self.assertEqual(ic.load_incremental_counter(),
+                          {"batch_number": 3, "task_number": 1, "batch_size": 6})
 
 
 class TestParseIncrementalTag(unittest.TestCase):
@@ -166,24 +183,30 @@ class TestGatherAndGroup(unittest.TestCase):
 
 
 class TestEligibleAndAutoClose(unittest.TestCase):
-    def _full_cleared_batch(self, batch_number):
+    def _full_cleared_batch(self, batch_number, size=6):
         return [{"ref": f"R{t}", "batch_number": batch_number, "task_number": t, "status": "cleared"}
-                for t in range(1, 7)]
+                for t in range(1, size + 1)]
 
     def test_batch_eligible_when_all_6_cleared(self):
         grouped = {2: self._full_cleared_batch(2)}
-        self.assertEqual(ic._ic_eligible_batches(grouped), [2])
+        self.assertEqual(ic._ic_eligible_batches(grouped, batch_size=6), [2])
 
     def test_batch_not_eligible_when_one_still_queued(self):
         items = self._full_cleared_batch(2)
         items[0]["status"] = "queued"
         grouped = {2: items}
-        self.assertEqual(ic._ic_eligible_batches(grouped), [])
+        self.assertEqual(ic._ic_eligible_batches(grouped, batch_size=6), [])
 
     def test_batch_not_eligible_when_missing_a_task_slot(self):
         items = self._full_cleared_batch(2)[:-1]   # only 5 of 6
         grouped = {2: items}
-        self.assertEqual(ic._ic_eligible_batches(grouped), [])
+        self.assertEqual(ic._ic_eligible_batches(grouped, batch_size=6), [])
+
+    def test_smaller_configured_batch_size_makes_a_4_task_batch_eligible(self):
+        grouped = {2: self._full_cleared_batch(2, size=4)}
+        self.assertEqual(ic._ic_eligible_batches(grouped, batch_size=4), [2])
+        # ...but not eligible under the old size of 6
+        self.assertEqual(ic._ic_eligible_batches(grouped, batch_size=6), [])
 
     def test_auto_close_flags_newly_eligible_only(self):
         grouped = {2: self._full_cleared_batch(2), 3: self._full_cleared_batch(3)}
@@ -191,14 +214,14 @@ class TestEligibleAndAutoClose(unittest.TestCase):
             closed_file = os.path.join(tmpdir, "closed.json")
             with patch.object(ic, "SAVED_INCREMENTAL_CLOSED_FILE", closed_file):
                 ic.close_batch(2)   # batch 2 already closed beforehand
-                newly = ic._ic_auto_close(grouped)
+                newly = ic._ic_auto_close(grouped, batch_size=6)
                 self.assertEqual(newly, [3])
                 self.assertEqual(ic.load_closed_batches(), [2, 3])
 
 
 class TestFormatReports(unittest.TestCase):
     def test_by_batch_report_empty(self):
-        lines = ic._ic_format_by_batch_report({}, [])
+        lines = ic._ic_format_by_batch_report({}, [], batch_size=6)
         self.assertIn("No incremental-tagged tasks yet", "\n".join(lines))
 
     def test_by_batch_report_shows_status_icons_and_closed_flag(self):
@@ -208,24 +231,29 @@ class TestFormatReports(unittest.TestCase):
                 {"ref": "REF2", "task_number": 3, "status": "cleared", "valuer_name": "John Otieno"},
             ],
         }
-        lines = "\n".join(ic._ic_format_by_batch_report(grouped, [2]))
-        self.assertIn("*Batch 2* ✅ CLOSED", lines)
+        lines = "\n".join(ic._ic_format_by_batch_report(grouped, [2], batch_size=6))
+        self.assertIn("*Batch 2* ✅ CLOSED — 2/6 tagged", lines)
         self.assertIn("T2: `REF1` ⏳ Jane Doe", lines)
         self.assertIn("T3: `REF2` ✅ John Otieno", lines)
 
+    def test_by_batch_report_reflects_configured_batch_size(self):
+        grouped = {2: [{"ref": "REF1", "task_number": 2, "status": "queued", "valuer_name": "Jane Doe"}]}
+        lines = "\n".join(ic._ic_format_by_batch_report(grouped, [], batch_size=4))
+        self.assertIn("1/4 tagged", lines)
+
     def test_by_batch_report_no_closed_flag_when_not_closed(self):
         grouped = {2: [{"ref": "REF1", "task_number": 2, "status": "queued", "valuer_name": "Jane Doe"}]}
-        lines = "\n".join(ic._ic_format_by_batch_report(grouped, []))
+        lines = "\n".join(ic._ic_format_by_batch_report(grouped, [], batch_size=6))
         self.assertIn("*Batch 2* —", lines)
         self.assertNotIn("CLOSED", lines)
 
     def test_valuer_name_with_special_chars_is_escaped(self):
         grouped = {2: [{"ref": "REF1", "task_number": 2, "status": "queued", "valuer_name": "Jane_Doe"}]}
-        lines = "\n".join(ic._ic_format_by_batch_report(grouped, []))
+        lines = "\n".join(ic._ic_format_by_batch_report(grouped, [], batch_size=6))
         self.assertIn("Jane\\_Doe", lines)
 
     def test_cleared_report_empty(self):
-        lines = ic._ic_format_cleared_report([])
+        lines = ic._ic_format_cleared_report([], batch_size=6)
         self.assertIn("No cleared incremental-tagged tasks yet", "\n".join(lines))
 
     def test_cleared_report_groups_by_six_in_clearance_order(self):
@@ -234,15 +262,25 @@ class TestFormatReports(unittest.TestCase):
              "assigned_at": f"2026-07-{10 + i:02d} 09:00:00", "valuer_name": "Jane Doe"}
             for i in range(1, 8)   # 7 cleared items -> First Cleared (6) + Second Cleared (1)
         ]
-        lines = "\n".join(ic._ic_format_cleared_report(items))
+        lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=6))
         self.assertIn("*First Cleared* (6/6)", lines)
         self.assertIn("*Second Cleared* (1/6)", lines)
+
+    def test_cleared_report_groups_by_configured_batch_size(self):
+        items = [
+            {"ref": f"R{i}", "batch_number": 4, "task_number": i, "status": "cleared",
+             "assigned_at": f"2026-07-{10 + i:02d} 09:00:00", "valuer_name": "Jane Doe"}
+            for i in range(1, 5)   # 4 cleared items, batch_size=4 -> exactly one full group
+        ]
+        lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=4))
+        self.assertIn("*First Cleared* (4/4)", lines)
+        self.assertNotIn("Second Cleared", lines)
 
     def test_cleared_report_ignores_queued_items(self):
         items = [
             {"ref": "R1", "batch_number": 2, "task_number": 1, "status": "queued", "valuer_name": "Jane Doe"},
         ]
-        lines = "\n".join(ic._ic_format_cleared_report(items))
+        lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=6))
         self.assertIn("No cleared incremental-tagged tasks yet", lines)
 
     def test_cleared_report_mixes_original_batches_within_one_group(self):
@@ -252,7 +290,7 @@ class TestFormatReports(unittest.TestCase):
             {"ref": "B", "batch_number": 6, "task_number": 1, "status": "cleared",
              "assigned_at": "2026-07-11 09:00:00", "valuer_name": "Jane Doe"},
         ]
-        lines = "\n".join(ic._ic_format_cleared_report(items))
+        lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=6))
         self.assertIn("B4-T6", lines)
         self.assertIn("B6-T1", lines)
         self.assertIn("*First Cleared*", lines)
@@ -279,17 +317,19 @@ class TestRecvIcMenu(unittest.TestCase):
             result = _run(ic.recv_ic_menu(update, ctx))
         self.assertEqual(result, ic.ConversationHandler.END)
 
-    def test_setcounter_moves_to_set_batch(self):
+    def test_setcounter_moves_to_set_size(self):
         update = _make_query_update("ic_menu:setcounter")
         ctx = MagicMock()
-        with patch.object(ic, "allowed", return_value=True):
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "get_batch_size", return_value=6):
             result = _run(ic.recv_ic_menu(update, ctx))
-        self.assertEqual(result, ic.IC.SET_BATCH)
+        self.assertEqual(result, ic.IC.SET_SIZE)
 
     def test_bybatch_sends_report_and_ends(self):
         update = _make_query_update("ic_menu:bybatch")
         ctx = MagicMock()
         with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "load_dlv_batch", return_value=[]), \
              patch.object(ic, "load_saved_assignments", return_value={}), \
              patch.object(ic, "load_closed_batches", return_value=[]):
@@ -301,6 +341,7 @@ class TestRecvIcMenu(unittest.TestCase):
         update = _make_query_update("ic_menu:cleared")
         ctx = MagicMock()
         with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "load_dlv_batch", return_value=[]), \
              patch.object(ic, "load_saved_assignments", return_value={}):
             result = _run(ic.recv_ic_menu(update, ctx))
@@ -310,6 +351,7 @@ class TestRecvIcMenu(unittest.TestCase):
         update = _make_query_update("ic_menu:closebatch")
         ctx = MagicMock()
         with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "load_dlv_batch", return_value=[]), \
              patch.object(ic, "load_saved_assignments", return_value={}), \
              patch.object(ic, "load_closed_batches", return_value=[]):
@@ -321,6 +363,7 @@ class TestRecvIcMenu(unittest.TestCase):
         ctx = MagicMock()
         assignments = {f"R{t}": {"tag": f"B2-T{t}", "assigned_at": "2026-07-17 09:00:00"} for t in range(1, 7)}
         with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "load_dlv_batch", return_value=[]), \
              patch.object(ic, "load_saved_assignments", return_value=assignments), \
              patch.object(ic, "load_closed_batches", return_value=[]):
@@ -346,6 +389,43 @@ class TestRecvIcClosePick(unittest.TestCase):
         mock_close.assert_called_once_with(2)
 
 
+class TestRecvIcSetSize(unittest.TestCase):
+    def test_skip_keeps_current_batch_size(self):
+        update = _make_message_update("skip")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "get_batch_size", return_value=6):
+            result = _run(ic.recv_ic_set_size(update, ctx))
+        self.assertEqual(result, ic.IC.SET_BATCH)
+        self.assertEqual(ctx.user_data["ic_set_size"], 6)
+
+    def test_non_numeric_reprompts(self):
+        update = _make_message_update("abc")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        with patch.object(ic, "allowed", return_value=True):
+            result = _run(ic.recv_ic_set_size(update, ctx))
+        self.assertEqual(result, ic.IC.SET_SIZE)
+
+    def test_zero_or_negative_reprompts(self):
+        update = _make_message_update("0")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        with patch.object(ic, "allowed", return_value=True):
+            result = _run(ic.recv_ic_set_size(update, ctx))
+        self.assertEqual(result, ic.IC.SET_SIZE)
+
+    def test_valid_size_moves_to_set_batch(self):
+        update = _make_message_update("4")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        with patch.object(ic, "allowed", return_value=True):
+            result = _run(ic.recv_ic_set_size(update, ctx))
+        self.assertEqual(result, ic.IC.SET_BATCH)
+        self.assertEqual(ctx.user_data["ic_set_size"], 4)
+
+
 class TestRecvIcSetBatchAndTask(unittest.TestCase):
     def test_non_numeric_batch_reprompts(self):
         update = _make_message_update("abc")
@@ -358,31 +438,34 @@ class TestRecvIcSetBatchAndTask(unittest.TestCase):
     def test_valid_batch_moves_to_set_task(self):
         update = _make_message_update("2")
         ctx = MagicMock()
-        ctx.user_data = {}
+        ctx.user_data = {"ic_set_size": 4}
         with patch.object(ic, "allowed", return_value=True):
             result = _run(ic.recv_ic_set_batch(update, ctx))
         self.assertEqual(result, ic.IC.SET_TASK)
         self.assertEqual(ctx.user_data["ic_set_batch"], 2)
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("1-4", text)
 
-    def test_task_out_of_range_reprompts(self):
-        update = _make_message_update("7")
+    def test_task_out_of_range_for_configured_size_reprompts(self):
+        update = _make_message_update("5")
         ctx = MagicMock()
-        ctx.user_data = {"ic_set_batch": 2}
+        ctx.user_data = {"ic_set_batch": 2, "ic_set_size": 4}
         with patch.object(ic, "allowed", return_value=True):
             result = _run(ic.recv_ic_set_task(update, ctx))
         self.assertEqual(result, ic.IC.SET_TASK)
 
-    def test_valid_task_sets_counter_and_ends(self):
+    def test_valid_task_sets_counter_with_size_and_ends(self):
         update = _make_message_update("3")
         ctx = MagicMock()
-        ctx.user_data = {"ic_set_batch": 2}
+        ctx.user_data = {"ic_set_batch": 2, "ic_set_size": 4}
         with patch.object(ic, "allowed", return_value=True), \
              patch.object(ic, "set_incremental_counter") as mock_set:
             result = _run(ic.recv_ic_set_task(update, ctx))
         self.assertEqual(result, ic.ConversationHandler.END)
-        mock_set.assert_called_once_with(2, 3)
+        mock_set.assert_called_once_with(2, 3, 4)
         text = update.message.reply_text.call_args[0][0]
         self.assertIn("B2-T3", text)
+        self.assertIn("batch size: 4", text)
 
 
 if __name__ == "__main__":
