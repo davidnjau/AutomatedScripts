@@ -367,6 +367,43 @@ class TestAutoFetchJob(unittest.TestCase):
         self.assertLess(body.index("Ref: HIGH"), body.index("Ref: MID"))
         self.assertLess(body.index("Ref: MID"), body.index("Ref: LOW"))
 
+    def test_excel_format_sends_attachment_not_block_email(self):
+        cfg = {"days_back": 2, "email": "ops@example.com", "email_format": "excel"}
+        tasks = [_task()]
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "persist_af_result"), \
+             patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
+             patch.object(af, "ALLOWED_IDS", set()), \
+             patch.object(af, "_send_auto_fetch_email") as mock_block_email, \
+             patch.object(af, "_send_bulk_export_email") as mock_excel_email:
+            _run(af._auto_fetch_job(self.context))
+        mock_block_email.assert_not_called()
+        mock_excel_email.assert_called_once()
+        self.assertEqual(mock_excel_email.call_args[0][0], "ops@example.com")
+        self.assertTrue(mock_excel_email.call_args[0][1].endswith(".xlsx"))
+
+    def test_missing_email_format_defaults_to_block(self):
+        """Old schedules saved before email_format existed must still work."""
+        cfg = {"days_back": 2, "email": "ops@example.com"}   # no "email_format" key
+        tasks = [_task()]
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "persist_af_result"), \
+             patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
+             patch.object(af, "ALLOWED_IDS", set()), \
+             patch.object(af, "_send_auto_fetch_email") as mock_block_email, \
+             patch.object(af, "_send_bulk_export_email") as mock_excel_email:
+            _run(af._auto_fetch_job(self.context))
+        mock_block_email.assert_called_once()
+        mock_excel_email.assert_not_called()
+
     def _run_email_cycle(self, cfg, tasks):
         with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
              patch.object(af, "get_valid_tokens", return_value=TOKENS), \
@@ -660,39 +697,123 @@ class TestRecvAfEmail(unittest.TestCase):
         self.assertEqual(result, af.AF.EMAIL)
         self.assertIn("Invalid email", self.update.message.reply_text.call_args[0][0])
 
-    def test_valid_submission_confirms_the_support_credential(self):
-        """Regression test: the confirmation used to say nothing about which
-        account runs the job, hiding the fact it always needs a valid cached
-        Support Reg login regardless of what credential you used elsewhere."""
+    def test_valid_email_moves_to_email_format_step(self):
+        """A real email defers finalizing until the block/Excel format is
+        chosen next — only `skip` finalizes immediately."""
         self.update.message.text = "ops@example.com"
-        with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1") as mock_add:
-            result = _run(af.recv_af_email(self.update, self.ctx))
-        self.assertEqual(result, af.ConversationHandler.END)
-        mock_add.assert_called_once()
-        self.assertEqual(mock_add.call_args[0][0]["email"], "ops@example.com")
+        result = _run(af.recv_af_email(self.update, self.ctx))
+        self.assertEqual(result, af.AF.EMAIL_FORMAT)
+        self.assertEqual(self.ctx.user_data["af_email"], "ops@example.com")
         text = self.update.message.reply_text.call_args[0][0]
-        self.assertIn(af.CRED_LABELS[af._AF_CRED_TYPE], text)
-
-    def test_email_with_special_chars_is_escaped_in_confirmation(self):
-        self.update.message.text = "john_doe@example.com"
-        with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1"):
-            _run(af.recv_af_email(self.update, self.ctx))
-        text = self.update.message.reply_text.call_args[0][0]
-        self.assertIn("john\\_doe@example.com", text)
-
-    def test_valid_submission_schedules_a_job_tagged_with_the_new_id(self):
-        self.update.message.text = "ops@example.com"
-        with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1"):
-            _run(af.recv_af_email(self.update, self.ctx))
-        _, kwargs = self.ctx.job_queue.run_repeating.call_args
-        self.assertEqual(kwargs["name"], "auto_fetch_job:sched-1")
-        self.assertEqual(kwargs["data"], "sched-1")
+        self.assertIn("How should this email look", text)
 
     def test_skip_saves_schedule_with_no_email(self):
         self.update.message.text = "skip"
         with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1") as mock_add:
-            _run(af.recv_af_email(self.update, self.ctx))
+            result = _run(af.recv_af_email(self.update, self.ctx))
+        self.assertEqual(result, af.ConversationHandler.END)
         self.assertEqual(mock_add.call_args[0][0]["email"], "")
+        self.assertEqual(mock_add.call_args[0][0]["email_format"], "block")
+
+
+class TestRecvAfEmailFormat(unittest.TestCase):
+    """recv_af_email_format — the block/Excel choice, which finalizes the
+    schedule (only reached when a real email was entered)."""
+
+    def _make_query(self, data):
+        update = MagicMock()
+        query = update.callback_query
+        query.data = data
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        query.message.reply_text = AsyncMock()
+        return update
+
+    def setUp(self):
+        self.ctx = MagicMock()
+        self.ctx.user_data = {"af_email": "ops@example.com"}
+
+    def test_valid_submission_confirms_the_support_credential(self):
+        """Regression test: the confirmation used to say nothing about which
+        account runs the job, hiding the fact it always needs a valid cached
+        Support Reg login regardless of what credential you used elsewhere."""
+        update = self._make_query("af_emailfmt:block")
+        with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1") as mock_add:
+            result = _run(af.recv_af_email_format(update, self.ctx))
+        self.assertEqual(result, af.ConversationHandler.END)
+        mock_add.assert_called_once()
+        self.assertEqual(mock_add.call_args[0][0]["email"], "ops@example.com")
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn(af.CRED_LABELS[af._AF_CRED_TYPE], text)
+
+    def test_email_with_special_chars_is_escaped_in_confirmation(self):
+        self.ctx.user_data["af_email"] = "john_doe@example.com"
+        update = self._make_query("af_emailfmt:block")
+        with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1"):
+            _run(af.recv_af_email_format(update, self.ctx))
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("john\\_doe@example.com", text)
+
+    def test_valid_submission_schedules_a_job_tagged_with_the_new_id(self):
+        update = self._make_query("af_emailfmt:block")
+        with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1"):
+            _run(af.recv_af_email_format(update, self.ctx))
+        _, kwargs = self.ctx.job_queue.run_repeating.call_args
+        self.assertEqual(kwargs["name"], "auto_fetch_job:sched-1")
+        self.assertEqual(kwargs["data"], "sched-1")
+
+    def test_block_format_saved_and_shown_in_confirmation(self):
+        update = self._make_query("af_emailfmt:block")
+        with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1") as mock_add:
+            _run(af.recv_af_email_format(update, self.ctx))
+        self.assertEqual(mock_add.call_args[0][0]["email_format"], "block")
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("(Block)", text)
+
+    def test_excel_format_saved_and_shown_in_confirmation(self):
+        update = self._make_query("af_emailfmt:excel")
+        with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1") as mock_add:
+            _run(af.recv_af_email_format(update, self.ctx))
+        self.assertEqual(mock_add.call_args[0][0]["email_format"], "excel")
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("(Excel attachment)", text)
+
+
+class TestAfBuildExcel(unittest.TestCase):
+    """_af_build_excel — the Excel-attachment alternative to the block email body."""
+
+    def test_sheet_title_and_columns(self):
+        import io
+        import openpyxl
+        xlsx_bytes = af._af_build_excel([])
+        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
+        self.assertEqual(wb.sheetnames, ["Auto Fetch"])
+        ws = wb.active
+        header = [c.value for c in ws[1]]
+        self.assertEqual(header, ["Reference Number", "Source", "Assessor", "Consideration", "Currency",
+                                   "Parcel", "Registry", "County", "Date Added", "Tag"])
+
+    def test_rows_populated_and_sorted_highest_consideration_first(self):
+        import io
+        import openpyxl
+        tasks = [
+            _task(ref="LOW", consideration="1000000"),
+            _task(ref="HIGH", consideration="9000000"),
+        ]
+        xlsx_bytes = af._af_build_excel(tasks)
+        ws = openpyxl.load_workbook(io.BytesIO(xlsx_bytes)).active
+        self.assertEqual(ws.cell(row=2, column=1).value, "HIGH")
+        self.assertEqual(ws.cell(row=3, column=1).value, "LOW")
+
+    def test_officers_fallback_used_when_no_assessor(self):
+        import io
+        import openpyxl
+        t = _task()
+        t.pop("assessor", None)
+        t["officers"] = [{"name": "Jane Doe", "role": "COUNTY_REGISTRAR"}]
+        xlsx_bytes = af._af_build_excel([t])
+        ws = openpyxl.load_workbook(io.BytesIO(xlsx_bytes)).active
+        self.assertIn("Jane Doe", ws.cell(row=2, column=3).value)
 
 
 class TestAfConsiderationValue(unittest.TestCase):

@@ -39,15 +39,29 @@ emailed last cycle, keyed by schedule id. A cycle whose current ref set
 matches exactly is skipped — the Telegram summary still sends every cycle
 regardless. Any difference (new/dropped ref) sends the full current list,
 not just the delta, and updates the stored set.
+
+A schedule's email (if any) picks one of two formats, asked right after a
+real email address is entered (skip has nothing to format, so it's not
+asked): "block" (default, the plain-text _ft_format_task_block body via
+_send_auto_fetch_email — unchanged from before this option existed) or
+"excel" (_af_build_excel's single-sheet workbook, sent as an attachment
+via email_service._send_bulk_export_email — the same attachment-based
+sender DLV Report Schedule's own emailed reports use). Old schedules
+saved before this existed have no "email_format" key and default to
+"block".
 """
 
+import io
 import json
 import os
 import re
 import time
 import uuid
+from datetime import datetime
 from enum import Enum, auto
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+import openpyxl
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -90,8 +104,9 @@ from common import (
     persist_assignment,
 )
 from dlv_core import load_dlv_batch
-from email_service import _send_auto_fetch_email
+from email_service import _send_auto_fetch_email, _send_bulk_export_email
 from endpoints import STAMP_DUTY_FIX_APPLICATION_URL
+from excel_report import autofit_columns, style_header_row
 from fetch_tasks import _ft_format_task_block, _load_fetch_tasks
 from task_block import assessor_field, consideration_field, format_labeled_block, parcel_field
 from telegram_report import _send_chunked_report
@@ -115,6 +130,7 @@ class AF(Enum):
     AMOUNT_TEXT = auto()   # custom amount text entry
     SECTIONAL   = auto()   # exclude / only / all sectional
     EMAIL       = auto()   # optional recipient email address
+    EMAIL_FORMAT = auto()  # block (text) or Excel attachment — only asked when an email was entered
 
 
 # ──────────────────────────────────────────────────────────
@@ -553,20 +569,18 @@ async def recv_af_sectional(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return AF.EMAIL
 
 
-async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+def _af_email_format_keyboard() -> InlineKeyboardMarkup:
+    """Choose how a schedule's email should look — only shown when an email
+    address was actually entered (Telegram-only schedules skip this)."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 Block (text email)", callback_data="af_emailfmt:block")],
+        [InlineKeyboardButton("📊 Excel attachment",    callback_data="af_emailfmt:excel")],
+    ])
 
-    if text.lower() == "skip":
-        email = ""
-    else:
-        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}", text):
-            await update.message.reply_text(
-                "❌ Invalid email address. Enter a valid email (e.g. `user@example.com`) or send `skip`.",
-                parse_mode="Markdown",
-            )
-            return AF.EMAIL
-        email = text
 
+def _af_create_schedule(ctx: ContextTypes.DEFAULT_TYPE, email: str, email_format: str) -> Tuple[str, Dict]:
+    """Persist a new Auto Fetch schedule from the just-completed setup flow
+    and register its repeating job. Returns (schedule_id, cfg)."""
     interval   = ctx.user_data.get("af_interval_minutes", 60)
     days       = ctx.user_data.get("af_days_back", 2)
     county     = ctx.user_data.get("af_county", "")
@@ -584,6 +598,7 @@ async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "amount_max":       amount_max,
         "sectional_filter": sectional,
         "email":            email,
+        "email_format":     email_format,
     }
     schedule_id = add_auto_fetch_schedule(cfg)
     ctx.job_queue.run_repeating(
@@ -593,24 +608,70 @@ async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         name=f"auto_fetch_job:{schedule_id}",
         data=schedule_id,
     )
+    return schedule_id, cfg
 
+
+def _af_schedule_created_text(cfg: Dict) -> str:
+    """Confirmation text shown right after a new schedule is created."""
+    amount_min = cfg.get("amount_min")
+    amount_max = cfg.get("amount_max")
     lo_s      = f"KES {int(amount_min):,}" if amount_min is not None else "0"
     hi_s      = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
-    co_label  = county.title() or "All"
-    re_label  = registry.title() or "All"
-    sec_label = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(sectional, sectional)
-    email_label = email or "Telegram only"
-    await update.message.reply_text(
+    co_label  = (cfg.get("county_filter") or "").title() or "All"
+    re_label  = (cfg.get("registry_filter") or "").title() or "All"
+    sec_label = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(
+        cfg.get("sectional_filter", "exclude"), cfg.get("sectional_filter", "exclude"),
+    )
+    email        = cfg.get("email") or ""
+    email_label  = email or "Telegram only"
+    format_label = " (Excel attachment)" if cfg.get("email_format") == "excel" else " (Block)"
+    interval     = cfg.get("interval_minutes", 60)
+    return (
         f"✅ *Auto Fetch schedule added*\n"
-        f"Every *{interval} min* | Days back: *{days}*\n"
+        f"Every *{interval} min* | Days back: *{cfg.get('days_back', 2)}*\n"
         f"County: *{co_label}* | Registry: *{re_label}*\n"
         f"Amount: {lo_s} – {hi_s} | Sectional: *{sec_label}*\n"
-        f"Email: *{md_escape(email_label)}*\n"
+        f"Email: *{md_escape(email_label)}*{format_label if email else ''}\n"
         f"Account: *{CRED_LABELS[_AF_CRED_TYPE]}* (requires a cached, valid login — check 🔒 Token Status)\n"
-        f"First run in {interval} min.",
-        parse_mode="Markdown",
-        reply_markup=_main_menu(),
+        f"First run in {interval} min."
     )
+
+
+async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Parse the entered email (or `skip`). A real email defers finalizing
+    the schedule until the format (block vs Excel) is chosen next; `skip`
+    finalizes immediately since there's no email to format."""
+    text = update.message.text.strip()
+
+    if text.lower() == "skip":
+        _, cfg = _af_create_schedule(ctx, "", "block")
+        await update.message.reply_text(
+            _af_schedule_created_text(cfg), parse_mode="Markdown", reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}", text):
+        await update.message.reply_text(
+            "❌ Invalid email address. Enter a valid email (e.g. `user@example.com`) or send `skip`.",
+            parse_mode="Markdown",
+        )
+        return AF.EMAIL
+
+    ctx.user_data["af_email"] = text
+    await update.message.reply_text("📧 How should this email look?", reply_markup=_af_email_format_keyboard())
+    return AF.EMAIL_FORMAT
+
+
+async def recv_af_email_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle the block/Excel choice, then finalize the schedule."""
+    query = update.callback_query
+    await query.answer()
+    email_format = query.data.split(":", 1)[1]
+    email = ctx.user_data.get("af_email", "")
+
+    _, cfg = _af_create_schedule(ctx, email, email_format)
+    await query.edit_message_text(_af_schedule_created_text(cfg), parse_mode="Markdown")
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
     return ConversationHandler.END
 
 
@@ -624,6 +685,41 @@ def _af_consideration_value(t: dict) -> float:
         return float(str(raw).replace(",", "").strip())
     except (ValueError, TypeError):
         return -1.0
+
+
+def _af_build_excel(tasks: List[Dict]) -> bytes:
+    """Build the Auto Fetch Excel export — the alternative to the
+    plain-text block email body, selected via the schedule's 📊 Excel
+    attachment option. One row per task, same highest-consideration-first
+    order the block email already uses."""
+    tasks = sorted(tasks, key=_af_consideration_value, reverse=True)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Auto Fetch"
+    cols = ["Reference Number", "Source", "Assessor", "Consideration", "Currency",
+            "Parcel", "Registry", "County", "Date Added", "Tag"]
+    style_header_row(ws, cols)
+    for t in tasks:
+        assessor = t.get("assessor") or ""
+        if not assessor:
+            officers = t.get("officers") or []
+            assessor = ", ".join(f"{o.get('name', '')} ({o.get('role', '')})" for o in officers if o.get("name"))
+        ws.append([
+            t.get("reference_number", ""),
+            t.get("source", ""),
+            assessor,
+            t.get("consideration", ""),
+            t.get("currency_code", ""),
+            t.get("parcel_number", ""),
+            (t.get("registry") or "").upper(),
+            (t.get("county") or "").upper(),
+            (t.get("date_created") or "")[:10],
+            t.get("tag", ""),
+        ])
+    autofit_columns(ws, min_width=15, max_width=60)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -794,17 +890,25 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-        plain_header = (
-            f"Auto Fetch — {len(tasks)} task(s)\n"
-            f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | {sec_label}\n"
-            + "─" * 60 + "\n\n"
-        )
-        email_tasks   = sorted(tasks, key=_af_consideration_value, reverse=True)
-        plain_body    = plain_header + "\n\n".join(_ft_format_task_block(i, t) for i, t in enumerate(email_tasks, 1))
-        email_subject = f"Auto Fetch — {len(tasks)} task(s) found"
+        email_format = cfg.get("email_format", "block")
         try:
-            _send_auto_fetch_email(email, email_subject, plain_body)
-            logger.info("Auto Fetch email sent to %s", email)
+            if email_format == "excel":
+                xlsx_bytes = _af_build_excel(tasks)
+                filename   = f"auto_fetch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                _send_bulk_export_email(email, filename, xlsx_bytes)
+            else:
+                plain_header = (
+                    f"Auto Fetch — {len(tasks)} task(s)\n"
+                    f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | {sec_label}\n"
+                    + "─" * 60 + "\n\n"
+                )
+                email_tasks   = sorted(tasks, key=_af_consideration_value, reverse=True)
+                plain_body    = plain_header + "\n\n".join(
+                    _ft_format_task_block(i, t) for i, t in enumerate(email_tasks, 1)
+                )
+                email_subject = f"Auto Fetch — {len(tasks)} task(s) found"
+                _send_auto_fetch_email(email, email_subject, plain_body)
+            logger.info("Auto Fetch email (%s) sent to %s", email_format, email)
             email_state[schedule_id] = current_refs
             save_af_email_state(email_state)
         except Exception as e:
@@ -940,6 +1044,7 @@ def register(app: Application) -> None:
             AF.AMOUNT_TEXT: [MessageHandler(not_cancel, recv_af_amount_text)],
             AF.SECTIONAL:   [CallbackQueryHandler(recv_af_sectional,    pattern=r"^ft_sectional:")],
             AF.EMAIL:       [MessageHandler(not_cancel, recv_af_email)],
+            AF.EMAIL_FORMAT: [CallbackQueryHandler(recv_af_email_format, pattern=r"^af_emailfmt:")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
