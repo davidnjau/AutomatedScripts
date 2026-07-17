@@ -16,6 +16,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import openpyxl
@@ -337,14 +338,35 @@ class TestDtValuerKey(unittest.TestCase):
         self.assertEqual(dlv_tasks._dt_valuer_key({}), "")
 
 
-class TestDtCollectValuers(unittest.TestCase):
-    """_dt_collect_valuers dedups by key across open + closed, sorted by name."""
+class TestDtLoadAssignmentItems(unittest.TestCase):
+    """_dt_load_assignment_items — saved_assignments.json flattened into
+    item dicts with 'ref' merged in, matching the shape every filter/field
+    builder here expects."""
 
-    def test_dedupes_across_open_and_closed_and_sorts_by_name(self):
+    def test_merges_ref_key_into_each_item(self):
+        with patch.object(dlv_tasks, "load_saved_assignments", return_value={
+                "REF1": {"valuer_name": "Jane Doe", "valuer_uid": "u1"},
+             }):
+            items = dlv_tasks._dt_load_assignment_items()
+        self.assertEqual(items, [{"ref": "REF1", "valuer_name": "Jane Doe", "valuer_uid": "u1"}])
+
+    def test_empty_store_returns_empty_list(self):
+        with patch.object(dlv_tasks, "load_saved_assignments", return_value={}):
+            self.assertEqual(dlv_tasks._dt_load_assignment_items(), [])
+
+
+class TestDtCollectValuers(unittest.TestCase):
+    """_dt_collect_valuers dedups by key across queue + at-desk (assignments) + closed, sorted by name."""
+
+    def test_dedupes_across_open_desk_and_closed_and_sorts_by_name(self):
         with patch.object(dlv_tasks, "load_dlv_batch", return_value=[
                 {"valuer_uid": "u2", "valuer_name": "Zed Valuer"},
                 {"valuer_uid": "u1", "valuer_name": "Amos Valuer"},
              ]), \
+             patch.object(dlv_tasks, "load_saved_assignments", return_value={
+                "REF1": {"valuer_uid": "u1", "valuer_name": "Amos Valuer"},   # same key — should not duplicate
+                "REF2": {"valuer_uid": "u4", "valuer_name": "Desk Valuer"},
+             }), \
              patch.object(dlv_tasks, "load_dlv_closed", return_value=[
                 {"valuer_uid": "u1", "valuer_name": "Amos Valuer"},   # same key — should not duplicate
                 {"valuer_uid": "u3", "valuer_name": "Beth Valuer"},
@@ -355,39 +377,70 @@ class TestDtCollectValuers(unittest.TestCase):
             [
                 {"key": "u1", "name": "Amos Valuer"},
                 {"key": "u3", "name": "Beth Valuer"},
+                {"key": "u4", "name": "Desk Valuer"},
                 {"key": "u2", "name": "Zed Valuer"},
             ],
         )
 
     def test_empty_when_no_items_anywhere(self):
         with patch.object(dlv_tasks, "load_dlv_batch", return_value=[]), \
+             patch.object(dlv_tasks, "load_saved_assignments", return_value={}), \
              patch.object(dlv_tasks, "load_dlv_closed", return_value=[]):
             self.assertEqual(dlv_tasks._dt_collect_valuers(), [])
 
     def test_items_without_uid_or_name_are_skipped(self):
         with patch.object(dlv_tasks, "load_dlv_batch", return_value=[{"valuer_uid": "", "valuer_name": ""}]), \
+             patch.object(dlv_tasks, "load_saved_assignments", return_value={}), \
              patch.object(dlv_tasks, "load_dlv_closed", return_value=[]):
             self.assertEqual(dlv_tasks._dt_collect_valuers(), [])
 
 
-class TestDtFormatValuerReport(unittest.TestCase):
-    """_dt_format_valuer_report renders queued + period-filtered closed history
-    for one valuer, each ref as its own labeled block (not a packed one-liner)."""
+class TestDtDaysPast(unittest.TestCase):
+    """_dt_days_past — truncated datetime + "- N days past" suffix, handling
+    both DLV Batch's "T"-separated ISO format and saved_assignments.json's
+    space-separated "%Y-%m-%d %H:%M:%S"."""
 
-    def test_queued_and_closed_sections_render_expected_fields(self):
+    def test_missing_returns_em_dash(self):
+        self.assertEqual(dlv_tasks._dt_days_past(""), "—")
+        self.assertEqual(dlv_tasks._dt_days_past(None), "—")
+
+    def test_today_shows_zero_days_past(self):
+        today = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        self.assertIn("0 days past", dlv_tasks._dt_days_past(today))
+
+    def test_space_separated_format_is_parsed(self):
+        today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.assertIn("days past", dlv_tasks._dt_days_past(today))
+
+    def test_unparseable_falls_back_to_truncated_raw(self):
+        self.assertEqual(dlv_tasks._dt_days_past("not-a-date"), "not-a-date"[:16])
+
+
+class TestDtFormatValuerReport(unittest.TestCase):
+    """_dt_format_valuer_report renders queued + at-desk + period-filtered
+    closed history for one valuer, each ref as its own labeled block (not a
+    packed one-liner)."""
+
+    def test_queued_desk_and_closed_sections_render_expected_fields(self):
         queued = [{"ref": "REG/A/1", "assessor": "Assessor A", "queued_at": "2026-07-10T10:00:00",
                    "consideration": "6000000", "currency_code": "KES", "parcel": "NAIROBI/BLOCK1/1"}]
+        desk = [{"ref": "REG/A/4", "assessor": "Assessor D", "assigned_at": "2026-07-15 09:00:00",
+                 "consideration": "1000000", "currency_code": "KES", "parcel": "NAIROBI/BLOCK4/4"}]
         closed = [{"ref": "REG/A/2", "assessor": "Assessor B", "queued_at": "2026-07-01T09:00:00",
                    "closed_at": "2026-07-12T11:00:00", "closed_reason": "completed",
                    "consideration_amount": "4000000", "currency_code": "KES", "parcel": "NAIROBI/BLOCK2/2"}]
-        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", queued, closed, "1 week"))
+        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", queued, desk, closed, "1 week"))
         self.assertIn("👤 *DLV Report — Jane Doe*", lines)
         self.assertIn("⏳ *Currently Queued* (1)", lines)
         self.assertIn("`REG/A/1`", lines)
         self.assertIn("Assessor: Assessor A", lines)
         self.assertIn("💰 Consideration: KES 6,000,000.00", lines)
         self.assertIn("📋 Parcel: NAIROBI/BLOCK1/1", lines)
-        self.assertIn("📜 *History* (1 week) — 1", lines)
+        self.assertIn("🏢 *At Valuer's Desk* (1)", lines)
+        self.assertIn("`REG/A/4`", lines)
+        self.assertIn("💰 Consideration: KES 1,000,000.00", lines)
+        self.assertIn("📋 Parcel: NAIROBI/BLOCK4/4", lines)
+        self.assertIn("📜 *Valuer Completed* (1 week) — 1", lines)
         self.assertIn("`REG/A/2`", lines)
         self.assertIn("💰 Consideration: KES 4,000,000.00", lines)
         self.assertIn("📋 Parcel: NAIROBI/BLOCK2/2", lines)
@@ -398,26 +451,29 @@ class TestDtFormatValuerReport(unittest.TestCase):
             {"ref": "REG/A/1", "consideration": "1000000", "currency_code": "KES", "queued_at": "t"},
             {"ref": "REG/A/2", "consideration": "2000000", "currency_code": "KES", "queued_at": "t"},
         ]
+        desk = [{"ref": "REG/A/4", "consideration": "1500000", "currency_code": "KES", "assigned_at": "t"}]
         closed = [{"ref": "REG/A/3", "consideration_amount": "500000", "currency_code": "KES",
                    "closed_at": "t", "closed_reason": "completed"}]
-        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", queued, closed, "All time"))
+        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", queued, desk, closed, "All time"))
         self.assertIn("⏳ *Currently Queued* (2) — Total: KES 3,000,000.00", lines)
-        self.assertIn("📜 *History* (All time) — 1 — Total: KES 500,000.00", lines)
+        self.assertIn("🏢 *At Valuer's Desk* (1) — Total: KES 1,500,000.00", lines)
+        self.assertIn("📜 *Valuer Completed* (All time) — 1 — Total: KES 500,000.00", lines)
 
     def test_totals_are_zero_with_no_parseable_consideration(self):
         lines = "\n".join(dlv_tasks._dt_format_valuer_report(
-            "Jane Doe", [{"ref": "REG/A/1", "queued_at": "t"}], [], "All time"))
+            "Jane Doe", [{"ref": "REG/A/1", "queued_at": "t"}], [], [], "All time"))
         self.assertIn("Total: KES 0.00", lines)
 
     def test_empty_sections_render_none_placeholder(self):
-        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", [], [], "All time"))
+        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", [], [], [], "All time"))
         self.assertIn("⏳ *Currently Queued* (0)", lines)
-        self.assertIn("📜 *History* (All time) — 0", lines)
-        self.assertEqual(lines.count("_none_"), 2)
+        self.assertIn("🏢 *At Valuer's Desk* (0)", lines)
+        self.assertIn("📜 *Valuer Completed* (All time) — 0", lines)
+        self.assertEqual(lines.count("_none_"), 3)
 
     def test_unknown_closed_reason_labeled_unknown(self):
         closed = [{"ref": "REG/A/3", "closed_at": "2026-07-12T11:00:00", "closed_reason": "something_else"}]
-        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", [], closed, "All time"))
+        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", [], [], closed, "All time"))
         self.assertIn("❓ Unknown", lines)
 
     def test_tag_rendered_when_present_omitted_when_absent(self):
@@ -425,44 +481,58 @@ class TestDtFormatValuerReport(unittest.TestCase):
             {"ref": "REG/A/1", "assessor": "A", "queued_at": "t", "tag": "Queue"},
             {"ref": "REG/A/2", "assessor": "B", "queued_at": "t"},
         ]
-        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", queued, [], "All time"))
+        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", queued, [], [], "All time"))
         self.assertIn("🏷 Tag: Queue", lines)
         # only one 🏷 marker — the untagged ref doesn't get one
         self.assertEqual(lines.count("🏷"), 1)
 
     def test_missing_consideration_and_parcel_fall_back_to_em_dash(self):
         lines = "\n".join(dlv_tasks._dt_format_valuer_report(
-            "Jane Doe", [{"ref": "REG/A/1", "queued_at": "t"}], [], "All time"))
+            "Jane Doe", [{"ref": "REG/A/1", "queued_at": "t"}], [], [], "All time"))
         self.assertIn("💰 Consideration: —", lines)
         self.assertIn("📋 Parcel: —", lines)
+
+    def test_desk_item_shows_assigned_date_not_queued_or_closed(self):
+        desk = [{"ref": "REG/A/4", "assigned_at": "2026-07-15 09:00:00"}]
+        lines = "\n".join(dlv_tasks._dt_format_valuer_report("Jane Doe", [], desk, [], "All time"))
+        self.assertIn("📅 Assigned: 2026-07-15 09:00", lines)
+        self.assertNotIn("📅 Queued", lines)
+        self.assertNotIn("📅 Closed", lines)
 
 
 class TestDtFormatTagReport(unittest.TestCase):
     """_dt_format_tag_report — the By Tag report, spans multiple valuers so
     each line shows who it's with (unlike By Valuer, where that's implied)."""
 
-    def test_queued_and_closed_show_valuer_per_line(self):
+    def test_queued_desk_and_closed_show_valuer_per_line(self):
         queued = [{"ref": "REG/A/1", "valuer_name": "Jane Doe", "assessor": "A1",
                    "queued_at": "2026-07-10T10:00:00", "tag": "Queue",
                    "consideration": "3000000", "currency_code": "KES", "parcel": "NAIROBI/BLOCK1/1"}]
+        desk = [{"ref": "REG/A/4", "valuer_name": "Amara Kip", "assessor": "A4",
+                 "assigned_at": "2026-07-15 09:00:00", "tag": "Queue",
+                 "consideration": "1000000", "currency_code": "KES", "parcel": "NAIROBI/BLOCK4/4"}]
         closed = [{"ref": "REG/A/2", "valuer_name": "John Otieno", "assessor": "A2",
                    "queued_at": "2026-07-01T09:00:00", "closed_at": "2026-07-12T11:00:00",
                    "closed_reason": "completed", "tag": "Queue",
                    "consideration_amount": "2000000", "currency_code": "KES", "parcel": "NAIROBI/BLOCK2/2"}]
-        lines = "\n".join(dlv_tasks._dt_format_tag_report("Queue", queued, closed, "All time"))
+        lines = "\n".join(dlv_tasks._dt_format_tag_report("Queue", queued, desk, closed, "All time"))
         self.assertIn("🏷 *DLV Report — Tag: Queue*", lines)
         self.assertIn("Valuer: Jane Doe", lines)
+        self.assertIn("Valuer: Amara Kip", lines)
         self.assertIn("Valuer: John Otieno", lines)
         self.assertIn("💰 Consideration: KES 3,000,000.00", lines)
         self.assertIn("📋 Parcel: NAIROBI/BLOCK1/1", lines)
+        self.assertIn("💰 Consideration: KES 1,000,000.00", lines)
+        self.assertIn("📋 Parcel: NAIROBI/BLOCK4/4", lines)
         self.assertIn("💰 Consideration: KES 2,000,000.00", lines)
         self.assertIn("📋 Parcel: NAIROBI/BLOCK2/2", lines)
         self.assertIn("⏳ *Currently Queued* (1) — Total: KES 3,000,000.00", lines)
-        self.assertIn("📜 *History* (All time) — 1 — Total: KES 2,000,000.00", lines)
+        self.assertIn("🏢 *At Valuer's Desk* (1) — Total: KES 1,000,000.00", lines)
+        self.assertIn("📜 *Valuer Completed* (All time) — 1 — Total: KES 2,000,000.00", lines)
 
     def test_empty_sections_render_none_placeholder(self):
-        lines = "\n".join(dlv_tasks._dt_format_tag_report("Queue", [], [], "All time"))
-        self.assertEqual(lines.count("_none_"), 2)
+        lines = "\n".join(dlv_tasks._dt_format_tag_report("Queue", [], [], [], "All time"))
+        self.assertEqual(lines.count("_none_"), 3)
 
 
 class TestDtSendTelegram(unittest.TestCase):
@@ -576,6 +646,7 @@ class TestRecvDtPeriodTagMode(unittest.TestCase):
         with patch.object(dlv_tasks, "allowed", return_value=True), \
              patch.object(dlv_tasks, "load_dlv_batch", return_value=queued), \
              patch.object(dlv_tasks, "load_dlv_closed", return_value=closed), \
+             patch.object(dlv_tasks, "load_saved_assignments", return_value={}), \
              patch.object(dlv_tasks, "_dt_send_tag_report", new_callable=AsyncMock) as mock_send:
             result = _run(dlv_tasks.recv_dt_period(update, ctx))
 
@@ -595,10 +666,58 @@ class TestRecvDtPeriodTagMode(unittest.TestCase):
         with patch.object(dlv_tasks, "allowed", return_value=True), \
              patch.object(dlv_tasks, "load_dlv_batch", return_value=[]), \
              patch.object(dlv_tasks, "load_dlv_closed", return_value=[]), \
+             patch.object(dlv_tasks, "load_saved_assignments", return_value={}), \
              patch.object(dlv_tasks, "_dt_send_valuer_report", new_callable=AsyncMock):
             _run(dlv_tasks.recv_dt_period(update, ctx))
         building_text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("Jane\\_Doe", building_text)
+
+    def test_valuer_mode_desk_excludes_refs_already_closed(self):
+        """A ref present in both saved_assignments.json and
+        saved_dlv_closed.json (the fuller story: assigned, then completed/
+        returned) must only appear under Valuer Completed, not At Valuer's
+        Desk too."""
+        update = _make_query_update("dt_period:0")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        ctx.bot.send_message = AsyncMock()
+        sess = dlv_tasks._get_dt_sess(ctx)
+        sess.report_mode     = "valuer"
+        sess.selected_valuer = {"key": "u1", "name": "Jane Doe"}
+        closed = [{"ref": "REF1", "valuer_uid": "u1", "closed_at": "2026-07-01"}]
+        assignments = {
+            "REF1": {"valuer_uid": "u1", "assigned_at": "2026-06-30 09:00:00"},   # already closed — excluded
+            "REF2": {"valuer_uid": "u1", "assigned_at": "2026-07-10 09:00:00"},   # still at desk
+        }
+        with patch.object(dlv_tasks, "allowed", return_value=True), \
+             patch.object(dlv_tasks, "load_dlv_batch", return_value=[]), \
+             patch.object(dlv_tasks, "load_dlv_closed", return_value=closed), \
+             patch.object(dlv_tasks, "load_saved_assignments", return_value=assignments), \
+             patch.object(dlv_tasks, "_dt_send_valuer_report", new_callable=AsyncMock) as mock_send:
+            _run(dlv_tasks.recv_dt_period(update, ctx))
+        sent_desk = mock_send.call_args[0][3]
+        self.assertEqual([i["ref"] for i in sent_desk], ["REF2"])
+
+    def test_tag_mode_desk_filters_by_tag(self):
+        update = _make_query_update("dt_period:0")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        ctx.bot.send_message = AsyncMock()
+        sess = dlv_tasks._get_dt_sess(ctx)
+        sess.report_mode  = "tag"
+        sess.selected_tag = "Queue"
+        assignments = {
+            "REF1": {"tag": "Queue", "assigned_at": "2026-07-10 09:00:00"},
+            "REF2": {"tag": "Direct", "assigned_at": "2026-07-10 09:00:00"},
+        }
+        with patch.object(dlv_tasks, "allowed", return_value=True), \
+             patch.object(dlv_tasks, "load_dlv_batch", return_value=[]), \
+             patch.object(dlv_tasks, "load_dlv_closed", return_value=[]), \
+             patch.object(dlv_tasks, "load_saved_assignments", return_value=assignments), \
+             patch.object(dlv_tasks, "_dt_send_tag_report", new_callable=AsyncMock) as mock_send:
+            _run(dlv_tasks.recv_dt_period(update, ctx))
+        sent_desk = mock_send.call_args[0][3]
+        self.assertEqual([i["ref"] for i in sent_desk], ["REF1"])
 
 
 if __name__ == "__main__":

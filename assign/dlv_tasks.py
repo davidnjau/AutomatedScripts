@@ -4,8 +4,12 @@ dlv_tasks.py
 ============
 DLV Tasks — live-check the DLV Batch queue (📋 DLV Tasks button /
 /dlvtasks) and produce an Open/Closed report (Telegram text or Excel),
-a per-valuer report and a per-tag report (each: queued + closed history,
-filterable by look-back period — see _dt_format_report_lines, shared by
+a per-valuer report and a per-tag report (each: Currently Queued from
+saved_dlv_batch.json, At Valuer's Desk from saved_assignments.json —
+assigned but not yet found completed/returned, since a ref dropped from
+the queue at assignment time is otherwise untracked until it surfaces in
+the closed store — and Valuer Completed from saved_dlv_closed.json,
+filterable by look-back period; see _dt_format_report_lines, shared by
 both), plus the multi-select bulk-delete flow for the open queue.
 
 Every report's per-task block (_dt_format_task_block for Open Tasks,
@@ -57,6 +61,7 @@ from common import (
     cmd_cancel,
     deny,
     fallback,
+    load_saved_assignments,
     logger,
     md_escape,
     not_cancel,
@@ -446,7 +451,7 @@ async def _dt_send_closed_report(chat_id: int, rows: List[dict], bot) -> None:
             continue
         lines.append(f"{label_for[reason]} ({len(tasks)})")
         for i, t in enumerate(tasks, start=1):
-            lines.append(_dt_format_report_item_block(i, t, show_valuer=True, is_closed=True))
+            lines.append(_dt_format_report_item_block(i, t, show_valuer=True, section="closed"))
 
     async def _send(text, reply_markup):
         await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
@@ -472,11 +477,26 @@ def _dt_valuer_key(item: dict) -> str:
     return (item.get("valuer_name") or "").strip().upper()
 
 
+def _dt_load_assignment_items() -> List[dict]:
+    """saved_assignments.json as a flat list of item dicts (ref merged in —
+    the store keys by ref, but every filter/field-builder here expects a
+    "ref" field like DLV Batch's own item dicts have). This is the "At
+    Valuer's Desk" section's source: refs that have been assigned (so
+    dropped out of saved_dlv_batch.json for good) but not yet found
+    completed/returned (which would then move them into
+    saved_dlv_closed.json) — a ref assigned outside DLV Batch's own
+    processing loop (e.g. via New Assignment) never reaches the closed
+    store at all, so without this it silently vanishes from every DLV
+    Tasks report the moment it's assigned."""
+    return [{**info, "ref": ref} for ref, info in load_saved_assignments().items()]
+
+
 def _dt_collect_valuers() -> List[dict]:
-    """Dedup, name-sorted list of every valuer seen in either the open queue or closed
-    history, for the By Valuer picker: [{"key": uid-or-name, "name": display name}]."""
+    """Dedup, name-sorted list of every valuer seen in the open queue, at a
+    valuer's desk (assigned but not yet closed), or in closed history, for
+    the By Valuer picker: [{"key": uid-or-name, "name": display name}]."""
     seen: dict = {}
-    for item in load_dlv_batch() + load_dlv_closed():
+    for item in load_dlv_batch() + _dt_load_assignment_items() + load_dlv_closed():
         key = _dt_valuer_key(item)
         if not key or key in seen:
             continue
@@ -564,25 +584,44 @@ def _dt_sum_consideration(items: List[dict]) -> str:
     return format_consideration(str(sum(values)), currency) if values else format_consideration("0", currency)
 
 
-def _dt_format_report_item_block(i: int, item: dict, show_valuer: bool, is_closed: bool) -> str:
+def _dt_days_past(date_str: Optional[str]) -> str:
+    """Render a stored datetime (either DLV Batch's "T"-separated ISO
+    format or saved_assignments.json's "%Y-%m-%d %H:%M:%S") truncated to
+    minutes, with a "- N days past" suffix — or "—" if missing/unparseable."""
+    if not date_str:
+        return "—"
+    try:
+        days = (datetime.now() - datetime.fromisoformat(date_str[:19])).days
+        unit = "day" if days == 1 else "days"
+        return f"{date_str[:16]} - {days} {unit} past"
+    except ValueError:
+        return date_str[:16]
+
+
+def _dt_format_report_item_block(i: int, item: dict, show_valuer: bool, section: str) -> str:
     """One ref's labeled block for the Closed/By Valuer/By Tag reports —
     Assessor, Consideration, Parcel (task_block.py's shared field
     builders), plus Valuer (By Tag/Closed only, since both span multiple
-    valuers) and either Queued or Closed-with-status. See
-    task_block.format_labeled_block for the shared visual every report in
-    the bot uses — only these fields differ."""
+    valuers) and a section-appropriate date. section is one of "queued"
+    (still in saved_dlv_batch.json), "desk" (assigned — dropped from the
+    queue but not yet found completed/returned, sourced from
+    saved_assignments.json), or "closed" (completed/returned, from
+    saved_dlv_closed.json). See task_block.format_labeled_block for the
+    shared visual every report in the bot uses — only these fields differ."""
     fields: List[Tuple[str, str]] = []
     if show_valuer:
         fields.append(("👤 Valuer", item.get("valuer_name") or "—"))
     fields.append(assessor_field(item))
     fields.append(consideration_field(item))
     fields.append(parcel_field(item))
-    if is_closed:
+    if section == "closed":
         label_for = {"completed": "✅ Completed", "returned": "↩️ Returned"}
         status_label = label_for.get(item.get("closed_reason"), "❓ Unknown")
-        fields.append(("📅 Closed", f"{(item.get('closed_at') or '—')[:16]} ({status_label})"))
+        fields.append(("📅 Closed", f"{_dt_days_past(item.get('closed_at'))} ({status_label})"))
+    elif section == "desk":
+        fields.append(("📅 Assigned", _dt_days_past(item.get("assigned_at"))))
     else:
-        fields.append(("📅 Queued", (item.get("queued_at") or "—")[:16]))
+        fields.append(("📅 Queued", _dt_days_past(item.get("queued_at"))))
     tag = tag_field(item)
     if tag:
         fields.append(tag)
@@ -590,47 +629,59 @@ def _dt_format_report_item_block(i: int, item: dict, show_valuer: bool, is_close
     return format_labeled_block(i, item.get("ref"), fields)
 
 
-def _dt_format_report_lines(header: str, queued: List[dict], closed: List[dict], period_label: str,
-                             show_valuer: bool = False) -> List[str]:
-    """Text lines shared by the By Valuer and By Tag reports: currently-queued
-    refs, then closed history within the chosen look-back period, each ref
-    rendered as its own labeled block (Ref, Consideration, Parcel, Assessor,
-    Tag) rather than a single packed line. Uses only fields already stored
-    on the queue/closed items (no live API calls). show_valuer=True adds a
-    Valuer field per block — needed for By Tag, which spans multiple
-    valuers, but redundant for By Valuer, where it's already implied by the
-    header."""
+def _dt_format_report_lines(header: str, queued: List[dict], desk: List[dict], closed: List[dict],
+                             period_label: str, show_valuer: bool = False) -> List[str]:
+    """Text lines shared by the By Valuer and By Tag reports, in three
+    sections: Currently Queued (still in saved_dlv_batch.json), At
+    Valuer's Desk (assigned but not yet found completed/returned, from
+    saved_assignments.json), and Valuer Completed (from
+    saved_dlv_closed.json, within the chosen look-back period) — each ref
+    rendered as its own labeled block (Ref, Consideration, Parcel,
+    Assessor, Tag) rather than a single packed line. Uses only fields
+    already stored on the queue/assignment/closed items (no live API
+    calls). show_valuer=True adds a Valuer field per block — needed for By
+    Tag, which spans multiple valuers, but redundant for By Valuer, where
+    it's already implied by the header."""
     lines = [header]
 
     lines.append(f"⏳ *Currently Queued* ({len(queued)}) — Total: {_dt_sum_consideration(queued)}")
     if not queued:
         lines.append("  _none_")
     for i, item in enumerate(sorted(queued, key=lambda i: i.get("queued_at", "")), start=1):
-        lines.append(_dt_format_report_item_block(i, item, show_valuer, is_closed=False))
+        lines.append(_dt_format_report_item_block(i, item, show_valuer, section="queued"))
 
-    lines.append(f"📜 *History* ({period_label}) — {len(closed)} — Total: {_dt_sum_consideration(closed)}")
+    lines.append(f"🏢 *At Valuer's Desk* ({len(desk)}) — Total: {_dt_sum_consideration(desk)}")
+    if not desk:
+        lines.append("  _none_")
+    for i, item in enumerate(sorted(desk, key=lambda i: i.get("assigned_at", ""), reverse=True), start=1):
+        lines.append(_dt_format_report_item_block(i, item, show_valuer, section="desk"))
+
+    lines.append(f"📜 *Valuer Completed* ({period_label}) — {len(closed)} — Total: {_dt_sum_consideration(closed)}")
     if not closed:
         lines.append("  _none_")
     for i, item in enumerate(sorted(closed, key=lambda i: i.get("closed_at", ""), reverse=True), start=1):
-        lines.append(_dt_format_report_item_block(i, item, show_valuer, is_closed=True))
+        lines.append(_dt_format_report_item_block(i, item, show_valuer, section="closed"))
 
     return lines
 
 
-def _dt_format_valuer_report(valuer_name: str, queued: List[dict], closed: List[dict], period_label: str) -> List[str]:
+def _dt_format_valuer_report(valuer_name: str, queued: List[dict], desk: List[dict], closed: List[dict],
+                              period_label: str) -> List[str]:
     """One valuer's DLV report — see _dt_format_report_lines."""
-    return _dt_format_report_lines(f"👤 *DLV Report — {valuer_name}*", queued, closed, period_label)
+    return _dt_format_report_lines(f"👤 *DLV Report — {valuer_name}*", queued, desk, closed, period_label)
 
 
-def _dt_format_tag_report(tag: str, queued: List[dict], closed: List[dict], period_label: str) -> List[str]:
+def _dt_format_tag_report(tag: str, queued: List[dict], desk: List[dict], closed: List[dict],
+                           period_label: str) -> List[str]:
     """One tag's DLV report, spanning every valuer — see _dt_format_report_lines."""
-    return _dt_format_report_lines(f"🏷 *DLV Report — Tag: {tag}*", queued, closed, period_label, show_valuer=True)
+    return _dt_format_report_lines(f"🏷 *DLV Report — Tag: {tag}*", queued, desk, closed, period_label,
+                                    show_valuer=True)
 
 
-async def _dt_send_valuer_report(chat_id: int, valuer_name: str, queued: List[dict], closed: List[dict],
-                                  period_label: str, bot) -> None:
-    """Send the By Valuer DLV report (queued + closed-history) as chunked Telegram messages."""
-    lines = _dt_format_valuer_report(valuer_name, queued, closed, period_label)
+async def _dt_send_valuer_report(chat_id: int, valuer_name: str, queued: List[dict], desk: List[dict],
+                                  closed: List[dict], period_label: str, bot) -> None:
+    """Send the By Valuer DLV report (queued + at-desk + closed-history) as chunked Telegram messages."""
+    lines = _dt_format_valuer_report(valuer_name, queued, desk, closed, period_label)
 
     async def _send(text, reply_markup):
         await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
@@ -638,10 +689,10 @@ async def _dt_send_valuer_report(chat_id: int, valuer_name: str, queued: List[di
     await _send_chunked_report(_send, lines, join="\n\n")
 
 
-async def _dt_send_tag_report(chat_id: int, tag: str, queued: List[dict], closed: List[dict],
-                               period_label: str, bot) -> None:
-    """Send the By Tag DLV report (queued + closed-history, spanning every valuer) as chunked Telegram messages."""
-    lines = _dt_format_tag_report(tag, queued, closed, period_label)
+async def _dt_send_tag_report(chat_id: int, tag: str, queued: List[dict], desk: List[dict],
+                               closed: List[dict], period_label: str, bot) -> None:
+    """Send the By Tag DLV report (queued + at-desk + closed-history, spanning every valuer) as chunked Telegram messages."""
+    lines = _dt_format_tag_report(tag, queued, desk, closed, period_label)
 
     async def _send(text, reply_markup):
         await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
@@ -720,21 +771,27 @@ async def recv_dt_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tag    = sess.selected_tag
         queued = [i for i in load_dlv_batch() if i.get("tag") == tag]
         closed = [c for c in load_dlv_closed() if c.get("tag") == tag]
+        closed_refs = {c["ref"] for c in closed}
+        desk   = [a for a in _dt_load_assignment_items() if a.get("tag") == tag and a["ref"] not in closed_refs]
         if days:
             cutoff = _date_cutoff_str(days)
             closed = [c for c in closed if _within_days(c.get("closed_at", ""), cutoff)]
+            desk   = [a for a in desk if _within_days(a.get("assigned_at", ""), cutoff)]
         await query.edit_message_text(f"⏳ Building report for tag *{tag}*…", parse_mode="Markdown")
-        await _dt_send_tag_report(query.message.chat_id, tag, queued, closed, period_label, ctx.bot)
+        await _dt_send_tag_report(query.message.chat_id, tag, queued, desk, closed, period_label, ctx.bot)
     else:
         valuer = sess.selected_valuer
         key    = valuer["key"]
         queued = [i for i in load_dlv_batch() if _dt_valuer_key(i) == key]
         closed = [c for c in load_dlv_closed() if _dt_valuer_key(c) == key]
+        closed_refs = {c["ref"] for c in closed}
+        desk   = [a for a in _dt_load_assignment_items() if _dt_valuer_key(a) == key and a["ref"] not in closed_refs]
         if days:
             cutoff = _date_cutoff_str(days)
             closed = [c for c in closed if _within_days(c.get("closed_at", ""), cutoff)]
+            desk   = [a for a in desk if _within_days(a.get("assigned_at", ""), cutoff)]
         await query.edit_message_text(f"⏳ Building report for *{md_escape(valuer['name'])}*…", parse_mode="Markdown")
-        await _dt_send_valuer_report(query.message.chat_id, valuer["name"], queued, closed, period_label, ctx.bot)
+        await _dt_send_valuer_report(query.message.chat_id, valuer["name"], queued, desk, closed, period_label, ctx.bot)
 
     await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
     return ConversationHandler.END
