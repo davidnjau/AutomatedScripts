@@ -14,6 +14,7 @@ COPY dlv_core.py .
 COPY fetch_tasks_cache.py .
 COPY task_block.py .
 COPY dlv_batch.py .
+COPY dlv_incremental.py .
 COPY dlv_tasks.py .
 COPY hold_tasks.py .
 COPY morning_briefing.py .

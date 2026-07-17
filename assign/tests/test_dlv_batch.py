@@ -429,6 +429,16 @@ class TestDbFormatBatchSummary(unittest.TestCase):
         summary = dlv_batch._db_format_batch_summary(sess)
         self.assertIn("Ghost\\_Name", summary)
 
+    def test_incremental_pick_shows_placeholder_not_raw_sentinel(self):
+        with patch.object(dlv_batch, "_fetch_tasks_log_lookup", return_value=None):
+            sess = self._sess(
+                [{"refs": ["REF1"], "valuer_name": "Jane Doe", "status": "resolved"}],
+                tag_by_ref={"REF1": dlv_batch.INCREMENTAL_TAG_SENTINEL},
+            )
+            summary = dlv_batch._db_format_batch_summary(sess)
+        self.assertIn("🔢 Incremental (auto)", summary)
+        self.assertNotIn(dlv_batch.INCREMENTAL_TAG_SENTINEL, summary)
+
 
 class TestDbTagKeyboards(unittest.TestCase):
     def test_tag_ref_keyboard_shows_tag_or_no_tag(self):
@@ -438,13 +448,33 @@ class TestDbTagKeyboards(unittest.TestCase):
         self.assertIn("REF2 — no tag", texts)
         self.assertIn("✅ Done Tagging", texts)
 
-    def test_tag_value_keyboard_lists_fixed_tags_plus_clear_and_back(self):
+    def test_tag_ref_keyboard_shows_incremental_preview_not_raw_sentinel(self):
+        markup = dlv_batch._db_tag_ref_keyboard(["REF1"], {"REF1": dlv_batch.INCREMENTAL_TAG_SENTINEL})
+        texts = [b.text for row in markup.inline_keyboard for b in row]
+        self.assertIn("REF1 [🏷 🔢 Incremental (auto)]", texts)
+
+    def test_tag_value_keyboard_lists_fixed_tags_plus_incremental_clear_and_back(self):
         markup = dlv_batch._db_tag_value_keyboard()
         texts = [b.text for row in markup.inline_keyboard for b in row]
         for tag in dlv_batch.DLV_TAGS:
             self.assertIn(tag, texts)
+        self.assertIn("🔢 Incremental", texts)
         self.assertIn("🚫 Clear tag", texts)
         self.assertIn("⬅️ Back", texts)
+
+    def test_tag_value_keyboard_incremental_button_uses_sentinel_callback(self):
+        markup = dlv_batch._db_tag_value_keyboard()
+        buttons = [b for row in markup.inline_keyboard for b in row]
+        incremental_btn = next(b for b in buttons if b.text == "🔢 Incremental")
+        self.assertEqual(incremental_btn.callback_data, f"db_tagval:{dlv_batch.INCREMENTAL_TAG_SENTINEL}")
+
+
+class TestDbTagPreview(unittest.TestCase):
+    def test_incremental_sentinel_shows_placeholder(self):
+        self.assertEqual(dlv_batch._db_tag_preview(dlv_batch.INCREMENTAL_TAG_SENTINEL), "🔢 Incremental (auto)")
+
+    def test_fixed_tag_shown_unchanged(self):
+        self.assertEqual(dlv_batch._db_tag_preview("Queue"), "Queue")
 
 
 class TestRecvDbConfirmTagBranch(unittest.TestCase):
@@ -589,6 +619,39 @@ class TestRecvDbConfirmAttachesTag(unittest.TestCase):
         self.assertEqual(len(saved_items), 1)
         self.assertEqual(saved_items[0]["tag"], "Queue")
         self.assertEqual(saved_items[0]["queued_at"], "2026-07-01T09:00:00")
+
+    def test_incremental_sentinel_resolved_to_real_tag_at_confirm_time(self):
+        """The counter must only be consumed once the batch is actually
+        saved — not when "Incremental" was picked during Tag Tasks."""
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = dlv_batch._get_db_sess(ctx)
+        sess.groups = [{"refs": ["REF1"], "valuer_name": "Jane", "valuer_uid": "u1",
+                        "valuer_acct": "a1", "status": "resolved"}]
+        sess.tag_by_ref = {"REF1": dlv_batch.INCREMENTAL_TAG_SENTINEL}
+        with patch.object(dlv_batch, "next_incremental_tag", return_value="B2-T3") as mock_next:
+            saved_items = self._confirm(ctx)
+        mock_next.assert_called_once()
+        self.assertEqual(saved_items[0]["tag"], "B2-T3")
+
+    def test_incremental_sentinel_resolved_for_retagged_existing_ref(self):
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = dlv_batch._get_db_sess(ctx)
+        sess.groups = [{"refs": ["REF1"], "valuer_name": "Jane", "valuer_uid": "u1",
+                        "valuer_acct": "a1", "status": "resolved"}]
+        sess.tag_by_ref = {"REF1": dlv_batch.INCREMENTAL_TAG_SENTINEL}
+        existing_item = {"ref": "REF1", "valuer_name": "Jane", "valuer_uid": "u1",
+                          "valuer_acct": "a1", "queued_at": "2026-07-01T09:00:00", "tag": ""}
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=[existing_item]), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save, \
+             patch.object(dlv_batch, "_fetch_tasks_log_lookup", return_value=None), \
+             patch.object(dlv_batch, "_fetch_tasks_log_remove"), \
+             patch.object(dlv_batch, "_any_valid_tokens", return_value=None), \
+             patch.object(dlv_batch, "next_incremental_tag", return_value="B2-T4"):
+            _run(dlv_batch.recv_db_confirm(_make_query_update("db:confirm"), ctx))
+        saved_items = mock_save.call_args[0][0]
+        self.assertEqual(saved_items[0]["tag"], "B2-T4")
 
 
 class TestRecvDbConfirmCachesParcelAndConsideration(unittest.TestCase):
