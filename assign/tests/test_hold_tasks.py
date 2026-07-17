@@ -210,6 +210,38 @@ class TestProcessHoldItem(unittest.TestCase):
         self.assertTrue(result["keep"])
         self.assertIn("boom", result["item"]["last_error"])
 
+    def test_takeover_names_with_markdown_special_chars_are_escaped(self):
+        """Regression: an unescaped '_' in a valuer name raised
+        telegram.error.BadRequest ("can't find end of the entity") and
+        crashed the whole send. See common.md_escape."""
+        self.item["held_valuer_name"] = "Jane_Doe"
+        detail = {"actors": [{"role": "VALUATION OFFICER", "user_details": {"id": "uid-2", "names": "John_Roe"}}]}
+        self.http_sess.post.return_value = MagicMock(raise_for_status=lambda: None)
+        with patch.object(ht, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(ht, "_fetch_ref_detail_dlv", return_value=detail), \
+             patch.object(ht, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
+             }):
+            result = self._run_item()
+        self.assertIn("taken over by *John\\_Roe*", result["line"])
+        self.assertIn("reverted back to *Jane\\_Doe*", result["line"])
+
+
+class TestHtShowQueue(unittest.TestCase):
+    """_ht_show_queue — the Held Tasks list; held_valuer_name must be
+    escaped since it's free text, same crash class as _process_hold_item's
+    takeover line."""
+
+    def test_held_valuer_name_with_special_chars_is_escaped(self):
+        edit_fn = AsyncMock()
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        items = [{"ref": "REF1", "held_valuer_name": "Jane_Doe"}]
+        with patch.object(ht, "load_hold_tasks", return_value=items):
+            _run(ht._ht_show_queue(edit_fn, 123, ctx))
+        text = edit_fn.call_args[0][0]
+        self.assertIn("Jane\\_Doe", text)
+
 
 # ── Background job ───────────────────────────────────────
 

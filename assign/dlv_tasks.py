@@ -58,6 +58,7 @@ from common import (
     deny,
     fallback,
     logger,
+    md_escape,
     not_cancel,
 )
 from dlv_core import (
@@ -667,7 +668,7 @@ async def recv_dt_pick_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess.report_mode     = "valuer"
 
     await query.edit_message_text(
-        f"👤 *{sess.selected_valuer['name']}*\n\nFilter history by period:",
+        f"👤 *{md_escape(sess.selected_valuer['name'])}*\n\nFilter history by period:",
         parse_mode="Markdown",
         reply_markup=_dt_period_keyboard(),
     )
@@ -732,7 +733,7 @@ async def recv_dt_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if days:
             cutoff = _date_cutoff_str(days)
             closed = [c for c in closed if _within_days(c.get("closed_at", ""), cutoff)]
-        await query.edit_message_text(f"⏳ Building report for *{valuer['name']}*…", parse_mode="Markdown")
+        await query.edit_message_text(f"⏳ Building report for *{md_escape(valuer['name'])}*…", parse_mode="Markdown")
         await _dt_send_valuer_report(query.message.chat_id, valuer["name"], queued, closed, period_label, ctx.bot)
 
     await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
@@ -863,7 +864,7 @@ async def recv_dt_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if sess.email:
         try:
             _send_bulk_export_email(sess.email, filename, xlsx_bytes)
-            await update.message.reply_text(f"📧 File also sent to *{sess.email}*.", parse_mode="Markdown")
+            await update.message.reply_text(f"📧 File also sent to *{md_escape(sess.email)}*.", parse_mode="Markdown")
         except Exception as exc:
             await update.message.reply_text(f"⚠️ Email failed: `{exc}`", parse_mode="Markdown")
 
@@ -975,7 +976,7 @@ async def _dt_send_telegram(chat_id: int, rows: List[dict], bot) -> None:
 
     lines = [f"📋 *DLV Tasks Report* — {len(rows)} task(s)\n"]
     for valuer, tasks in sorted(groups.items()):
-        lines.append(f"\n👤 *{valuer}* ({len(tasks)} task(s))")
+        lines.append(f"\n👤 *{md_escape(valuer)}* ({len(tasks)} task(s))")
         for i, t in enumerate(tasks, start=1):
             lines.append(_dt_format_task_block(i, t))
 

@@ -282,6 +282,21 @@ class TestDoAssignTasks(unittest.TestCase):
         self.assertTrue(any("REF/0" in t for t in sent_texts))
         self.assertTrue(any("REF/399" in t for t in sent_texts))
 
+    def test_staff_name_with_markdown_chars_is_escaped_in_header(self):
+        """Regression: an unescaped '_'/'*' in staff_name crashes the
+        completion header's send with telegram.error.BadRequest ("can't
+        find end of the entity"). See common.md_escape."""
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        http_sess = MagicMock()
+        http_sess.post.return_value = MagicMock(raise_for_status=lambda: None)
+        tasks = [{"reference_number": "REF/1", "consideration_amount": 1000}]
+        with patch.object(rt_mod, "persist_assignment"), \
+             patch.object(rt_mod, "persist_task_batch"):
+            _run(rt_mod._do_assign_tasks(bot, 555, http_sess, TOKENS, tasks, "uid1", "Jane_Doe", "staff"))
+        sent_texts = [c.args[1] for c in bot.send_message.call_args_list]
+        self.assertTrue(any("Jane\\_Doe" in t for t in sent_texts))
+
 
 class TestRtFetchAndShow(unittest.TestCase):
     def test_large_matched_list_paginates_instead_of_collapsing(self):

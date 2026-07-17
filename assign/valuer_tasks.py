@@ -54,6 +54,7 @@ from common import (
     fallback,
     get_valid_tokens,
     logger,
+    md_escape,
     not_cancel,
 )
 from endpoints import (
@@ -226,7 +227,7 @@ def _vt_run(
 
     try:
         _tg(
-            f"🔍 Searching tasks for *{valuer_name}* over the last *{days_back}* day(s)…\n"
+            f"🔍 Searching tasks for *{md_escape(valuer_name)}* over the last *{days_back}* day(s)…\n"
             f"_(cutoff: {cutoff})_"
         )
 
@@ -293,7 +294,7 @@ def _vt_run(
 
         if not matched:
             _tg(
-                f"ℹ️ No tasks assigned to *{valuer_name}* found in the last *{days_back}* day(s)."
+                f"ℹ️ No tasks assigned to *{md_escape(valuer_name)}* found in the last *{days_back}* day(s)."
             )
             return
 
@@ -301,7 +302,7 @@ def _vt_run(
         matched.sort(key=lambda t: t.get("date_created", ""), reverse=True)
 
         _tg(
-            f"✅ *{len(matched)}* task(s) found for *{valuer_name}*.\nBuilding report…"
+            f"✅ *{len(matched)}* task(s) found for *{md_escape(valuer_name)}*.\nBuilding report…"
         )
 
         xlsx_bytes = _vt_build_excel(valuer_name, days_back, matched)
@@ -316,7 +317,7 @@ def _vt_run(
                 document=io.BytesIO(xlsx_bytes),
                 filename=filename,
                 caption=(
-                    f"👤 *{valuer_name}* — last {days_back} day(s)\n"
+                    f"👤 *{md_escape(valuer_name)}* — last {days_back} day(s)\n"
                     f"Tasks found: {len(matched)}"
                 ),
             ),
@@ -387,7 +388,7 @@ async def recv_vt_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    await update.message.reply_text(f"🔍 Searching for *{name}*…", parse_mode="Markdown")
+    await update.message.reply_text(f"🔍 Searching for *{md_escape(name)}*…", parse_mode="Markdown")
     try:
         http_sess = build_session()
         resp = http_sess.get(
@@ -406,7 +407,7 @@ async def recv_vt_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not results:
         await update.message.reply_text(
-            f"⚠️ No staff found for *{name}*. Try a different name.",
+            f"⚠️ No staff found for *{md_escape(name)}*. Try a different name.",
             parse_mode="Markdown",
         )
         return VT.STAFF_NAME
@@ -448,7 +449,7 @@ async def recv_vt_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess.valuer_uid   = uid
 
     await query.edit_message_text(
-        f"✅ Valuer: *{full_name}*\n\nHow many days back do you want to check?",
+        f"✅ Valuer: *{md_escape(full_name)}*\n\nHow many days back do you want to check?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [
@@ -515,7 +516,7 @@ async def _vt_start_run(
         return ConversationHandler.END
 
     confirm_text = (
-        f"⏳ Fetching tasks for *{sess.valuer_name}* — last *{days_back}* day(s)…\n"
+        f"⏳ Fetching tasks for *{md_escape(sess.valuer_name)}* — last *{days_back}* day(s)…\n"
         "You will be notified when done."
     )
     if edit_msg:

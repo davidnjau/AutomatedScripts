@@ -85,6 +85,7 @@ from common import (
     load_saved_assignments,
     load_sectional_config,
     logger,
+    md_escape,
     not_cancel,
     persist_assignment,
 )
@@ -209,7 +210,7 @@ def _af_format_schedule_summary(cfg: Dict) -> str:
                   cfg.get("sectional_filter", "exclude"), "Exclude Sectional")
     email_s = cfg.get("email") or "Telegram only"
     return (
-        f"📧 *{email_s}* — every {mins} min, days back: {days}\n"
+        f"📧 *{md_escape(email_s)}* — every {mins} min, days back: {days}\n"
         f"   County: {county.title()} | Registry: {reg.title()}\n"
         f"   Amount: {lo_s} – {hi_s} | {sec}"
     )
@@ -389,7 +390,7 @@ async def recv_af_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_af_email_state(email_state)
 
     label = (cfg or {}).get("email") or "Telegram only"
-    msg = f"🗑 Removed the schedule for *{label}*." if removed else "⚠️ That schedule was already removed."
+    msg = f"🗑 Removed the schedule for *{md_escape(label)}*." if removed else "⚠️ That schedule was already removed."
     await query.edit_message_text(msg, parse_mode="Markdown")
     await query.message.reply_text("Main menu:", reply_markup=_main_menu())
     return ConversationHandler.END
@@ -604,7 +605,7 @@ async def recv_af_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Every *{interval} min* | Days back: *{days}*\n"
         f"County: *{co_label}* | Registry: *{re_label}*\n"
         f"Amount: {lo_s} – {hi_s} | Sectional: *{sec_label}*\n"
-        f"Email: *{email_label}*\n"
+        f"Email: *{md_escape(email_label)}*\n"
         f"Account: *{CRED_LABELS[_AF_CRED_TYPE]}* (requires a cached, valid login — check 🔒 Token Status)\n"
         f"First run in {interval} min.",
         parse_mode="Markdown",
@@ -816,7 +817,7 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             for chat_id in ALLOWED_IDS:
                 try:
                     await context.bot.send_message(
-                        chat_id, f"⚠️ Auto Fetch email delivery to *{email}* failed: `{e}`",
+                        chat_id, f"⚠️ Auto Fetch email delivery to *{md_escape(email)}* failed: `{e}`",
                         parse_mode="Markdown",
                     )
                 except Exception as notify_err:
@@ -875,7 +876,7 @@ async def recv_af_result_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     header = (
         f"🗂 *AF Run — {run['run_at']}*\n"
-        f"Schedule: *{run.get('schedule_label', 'Telegram only')}*\n"
+        f"Schedule: *{md_escape(run.get('schedule_label', 'Telegram only'))}*\n"
         f"Tasks found: *{run['count']}*\n"
         f"Filters: County={f.get('county','All') or 'All'} | Registry={f.get('registry','All') or 'All'}\n"
         f"Amount: {lo_s}–{hi_s} | {sec_label}\n\n"

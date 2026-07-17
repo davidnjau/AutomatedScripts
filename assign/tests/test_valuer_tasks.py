@@ -8,6 +8,7 @@ Run with: python3 -m unittest discover -s assign/tests -v
 """
 
 import asyncio
+import concurrent.futures
 import os
 import sys
 import unittest
@@ -205,6 +206,31 @@ class TestRecvVtSelect(unittest.TestCase):
         with patch.object(vt, "allowed", return_value=True):
             result = _run(vt.recv_vt_select(update, ctx))
         self.assertEqual(result, vt.VT.DAYS_BACK)
+
+
+class TestVtRun(unittest.TestCase):
+    """_vt_run — the background worker; regression for telegram.error.BadRequest
+    ("can't find end of the entity") when valuer_name has a raw '_'/'*'."""
+
+    def test_valuer_name_with_markdown_chars_is_escaped(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+
+        def fake_run_coroutine_threadsafe(coro, loop):
+            fut = concurrent.futures.Future()
+            try:
+                fut.set_result(asyncio.run(coro))
+            except Exception as e:
+                fut.set_exception(e)
+            return fut
+
+        with patch.object(vt.asyncio, "run_coroutine_threadsafe", side_effect=fake_run_coroutine_threadsafe), \
+             patch.object(vt, "build_session", return_value=MagicMock()), \
+             patch.object(vt, "_vt_fetch_all_tasks", return_value=[]):
+            vt._vt_run(TOKENS, 555, bot, MagicMock(), "uid1", "Jane_Doe", 30)
+
+        sent_texts = [c.args[1] for c in bot.send_message.call_args_list]
+        self.assertTrue(any("Jane\\_Doe" in t for t in sent_texts))
 
 
 class TestVtStartRun(unittest.TestCase):

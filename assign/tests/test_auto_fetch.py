@@ -453,6 +453,24 @@ class TestAutoFetchJob(unittest.TestCase):
             parse_mode="Markdown",
         )
 
+    def test_email_failure_notification_escapes_special_chars_in_email(self):
+        cfg = {"days_back": 2, "email": "john_doe@example.com"}
+        tasks = [_task()]
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "persist_af_result"), \
+             patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
+             patch.object(af, "ALLOWED_IDS", {111}), \
+             patch.object(af, "_send_auto_fetch_email", side_effect=RuntimeError("smtp down")):
+            _run(af._auto_fetch_job(self.context))
+        self.context.bot.send_message.assert_any_call(
+            111, "⚠️ Auto Fetch email delivery to *john\\_doe@example.com* failed: `smtp down`",
+            parse_mode="Markdown",
+        )
+
     def test_sectional_auto_routes_when_specialist_configured(self):
         # sectional_filter="all" so the earlier main filter step doesn't
         # strip the sectional task before auto-routing gets a chance to see it
@@ -568,6 +586,21 @@ class TestRecvAfResultDetail(unittest.TestCase):
         text = update.callback_query.message.reply_text.call_args[0][0]
         self.assertIn("📊 Status: ✅ assigned to Byron", text)
 
+    def test_schedule_label_with_special_chars_is_escaped(self):
+        """Regression: run['schedule_label'] is the schedule's email — an
+        unescaped '_' there raised telegram.error.BadRequest."""
+        update = self._make_query("r1")
+        ctx = MagicMock()
+        run = {
+            "run_id": "r1", "run_at": "t", "count": 0, "schedule_label": "john_doe@example.com",
+            "tasks": [], "filters": {},
+        }
+        with patch.object(af, "load_af_results", return_value=[run]), \
+             patch.object(af, "load_saved_assignments", return_value={}):
+            _run(af.recv_af_result_detail(update, ctx))
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("john\\_doe@example.com", text)
+
 
 class TestRegisterRestoresSchedule(unittest.TestCase):
     """register() restores every saved Auto Fetch schedule on startup, each
@@ -640,6 +673,13 @@ class TestRecvAfEmail(unittest.TestCase):
         text = self.update.message.reply_text.call_args[0][0]
         self.assertIn(af.CRED_LABELS[af._AF_CRED_TYPE], text)
 
+    def test_email_with_special_chars_is_escaped_in_confirmation(self):
+        self.update.message.text = "john_doe@example.com"
+        with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1"):
+            _run(af.recv_af_email(self.update, self.ctx))
+        text = self.update.message.reply_text.call_args[0][0]
+        self.assertIn("john\\_doe@example.com", text)
+
     def test_valid_submission_schedules_a_job_tagged_with_the_new_id(self):
         self.update.message.text = "ops@example.com"
         with patch.object(af, "add_auto_fetch_schedule", return_value="sched-1"):
@@ -693,6 +733,12 @@ class TestAfFormatScheduleSummary(unittest.TestCase):
     def test_summary_labels_telegram_only_when_no_email(self):
         summary = af._af_format_schedule_summary({"interval_minutes": 30})
         self.assertIn("Telegram only", summary)
+
+    def test_email_with_markdown_special_chars_is_escaped(self):
+        """Regression: an unescaped '_' in an email address raised
+        telegram.error.BadRequest ("can't find end of the entity")."""
+        summary = af._af_format_schedule_summary({"interval_minutes": 30, "email": "john_doe@example.com"})
+        self.assertIn("john\\_doe@example.com", summary)
 
 
 class TestCmdAutoFetch(unittest.TestCase):
@@ -799,6 +845,18 @@ class TestRecvAfRemove(unittest.TestCase):
         mock_remove.assert_called_once_with("sched-1")
         mock_save_state.assert_not_called()   # nothing to clean up — state was already empty
         self.assertIn("abc@gmail.com", update.callback_query.edit_message_text.call_args[0][0])
+
+    def test_removed_schedule_email_with_special_chars_is_escaped(self):
+        update = self._make_query("af_remove:sched-1")
+        ctx = MagicMock()
+        ctx.job_queue.get_jobs_by_name.return_value = []
+        with patch.object(af, "get_auto_fetch_schedule",
+                           return_value={"id": "sched-1", "email": "john_doe@example.com"}), \
+             patch.object(af, "remove_auto_fetch_schedule", return_value=True), \
+             patch.object(af, "load_af_email_state", return_value={}), \
+             patch.object(af, "save_af_email_state"):
+            _run(af.recv_af_remove(update, ctx))
+        self.assertIn("john\\_doe@example.com", update.callback_query.edit_message_text.call_args[0][0])
 
     def test_removing_a_schedule_also_drops_its_email_dedup_state(self):
         update = self._make_query("af_remove:sched-1")
