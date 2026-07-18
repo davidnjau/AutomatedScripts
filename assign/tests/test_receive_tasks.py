@@ -348,6 +348,16 @@ class TestRecvRtAmountChoice(unittest.TestCase):
         self.assertEqual(rt.amount_min, 1_000_000.0)
         self.assertEqual(rt.amount_max, 5_000_000.0)
 
+    def test_10m_50m_range_sets_min_max(self):
+        update = _make_update_with_callback("ft_amount:10m_50m")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        result = _run(rt_mod.recv_rt_amount_choice(update, ctx))
+        self.assertEqual(result, rt_mod.RS.SCHEDULE_CHOICE)
+        rt = ctx.user_data["rt_session"]
+        self.assertEqual(rt.amount_min, 10_000_000.0)
+        self.assertEqual(rt.amount_max, 50_000_000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -368,10 +368,11 @@ def _ft_amount_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("10M – 80M",      callback_data="ft_amount:10m_80m"),
         ],
         [
+            InlineKeyboardButton("10M – 50M",      callback_data="ft_amount:10m_50m"),
             InlineKeyboardButton("50M – 3B",       callback_data="ft_amount:50m_3b"),
-            InlineKeyboardButton("✏️ Custom",       callback_data="ft_amount:custom"),
         ],
         [
+            InlineKeyboardButton("✏️ Custom",       callback_data="ft_amount:custom"),
             InlineKeyboardButton("📋 No filter",   callback_data="ft_amount:all"),
         ],
     ])
