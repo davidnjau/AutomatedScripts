@@ -116,6 +116,25 @@ class TestPersistAssignment(unittest.TestCase):
 
 
 
+class TestFtAmountKeyboard(unittest.TestCase):
+    """_ft_amount_keyboard — the shared amount-range picker used by Fetch
+    Tasks/Auto Fetch/Receive Tasks."""
+
+    def test_includes_10m_50m_range(self):
+        kbd = common._ft_amount_keyboard()
+        buttons = [b for row in kbd.inline_keyboard for b in row]
+        texts = [b.text for b in buttons]
+        callback_data = [b.callback_data for b in buttons]
+        self.assertIn("10M – 50M", texts)
+        self.assertIn("ft_amount:10m_50m", callback_data)
+
+    def test_includes_custom_and_no_filter_options(self):
+        kbd = common._ft_amount_keyboard()
+        callback_data = [b.callback_data for row in kbd.inline_keyboard for b in row]
+        self.assertIn("ft_amount:custom", callback_data)
+        self.assertIn("ft_amount:all", callback_data)
+
+
 class TestBeCredKeyboard(unittest.TestCase):
     def test_no_valid_tokens_returns_none(self):
         with patch.object(common, "get_valid_tokens", return_value=None):
