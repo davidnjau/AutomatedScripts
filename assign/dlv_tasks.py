@@ -749,6 +749,34 @@ async def recv_dt_pick_tag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return DT.PICK_PERIOD
 
 
+def _dt_gather_report_data(scope: str, target_key: str, period_days: int) -> Tuple[List[dict], List[dict], List[dict]]:
+    """Gather (queued, at-desk, closed-within-period) for a given scope
+    ("valuer" or "tag") + target — the data-gathering half of By
+    Valuer/By Tag, factored out of recv_dt_period so
+    dlv_report_schedule.py's background job can reuse the exact same
+    filtering logic for its own scheduled runs rather than duplicating it."""
+    if scope == "tag":
+        queued = [i for i in load_dlv_batch() if i.get("tag") == target_key]
+        closed = [c for c in load_dlv_closed() if c.get("tag") == target_key]
+    else:
+        queued = [i for i in load_dlv_batch() if _dt_valuer_key(i) == target_key]
+        closed = [c for c in load_dlv_closed() if _dt_valuer_key(c) == target_key]
+
+    closed_refs = {c["ref"] for c in closed}
+    if scope == "tag":
+        desk = [a for a in _dt_load_assignment_items() if a.get("tag") == target_key and a["ref"] not in closed_refs]
+    else:
+        desk = [a for a in _dt_load_assignment_items()
+                if _dt_valuer_key(a) == target_key and a["ref"] not in closed_refs]
+
+    if period_days:
+        cutoff = _date_cutoff_str(period_days)
+        closed = [c for c in closed if _within_days(c.get("closed_at", ""), cutoff)]
+        desk   = [a for a in desk if _within_days(a.get("assigned_at", ""), cutoff)]
+
+    return queued, desk, closed
+
+
 async def recv_dt_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """By Valuer/By Tag: handle the period-picker tap, filter, and send the
     combined report — branches on sess.report_mode set by whichever picker
@@ -768,28 +796,14 @@ async def recv_dt_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     period_label = next((label for label, d in _DT_PERIOD_OPTIONS if d == days), "All time")
 
     if sess.report_mode == "tag":
-        tag    = sess.selected_tag
-        queued = [i for i in load_dlv_batch() if i.get("tag") == tag]
-        closed = [c for c in load_dlv_closed() if c.get("tag") == tag]
-        closed_refs = {c["ref"] for c in closed}
-        desk   = [a for a in _dt_load_assignment_items() if a.get("tag") == tag and a["ref"] not in closed_refs]
-        if days:
-            cutoff = _date_cutoff_str(days)
-            closed = [c for c in closed if _within_days(c.get("closed_at", ""), cutoff)]
-            desk   = [a for a in desk if _within_days(a.get("assigned_at", ""), cutoff)]
+        tag = sess.selected_tag
+        queued, desk, closed = _dt_gather_report_data("tag", tag, days)
         await query.edit_message_text(f"⏳ Building report for tag *{tag}*…", parse_mode="Markdown")
         await _dt_send_tag_report(query.message.chat_id, tag, queued, desk, closed, period_label, ctx.bot)
     else:
         valuer = sess.selected_valuer
         key    = valuer["key"]
-        queued = [i for i in load_dlv_batch() if _dt_valuer_key(i) == key]
-        closed = [c for c in load_dlv_closed() if _dt_valuer_key(c) == key]
-        closed_refs = {c["ref"] for c in closed}
-        desk   = [a for a in _dt_load_assignment_items() if _dt_valuer_key(a) == key and a["ref"] not in closed_refs]
-        if days:
-            cutoff = _date_cutoff_str(days)
-            closed = [c for c in closed if _within_days(c.get("closed_at", ""), cutoff)]
-            desk   = [a for a in desk if _within_days(a.get("assigned_at", ""), cutoff)]
+        queued, desk, closed = _dt_gather_report_data("valuer", key, days)
         await query.edit_message_text(f"⏳ Building report for *{md_escape(valuer['name'])}*…", parse_mode="Markdown")
         await _dt_send_valuer_report(query.message.chat_id, valuer["name"], queued, desk, closed, period_label, ctx.bot)
 

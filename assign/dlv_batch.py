@@ -10,11 +10,16 @@ Users send lines like "REF1, REF2 : Valuer Name"; refs are queued into
 saved_dlv_batch.json (via dlv_core) and a repeating background job tries
 to find + assign each one in DLV until it succeeds or closes out.
 
-Before confirming, refs can optionally be tagged (one of dlv_core.DLV_TAGS
-per ref) via the "🏷 Tag Tasks" step — the tag rides along on the queue
-item and, since closed records are built by spreading the item dict,
-carries through to the closed store automatically. DLV Tasks' "By Tag"
-report and the 🔍 DLV Queue viewer both surface it.
+Before confirming, refs can optionally be tagged (one of dlv_core.DLV_TAGS,
+or 🔢 Incremental — dlv_incremental.py's auto-sequenced "B{batch}-T{task}"
+alternative) per ref via the "🏷 Tag Tasks" step — the tag rides along on
+the queue item and, since closed records are built by spreading the item
+dict, carries through to the closed store automatically. DLV Tasks' "By
+Tag" report and the 🔍 DLV Queue viewer both surface fixed tags; Incremental
+tags get their own report (dlv_incremental.py) since they're unique per
+ref rather than a small filterable vocabulary. An Incremental pick is
+only resolved to a real tag value at confirm time (see recv_db_confirm),
+not when picked — see dlv_incremental.py's module docstring for why.
 
 Call register(app) from bot.py's main() to wire this feature in.
 """
@@ -71,6 +76,7 @@ from dlv_core import (
     load_dlv_batch,
     save_dlv_batch,
 )
+from dlv_incremental import INCREMENTAL_TAG_SENTINEL, next_incremental_tag
 from endpoints import ACCOUNTS_LIST_URL, STAMP_DUTY_FIX_APPLICATION_URL
 from fetch_tasks_cache import _fetch_tasks_log_lookup, _fetch_tasks_log_remove
 from task_block import format_labeled_block
@@ -524,6 +530,14 @@ async def cmd_dlv_batch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return DB.INPUT_BATCH
 
 
+def _db_tag_preview(tag: str) -> str:
+    """Display-friendly preview of a picked-but-not-yet-resolved tag — the
+    Incremental sentinel hasn't been turned into a real "B{n}-T{n}" value
+    yet (that happens at confirm time), so show a placeholder instead of
+    the raw sentinel string."""
+    return "🔢 Incremental (auto)" if tag == INCREMENTAL_TAG_SENTINEL else tag
+
+
 def _db_format_batch_summary(sess: DBSession) -> str:
     """Build the confirm-step summary text — resolved/unresolved groups, each
     ref annotated with its tag (if any) from a prior Tag Tasks pass."""
@@ -531,7 +545,7 @@ def _db_format_batch_summary(sess: DBSession) -> str:
     has_unresolved = False
     for g in sess.groups:
         refs_str = ", ".join(
-            f"`{r}`" + (f" 🏷{sess.tag_by_ref[r]}" if sess.tag_by_ref.get(r) else "")
+            f"`{r}`" + (f" 🏷{_db_tag_preview(sess.tag_by_ref[r])}" if sess.tag_by_ref.get(r) else "")
             for r in g["refs"]
         )
         if g["status"] == "resolved":
@@ -570,7 +584,7 @@ def _db_tag_ref_keyboard(tag_refs: List[str], tag_by_ref: Dict[str, str]) -> Inl
     rows = []
     for i, ref in enumerate(tag_refs):
         tag = tag_by_ref.get(ref, "")
-        label = f"{ref} [🏷 {tag}]" if tag else f"{ref} — no tag"
+        label = f"{ref} [🏷 {_db_tag_preview(tag)}]" if tag else f"{ref} — no tag"
         rows.append([InlineKeyboardButton(label, callback_data=f"db_tagref:{i}")])
     rows.append([
         InlineKeyboardButton("✅ Done Tagging", callback_data="db_tagref:done"),
@@ -580,7 +594,11 @@ def _db_tag_ref_keyboard(tag_refs: List[str], tag_by_ref: Dict[str, str]) -> Inl
 
 
 def _db_tag_value_keyboard() -> InlineKeyboardMarkup:
+    """Fixed dlv_core.DLV_TAGS values, plus 🔢 Incremental — picking it
+    stores INCREMENTAL_TAG_SENTINEL for now; recv_db_confirm resolves it to
+    a real "B{n}-T{n}" value only once the batch is actually saved."""
     rows = [[InlineKeyboardButton(t, callback_data=f"db_tagval:{t}")] for t in DLV_TAGS]
+    rows.append([InlineKeyboardButton("🔢 Incremental", callback_data=f"db_tagval:{INCREMENTAL_TAG_SENTINEL}")])
     rows.append([InlineKeyboardButton("🚫 Clear tag", callback_data="db_tagval:clear")])
     rows.append([InlineKeyboardButton("⬅️ Back",      callback_data="db_tagval:back")])
     return InlineKeyboardMarkup(rows)
@@ -695,6 +713,11 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for g in to_save:
         for ref in g["refs"]:
             tag = sess.tag_by_ref.get(ref, "")
+            if tag == INCREMENTAL_TAG_SENTINEL:
+                # Resolved (and the counter consumed) only now that the
+                # batch is actually being saved — cancelling before this
+                # point must never burn a counter slot for nothing.
+                tag = next_incremental_tag()
             if ref not in existing_by_ref:
                 new_item = {
                     "ref":         ref,
