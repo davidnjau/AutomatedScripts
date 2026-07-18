@@ -982,6 +982,27 @@ class TestCmdAutoFetch(unittest.TestCase):
         self.assertIn("🗑 Remove Schedule", self._button_texts())
 
 
+class TestRecvAfAmount(unittest.TestCase):
+    """recv_af_amount — preset amount-range picker, including the new 10M-50M option."""
+
+    def _make_query(self, data):
+        update = MagicMock()
+        query = update.callback_query
+        query.data = data
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        return update
+
+    def test_10m_50m_range_sets_min_max(self):
+        update = self._make_query("ft_amount:10m_50m")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        result = _run(af.recv_af_amount(update, ctx))
+        self.assertEqual(result, af.AF.SECTIONAL)
+        self.assertEqual(ctx.user_data["af_amount_min"], 10_000_000.0)
+        self.assertEqual(ctx.user_data["af_amount_max"], 50_000_000.0)
+
+
 class TestRecvAfMenu(unittest.TestCase):
     """recv_af_menu — Add / Remove / Close from the schedule list."""
 

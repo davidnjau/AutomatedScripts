@@ -320,5 +320,27 @@ class TestFtDoFetch(unittest.TestCase):
         self.assertIn("No qualifying tasks", self.message.reply_text.call_args[0][0])
 
 
+class TestRecvFtAmountFilter(unittest.TestCase):
+    """recv_ft_amount_filter — preset amount-range picker, including the new 10M-50M option."""
+
+    def _make_query(self, data):
+        update = MagicMock()
+        query = update.callback_query
+        query.data = data
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        return update
+
+    def test_10m_50m_range_sets_min_max(self):
+        update = self._make_query("ft_amount:10m_50m")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        result = _run(ft.recv_ft_amount_filter(update, ctx))
+        self.assertEqual(result, ft.FT.SECTIONAL_FILTER)
+        sess = ctx.user_data["ft_session"]
+        self.assertEqual(sess.amount_min, 10_000_000.0)
+        self.assertEqual(sess.amount_max, 50_000_000.0)
+
+
 if __name__ == "__main__":
     unittest.main()
