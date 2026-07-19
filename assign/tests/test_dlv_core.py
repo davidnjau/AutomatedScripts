@@ -279,5 +279,28 @@ class TestDlvTags(unittest.TestCase):
         self.assertTrue(all(isinstance(t, str) and t for t in dlv_core.DLV_TAGS))
 
 
+class TestParseIncrementalTag(unittest.TestCase):
+    """parse_incremental_tag/is_incremental_tag — shared here (not
+    dlv_incremental.py or dlv_tasks.py) since both of those modules need
+    them and dlv_incremental.py already imports from dlv_tasks.py."""
+
+    def test_valid_tag_parses(self):
+        self.assertEqual(dlv_core.parse_incremental_tag("B2-T3"), (2, 3))
+
+    def test_fixed_tag_returns_none(self):
+        self.assertIsNone(dlv_core.parse_incremental_tag("Queue"))
+
+    def test_empty_or_none_returns_none(self):
+        self.assertIsNone(dlv_core.parse_incremental_tag(""))
+        self.assertIsNone(dlv_core.parse_incremental_tag(None))
+
+    def test_is_incremental_tag_true_for_valid_tag(self):
+        self.assertTrue(dlv_core.is_incremental_tag("B9-T1"))
+
+    def test_is_incremental_tag_false_for_fixed_tag(self):
+        self.assertFalse(dlv_core.is_incremental_tag("Direct"))
+        self.assertFalse(dlv_core.is_incremental_tag(""))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -47,7 +47,7 @@ import json
 import os
 import re
 from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -74,18 +74,19 @@ from common import (
     md_escape,
     not_cancel,
 )
-from dlv_core import load_dlv_batch
+from dlv_core import load_dlv_batch, parse_incremental_tag
 from telegram_report import _send_chunked_report
 
 SAVED_INCREMENTAL_COUNTER_FILE = os.path.join(DATA_DIR, "saved_incremental_counter.json")
 SAVED_INCREMENTAL_CLOSED_FILE  = os.path.join(DATA_DIR, "saved_incremental_closed_batches.json")
 
-# Picked in DLV Batch's Tag Tasks step (dlv_batch.py's _db_tag_value_keyboard);
-# resolved to a real "B{n}-T{n}" value only at confirm time, by
-# next_incremental_tag() — see module docstring for why not at pick time.
-INCREMENTAL_TAG_SENTINEL = "__incremental__"
+# INCREMENTAL_TAG_SENTINEL/parse_incremental_tag live in dlv_core.py (the
+# shared low-level DLV module), not here, since dlv_tasks.py needs them too
+# and this module already imports from dlv_tasks.py — importing
+# dlv_core.INCREMENTAL_TAG_SENTINEL back here would be pointless (this
+# module never picks the sentinel, only resolves it via next_incremental_tag),
+# so callers needing it (dlv_batch.py) import it from dlv_core directly.
 
-_INCREMENTAL_TAG_RE = re.compile(r"^B(\d+)-T(\d+)$")
 _DEFAULT_BATCH_SIZE = 6
 
 _ORDINALS = ["First", "Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh", "Eighth", "Ninth", "Tenth"]
@@ -142,15 +143,6 @@ def next_incremental_tag() -> str:
     else:
         save_incremental_counter({"batch_number": batch, "task_number": task + 1, "batch_size": size})
     return tag
-
-
-def parse_incremental_tag(tag: Optional[str]) -> Optional[Tuple[int, int]]:
-    """(batch_number, task_number) parsed from a "B{n}-T{n}" tag, or None
-    if tag is empty or doesn't match (e.g. a fixed Queue/Direct tag)."""
-    m = _INCREMENTAL_TAG_RE.match(tag or "")
-    if not m:
-        return None
-    return int(m.group(1)), int(m.group(2))
 
 
 # ──────────────────────────────────────────────────────────

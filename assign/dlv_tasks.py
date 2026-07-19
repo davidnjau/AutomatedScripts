@@ -68,6 +68,7 @@ from common import (
 )
 from dlv_core import (
     DLV_TAGS,
+    INCREMENTAL_TAG_SENTINEL,
     _append_dlv_closed,
     _classify_dlv_detail,
     _fetch_ref_detail_dlv,
@@ -75,6 +76,7 @@ from dlv_core import (
     _resolve_assessor,
     _search_ref_dlv,
     _search_ref_stampduty,
+    is_incremental_tag,
     load_dlv_batch,
     load_dlv_closed,
     save_dlv_batch,
@@ -527,10 +529,20 @@ def _dt_period_keyboard() -> InlineKeyboardMarkup:
 
 
 def _dt_tag_keyboard() -> InlineKeyboardMarkup:
-    """Fixed-list tag picker for the By Tag scope."""
+    """Fixed-list tag picker for the By Tag scope, plus 🔢 Incremental — a
+    special option showing every incremental-tagged ref together, since
+    they're unique per ref ("B{n}-T{n}") rather than one of DLV_TAGS'
+    small fixed set."""
     rows = [[InlineKeyboardButton(t, callback_data=f"dt_picktag:{t}")] for t in DLV_TAGS]
+    rows.append([InlineKeyboardButton("🔢 Incremental", callback_data=f"dt_picktag:{INCREMENTAL_TAG_SENTINEL}")])
     rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="dt_picktag_cancel")])
     return InlineKeyboardMarkup(rows)
+
+
+def _dt_tag_display(tag: str) -> str:
+    """Display-friendly label for a picked tag — the Incremental sentinel
+    isn't a real tag value, just a filter meaning "any incremental tag"."""
+    return "🔢 Incremental" if tag == INCREMENTAL_TAG_SENTINEL else tag
 
 
 async def _dt_run_valuer_select(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
@@ -674,8 +686,8 @@ def _dt_format_valuer_report(valuer_name: str, queued: List[dict], desk: List[di
 def _dt_format_tag_report(tag: str, queued: List[dict], desk: List[dict], closed: List[dict],
                            period_label: str) -> List[str]:
     """One tag's DLV report, spanning every valuer — see _dt_format_report_lines."""
-    return _dt_format_report_lines(f"🏷 *DLV Report — Tag: {tag}*", queued, desk, closed, period_label,
-                                    show_valuer=True)
+    return _dt_format_report_lines(f"🏷 *DLV Report — Tag: {_dt_tag_display(tag)}*", queued, desk, closed,
+                                    period_label, show_valuer=True)
 
 
 async def _dt_send_valuer_report(chat_id: int, valuer_name: str, queued: List[dict], desk: List[dict],
@@ -742,11 +754,21 @@ async def recv_dt_pick_tag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess.report_mode  = "tag"
 
     await query.edit_message_text(
-        f"🏷 *{sess.selected_tag}*\n\nFilter history by period:",
+        f"🏷 *{_dt_tag_display(sess.selected_tag)}*\n\nFilter history by period:",
         parse_mode="Markdown",
         reply_markup=_dt_period_keyboard(),
     )
     return DT.PICK_PERIOD
+
+
+def _dt_tag_matches(item: dict, target_key: str) -> bool:
+    """True if item's tag matches the By Tag scope's target — either an
+    exact fixed-vocabulary tag, or (when target_key is the Incremental
+    sentinel) any auto-sequenced "B{n}-T{n}" tag at all, since those are
+    unique per ref rather than one shared value to match exactly."""
+    if target_key == INCREMENTAL_TAG_SENTINEL:
+        return is_incremental_tag(item.get("tag", ""))
+    return item.get("tag") == target_key
 
 
 def _dt_gather_report_data(scope: str, target_key: str, period_days: int) -> Tuple[List[dict], List[dict], List[dict]]:
@@ -756,15 +778,15 @@ def _dt_gather_report_data(scope: str, target_key: str, period_days: int) -> Tup
     dlv_report_schedule.py's background job can reuse the exact same
     filtering logic for its own scheduled runs rather than duplicating it."""
     if scope == "tag":
-        queued = [i for i in load_dlv_batch() if i.get("tag") == target_key]
-        closed = [c for c in load_dlv_closed() if c.get("tag") == target_key]
+        queued = [i for i in load_dlv_batch() if _dt_tag_matches(i, target_key)]
+        closed = [c for c in load_dlv_closed() if _dt_tag_matches(c, target_key)]
     else:
         queued = [i for i in load_dlv_batch() if _dt_valuer_key(i) == target_key]
         closed = [c for c in load_dlv_closed() if _dt_valuer_key(c) == target_key]
 
     closed_refs = {c["ref"] for c in closed}
     if scope == "tag":
-        desk = [a for a in _dt_load_assignment_items() if a.get("tag") == target_key and a["ref"] not in closed_refs]
+        desk = [a for a in _dt_load_assignment_items() if _dt_tag_matches(a, target_key) and a["ref"] not in closed_refs]
     else:
         desk = [a for a in _dt_load_assignment_items()
                 if _dt_valuer_key(a) == target_key and a["ref"] not in closed_refs]
@@ -798,7 +820,7 @@ async def recv_dt_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if sess.report_mode == "tag":
         tag = sess.selected_tag
         queued, desk, closed = _dt_gather_report_data("tag", tag, days)
-        await query.edit_message_text(f"⏳ Building report for tag *{tag}*…", parse_mode="Markdown")
+        await query.edit_message_text(f"⏳ Building report for tag *{_dt_tag_display(tag)}*…", parse_mode="Markdown")
         await _dt_send_tag_report(query.message.chat_id, tag, queued, desk, closed, period_label, ctx.bot)
     else:
         valuer = sess.selected_valuer
