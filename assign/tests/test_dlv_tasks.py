@@ -586,6 +586,41 @@ class TestDtTagKeyboard(unittest.TestCase):
             self.assertIn(tag, texts)
         self.assertIn("🛑 Cancel", texts)
 
+    def test_includes_incremental_option(self):
+        markup = dlv_tasks._dt_tag_keyboard()
+        buttons = [b for row in markup.inline_keyboard for b in row]
+        texts = [b.text for b in buttons]
+        callback_data = [b.callback_data for b in buttons]
+        self.assertIn("🔢 Incremental", texts)
+        self.assertIn(f"dt_picktag:{dlv_tasks.INCREMENTAL_TAG_SENTINEL}", callback_data)
+
+
+class TestDtTagDisplay(unittest.TestCase):
+    """_dt_tag_display — friendly label for a picked tag, not the raw sentinel."""
+
+    def test_incremental_sentinel_shows_friendly_label(self):
+        self.assertEqual(dlv_tasks._dt_tag_display(dlv_tasks.INCREMENTAL_TAG_SENTINEL), "🔢 Incremental")
+
+    def test_fixed_tag_shown_unchanged(self):
+        self.assertEqual(dlv_tasks._dt_tag_display("Queue"), "Queue")
+
+
+class TestDtTagMatches(unittest.TestCase):
+    """_dt_tag_matches — exact match for fixed tags, "any incremental tag"
+    for the Incremental sentinel."""
+
+    def test_exact_tag_match(self):
+        self.assertTrue(dlv_tasks._dt_tag_matches({"tag": "Queue"}, "Queue"))
+        self.assertFalse(dlv_tasks._dt_tag_matches({"tag": "Direct"}, "Queue"))
+
+    def test_incremental_sentinel_matches_any_incremental_tag(self):
+        self.assertTrue(dlv_tasks._dt_tag_matches({"tag": "B2-T3"}, dlv_tasks.INCREMENTAL_TAG_SENTINEL))
+        self.assertTrue(dlv_tasks._dt_tag_matches({"tag": "B9-T1"}, dlv_tasks.INCREMENTAL_TAG_SENTINEL))
+
+    def test_incremental_sentinel_does_not_match_fixed_tags(self):
+        self.assertFalse(dlv_tasks._dt_tag_matches({"tag": "Queue"}, dlv_tasks.INCREMENTAL_TAG_SENTINEL))
+        self.assertFalse(dlv_tasks._dt_tag_matches({"tag": ""}, dlv_tasks.INCREMENTAL_TAG_SENTINEL))
+
 
 class TestRecvDtPickTag(unittest.TestCase):
     """recv_dt_pick_tag — By Tag's tag picker, hands off to the shared period step."""
@@ -664,6 +699,22 @@ class TestDtGatherReportData(unittest.TestCase):
             q, d, c = dlv_tasks._dt_gather_report_data("valuer", "u1", 7)
         self.assertEqual(d, [])
         self.assertEqual(c, [])
+
+    def test_incremental_sentinel_matches_every_incremental_tag_regardless_of_batch(self):
+        """DLV Tasks' By Tag has no fixed-vocabulary entry for incremental
+        tags (they're unique per ref) — the Incremental sentinel is a
+        special filter matching ALL of them together."""
+        queued = [
+            {"ref": "REF1", "tag": "B2-T3"},
+            {"ref": "REF2", "tag": "B5-T1"},
+            {"ref": "REF3", "tag": "Queue"},
+            {"ref": "REF4", "tag": ""},
+        ]
+        with patch.object(dlv_tasks, "load_dlv_batch", return_value=queued), \
+             patch.object(dlv_tasks, "load_dlv_closed", return_value=[]), \
+             patch.object(dlv_tasks, "load_saved_assignments", return_value={}):
+            q, d, c = dlv_tasks._dt_gather_report_data("tag", dlv_tasks.INCREMENTAL_TAG_SENTINEL, 0)
+        self.assertEqual({i["ref"] for i in q}, {"REF1", "REF2"})
 
 
 class TestRecvDtPeriodTagMode(unittest.TestCase):

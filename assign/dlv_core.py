@@ -11,6 +11,12 @@ whether a reference number is already queued):
 - Live search + classification against the two stages a stamp-duty
   reference can be at: the assessor/HQ stage (stampdutyservice) and the
   DLV stage (valuationservice).
+- DLV_TAGS (the fixed Queue/Direct vocabulary) and the incremental-tag
+  sentinel/parser (INCREMENTAL_TAG_SENTINEL/parse_incremental_tag/
+  is_incremental_tag) — dlv_incremental.py's auto-sequenced "B{n}-T{n}"
+  tags live here rather than in dlv_incremental.py or dlv_tasks.py
+  because both of those need them and dlv_incremental.py already imports
+  from dlv_tasks.py, so dlv_tasks.py importing back would cycle.
 
 Moved out of bot.py so DLV Batch and DLV Tasks can each depend on this
 one place instead of on each other.
@@ -18,7 +24,8 @@ one place instead of on each other.
 
 import json
 import os
-from typing import Dict, List, Optional
+import re
+from typing import Dict, List, Optional, Tuple
 
 from ardhisasa_auth import AuthTokens, build_session
 
@@ -45,6 +52,37 @@ SAVED_DLV_CLOSED_FILE = os.path.join(DATA_DIR, "saved_dlv_closed.json")
 # Shared here since both DLV Batch (sets the tag) and DLV Tasks (reports on
 # it) need the same vocabulary.
 DLV_TAGS = ["Queue", "Direct"]
+
+# dlv_incremental.py's auto-sequenced "B{batch}-T{task}" tag is a third DLV
+# Batch tag option that doesn't fit DLV_TAGS' fixed-vocabulary picker (it's
+# unique per ref, not one of a small filterable set). The sentinel/parser
+# live here — rather than in dlv_incremental.py or dlv_tasks.py — since both
+# of those modules need them and dlv_incremental.py already imports from
+# dlv_tasks.py (_dt_gather_report_data et al.), so dlv_tasks.py importing
+# back from dlv_incremental.py would be a circular import.
+#
+# Two distinct uses of the same sentinel:
+#   - dlv_batch.py's Tag Tasks picker: "generate a new incremental tag for
+#     this ref" (resolved to a real "B{n}-T{n}" value at confirm time).
+#   - dlv_tasks.py's By Tag picker: "show every ref whose tag is ANY
+#     incremental tag together" (a filter, not a value to assign).
+INCREMENTAL_TAG_SENTINEL = "__incremental__"
+
+_INCREMENTAL_TAG_RE = re.compile(r"^B(\d+)-T(\d+)$")
+
+
+def parse_incremental_tag(tag: Optional[str]) -> Optional[Tuple[int, int]]:
+    """(batch_number, task_number) parsed from a "B{n}-T{n}" tag, or None
+    if tag is empty or doesn't match (e.g. a fixed Queue/Direct tag)."""
+    m = _INCREMENTAL_TAG_RE.match(tag or "")
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def is_incremental_tag(tag: Optional[str]) -> bool:
+    """True if tag is a "B{n}-T{n}" auto-sequenced incremental tag."""
+    return parse_incremental_tag(tag) is not None
 
 
 # ──────────────────────────────────────────────────────────

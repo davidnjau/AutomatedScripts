@@ -25,7 +25,9 @@ Reports here are deliberately separate from DLV Tasks' own By
 Valuer/By Tag reports (which assume a small fixed tag vocabulary for
 their picker) since incremental tags are unique per ref. Both always use
 the CURRENT batch_size setting, even for batches created under a
-different size before it was last changed:
+different size before it was last changed. Each item within them is
+rendered as its own labeled block via task_block.format_labeled_block —
+the shared visual every report in the bot uses — not a packed one-liner:
 
 - 📦 By Batch — every incremental-tagged ref, grouped by its original
   batch_number, sourced from saved_dlv_batch.json ("queued") and
@@ -47,7 +49,7 @@ import json
 import os
 import re
 from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -71,21 +73,22 @@ from common import (
     deny,
     fallback,
     load_saved_assignments,
-    md_escape,
     not_cancel,
 )
-from dlv_core import load_dlv_batch
+from dlv_core import load_dlv_batch, parse_incremental_tag
+from task_block import assessor_field, consideration_field, format_labeled_block, parcel_field
 from telegram_report import _send_chunked_report
 
 SAVED_INCREMENTAL_COUNTER_FILE = os.path.join(DATA_DIR, "saved_incremental_counter.json")
 SAVED_INCREMENTAL_CLOSED_FILE  = os.path.join(DATA_DIR, "saved_incremental_closed_batches.json")
 
-# Picked in DLV Batch's Tag Tasks step (dlv_batch.py's _db_tag_value_keyboard);
-# resolved to a real "B{n}-T{n}" value only at confirm time, by
-# next_incremental_tag() — see module docstring for why not at pick time.
-INCREMENTAL_TAG_SENTINEL = "__incremental__"
+# INCREMENTAL_TAG_SENTINEL/parse_incremental_tag live in dlv_core.py (the
+# shared low-level DLV module), not here, since dlv_tasks.py needs them too
+# and this module already imports from dlv_tasks.py — importing
+# dlv_core.INCREMENTAL_TAG_SENTINEL back here would be pointless (this
+# module never picks the sentinel, only resolves it via next_incremental_tag),
+# so callers needing it (dlv_batch.py) import it from dlv_core directly.
 
-_INCREMENTAL_TAG_RE = re.compile(r"^B(\d+)-T(\d+)$")
 _DEFAULT_BATCH_SIZE = 6
 
 _ORDINALS = ["First", "Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh", "Eighth", "Ninth", "Tenth"]
@@ -142,15 +145,6 @@ def next_incremental_tag() -> str:
     else:
         save_incremental_counter({"batch_number": batch, "task_number": task + 1, "batch_size": size})
     return tag
-
-
-def parse_incremental_tag(tag: Optional[str]) -> Optional[Tuple[int, int]]:
-    """(batch_number, task_number) parsed from a "B{n}-T{n}" tag, or None
-    if tag is empty or doesn't match (e.g. a fixed Queue/Direct tag)."""
-    m = _INCREMENTAL_TAG_RE.match(tag or "")
-    if not m:
-        return None
-    return int(m.group(1)), int(m.group(2))
 
 
 # ──────────────────────────────────────────────────────────
@@ -239,8 +233,10 @@ def _ic_auto_close(grouped: Dict[int, List[Dict]], batch_size: int) -> List[int]
 # Report formatting
 # ──────────────────────────────────────────────────────────
 def _ic_format_by_batch_report(grouped: Dict[int, List[Dict]], closed_batches: List[int], batch_size: int) -> List[str]:
-    """📦 By Batch — one section per original batch number, each task
-    slot's ref/status/valuer, flagging closed batches."""
+    """📦 By Batch — one section per original batch number, each task slot
+    rendered as its own labeled block (task_block.format_labeled_block —
+    the shared visual every report in the bot uses, numbered by its
+    task_number), flagging closed batches."""
     lines = ["📦 *Incremental Report — By Batch*\n"]
     if not grouped:
         lines.append("_No incremental-tagged tasks yet._")
@@ -251,15 +247,22 @@ def _ic_format_by_batch_report(grouped: Dict[int, List[Dict]], closed_batches: L
         status_note = " ✅ CLOSED" if batch_number in closed_set else ""
         lines.append(f"*Batch {batch_number}*{status_note} — {len(items)}/{batch_size} tagged")
         for item in items:
-            status_icon = "✅" if item["status"] == "cleared" else "⏳"
-            valuer = md_escape(item.get("valuer_name") or "—")
-            lines.append(f"  T{item['task_number']}: `{item['ref']}` {status_icon} {valuer}")
+            status_label = "✅ Cleared" if item["status"] == "cleared" else "⏳ Queued"
+            fields = [
+                ("📊 Status", status_label),
+                ("👤 Valuer", item.get("valuer_name") or "—"),
+                assessor_field(item),
+                consideration_field(item),
+                parcel_field(item),
+            ]
+            lines.append(format_labeled_block(item["task_number"], item["ref"], fields))
     return lines
 
 
 def _ic_format_cleared_report(items: List[Dict], batch_size: int) -> List[str]:
     """✅ Cleared — cleared items only, sorted by clearance (assigned_at)
-    order and chunked into groups of batch_size regardless of original batch."""
+    order and chunked into groups of batch_size regardless of original
+    batch, each rendered as its own labeled block."""
     cleared = [i for i in items if i["status"] == "cleared"]
     cleared.sort(key=lambda i: i.get("assigned_at", ""))
     lines = ["✅ *Incremental Report — Cleared*\n"]
@@ -271,9 +274,15 @@ def _ic_format_cleared_report(items: List[Dict], batch_size: int) -> List[str]:
         ordinal_idx = group_idx // batch_size
         ordinal = f"{_ORDINALS[ordinal_idx]} Cleared" if ordinal_idx < len(_ORDINALS) else f"Cleared Group {ordinal_idx + 1}"
         lines.append(f"*{ordinal}* ({len(group)}/{batch_size})")
-        for item in group:
-            valuer = md_escape(item.get("valuer_name") or "—")
-            lines.append(f"  B{item['batch_number']}-T{item['task_number']}: `{item['ref']}` — {valuer}")
+        for i, item in enumerate(group, start=1):
+            fields = [
+                ("🔢 Batch/Task", f"B{item['batch_number']}-T{item['task_number']}"),
+                ("👤 Valuer", item.get("valuer_name") or "—"),
+                assessor_field(item),
+                consideration_field(item),
+                parcel_field(item),
+            ]
+            lines.append(format_labeled_block(i, item["ref"], fields))
     return lines
 
 
