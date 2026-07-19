@@ -69,6 +69,7 @@ from common import (
 )
 from dlv_core import (
     DLV_TAGS,
+    INCREMENTAL_TAG_SENTINEL,
     _append_dlv_closed,
     _classify_dlv_detail,
     _fetch_ref_detail_dlv,
@@ -76,7 +77,7 @@ from dlv_core import (
     load_dlv_batch,
     save_dlv_batch,
 )
-from dlv_incremental import INCREMENTAL_TAG_SENTINEL, next_incremental_tag
+from dlv_incremental import next_incremental_tag
 from endpoints import ACCOUNTS_LIST_URL, STAMP_DUTY_FIX_APPLICATION_URL
 from fetch_tasks_cache import _fetch_tasks_log_lookup, _fetch_tasks_log_remove
 from task_block import format_labeled_block
