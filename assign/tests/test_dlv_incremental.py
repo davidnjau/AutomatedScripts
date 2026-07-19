@@ -504,5 +504,331 @@ class TestRecvIcSetBatchAndTask(unittest.TestCase):
         self.assertIn("batch size: 4", text)
 
 
+class TestNotifyConfigAndStatePersistence(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.config_file = os.path.join(self.tmpdir.name, "saved_incremental_notify_config.json")
+        self.state_file = os.path.join(self.tmpdir.name, "saved_incremental_notify_state.json")
+        self._patches = [
+            patch.object(ic, "SAVED_INCREMENTAL_NOTIFY_CONFIG_FILE", self.config_file),
+            patch.object(ic, "SAVED_INCREMENTAL_NOTIFY_STATE_FILE", self.state_file),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        self.tmpdir.cleanup()
+
+    def test_missing_config_defaults_to_disabled(self):
+        self.assertEqual(ic.load_notify_config(), {"enabled": False, "interval_minutes": 30, "email": ""})
+
+    def test_save_and_load_config_roundtrip(self):
+        ic.save_notify_config({"enabled": True, "interval_minutes": 60, "email": "a@b.com"})
+        self.assertEqual(ic.load_notify_config(), {"enabled": True, "interval_minutes": 60, "email": "a@b.com"})
+
+    def test_missing_state_defaults_to_empty(self):
+        self.assertEqual(ic.load_notify_state(), {"closed_batches": [], "reported_cleared_refs": []})
+
+    def test_save_and_load_state_roundtrip(self):
+        ic.save_notify_state({"closed_batches": [1, 2], "reported_cleared_refs": ["R1"]})
+        self.assertEqual(ic.load_notify_state(), {"closed_batches": [1, 2], "reported_cleared_refs": ["R1"]})
+
+
+class TestOpenBatches(unittest.TestCase):
+    def test_excludes_closed_batches(self):
+        grouped = {2: [{"ref": "R1"}], 3: [{"ref": "R2"}]}
+        self.assertEqual(ic._ic_open_batches(grouped, [2]), {3: [{"ref": "R2"}]})
+
+    def test_no_closed_batches_returns_all(self):
+        grouped = {2: [{"ref": "R1"}], 3: [{"ref": "R2"}]}
+        self.assertEqual(ic._ic_open_batches(grouped, []), grouped)
+
+    def test_all_closed_returns_empty(self):
+        grouped = {2: [{"ref": "R1"}]}
+        self.assertEqual(ic._ic_open_batches(grouped, [2]), {})
+
+
+class TestNewClearedItems(unittest.TestCase):
+    def test_only_cleared_and_unreported_included(self):
+        items = [
+            {"ref": "R1", "status": "cleared", "assigned_at": "2026-07-10 09:00:00"},
+            {"ref": "R2", "status": "queued", "assigned_at": ""},
+            {"ref": "R3", "status": "cleared", "assigned_at": "2026-07-09 09:00:00"},
+        ]
+        new = ic._ic_new_cleared_items(items, already_reported=["R1"])
+        self.assertEqual([i["ref"] for i in new], ["R3"])
+
+    def test_sorted_by_assigned_at(self):
+        items = [
+            {"ref": "R1", "status": "cleared", "assigned_at": "2026-07-12 09:00:00"},
+            {"ref": "R2", "status": "cleared", "assigned_at": "2026-07-10 09:00:00"},
+        ]
+        new = ic._ic_new_cleared_items(items, already_reported=[])
+        self.assertEqual([i["ref"] for i in new], ["R2", "R1"])
+
+    def test_nothing_new_returns_empty(self):
+        items = [{"ref": "R1", "status": "cleared", "assigned_at": "2026-07-10 09:00:00"}]
+        self.assertEqual(ic._ic_new_cleared_items(items, already_reported=["R1"]), [])
+
+
+class TestFormatNewlyClearedSection(unittest.TestCase):
+    def test_empty_shows_none(self):
+        lines = "\n".join(ic._ic_format_newly_cleared_section([], batch_size=6))
+        self.assertIn("_None._", lines)
+        self.assertIn("0 task(s)", lines)
+
+    def test_renders_labeled_blocks_grouped_by_batch_size(self):
+        items = [
+            {"ref": f"R{i}", "batch_number": 4, "task_number": i, "valuer_name": "Jane Doe"}
+            for i in range(1, 8)   # 7 items, batch_size 6 -> 2 groups
+        ]
+        lines = "\n".join(ic._ic_format_newly_cleared_section(items, batch_size=6))
+        self.assertIn("*Cleared Group 1* (6/6)", lines)
+        self.assertIn("*Cleared Group 2* (1/6)", lines)
+        self.assertIn("1. 📌 *Ref:* `R1`", lines)
+        self.assertIn("🔢 Batch/Task: B4-T1", lines)
+        self.assertIn("👤 Valuer: Jane Doe", lines)
+
+
+class TestIcNotifyJob(unittest.TestCase):
+    def _make_ctx(self):
+        ctx = MagicMock()
+        ctx.job.schedule_removal = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        return ctx
+
+    def test_disabled_config_removes_job_and_does_nothing_else(self):
+        ctx = self._make_ctx()
+        with patch.object(ic, "load_notify_config", return_value={"enabled": False}):
+            _run(ic._ic_notify_job(ctx))
+        ctx.job.schedule_removal.assert_called_once()
+        ctx.bot.send_message.assert_not_called()
+
+    def test_nothing_new_skips_send(self):
+        ctx = self._make_ctx()
+        with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "email": ""}), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "_ic_gather_items", return_value=[]), \
+             patch.object(ic, "_ic_auto_close"), \
+             patch.object(ic, "load_closed_batches", return_value=[]), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "save_notify_state") as mock_save:
+            _run(ic._ic_notify_job(ctx))
+        ctx.bot.send_message.assert_not_called()
+        mock_save.assert_not_called()
+
+    def test_newly_closed_batch_triggers_send_and_saves_state(self):
+        ctx = self._make_ctx()
+        items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared", "valuer_name": "Jane Doe"}]
+        with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "email": ""}), \
+             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "_ic_gather_items", return_value=items), \
+             patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
+             patch.object(ic, "_ic_auto_close"), \
+             patch.object(ic, "load_closed_batches", return_value=[2]), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "save_notify_state") as mock_save:
+            _run(ic._ic_notify_job(ctx))
+        ctx.bot.send_message.assert_called()
+        sent_text = "\n".join(call.args[1] for call in ctx.bot.send_message.call_args_list)
+        self.assertIn("Newly filled: Batch 2", sent_text)
+        mock_save.assert_called_once()
+        saved_state = mock_save.call_args[0][0]
+        self.assertEqual(saved_state["closed_batches"], [2])
+        self.assertEqual(saved_state["reported_cleared_refs"], ["R1"])
+
+    def test_new_cleared_item_triggers_send_without_newly_closed_batch(self):
+        ctx = self._make_ctx()
+        items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared",
+                  "valuer_name": "Jane Doe", "assigned_at": "2026-07-17 09:00:00"}]
+        with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "email": ""}), \
+             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "_ic_gather_items", return_value=items), \
+             patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
+             patch.object(ic, "_ic_auto_close"), \
+             patch.object(ic, "load_closed_batches", return_value=[]), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "save_notify_state") as mock_save:
+            _run(ic._ic_notify_job(ctx))
+        ctx.bot.send_message.assert_called()
+        sent_text = "\n".join(call.args[1] for call in ctx.bot.send_message.call_args_list)
+        self.assertIn("Newly Cleared", sent_text)
+        self.assertIn("B2-T1", sent_text)
+        mock_save.assert_called_once()
+
+    def test_email_configured_sends_email(self):
+        ctx = self._make_ctx()
+        items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared",
+                  "valuer_name": "Jane Doe", "assigned_at": "2026-07-17 09:00:00"}]
+        with patch.object(ic, "load_notify_config",
+                           return_value={"enabled": True, "interval_minutes": 30, "email": "a@b.com"}), \
+             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "_ic_gather_items", return_value=items), \
+             patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
+             patch.object(ic, "_ic_auto_close"), \
+             patch.object(ic, "load_closed_batches", return_value=[]), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "save_notify_state"), \
+             patch.object(ic, "_send_auto_fetch_email") as mock_email:
+            _run(ic._ic_notify_job(ctx))
+        mock_email.assert_called_once()
+        self.assertEqual(mock_email.call_args[0][0], "a@b.com")
+
+    def test_email_failure_is_logged_not_raised(self):
+        ctx = self._make_ctx()
+        items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared",
+                  "valuer_name": "Jane Doe", "assigned_at": "2026-07-17 09:00:00"}]
+        with patch.object(ic, "load_notify_config",
+                           return_value={"enabled": True, "interval_minutes": 30, "email": "a@b.com"}), \
+             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "_ic_gather_items", return_value=items), \
+             patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
+             patch.object(ic, "_ic_auto_close"), \
+             patch.object(ic, "load_closed_batches", return_value=[]), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "save_notify_state"), \
+             patch.object(ic, "_send_auto_fetch_email", side_effect=Exception("smtp down")):
+            _run(ic._ic_notify_job(ctx))   # must not raise
+        # failure notice sent to allowed chats in addition to the report
+        sent_texts = [call.args[1] for call in ctx.bot.send_message.call_args_list]
+        self.assertTrue(any("failed" in t for t in sent_texts))
+
+    def test_no_duplicate_header_sent_per_chat(self):
+        """Regression: an earlier draft sent a standalone header message
+        before the chunked report, duplicating the header already at the
+        top of `lines` — only one send per chat's single-chunk report."""
+        ctx = self._make_ctx()
+        items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared",
+                  "valuer_name": "Jane Doe", "assigned_at": "2026-07-17 09:00:00"}]
+        with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "email": ""}), \
+             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "_ic_gather_items", return_value=items), \
+             patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
+             patch.object(ic, "_ic_auto_close"), \
+             patch.object(ic, "load_closed_batches", return_value=[]), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "save_notify_state"):
+            _run(ic._ic_notify_job(ctx))
+        self.assertEqual(ctx.bot.send_message.call_count, 1)
+
+
+class TestRecvIcNotifyMenu(unittest.TestCase):
+    def test_cancel_ends_conversation(self):
+        update = _make_query_update("ic_notify:cancel")
+        ctx = MagicMock()
+        with patch.object(ic, "allowed", return_value=True):
+            result = _run(ic.recv_ic_notify_menu(update, ctx))
+        self.assertEqual(result, ic.ConversationHandler.END)
+
+    def test_configure_moves_to_interval_state(self):
+        update = _make_query_update("ic_notify:configure")
+        ctx = MagicMock()
+        with patch.object(ic, "allowed", return_value=True):
+            result = _run(ic.recv_ic_notify_menu(update, ctx))
+        self.assertEqual(result, ic.IC.NOTIFY_INTERVAL)
+
+    def test_disable_saves_config_and_removes_job(self):
+        update = _make_query_update("ic_notify:disable")
+        ctx = MagicMock()
+        job = MagicMock()
+        ctx.job_queue.get_jobs_by_name.return_value = [job]
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "email": ""}), \
+             patch.object(ic, "save_notify_config") as mock_save:
+            result = _run(ic.recv_ic_notify_menu(update, ctx))
+        self.assertEqual(result, ic.ConversationHandler.END)
+        mock_save.assert_called_once_with({"enabled": False, "interval_minutes": 30, "email": ""})
+        job.schedule_removal.assert_called_once()
+
+
+class TestRecvIcNotifyInterval(unittest.TestCase):
+    def test_cancel_ends_conversation(self):
+        update = _make_query_update("ic_notify_int:cancel")
+        ctx = MagicMock()
+        with patch.object(ic, "allowed", return_value=True):
+            result = _run(ic.recv_ic_notify_interval(update, ctx))
+        self.assertEqual(result, ic.ConversationHandler.END)
+
+    def test_valid_interval_stores_and_moves_to_email_state(self):
+        update = _make_query_update("ic_notify_int:60")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        with patch.object(ic, "allowed", return_value=True):
+            result = _run(ic.recv_ic_notify_interval(update, ctx))
+        self.assertEqual(result, ic.IC.NOTIFY_EMAIL)
+        self.assertEqual(ctx.user_data["ic_notify_interval"], 60)
+
+
+class TestRecvIcNotifyEmail(unittest.TestCase):
+    def test_skip_saves_config_with_no_email(self):
+        update = _make_message_update("skip")
+        ctx = MagicMock()
+        ctx.user_data = {"ic_notify_interval": 30}
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "save_notify_config") as mock_save, \
+             patch.object(ic, "_ic_schedule_notify_job") as mock_schedule:
+            result = _run(ic.recv_ic_notify_email(update, ctx))
+        self.assertEqual(result, ic.ConversationHandler.END)
+        mock_save.assert_called_once_with({"enabled": True, "interval_minutes": 30, "email": ""})
+        mock_schedule.assert_called_once_with(ctx.job_queue, 30)
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("Telegram only", text)
+
+    def test_email_provided_is_saved_and_scheduled(self):
+        update = _make_message_update("a@b.com")
+        ctx = MagicMock()
+        ctx.user_data = {"ic_notify_interval": 60}
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "save_notify_config") as mock_save, \
+             patch.object(ic, "_ic_schedule_notify_job") as mock_schedule:
+            result = _run(ic.recv_ic_notify_email(update, ctx))
+        self.assertEqual(result, ic.ConversationHandler.END)
+        mock_save.assert_called_once_with({"enabled": True, "interval_minutes": 60, "email": "a@b.com"})
+        mock_schedule.assert_called_once_with(ctx.job_queue, 60)
+
+
+class TestScheduleNotifyJob(unittest.TestCase):
+    def test_removes_existing_job_before_scheduling(self):
+        job_queue = MagicMock()
+        stale_job = MagicMock()
+        job_queue.get_jobs_by_name.return_value = [stale_job]
+        ic._ic_schedule_notify_job(job_queue, 30)
+        stale_job.schedule_removal.assert_called_once()
+        job_queue.run_repeating.assert_called_once()
+        _, kwargs = job_queue.run_repeating.call_args
+        self.assertEqual(kwargs["interval"], 1800)
+        self.assertEqual(kwargs["name"], ic._IC_NOTIFY_JOB_NAME)
+
+
+class TestRecvIcMenuNotifyAction(unittest.TestCase):
+    def test_notify_action_shows_status_and_moves_to_notify_menu(self):
+        update = _make_query_update("ic_menu:notify")
+        ctx = MagicMock()
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "email": "a@b.com"}):
+            result = _run(ic.recv_ic_menu(update, ctx))
+        self.assertEqual(result, ic.IC.NOTIFY_MENU)
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Enabled", text)
+        self.assertIn("a@b.com", text)
+
+    def test_notify_action_shows_disabled_status(self):
+        update = _make_query_update("ic_menu:notify")
+        ctx = MagicMock()
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "load_notify_config", return_value={"enabled": False, "interval_minutes": 30, "email": ""}):
+            result = _run(ic.recv_ic_menu(update, ctx))
+        self.assertEqual(result, ic.IC.NOTIFY_MENU)
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Disabled", text)
+
+
 if __name__ == "__main__":
     unittest.main()
