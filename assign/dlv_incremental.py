@@ -43,11 +43,13 @@ the shared visual every report in the bot uses — not a packed one-liner:
   number, since tasks from different batches can clear in any order.
 
 🔔 Notify on Fill is a single scheduled job (saved_incremental_notify_
-config.json: enabled/interval_minutes/email — not a multi-schedule
+config.json: enabled/interval_minutes/emails — not a multi-schedule
 feature like Auto Fetch, since there's only one counter/one set of
 batches to watch) that periodically checks for state changes and — only
 if something is new — sends a combined report via Telegram (every
-ALLOWED_IDS chat) and email (if configured):
+ALLOWED_IDS chat) and email (if any addresses are configured — comma/
+semicolon-separated at entry time, parsed by _ic_parse_emails, each
+address emailed independently so one bad address can't block the rest):
 - 📦 Available Batches — every batch not yet closed, in the same
   per-task labeled-block format as 📦 By Batch (_ic_format_batch_section,
   the header-less helper both share).
@@ -60,8 +62,10 @@ state needed — it's the same status flag ✋ Close Batch/auto-close use),
 while cleared refs need their own "reported_cleared_refs" list since a
 cleared item doesn't otherwise disappear from _ic_gather_items()'s
 output. Configure via the 🔢 Incremental menu's "🔔 Notify on Fill"
-action; the interval/email choice is saved and the job is (re)scheduled
-immediately, and restored on bot startup if still enabled.
+action; the interval/email(s) choice is saved and the job is (re)scheduled
+immediately, and restored on bot startup if still enabled. A config saved
+before multi-address support existed (a singular "email" string) is
+migrated to the "emails" list shape on load.
 
 Call register(app) from bot.py's main() to wire this feature in.
 """
@@ -203,12 +207,31 @@ def close_batch(batch_number: int) -> None:
 # there's no per-schedule filter dimension to make more than one useful)
 # ──────────────────────────────────────────────────────────
 def load_notify_config() -> Dict:
-    """{"enabled", "interval_minutes", "email"} — defaults to disabled."""
+    """{"enabled", "interval_minutes", "emails"} — defaults to disabled.
+    A config saved before multi-address support existed only has a
+    singular "email" string — migrated to the "emails" list shape here
+    rather than requiring a one-time migration step."""
     try:
         with open(SAVED_INCREMENTAL_NOTIFY_CONFIG_FILE) as f:
-            return json.load(f)
+            cfg = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"enabled": False, "interval_minutes": 30, "email": ""}
+        return {"enabled": False, "interval_minutes": 30, "emails": []}
+    if "emails" not in cfg:
+        cfg["emails"] = [cfg["email"]] if cfg.get("email") else []
+    return cfg
+
+
+def _ic_parse_emails(text: str) -> List[str]:
+    """Split a comma/semicolon-separated string into a deduplicated list
+    of trimmed, non-empty email addresses (order preserved)."""
+    raw = re.split(r"[,;]", text)
+    seen = set()
+    emails = []
+    for candidate in (a.strip() for a in raw):
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            emails.append(candidate)
+    return emails
 
 
 def save_notify_config(cfg: Dict) -> None:
@@ -453,12 +476,11 @@ async def _ic_notify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.warning("Incremental Notify on Fill Telegram error for %s: %s", chat_id, e)
         await _send_chunked_report(_send, lines, join="\n\n")
 
-    email = cfg.get("email", "")
-    if email:
+    for email in cfg.get("emails", []):
         try:
             _send_auto_fetch_email(email, "Incremental — Notify on Fill", "\n\n".join(lines))
         except Exception as e:
-            logger.warning("Incremental Notify on Fill email failed: %s", e)
+            logger.warning("Incremental Notify on Fill email to %s failed: %s", email, e)
             for chat_id in ALLOWED_IDS:
                 try:
                     await context.bot.send_message(
@@ -581,9 +603,10 @@ async def recv_ic_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "notify":
         cfg = load_notify_config()
+        emails = cfg.get("emails", [])
         status = (
             f"🔔 Enabled — every {cfg.get('interval_minutes', 30)} min, "
-            f"emailing *{md_escape(cfg['email'])}*" if cfg.get("enabled") and cfg.get("email")
+            f"emailing *{md_escape(', '.join(emails))}*" if cfg.get("enabled") and emails
             else f"🔔 Enabled — every {cfg.get('interval_minutes', 30)} min, Telegram only" if cfg.get("enabled")
             else "🚫 Disabled"
         )
@@ -743,7 +766,8 @@ async def recv_ic_notify_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 
     ctx.user_data["ic_notify_interval"] = int(data)
     await query.edit_message_text(
-        "Enter an email to also receive the report, or send `skip` for Telegram-only:",
+        "Enter the email address(es) to also receive the report (comma-separated for "
+        "more than one), or send `skip` for Telegram-only:",
         parse_mode="Markdown",
     )
     return IC.NOTIFY_EMAIL
@@ -753,13 +777,13 @@ async def recv_ic_notify_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Finalize Notify on Fill: save config and (re)schedule the repeating job."""
     if not allowed(update): return await deny(update)
     text = update.message.text.strip()
-    email = "" if text.lower() == "skip" else text
+    emails = [] if text.lower() == "skip" else _ic_parse_emails(text)
     interval_minutes = ctx.user_data.get("ic_notify_interval", 30)
 
-    save_notify_config({"enabled": True, "interval_minutes": interval_minutes, "email": email})
+    save_notify_config({"enabled": True, "interval_minutes": interval_minutes, "emails": emails})
     _ic_schedule_notify_job(ctx.job_queue, interval_minutes)
 
-    delivery = f"Telegram + email (*{md_escape(email)}*)" if email else "Telegram only"
+    delivery = f"Telegram + email (*{md_escape(', '.join(emails))}*)" if emails else "Telegram only"
     await update.message.reply_text(
         f"✅ Notify on Fill enabled — checking every {interval_minutes} min, delivery: {delivery}.",
         parse_mode="Markdown",

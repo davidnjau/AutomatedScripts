@@ -522,11 +522,24 @@ class TestNotifyConfigAndStatePersistence(unittest.TestCase):
         self.tmpdir.cleanup()
 
     def test_missing_config_defaults_to_disabled(self):
-        self.assertEqual(ic.load_notify_config(), {"enabled": False, "interval_minutes": 30, "email": ""})
+        self.assertEqual(ic.load_notify_config(), {"enabled": False, "interval_minutes": 30, "emails": []})
 
     def test_save_and_load_config_roundtrip(self):
-        ic.save_notify_config({"enabled": True, "interval_minutes": 60, "email": "a@b.com"})
-        self.assertEqual(ic.load_notify_config(), {"enabled": True, "interval_minutes": 60, "email": "a@b.com"})
+        ic.save_notify_config({"enabled": True, "interval_minutes": 60, "emails": ["a@b.com"]})
+        self.assertEqual(ic.load_notify_config(), {"enabled": True, "interval_minutes": 60, "emails": ["a@b.com"]})
+
+    def test_save_and_load_config_with_multiple_emails(self):
+        ic.save_notify_config({"enabled": True, "interval_minutes": 60, "emails": ["a@b.com", "c@d.com"]})
+        self.assertEqual(ic.load_notify_config(),
+                          {"enabled": True, "interval_minutes": 60, "emails": ["a@b.com", "c@d.com"]})
+
+    def test_legacy_singular_email_field_migrated_to_emails_list(self):
+        ic.save_notify_config({"enabled": True, "interval_minutes": 30, "email": "old@b.com"})
+        self.assertEqual(ic.load_notify_config()["emails"], ["old@b.com"])
+
+    def test_legacy_empty_email_field_migrates_to_empty_list(self):
+        ic.save_notify_config({"enabled": False, "interval_minutes": 30, "emails": []})
+        self.assertEqual(ic.load_notify_config()["emails"], [])
 
     def test_missing_state_defaults_to_empty(self):
         self.assertEqual(ic.load_notify_state(), {"closed_batches": [], "reported_cleared_refs": []})
@@ -608,7 +621,7 @@ class TestIcNotifyJob(unittest.TestCase):
 
     def test_nothing_new_skips_send(self):
         ctx = self._make_ctx()
-        with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "email": ""}), \
+        with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "emails": []}), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=[]), \
              patch.object(ic, "_ic_auto_close"), \
@@ -622,7 +635,7 @@ class TestIcNotifyJob(unittest.TestCase):
     def test_newly_closed_batch_triggers_send_and_saves_state(self):
         ctx = self._make_ctx()
         items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared", "valuer_name": "Jane Doe"}]
-        with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "email": ""}), \
+        with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "emails": []}), \
              patch.object(ic, "ALLOWED_IDS", [111]), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=items), \
@@ -644,7 +657,7 @@ class TestIcNotifyJob(unittest.TestCase):
         ctx = self._make_ctx()
         items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared",
                   "valuer_name": "Jane Doe", "assigned_at": "2026-07-17 09:00:00"}]
-        with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "email": ""}), \
+        with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "emails": []}), \
              patch.object(ic, "ALLOWED_IDS", [111]), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=items), \
@@ -665,7 +678,7 @@ class TestIcNotifyJob(unittest.TestCase):
         items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared",
                   "valuer_name": "Jane Doe", "assigned_at": "2026-07-17 09:00:00"}]
         with patch.object(ic, "load_notify_config",
-                           return_value={"enabled": True, "interval_minutes": 30, "email": "a@b.com"}), \
+                           return_value={"enabled": True, "interval_minutes": 30, "emails": ["a@b.com"]}), \
              patch.object(ic, "ALLOWED_IDS", [111]), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=items), \
@@ -679,12 +692,53 @@ class TestIcNotifyJob(unittest.TestCase):
         mock_email.assert_called_once()
         self.assertEqual(mock_email.call_args[0][0], "a@b.com")
 
+    def test_multiple_emails_each_sent_independently(self):
+        ctx = self._make_ctx()
+        items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared",
+                  "valuer_name": "Jane Doe", "assigned_at": "2026-07-17 09:00:00"}]
+        with patch.object(ic, "load_notify_config",
+                           return_value={"enabled": True, "interval_minutes": 30,
+                                         "emails": ["a@b.com", "c@d.com"]}), \
+             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "_ic_gather_items", return_value=items), \
+             patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
+             patch.object(ic, "_ic_auto_close"), \
+             patch.object(ic, "load_closed_batches", return_value=[]), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "save_notify_state"), \
+             patch.object(ic, "_send_auto_fetch_email") as mock_email:
+            _run(ic._ic_notify_job(ctx))
+        self.assertEqual(mock_email.call_count, 2)
+        recipients = [call.args[0] for call in mock_email.call_args_list]
+        self.assertEqual(recipients, ["a@b.com", "c@d.com"])
+
+    def test_one_bad_email_does_not_block_the_others(self):
+        ctx = self._make_ctx()
+        items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared",
+                  "valuer_name": "Jane Doe", "assigned_at": "2026-07-17 09:00:00"}]
+        with patch.object(ic, "load_notify_config",
+                           return_value={"enabled": True, "interval_minutes": 30,
+                                         "emails": ["bad@b.com", "good@d.com"]}), \
+             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "_ic_gather_items", return_value=items), \
+             patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
+             patch.object(ic, "_ic_auto_close"), \
+             patch.object(ic, "load_closed_batches", return_value=[]), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "save_notify_state"), \
+             patch.object(ic, "_send_auto_fetch_email",
+                           side_effect=[Exception("bounced"), None]) as mock_email:
+            _run(ic._ic_notify_job(ctx))   # must not raise
+        self.assertEqual(mock_email.call_count, 2)
+
     def test_email_failure_is_logged_not_raised(self):
         ctx = self._make_ctx()
         items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared",
                   "valuer_name": "Jane Doe", "assigned_at": "2026-07-17 09:00:00"}]
         with patch.object(ic, "load_notify_config",
-                           return_value={"enabled": True, "interval_minutes": 30, "email": "a@b.com"}), \
+                           return_value={"enabled": True, "interval_minutes": 30, "emails": ["a@b.com"]}), \
              patch.object(ic, "ALLOWED_IDS", [111]), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=items), \
@@ -706,7 +760,7 @@ class TestIcNotifyJob(unittest.TestCase):
         ctx = self._make_ctx()
         items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared",
                   "valuer_name": "Jane Doe", "assigned_at": "2026-07-17 09:00:00"}]
-        with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "email": ""}), \
+        with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "emails": []}), \
              patch.object(ic, "ALLOWED_IDS", [111]), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=items), \
@@ -740,11 +794,11 @@ class TestRecvIcNotifyMenu(unittest.TestCase):
         job = MagicMock()
         ctx.job_queue.get_jobs_by_name.return_value = [job]
         with patch.object(ic, "allowed", return_value=True), \
-             patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "email": ""}), \
+             patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "emails": []}), \
              patch.object(ic, "save_notify_config") as mock_save:
             result = _run(ic.recv_ic_notify_menu(update, ctx))
         self.assertEqual(result, ic.ConversationHandler.END)
-        mock_save.assert_called_once_with({"enabled": False, "interval_minutes": 30, "email": ""})
+        mock_save.assert_called_once_with({"enabled": False, "interval_minutes": 30, "emails": []})
         job.schedule_removal.assert_called_once()
 
 
@@ -776,7 +830,7 @@ class TestRecvIcNotifyEmail(unittest.TestCase):
              patch.object(ic, "_ic_schedule_notify_job") as mock_schedule:
             result = _run(ic.recv_ic_notify_email(update, ctx))
         self.assertEqual(result, ic.ConversationHandler.END)
-        mock_save.assert_called_once_with({"enabled": True, "interval_minutes": 30, "email": ""})
+        mock_save.assert_called_once_with({"enabled": True, "interval_minutes": 30, "emails": []})
         mock_schedule.assert_called_once_with(ctx.job_queue, 30)
         text = update.message.reply_text.call_args[0][0]
         self.assertIn("Telegram only", text)
@@ -790,8 +844,45 @@ class TestRecvIcNotifyEmail(unittest.TestCase):
              patch.object(ic, "_ic_schedule_notify_job") as mock_schedule:
             result = _run(ic.recv_ic_notify_email(update, ctx))
         self.assertEqual(result, ic.ConversationHandler.END)
-        mock_save.assert_called_once_with({"enabled": True, "interval_minutes": 60, "email": "a@b.com"})
+        mock_save.assert_called_once_with({"enabled": True, "interval_minutes": 60, "emails": ["a@b.com"]})
         mock_schedule.assert_called_once_with(ctx.job_queue, 60)
+
+    def test_multiple_comma_separated_emails_are_saved_as_a_list(self):
+        update = _make_message_update("a@b.com, c@d.com;e@f.com")
+        ctx = MagicMock()
+        ctx.user_data = {"ic_notify_interval": 30}
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "save_notify_config") as mock_save, \
+             patch.object(ic, "_ic_schedule_notify_job"):
+            result = _run(ic.recv_ic_notify_email(update, ctx))
+        self.assertEqual(result, ic.ConversationHandler.END)
+        mock_save.assert_called_once_with(
+            {"enabled": True, "interval_minutes": 30, "emails": ["a@b.com", "c@d.com", "e@f.com"]})
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("Telegram + email", text)
+
+
+class TestIcParseEmails(unittest.TestCase):
+    def test_splits_on_comma(self):
+        self.assertEqual(ic._ic_parse_emails("a@b.com,c@d.com"), ["a@b.com", "c@d.com"])
+
+    def test_splits_on_semicolon(self):
+        self.assertEqual(ic._ic_parse_emails("a@b.com;c@d.com"), ["a@b.com", "c@d.com"])
+
+    def test_strips_whitespace(self):
+        self.assertEqual(ic._ic_parse_emails(" a@b.com , c@d.com "), ["a@b.com", "c@d.com"])
+
+    def test_dedupes_preserving_order(self):
+        self.assertEqual(ic._ic_parse_emails("a@b.com,c@d.com,a@b.com"), ["a@b.com", "c@d.com"])
+
+    def test_ignores_empty_segments(self):
+        self.assertEqual(ic._ic_parse_emails("a@b.com,,c@d.com,"), ["a@b.com", "c@d.com"])
+
+    def test_single_email_returns_single_item_list(self):
+        self.assertEqual(ic._ic_parse_emails("a@b.com"), ["a@b.com"])
+
+    def test_empty_string_returns_empty_list(self):
+        self.assertEqual(ic._ic_parse_emails(""), [])
 
 
 class TestScheduleNotifyJob(unittest.TestCase):
@@ -812,7 +903,7 @@ class TestRecvIcMenuNotifyAction(unittest.TestCase):
         update = _make_query_update("ic_menu:notify")
         ctx = MagicMock()
         with patch.object(ic, "allowed", return_value=True), \
-             patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "email": "a@b.com"}):
+             patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "emails": ["a@b.com"]}):
             result = _run(ic.recv_ic_menu(update, ctx))
         self.assertEqual(result, ic.IC.NOTIFY_MENU)
         text = update.callback_query.edit_message_text.call_args[0][0]
@@ -823,7 +914,7 @@ class TestRecvIcMenuNotifyAction(unittest.TestCase):
         update = _make_query_update("ic_menu:notify")
         ctx = MagicMock()
         with patch.object(ic, "allowed", return_value=True), \
-             patch.object(ic, "load_notify_config", return_value={"enabled": False, "interval_minutes": 30, "email": ""}):
+             patch.object(ic, "load_notify_config", return_value={"enabled": False, "interval_minutes": 30, "emails": []}):
             result = _run(ic.recv_ic_menu(update, ctx))
         self.assertEqual(result, ic.IC.NOTIFY_MENU)
         text = update.callback_query.edit_message_text.call_args[0][0]
