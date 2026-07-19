@@ -42,6 +42,31 @@ the shared visual every report in the bot uses — not a packed one-liner:
   (First Cleared, Second Cleared, ...) — independent of original batch
   number, since tasks from different batches can clear in any order.
 
+🔔 Notify on Fill is a single scheduled job (saved_incremental_notify_
+config.json: enabled/interval_minutes/emails — not a multi-schedule
+feature like Auto Fetch, since there's only one counter/one set of
+batches to watch) that periodically checks for state changes and — only
+if something is new — sends a combined report via Telegram (every
+ALLOWED_IDS chat) and email (if any addresses are configured — comma/
+semicolon-separated at entry time, parsed by _ic_parse_emails, each
+address emailed independently so one bad address can't block the rest):
+- 📦 Available Batches — every batch not yet closed, in the same
+  per-task labeled-block format as 📦 By Batch (_ic_format_batch_section,
+  the header-less helper both share).
+- ✅ Newly Cleared — only cleared refs not yet included in a previous
+  Notify on Fill cycle, chunked into fresh batch_size-sized groups.
+Non-repetition uses two independent mechanisms, tracked in
+saved_incremental_notify_state.json: a batch stops appearing in
+Available Batches the moment load_closed_batches() flags it (no extra
+state needed — it's the same status flag ✋ Close Batch/auto-close use),
+while cleared refs need their own "reported_cleared_refs" list since a
+cleared item doesn't otherwise disappear from _ic_gather_items()'s
+output. Configure via the 🔢 Incremental menu's "🔔 Notify on Fill"
+action; the interval/email(s) choice is saved and the job is (re)scheduled
+immediately, and restored on bot startup if still enabled. A config saved
+before multi-address support existed (a singular "email" string) is
+migrated to the "emails" list shape on load.
+
 Call register(app) from bot.py's main() to wire this feature in.
 """
 
@@ -63,6 +88,7 @@ from telegram.ext import (
 )
 
 from common import (
+    ALLOWED_IDS,
     BTN_INCREMENTAL,
     DATA_DIR,
     _atomic_json_write,
@@ -73,14 +99,19 @@ from common import (
     deny,
     fallback,
     load_saved_assignments,
+    logger,
+    md_escape,
     not_cancel,
 )
 from dlv_core import load_dlv_batch, parse_incremental_tag
+from email_service import _send_auto_fetch_email
 from task_block import assessor_field, consideration_field, format_labeled_block, parcel_field
 from telegram_report import _send_chunked_report
 
-SAVED_INCREMENTAL_COUNTER_FILE = os.path.join(DATA_DIR, "saved_incremental_counter.json")
-SAVED_INCREMENTAL_CLOSED_FILE  = os.path.join(DATA_DIR, "saved_incremental_closed_batches.json")
+SAVED_INCREMENTAL_COUNTER_FILE      = os.path.join(DATA_DIR, "saved_incremental_counter.json")
+SAVED_INCREMENTAL_CLOSED_FILE       = os.path.join(DATA_DIR, "saved_incremental_closed_batches.json")
+SAVED_INCREMENTAL_NOTIFY_CONFIG_FILE = os.path.join(DATA_DIR, "saved_incremental_notify_config.json")
+SAVED_INCREMENTAL_NOTIFY_STATE_FILE  = os.path.join(DATA_DIR, "saved_incremental_notify_state.json")
 
 # INCREMENTAL_TAG_SENTINEL/parse_incremental_tag live in dlv_core.py (the
 # shared low-level DLV module), not here, since dlv_tasks.py needs them too
@@ -171,6 +202,72 @@ def close_batch(batch_number: int) -> None:
 
 
 # ──────────────────────────────────────────────────────────
+# Notify on Fill — a single scheduled job (not a multi-schedule feature
+# like Auto Fetch, since there's only one counter/one set of batches —
+# there's no per-schedule filter dimension to make more than one useful)
+# ──────────────────────────────────────────────────────────
+def load_notify_config() -> Dict:
+    """{"enabled", "interval_minutes", "emails"} — defaults to disabled.
+    A config saved before multi-address support existed only has a
+    singular "email" string — migrated to the "emails" list shape here
+    rather than requiring a one-time migration step."""
+    try:
+        with open(SAVED_INCREMENTAL_NOTIFY_CONFIG_FILE) as f:
+            cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"enabled": False, "interval_minutes": 30, "emails": []}
+    if "emails" not in cfg:
+        cfg["emails"] = [cfg["email"]] if cfg.get("email") else []
+    return cfg
+
+
+def _ic_parse_emails(text: str) -> List[str]:
+    """Split a comma/semicolon-separated string into a deduplicated list
+    of trimmed, non-empty email addresses (order preserved)."""
+    raw = re.split(r"[,;]", text)
+    seen = set()
+    emails = []
+    for candidate in (a.strip() for a in raw):
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            emails.append(candidate)
+    return emails
+
+
+def save_notify_config(cfg: Dict) -> None:
+    _atomic_json_write(SAVED_INCREMENTAL_NOTIFY_CONFIG_FILE, cfg, indent=2)
+
+
+def load_notify_state() -> Dict:
+    """{"closed_batches", "reported_cleared_refs"} — what the last
+    notification cycle already knew about, so the next cycle only reports
+    what's genuinely new (see _ic_notify_job)."""
+    try:
+        with open(SAVED_INCREMENTAL_NOTIFY_STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"closed_batches": [], "reported_cleared_refs": []}
+
+
+def save_notify_state(state: Dict) -> None:
+    _atomic_json_write(SAVED_INCREMENTAL_NOTIFY_STATE_FILE, state, indent=2)
+
+
+_IC_NOTIFY_JOB_NAME = "ic_notify_job"
+
+_IC_NOTIFY_INTERVALS = [
+    ("15 min",  15),
+    ("30 min",  30),
+    ("1 hr",    60),
+    ("2 hr",   120),
+    ("4 hr",   240),
+    ("6 hr",   360),
+    ("12 hr",  720),
+    ("24 hr", 1440),
+]
+
+
+# ──────────────────────────────────────────────────────────
 # Data gathering
 # ──────────────────────────────────────────────────────────
 def _ic_gather_items() -> List[Dict]:
@@ -232,15 +329,13 @@ def _ic_auto_close(grouped: Dict[int, List[Dict]], batch_size: int) -> List[int]
 # ──────────────────────────────────────────────────────────
 # Report formatting
 # ──────────────────────────────────────────────────────────
-def _ic_format_by_batch_report(grouped: Dict[int, List[Dict]], closed_batches: List[int], batch_size: int) -> List[str]:
-    """📦 By Batch — one section per original batch number, each task slot
-    rendered as its own labeled block (task_block.format_labeled_block —
-    the shared visual every report in the bot uses, numbered by its
-    task_number), flagging closed batches."""
-    lines = ["📦 *Incremental Report — By Batch*\n"]
-    if not grouped:
-        lines.append("_No incremental-tagged tasks yet._")
-        return lines
+def _ic_format_batch_section(grouped: Dict[int, List[Dict]], closed_batches: List[int], batch_size: int) -> List[str]:
+    """Shared batch-by-batch rendering (no header/empty-state of its own)
+    used by both the interactive 📦 By Batch report and Notify on Fill's
+    Available Batches section — one block per batch number, each task
+    slot as its own labeled block (task_block.format_labeled_block — the
+    shared visual every report in the bot uses, numbered by task_number)."""
+    lines = []
     closed_set = set(closed_batches)
     for batch_number in sorted(grouped):
         items = grouped[batch_number]
@@ -256,6 +351,17 @@ def _ic_format_by_batch_report(grouped: Dict[int, List[Dict]], closed_batches: L
                 parcel_field(item),
             ]
             lines.append(format_labeled_block(item["task_number"], item["ref"], fields))
+    return lines
+
+
+def _ic_format_by_batch_report(grouped: Dict[int, List[Dict]], closed_batches: List[int], batch_size: int) -> List[str]:
+    """📦 By Batch — one section per original batch number, flagging closed batches."""
+    lines = ["📦 *Incremental Report — By Batch*\n"]
+    section = _ic_format_batch_section(grouped, closed_batches, batch_size)
+    if not section:
+        lines.append("_No incremental-tagged tasks yet._")
+        return lines
+    lines += section
     return lines
 
 
@@ -286,15 +392,122 @@ def _ic_format_cleared_report(items: List[Dict], batch_size: int) -> List[str]:
     return lines
 
 
+def _ic_open_batches(grouped: Dict[int, List[Dict]], closed_batches: List[int]) -> Dict[int, List[Dict]]:
+    """grouped, minus any batch already flagged closed — "available" (still
+    in progress) batches only. A batch drops out of this on its own the
+    moment it closes, so a Notify on Fill cycle never re-reports one that
+    already filled in a previous cycle without any extra tracking."""
+    closed_set = set(closed_batches)
+    return {b: items for b, items in grouped.items() if b not in closed_set}
+
+
+def _ic_new_cleared_items(items: List[Dict], already_reported: List[str]) -> List[Dict]:
+    """Cleared items not yet included in a previous Notify on Fill cycle,
+    sorted by clearance (assigned_at) order."""
+    already = set(already_reported)
+    new_items = [i for i in items if i["status"] == "cleared" and i["ref"] not in already]
+    new_items.sort(key=lambda i: i.get("assigned_at", ""))
+    return new_items
+
+
+def _ic_format_newly_cleared_section(new_cleared: List[Dict], batch_size: int) -> List[str]:
+    """✅ Newly Cleared — only the tasks that cleared since the last Notify
+    on Fill cycle, chunked into groups of batch_size for this notification
+    (a fresh, per-notification grouping — not the interactive ✅ Cleared
+    report's running First/Second/Third Cleared history)."""
+    lines = [f"✅ *Newly Cleared* — {len(new_cleared)} task(s)\n"]
+    if not new_cleared:
+        lines.append("_None._")
+        return lines
+    for group_idx in range(0, len(new_cleared), batch_size):
+        group = new_cleared[group_idx:group_idx + batch_size]
+        lines.append(f"*Cleared Group {group_idx // batch_size + 1}* ({len(group)}/{batch_size})")
+        for i, item in enumerate(group, start=1):
+            fields = [
+                ("🔢 Batch/Task", f"B{item['batch_number']}-T{item['task_number']}"),
+                ("👤 Valuer", item.get("valuer_name") or "—"),
+                assessor_field(item),
+                consideration_field(item),
+                parcel_field(item),
+            ]
+            lines.append(format_labeled_block(i, item["ref"], fields))
+    return lines
+
+
+async def _ic_notify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Repeating job: check for newly-filled batches and newly-cleared
+    tasks since the last cycle, and — only if there's something new —
+    send a combined report (Available Batches + Newly Cleared) via
+    Telegram (every ALLOWED_IDS chat) and email (if configured)."""
+    cfg = load_notify_config()
+    if not cfg.get("enabled"):
+        context.job.schedule_removal()
+        return
+
+    batch_size = get_batch_size()
+    items      = _ic_gather_items()
+    grouped    = _ic_group_by_batch(items)
+    _ic_auto_close(grouped, batch_size)
+    closed_batches = load_closed_batches()
+
+    state = load_notify_state()
+    newly_closed = sorted(set(closed_batches) - set(state.get("closed_batches", [])))
+    new_cleared  = _ic_new_cleared_items(items, state.get("reported_cleared_refs", []))
+
+    if not newly_closed and not new_cleared:
+        logger.info("Incremental Notify on Fill: nothing new this cycle — skipping.")
+        return
+
+    open_batches = _ic_open_batches(grouped, closed_batches)
+    lines = ["🔔 *Incremental — Notify on Fill*\n"]
+    if newly_closed:
+        lines.append(f"✅ Newly filled: {', '.join(f'Batch {b}' for b in newly_closed)}\n")
+    lines.append("📦 *Available Batches*")
+    section = _ic_format_batch_section(open_batches, [], batch_size)
+    lines += section if section else ["_None open._"]
+    lines.append("")
+    lines += _ic_format_newly_cleared_section(new_cleared, batch_size)
+
+    for chat_id in ALLOWED_IDS:
+        async def _send(text, reply_markup, chat_id=chat_id):
+            try:
+                await context.bot.send_message(chat_id, text, parse_mode="Markdown")
+            except Exception as e:
+                logger.warning("Incremental Notify on Fill Telegram error for %s: %s", chat_id, e)
+        await _send_chunked_report(_send, lines, join="\n\n")
+
+    for email in cfg.get("emails", []):
+        try:
+            _send_auto_fetch_email(email, "Incremental — Notify on Fill", "\n\n".join(lines))
+        except Exception as e:
+            logger.warning("Incremental Notify on Fill email to %s failed: %s", email, e)
+            for chat_id in ALLOWED_IDS:
+                try:
+                    await context.bot.send_message(
+                        chat_id, f"⚠️ Incremental notify email delivery to *{md_escape(email)}* failed: `{e}`",
+                        parse_mode="Markdown",
+                    )
+                except Exception as notify_err:
+                    logger.warning("Incremental notify email-failure notify error for %s: %s", chat_id, notify_err)
+
+    save_notify_state({
+        "closed_batches":        closed_batches,
+        "reported_cleared_refs": state.get("reported_cleared_refs", []) + [i["ref"] for i in new_cleared],
+    })
+
+
 # ──────────────────────────────────────────────────────────
 # States — Incremental Report conversation
 # ──────────────────────────────────────────────────────────
 class IC(Enum):
-    MENU       = auto()   # By Batch / Cleared / Set Counter / Close Batch
-    SET_SIZE   = auto()   # enter tasks-per-batch (or skip to keep current)
-    SET_BATCH  = auto()   # enter the batch number to seed
-    SET_TASK   = auto()   # enter the task number to seed
-    CLOSE_PICK = auto()   # pick which eligible-but-unclosed batch to manually close
+    MENU            = auto()   # By Batch / Cleared / Set Counter / Close Batch / Notify on Fill
+    SET_SIZE        = auto()   # enter tasks-per-batch (or skip to keep current)
+    SET_BATCH       = auto()   # enter the batch number to seed
+    SET_TASK        = auto()   # enter the task number to seed
+    CLOSE_PICK      = auto()   # pick which eligible-but-unclosed batch to manually close
+    NOTIFY_MENU     = auto()   # show current Notify on Fill status; Enable/Configure, Disable, Cancel
+    NOTIFY_INTERVAL = auto()   # pick the repeating-check interval
+    NOTIFY_EMAIL    = auto()   # enter an email for the report, or `skip` for Telegram-only
 
 
 def _ic_menu_keyboard() -> InlineKeyboardMarkup:
@@ -304,6 +517,7 @@ def _ic_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅ Cleared",  callback_data="ic_menu:cleared")],
         [InlineKeyboardButton("⚙️ Set Counter", callback_data="ic_menu:setcounter")],
         [InlineKeyboardButton("🔓 Close Batch", callback_data="ic_menu:closebatch")],
+        [InlineKeyboardButton("🔔 Notify on Fill", callback_data="ic_menu:notify")],
         [InlineKeyboardButton("🛑 Cancel", callback_data="ic_menu:cancel")],
     ])
 
@@ -313,6 +527,45 @@ def _ic_close_pick_keyboard(batch_numbers: List[int]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(f"Batch {b}", callback_data=f"ic_close:{b}")] for b in batch_numbers]
     rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="ic_close:cancel")])
     return InlineKeyboardMarkup(rows)
+
+
+def _ic_notify_menu_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    """Enable/Configure is always offered (re-configuring replaces the
+    interval/email); Disable only makes sense when currently enabled."""
+    rows = [[InlineKeyboardButton("⚙️ Enable / Configure", callback_data="ic_notify:configure")]]
+    if enabled:
+        rows.append([InlineKeyboardButton("🚫 Disable", callback_data="ic_notify:disable")])
+    rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="ic_notify:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _ic_notify_interval_keyboard() -> InlineKeyboardMarkup:
+    """One button per candidate check interval, 4 per row."""
+    rows = []
+    row  = []
+    for label, mins in _IC_NOTIFY_INTERVALS:
+        row.append(InlineKeyboardButton(label, callback_data=f"ic_notify_int:{mins}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="ic_notify_int:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _ic_schedule_notify_job(job_queue, interval_minutes: int) -> None:
+    """(Re)schedule the single repeating Notify on Fill job — removes any
+    existing instance first so re-configuring the interval doesn't leave a
+    stale duplicate running alongside the new one."""
+    for job in job_queue.get_jobs_by_name(_IC_NOTIFY_JOB_NAME):
+        job.schedule_removal()
+    job_queue.run_repeating(
+        _ic_notify_job,
+        interval=interval_minutes * 60,
+        first=interval_minutes * 60,
+        name=_IC_NOTIFY_JOB_NAME,
+    )
 
 
 async def cmd_incremental(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -347,6 +600,22 @@ async def recv_ic_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         return IC.SET_SIZE
+
+    if action == "notify":
+        cfg = load_notify_config()
+        emails = cfg.get("emails", [])
+        status = (
+            f"🔔 Enabled — every {cfg.get('interval_minutes', 30)} min, "
+            f"emailing *{md_escape(', '.join(emails))}*" if cfg.get("enabled") and emails
+            else f"🔔 Enabled — every {cfg.get('interval_minutes', 30)} min, Telegram only" if cfg.get("enabled")
+            else "🚫 Disabled"
+        )
+        await query.edit_message_text(
+            f"🔔 *Notify on Fill*\n\nStatus: {status}",
+            parse_mode="Markdown",
+            reply_markup=_ic_notify_menu_keyboard(cfg.get("enabled", False)),
+        )
+        return IC.NOTIFY_MENU
 
     batch_size = get_batch_size()
     items      = _ic_gather_items()
@@ -453,6 +722,76 @@ async def recv_ic_set_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def recv_ic_notify_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle the Notify on Fill Enable/Configure/Disable/Cancel choice."""
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+
+    if action == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    if action == "disable":
+        cfg = load_notify_config()
+        cfg["enabled"] = False
+        save_notify_config(cfg)
+        for job in ctx.job_queue.get_jobs_by_name(_IC_NOTIFY_JOB_NAME):
+            job.schedule_removal()
+        await query.edit_message_text("🚫 Notify on Fill disabled.")
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    # action == "configure"
+    await query.edit_message_text(
+        "How often should it check for newly-filled batches / newly-cleared tasks?",
+        reply_markup=_ic_notify_interval_keyboard(),
+    )
+    return IC.NOTIFY_INTERVAL
+
+
+async def recv_ic_notify_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Store the picked check interval, then ask for an optional email."""
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    data = query.data.split(":", 1)[1]
+
+    if data == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    ctx.user_data["ic_notify_interval"] = int(data)
+    await query.edit_message_text(
+        "Enter the email address(es) to also receive the report (comma-separated for "
+        "more than one), or send `skip` for Telegram-only:",
+        parse_mode="Markdown",
+    )
+    return IC.NOTIFY_EMAIL
+
+
+async def recv_ic_notify_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Finalize Notify on Fill: save config and (re)schedule the repeating job."""
+    if not allowed(update): return await deny(update)
+    text = update.message.text.strip()
+    emails = [] if text.lower() == "skip" else _ic_parse_emails(text)
+    interval_minutes = ctx.user_data.get("ic_notify_interval", 30)
+
+    save_notify_config({"enabled": True, "interval_minutes": interval_minutes, "emails": emails})
+    _ic_schedule_notify_job(ctx.job_queue, interval_minutes)
+
+    delivery = f"Telegram + email (*{md_escape(', '.join(emails))}*)" if emails else "Telegram only"
+    await update.message.reply_text(
+        f"✅ Notify on Fill enabled — checking every {interval_minutes} min, delivery: {delivery}.",
+        parse_mode="Markdown",
+        reply_markup=_main_menu(),
+    )
+    return ConversationHandler.END
+
+
 # ──────────────────────────────────────────────────────────
 # Registration — called from bot.py's main()
 # ──────────────────────────────────────────────────────────
@@ -464,11 +803,14 @@ def register(app: Application) -> None:
             MessageHandler(filters.Regex(f"^{re.escape(BTN_INCREMENTAL)}$"), cmd_incremental),
         ],
         states={
-            IC.MENU:       [CallbackQueryHandler(recv_ic_menu, pattern=r"^ic_menu:")],
-            IC.SET_SIZE:   [MessageHandler(not_cancel, recv_ic_set_size)],
-            IC.SET_BATCH:  [MessageHandler(not_cancel, recv_ic_set_batch)],
-            IC.SET_TASK:   [MessageHandler(not_cancel, recv_ic_set_task)],
-            IC.CLOSE_PICK: [CallbackQueryHandler(recv_ic_close_pick, pattern=r"^ic_close:")],
+            IC.MENU:            [CallbackQueryHandler(recv_ic_menu, pattern=r"^ic_menu:")],
+            IC.SET_SIZE:        [MessageHandler(not_cancel, recv_ic_set_size)],
+            IC.SET_BATCH:       [MessageHandler(not_cancel, recv_ic_set_batch)],
+            IC.SET_TASK:        [MessageHandler(not_cancel, recv_ic_set_task)],
+            IC.CLOSE_PICK:      [CallbackQueryHandler(recv_ic_close_pick, pattern=r"^ic_close:")],
+            IC.NOTIFY_MENU:     [CallbackQueryHandler(recv_ic_notify_menu, pattern=r"^ic_notify:")],
+            IC.NOTIFY_INTERVAL: [CallbackQueryHandler(recv_ic_notify_interval, pattern=r"^ic_notify_int:")],
+            IC.NOTIFY_EMAIL:    [MessageHandler(not_cancel, recv_ic_notify_email)],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
@@ -479,3 +821,11 @@ def register(app: Application) -> None:
         per_message=False,
     )
     app.add_handler(ic_conv)
+
+    notify_cfg = load_notify_config()
+    if notify_cfg.get("enabled"):
+        _ic_schedule_notify_job(app.job_queue, notify_cfg.get("interval_minutes", 30))
+        logger.info(
+            "Incremental Notify on Fill: restored schedule (every %d min)",
+            notify_cfg.get("interval_minutes", 30),
+        )
