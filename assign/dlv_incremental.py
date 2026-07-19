@@ -50,18 +50,23 @@ if something is new — sends a combined report via Telegram (every
 ALLOWED_IDS chat) and email (if any addresses are configured — comma/
 semicolon-separated at entry time, parsed by _ic_parse_emails, each
 address emailed independently so one bad address can't block the rest):
-- 📦 Available Batches — every batch not yet closed, in the same
-  per-task labeled-block format as 📦 By Batch (_ic_format_batch_section,
-  the header-less helper both share).
+- 📦 Available Batches — every open (not yet closed) batch not already
+  shown in a previous cycle, in the same per-task labeled-block format
+  as 📦 By Batch (_ic_format_batch_section, the header-less helper both
+  share). Once a batch has been reported here, it's never shown again —
+  the assumption is its tasks either all get loaded to DLV Batch or are
+  ignored altogether, so there's no value in repeating it every cycle
+  while it sits open (_ic_new_open_batches, tracked via
+  "reported_batches").
 - ✅ Newly Cleared — only cleared refs not yet included in a previous
   Notify on Fill cycle, chunked into fresh batch_size-sized groups.
-Non-repetition uses two independent mechanisms, tracked in
+Non-repetition uses three independent mechanisms, all tracked in
 saved_incremental_notify_state.json: a batch stops appearing in
-Available Batches the moment load_closed_batches() flags it (no extra
-state needed — it's the same status flag ✋ Close Batch/auto-close use),
-while cleared refs need their own "reported_cleared_refs" list since a
-cleared item doesn't otherwise disappear from _ic_gather_items()'s
-output. Configure via the 🔢 Incremental menu's "🔔 Notify on Fill"
+Available Batches the moment it's shown once ("reported_batches") OR
+the moment load_closed_batches() flags it closed (whichever comes
+first), while cleared refs need their own "reported_cleared_refs" list
+since a cleared item doesn't otherwise disappear from
+_ic_gather_items()'s output. Configure via the 🔢 Incremental menu's "🔔 Notify on Fill"
 action; the interval/email(s) choice is saved and the job is (re)scheduled
 immediately, and restored on bot startup if still enabled. A config saved
 before multi-address support existed (a singular "email" string) is
@@ -239,14 +244,22 @@ def save_notify_config(cfg: Dict) -> None:
 
 
 def load_notify_state() -> Dict:
-    """{"closed_batches", "reported_cleared_refs"} — what the last
-    notification cycle already knew about, so the next cycle only reports
-    what's genuinely new (see _ic_notify_job)."""
+    """{"closed_batches", "reported_cleared_refs", "reported_batches"} —
+    what the last notification cycle already knew about, so the next
+    cycle only reports what's genuinely new (see _ic_notify_job).
+    "reported_batches" is the set of batch numbers already shown in a
+    previous Available Batches section — once shown, a batch is assumed
+    to either get fully loaded to DLV Batch or be ignored altogether, so
+    it's never repeated even if it's still open next cycle. A state saved
+    before this existed defaults it to empty rather than requiring a
+    migration step."""
     try:
         with open(SAVED_INCREMENTAL_NOTIFY_STATE_FILE) as f:
-            return json.load(f)
+            state = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"closed_batches": [], "reported_cleared_refs": []}
+        return {"closed_batches": [], "reported_cleared_refs": [], "reported_batches": []}
+    state.setdefault("reported_batches", [])
+    return state
 
 
 def save_notify_state(state: Dict) -> None:
@@ -394,11 +407,20 @@ def _ic_format_cleared_report(items: List[Dict], batch_size: int) -> List[str]:
 
 def _ic_open_batches(grouped: Dict[int, List[Dict]], closed_batches: List[int]) -> Dict[int, List[Dict]]:
     """grouped, minus any batch already flagged closed — "available" (still
-    in progress) batches only. A batch drops out of this on its own the
-    moment it closes, so a Notify on Fill cycle never re-reports one that
-    already filled in a previous cycle without any extra tracking."""
+    in progress) batches only."""
     closed_set = set(closed_batches)
     return {b: items for b, items in grouped.items() if b not in closed_set}
+
+
+def _ic_new_open_batches(open_batches: Dict[int, List[Dict]], reported_batches: List[int]) -> Dict[int, List[Dict]]:
+    """open_batches minus any batch already shown in a previous Notify on
+    Fill cycle. Once a batch's contents have been reported once, the
+    assumption is it either gets fully loaded to DLV Batch or is ignored
+    altogether — either way there's no need to keep repeating it every
+    cycle while it sits open, so it's never shown again regardless of
+    whether it later closes."""
+    reported = set(reported_batches)
+    return {b: items for b, items in open_batches.items() if b not in reported}
 
 
 def _ic_new_cleared_items(items: List[Dict], already_reported: List[str]) -> List[Dict]:
@@ -453,18 +475,19 @@ async def _ic_notify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     state = load_notify_state()
     newly_closed = sorted(set(closed_batches) - set(state.get("closed_batches", [])))
     new_cleared  = _ic_new_cleared_items(items, state.get("reported_cleared_refs", []))
+    open_batches = _ic_open_batches(grouped, closed_batches)
+    new_batches  = _ic_new_open_batches(open_batches, state.get("reported_batches", []))
 
-    if not newly_closed and not new_cleared:
+    if not newly_closed and not new_cleared and not new_batches:
         logger.info("Incremental Notify on Fill: nothing new this cycle — skipping.")
         return
 
-    open_batches = _ic_open_batches(grouped, closed_batches)
     lines = ["🔔 *Incremental — Notify on Fill*\n"]
     if newly_closed:
         lines.append(f"✅ Newly filled: {', '.join(f'Batch {b}' for b in newly_closed)}\n")
     lines.append("📦 *Available Batches*")
-    section = _ic_format_batch_section(open_batches, [], batch_size)
-    lines += section if section else ["_None open._"]
+    section = _ic_format_batch_section(new_batches, [], batch_size)
+    lines += section if section else ["_None new._"]
     lines.append("")
     lines += _ic_format_newly_cleared_section(new_cleared, batch_size)
 
@@ -493,6 +516,7 @@ async def _ic_notify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     save_notify_state({
         "closed_batches":        closed_batches,
         "reported_cleared_refs": state.get("reported_cleared_refs", []) + [i["ref"] for i in new_cleared],
+        "reported_batches":      sorted(set(state.get("reported_batches", [])) | set(new_batches)),
     })
 
 

@@ -542,11 +542,17 @@ class TestNotifyConfigAndStatePersistence(unittest.TestCase):
         self.assertEqual(ic.load_notify_config()["emails"], [])
 
     def test_missing_state_defaults_to_empty(self):
-        self.assertEqual(ic.load_notify_state(), {"closed_batches": [], "reported_cleared_refs": []})
+        self.assertEqual(ic.load_notify_state(),
+                          {"closed_batches": [], "reported_cleared_refs": [], "reported_batches": []})
 
     def test_save_and_load_state_roundtrip(self):
-        ic.save_notify_state({"closed_batches": [1, 2], "reported_cleared_refs": ["R1"]})
-        self.assertEqual(ic.load_notify_state(), {"closed_batches": [1, 2], "reported_cleared_refs": ["R1"]})
+        ic.save_notify_state({"closed_batches": [1, 2], "reported_cleared_refs": ["R1"], "reported_batches": [1]})
+        self.assertEqual(ic.load_notify_state(),
+                          {"closed_batches": [1, 2], "reported_cleared_refs": ["R1"], "reported_batches": [1]})
+
+    def test_state_saved_before_reported_batches_existed_defaults_it_to_empty(self):
+        ic.save_notify_state({"closed_batches": [1], "reported_cleared_refs": ["R1"]})
+        self.assertEqual(ic.load_notify_state()["reported_batches"], [])
 
 
 class TestOpenBatches(unittest.TestCase):
@@ -561,6 +567,29 @@ class TestOpenBatches(unittest.TestCase):
     def test_all_closed_returns_empty(self):
         grouped = {2: [{"ref": "R1"}]}
         self.assertEqual(ic._ic_open_batches(grouped, [2]), {})
+
+
+class TestNewOpenBatches(unittest.TestCase):
+    def test_excludes_already_reported_batches(self):
+        open_batches = {2: [{"ref": "R1"}], 3: [{"ref": "R2"}]}
+        self.assertEqual(ic._ic_new_open_batches(open_batches, [2]), {3: [{"ref": "R2"}]})
+
+    def test_no_reported_batches_returns_all(self):
+        open_batches = {2: [{"ref": "R1"}], 3: [{"ref": "R2"}]}
+        self.assertEqual(ic._ic_new_open_batches(open_batches, []), open_batches)
+
+    def test_all_already_reported_returns_empty(self):
+        open_batches = {2: [{"ref": "R1"}]}
+        self.assertEqual(ic._ic_new_open_batches(open_batches, [2]), {})
+
+    def test_a_batch_stays_reported_even_though_still_open(self):
+        """Regression: once shown, a batch must never resurface just
+        because it's still open on a later cycle."""
+        open_batches = {2: [{"ref": "R1"}], 3: [{"ref": "R2"}]}
+        first_cycle = ic._ic_new_open_batches(open_batches, [])
+        self.assertEqual(set(first_cycle), {2, 3})
+        second_cycle = ic._ic_new_open_batches(open_batches, list(first_cycle))
+        self.assertEqual(second_cycle, {})
 
 
 class TestNewClearedItems(unittest.TestCase):
@@ -626,7 +655,7 @@ class TestIcNotifyJob(unittest.TestCase):
              patch.object(ic, "_ic_gather_items", return_value=[]), \
              patch.object(ic, "_ic_auto_close"), \
              patch.object(ic, "load_closed_batches", return_value=[]), \
-             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": [], "reported_batches": []}), \
              patch.object(ic, "save_notify_state") as mock_save:
             _run(ic._ic_notify_job(ctx))
         ctx.bot.send_message.assert_not_called()
@@ -642,7 +671,7 @@ class TestIcNotifyJob(unittest.TestCase):
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
              patch.object(ic, "_ic_auto_close"), \
              patch.object(ic, "load_closed_batches", return_value=[2]), \
-             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": [], "reported_batches": []}), \
              patch.object(ic, "save_notify_state") as mock_save:
             _run(ic._ic_notify_job(ctx))
         ctx.bot.send_message.assert_called()
@@ -652,6 +681,49 @@ class TestIcNotifyJob(unittest.TestCase):
         saved_state = mock_save.call_args[0][0]
         self.assertEqual(saved_state["closed_batches"], [2])
         self.assertEqual(saved_state["reported_cleared_refs"], ["R1"])
+        self.assertEqual(saved_state["reported_batches"], [])
+
+    def test_new_open_batch_triggers_send_and_is_marked_reported(self):
+        """A batch that just appeared (still open, nothing cleared/closed
+        yet) must still trigger a send — it's reported exactly once."""
+        ctx = self._make_ctx()
+        items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "queued", "valuer_name": "Jane Doe"}]
+        with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "emails": []}), \
+             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "_ic_gather_items", return_value=items), \
+             patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
+             patch.object(ic, "_ic_auto_close"), \
+             patch.object(ic, "load_closed_batches", return_value=[]), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": [], "reported_batches": []}), \
+             patch.object(ic, "save_notify_state") as mock_save:
+            _run(ic._ic_notify_job(ctx))
+        ctx.bot.send_message.assert_called()
+        sent_text = "\n".join(call.args[1] for call in ctx.bot.send_message.call_args_list)
+        self.assertIn("Available Batches", sent_text)
+        self.assertIn("Batch 2", sent_text)
+        saved_state = mock_save.call_args[0][0]
+        self.assertEqual(saved_state["reported_batches"], [2])
+
+    def test_already_reported_open_batch_does_not_retrigger_or_reappear(self):
+        """Regression: once a batch's contents have been emailed, it must
+        never be resent even though it's still open and nothing else
+        changed — the assumption is it's either loaded to DLV Batch or
+        ignored, so there's nothing left to say about it."""
+        ctx = self._make_ctx()
+        items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "queued", "valuer_name": "Jane Doe"}]
+        with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "emails": []}), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "_ic_gather_items", return_value=items), \
+             patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
+             patch.object(ic, "_ic_auto_close"), \
+             patch.object(ic, "load_closed_batches", return_value=[]), \
+             patch.object(ic, "load_notify_state",
+                           return_value={"closed_batches": [], "reported_cleared_refs": [], "reported_batches": [2]}), \
+             patch.object(ic, "save_notify_state") as mock_save:
+            _run(ic._ic_notify_job(ctx))
+        ctx.bot.send_message.assert_not_called()
+        mock_save.assert_not_called()
 
     def test_new_cleared_item_triggers_send_without_newly_closed_batch(self):
         ctx = self._make_ctx()
@@ -664,7 +736,7 @@ class TestIcNotifyJob(unittest.TestCase):
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
              patch.object(ic, "_ic_auto_close"), \
              patch.object(ic, "load_closed_batches", return_value=[]), \
-             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": [], "reported_batches": []}), \
              patch.object(ic, "save_notify_state") as mock_save:
             _run(ic._ic_notify_job(ctx))
         ctx.bot.send_message.assert_called()
@@ -685,7 +757,7 @@ class TestIcNotifyJob(unittest.TestCase):
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
              patch.object(ic, "_ic_auto_close"), \
              patch.object(ic, "load_closed_batches", return_value=[]), \
-             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": [], "reported_batches": []}), \
              patch.object(ic, "save_notify_state"), \
              patch.object(ic, "_send_auto_fetch_email") as mock_email:
             _run(ic._ic_notify_job(ctx))
@@ -705,7 +777,7 @@ class TestIcNotifyJob(unittest.TestCase):
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
              patch.object(ic, "_ic_auto_close"), \
              patch.object(ic, "load_closed_batches", return_value=[]), \
-             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": [], "reported_batches": []}), \
              patch.object(ic, "save_notify_state"), \
              patch.object(ic, "_send_auto_fetch_email") as mock_email:
             _run(ic._ic_notify_job(ctx))
@@ -726,7 +798,7 @@ class TestIcNotifyJob(unittest.TestCase):
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
              patch.object(ic, "_ic_auto_close"), \
              patch.object(ic, "load_closed_batches", return_value=[]), \
-             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": [], "reported_batches": []}), \
              patch.object(ic, "save_notify_state"), \
              patch.object(ic, "_send_auto_fetch_email",
                            side_effect=[Exception("bounced"), None]) as mock_email:
@@ -745,7 +817,7 @@ class TestIcNotifyJob(unittest.TestCase):
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
              patch.object(ic, "_ic_auto_close"), \
              patch.object(ic, "load_closed_batches", return_value=[]), \
-             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": [], "reported_batches": []}), \
              patch.object(ic, "save_notify_state"), \
              patch.object(ic, "_send_auto_fetch_email", side_effect=Exception("smtp down")):
             _run(ic._ic_notify_job(ctx))   # must not raise
@@ -767,7 +839,7 @@ class TestIcNotifyJob(unittest.TestCase):
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
              patch.object(ic, "_ic_auto_close"), \
              patch.object(ic, "load_closed_batches", return_value=[]), \
-             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": []}), \
+             patch.object(ic, "load_notify_state", return_value={"closed_batches": [], "reported_cleared_refs": [], "reported_batches": []}), \
              patch.object(ic, "save_notify_state"):
             _run(ic._ic_notify_job(ctx))
         self.assertEqual(ctx.bot.send_message.call_count, 1)
