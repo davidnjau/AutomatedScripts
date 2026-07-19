@@ -233,8 +233,26 @@ class TestFormatReports(unittest.TestCase):
         }
         lines = "\n".join(ic._ic_format_by_batch_report(grouped, [2], batch_size=6))
         self.assertIn("*Batch 2* ✅ CLOSED — 2/6 tagged", lines)
-        self.assertIn("T2: `REF1` ⏳ Jane Doe", lines)
-        self.assertIn("T3: `REF2` ✅ John Otieno", lines)
+        self.assertIn("2. 📌 *Ref:* `REF1`", lines)
+        self.assertIn("📊 Status: ⏳ Queued", lines)
+        self.assertIn("👤 Valuer: Jane Doe", lines)
+        self.assertIn("3. 📌 *Ref:* `REF2`", lines)
+        self.assertIn("📊 Status: ✅ Cleared", lines)
+        self.assertIn("👤 Valuer: John Otieno", lines)
+
+    def test_by_batch_report_uses_shared_labeled_block_format(self):
+        """Regression: each task used to be a packed one-liner
+        ("T2: `REF1` ⏳ Jane Doe") — it must now use the same
+        task_block.format_labeled_block visual every other report uses."""
+        grouped = {
+            2: [{"ref": "REF1", "task_number": 2, "status": "queued", "valuer_name": "Jane Doe",
+                 "assessor": "Jane Assessor", "consideration": "1000000", "currency_code": "KES", "parcel": "P1"}],
+        }
+        lines = "\n".join(ic._ic_format_by_batch_report(grouped, [], batch_size=6))
+        self.assertIn("Assessor: Jane Assessor", lines)
+        self.assertIn("💰 Consideration: KES 1,000,000.00", lines)
+        self.assertIn("📋 Parcel: P1", lines)
+        self.assertNotIn("T2: `REF1`", lines)
 
     def test_by_batch_report_reflects_configured_batch_size(self):
         grouped = {2: [{"ref": "REF1", "task_number": 2, "status": "queued", "valuer_name": "Jane Doe"}]}
@@ -294,6 +312,24 @@ class TestFormatReports(unittest.TestCase):
         self.assertIn("B4-T6", lines)
         self.assertIn("B6-T1", lines)
         self.assertIn("*First Cleared*", lines)
+
+    def test_cleared_report_uses_shared_labeled_block_format(self):
+        """Regression: each cleared item used to be a packed one-liner
+        ("B4-T6: `A` — Jane Doe") — it must now use the same
+        task_block.format_labeled_block visual every other report uses."""
+        items = [
+            {"ref": "A", "batch_number": 4, "task_number": 6, "status": "cleared",
+             "assigned_at": "2026-07-10 09:00:00", "valuer_name": "Jane Doe",
+             "assessor": "Jane Assessor", "consideration": "2000000", "currency_code": "KES", "parcel": "P2"},
+        ]
+        lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=6))
+        self.assertIn("1. 📌 *Ref:* `A`", lines)
+        self.assertIn("🔢 Batch/Task: B4-T6", lines)
+        self.assertIn("👤 Valuer: Jane Doe", lines)
+        self.assertIn("Assessor: Jane Assessor", lines)
+        self.assertIn("💰 Consideration: KES 2,000,000.00", lines)
+        self.assertIn("📋 Parcel: P2", lines)
+        self.assertNotIn("B4-T6: `A` —", lines)
 
 
 class TestCmdIncremental(unittest.TestCase):
