@@ -75,6 +75,75 @@ class TestSelectTargets(unittest.TestCase):
         self.assertEqual(edr._select_targets(store, _args(all=True)), ["A1"])
 
 
+class TestEnrichOne(unittest.TestCase):
+    """_enrich_one — the per-ref merge decision. Specifically the
+    regression where a live lookup finding nothing but currency_code's
+    "KES" default used to get merged in as an empty-field placeholder,
+    making a later re-check wrongly report "already up to date" instead
+    of "still nothing found."""
+
+    def test_currency_code_default_alone_does_not_count_as_found(self):
+        store = {"REF1": {"ref": "REF1", "status": "assigned"}}
+        with patch.object(edr, "_lookup_context", return_value={
+            "registry": "", "county": "", "parcel": "", "consideration": "", "currency_code": "KES",
+        }):
+            outcome, changed = edr._enrich_one("REF1", store)
+        self.assertEqual(outcome, "not_found")
+        self.assertEqual(changed, [])
+        # nothing was written into the record
+        self.assertNotIn("registry", store["REF1"])
+        self.assertNotIn("currency_code", store["REF1"])
+
+    def test_real_data_found_enriches_and_writes_to_store(self):
+        store = {"REF1": {"ref": "REF1", "status": "assigned"}}
+        with patch.object(edr, "_lookup_context", return_value={
+            "registry": "NAIROBI", "county": "NAIROBI", "parcel": "P1",
+            "consideration": "1000000", "currency_code": "KES",
+        }):
+            outcome, changed = edr._enrich_one("REF1", store)
+        self.assertEqual(outcome, "enriched")
+        self.assertIn("parcel", changed)
+        self.assertEqual(store["REF1"]["parcel"], "P1")
+        self.assertEqual(store["REF1"]["currency_code"], "KES")
+
+    def test_second_run_with_same_empty_result_still_reports_not_found(self):
+        """The actual bug: a first run that found nothing must not poison
+        the record so a second run misreports "already up to date."""
+        store = {"REF1": {"ref": "REF1", "status": "assigned"}}
+        with patch.object(edr, "_lookup_context", return_value={
+            "registry": "", "county": "", "parcel": "", "consideration": "", "currency_code": "KES",
+        }):
+            first = edr._enrich_one("REF1", store)
+            second = edr._enrich_one("REF1", store)
+        self.assertEqual(first[0], "not_found")
+        self.assertEqual(second[0], "not_found")
+
+    def test_partial_real_data_does_not_merge_the_still_empty_fields(self):
+        store = {"REF1": {"ref": "REF1", "status": "assigned"}}
+        with patch.object(edr, "_lookup_context", return_value={
+            "registry": "NAIROBI", "county": "", "parcel": "", "consideration": "", "currency_code": "KES",
+        }):
+            outcome, changed = edr._enrich_one("REF1", store)
+        self.assertEqual(outcome, "enriched")
+        self.assertEqual(changed, ["registry", "currency_code"])
+        self.assertNotIn("county", store["REF1"])
+        self.assertNotIn("parcel", store["REF1"])
+
+    def test_already_fully_enriched_ref_reports_up_to_date(self):
+        store = {"REF1": {
+            "ref": "REF1", "status": "assigned",
+            "registry": "NAIROBI", "county": "NAIROBI", "parcel": "P1",
+            "consideration": "1000000", "currency_code": "KES",
+        }}
+        with patch.object(edr, "_lookup_context", return_value={
+            "registry": "NAIROBI", "county": "NAIROBI", "parcel": "P1",
+            "consideration": "1000000", "currency_code": "KES",
+        }):
+            outcome, changed = edr._enrich_one("REF1", store)
+        self.assertEqual(outcome, "up_to_date")
+        self.assertEqual(changed, [])
+
+
 class TestLookupContext(unittest.TestCase):
     def test_non_county_uses_staff_valuer(self):
         item = {"id": "app-1"}
