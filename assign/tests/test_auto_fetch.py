@@ -152,8 +152,9 @@ class TestAfResultsPersistence(unittest.TestCase):
 
 
 class TestAfEmailStatePersistence(unittest.TestCase):
-    """load/save_af_email_state — per-schedule record of which refs were
-    actually emailed last cycle, used to skip re-sending an unchanged list."""
+    """load/save_af_email_state — per-schedule cumulative record of every
+    ref ever actually emailed, used to drop already-sent refs from later
+    cycles."""
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -484,22 +485,25 @@ class TestAutoFetchJob(unittest.TestCase):
         mock_email_2 = self._run_email_cycle(cfg, tasks)
         mock_email_2.assert_not_called()
 
-    def test_new_task_added_sends_the_full_current_list_not_just_the_delta(self):
-        """abc@gmail.com already got 123; once 456 also matches, both should
-        be in the next email — not just the newly-added 456."""
+    def test_new_task_added_sends_only_the_new_task_not_previously_sent_ones(self):
+        """abc@gmail.com already got 123; once 456 also matches, only 456
+        should be in the next email — 123 is assumed already seen."""
         cfg = {"id": "sched-1", "days_back": 2, "email": "abc@gmail.com"}
         self._run_email_cycle(cfg, [_task(ref="123")])
         mock_email_2 = self._run_email_cycle(cfg, [_task(ref="123"), _task(ref="456")])
         mock_email_2.assert_called_once()
         body = mock_email_2.call_args[0][2]
-        self.assertIn("Ref: 123", body)
+        self.assertNotIn("Ref: 123", body)
         self.assertIn("Ref: 456", body)
 
-    def test_dropped_task_is_treated_as_a_change_and_resends(self):
+    def test_previously_sent_ref_reappearing_alone_does_not_resend(self):
+        """123 and 456 were already sent; a later cycle that only re-fetches
+        123 (456 no longer matches) has nothing new to email — 123 stays
+        suppressed even though the current ref set differs from last time."""
         cfg = {"id": "sched-1", "days_back": 2, "email": "ops@example.com"}
         self._run_email_cycle(cfg, [_task(ref="123"), _task(ref="456")])
         mock_email_2 = self._run_email_cycle(cfg, [_task(ref="123")])
-        mock_email_2.assert_called_once()
+        mock_email_2.assert_not_called()
 
     def test_different_schedules_are_deduped_independently(self):
         cfg_a = {"id": "sched-a", "days_back": 2, "email": "abc@gmail.com"}
