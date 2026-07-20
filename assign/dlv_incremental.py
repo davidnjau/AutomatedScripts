@@ -357,6 +357,7 @@ def _ic_format_batch_section(grouped: Dict[int, List[Dict]], closed_batches: Lis
         for item in items:
             status_label = "✅ Cleared" if item["status"] == "cleared" else "⏳ Queued"
             fields = [
+                ("🔢 Batch/Task", f"B{batch_number}-T{item['task_number']}"),
                 ("📊 Status", status_label),
                 ("👤 Valuer", item.get("valuer_name") or "—"),
                 assessor_field(item),

@@ -234,9 +234,11 @@ class TestFormatReports(unittest.TestCase):
         lines = "\n".join(ic._ic_format_by_batch_report(grouped, [2], batch_size=6))
         self.assertIn("*Batch 2* ✅ CLOSED — 2/6 tagged", lines)
         self.assertIn("2. 📌 *Ref:* `REF1`", lines)
+        self.assertIn("🔢 Batch/Task: B2-T2", lines)
         self.assertIn("📊 Status: ⏳ Queued", lines)
         self.assertIn("👤 Valuer: Jane Doe", lines)
         self.assertIn("3. 📌 *Ref:* `REF2`", lines)
+        self.assertIn("🔢 Batch/Task: B2-T3", lines)
         self.assertIn("📊 Status: ✅ Cleared", lines)
         self.assertIn("👤 Valuer: John Otieno", lines)
 
