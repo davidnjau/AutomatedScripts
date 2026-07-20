@@ -34,11 +34,15 @@ Call register(app) from bot.py's main() to wire this feature in (this
 also restores one repeating job per saved schedule on startup).
 
 Email delivery is deduplicated per schedule: saved_af_email_state.json
-(load_af_email_state/save_af_email_state) tracks the ref set actually
-emailed last cycle, keyed by schedule id. A cycle whose current ref set
-matches exactly is skipped — the Telegram summary still sends every cycle
-regardless. Any difference (new/dropped ref) sends the full current list,
-not just the delta, and updates the stored set.
+(load_af_email_state/save_af_email_state) accumulates every ref ever
+actually emailed for that schedule, keyed by schedule id. Each cycle,
+refs already in that set are dropped before building the email — once a
+ref has been emailed it's assumed seen and is never emailed again for
+that schedule, even if it keeps reappearing in later fetches. If nothing
+new is left after that filter, the email is skipped entirely (the
+Telegram summary still sends every cycle regardless, unfiltered). A
+successful send adds its refs to the stored set; a failed send does not,
+so it's retried next cycle.
 
 Each schedule picks one report_format ("block" or "excel", asked
 unconditionally right after the email step — see recv_af_email/
@@ -901,41 +905,43 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     logger.warning("Auto Fetch notify error for %s: %s", chat_id, e)
             await _send_chunked_report(_send, [header] + lines, join="\n\n")
 
-    # Email notification — skipped if this schedule's current ref set is
-    # identical to what was actually emailed last cycle (same tasks, same
-    # filters, nothing new). Any difference (a new ref, a dropped one) sends
-    # the full current list, not just the delta.
+    # Email notification — refs already emailed for this schedule (ever)
+    # are dropped before sending; once a ref has been emailed it's assumed
+    # seen and never resent, even if it keeps reappearing in later fetches.
     email = cfg.get("email", "")
     if email:
         schedule_id  = cfg.get("id", "")
-        current_refs = sorted(t.get("reference_number", "") for t in tasks)
         email_state  = load_af_email_state()
-        if current_refs == email_state.get(schedule_id):
+        already_sent = set(email_state.get(schedule_id, []))
+        new_tasks    = [t for t in tasks if t.get("reference_number", "") not in already_sent]
+
+        if not new_tasks:
             logger.info(
-                "Auto Fetch email skipped for %s — same %d task(s) as last send.",
-                email, len(current_refs),
+                "Auto Fetch email skipped for %s — all %d task(s) already sent previously.",
+                email, len(tasks),
             )
             return
 
         try:
             if report_format == "excel":
-                xlsx_bytes = _af_build_excel(tasks)
+                xlsx_bytes = _af_build_excel(new_tasks)
                 filename   = f"auto_fetch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                 _send_bulk_export_email(email, filename, xlsx_bytes)
             else:
                 plain_header = (
-                    f"Auto Fetch — {len(tasks)} task(s)\n"
+                    f"Auto Fetch — {len(new_tasks)} task(s)\n"
                     f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | {sec_label}\n"
                     + "─" * 60 + "\n\n"
                 )
-                email_tasks   = sorted(tasks, key=_af_consideration_value, reverse=True)
+                plain_sorted_tasks = sorted(new_tasks, key=_af_consideration_value, reverse=True)
                 plain_body    = plain_header + "\n\n".join(
-                    _ft_format_task_block(i, t) for i, t in enumerate(email_tasks, 1)
+                    _ft_format_task_block(i, t) for i, t in enumerate(plain_sorted_tasks, 1)
                 )
-                email_subject = f"Auto Fetch — {len(tasks)} task(s) found"
+                email_subject = f"Auto Fetch — {len(new_tasks)} task(s) found"
                 _send_auto_fetch_email(email, email_subject, plain_body)
-            logger.info("Auto Fetch email (%s) sent to %s", report_format, email)
-            email_state[schedule_id] = current_refs
+            logger.info("Auto Fetch email (%s) sent to %s — %d new task(s)", report_format, email, len(new_tasks))
+            new_refs = {t.get("reference_number", "") for t in new_tasks}
+            email_state[schedule_id] = sorted(already_sent | new_refs)
             save_af_email_state(email_state)
         except Exception as e:
             # Unlike the Telegram summary above, this used to fail silently —
