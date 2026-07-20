@@ -108,6 +108,33 @@ def _select_targets(store: dict, args) -> list:
     ]
 
 
+def _enrich_one(ref: str, store: dict) -> tuple:
+    """Live-lookup one ref and, if it found real descriptive data, merge it
+    into store[ref] in place. Returns (outcome, changed_fields) where
+    outcome is "enriched"/"up_to_date"/"not_found". currency_code's
+    "KES" default in _lu_extract_context doesn't count as "found" on its
+    own, and only genuinely non-empty fields are merged in — merging an
+    empty value for a field the record doesn't have yet would write a
+    placeholder that then makes a later re-check wrongly report
+    "already up to date" instead of "still nothing found" (the bug that
+    made a first --apply run look like it enriched refs it never
+    actually found live data for)."""
+    context = _lookup_context(ref)
+    found_something = any(context.get(f) for f in _ENRICH_FIELDS)
+    if not found_something:
+        return "not_found", []
+
+    non_empty_context = {k: v for k, v in context.items() if v not in dlv_core._EMPTY_VALUES}
+    before = store[ref]
+    after = dlv_core._merge_enrich(before, non_empty_context)
+    changed_fields = [k for k in after if before.get(k) != after.get(k)]
+    if not changed_fields:
+        return "up_to_date", []
+
+    store[ref] = after
+    return "enriched", changed_fields
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -128,21 +155,16 @@ def main():
 
     enriched, not_found, up_to_date = 0, 0, 0
     for i, ref in enumerate(targets, 1):
-        context = _lookup_context(ref)
-        if not context or not any(context.values()):
+        outcome, changed_fields = _enrich_one(ref, store)
+        if outcome == "not_found":
             not_found += 1
-            print(f"[{i}/{len(targets)}] {ref}: not found live — left as-is")
+            print(f"[{i}/{len(targets)}] {ref}: no descriptive data found live — left as-is")
+        elif outcome == "up_to_date":
+            up_to_date += 1
+            print(f"[{i}/{len(targets)}] {ref}: already up to date")
         else:
-            before = store[ref]
-            after = dlv_core._merge_enrich(before, context)
-            changed_fields = [k for k in after if before.get(k) != after.get(k)]
-            if changed_fields:
-                enriched += 1
-                store[ref] = after
-                print(f"[{i}/{len(targets)}] {ref}: enriched {changed_fields}")
-            else:
-                up_to_date += 1
-                print(f"[{i}/{len(targets)}] {ref}: already up to date")
+            enriched += 1
+            print(f"[{i}/{len(targets)}] {ref}: enriched {changed_fields}")
         if i < len(targets):
             time.sleep(args.delay)
 

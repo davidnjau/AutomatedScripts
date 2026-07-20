@@ -156,6 +156,19 @@ class TestPersistAssignment(unittest.TestCase):
         dlv_core.save_dlv_batch([{"ref": "Q1", "valuer_name": "Jane", "valuer_uid": "u1"}])
         self.assertNotIn("Q1", common.load_saved_assignments())
 
+    def test_reassigned_then_requeued_ref_does_not_double_appear(self):
+        """Regression: a ref that was assigned and then re-queued into DLV
+        Batch keeps its assigned_at (merge, not replace) but must not show
+        up in load_saved_assignments() anymore — its CURRENT status is
+        "queued", so it belongs only in "Currently Queued," not also in
+        "At Valuer's Desk". Real production data surfaced this: a ref
+        assigned then re-queued a minute later appeared in both sections
+        of the same By Valuer report."""
+        common.persist_assignment("REF1", "Jane Doe", "uid-1")
+        dlv_core.save_dlv_batch([{"ref": "REF1", "valuer_name": "Jane Doe", "valuer_uid": "uid-1"}])
+        self.assertNotIn("REF1", common.load_saved_assignments())
+        self.assertEqual([i["ref"] for i in dlv_core.load_dlv_batch()], ["REF1"])
+
     def test_removed_ref_with_a_valuer_still_appears_in_assignments(self):
         """A ref dropped from the DLV queue (status="removed") but that
         still carries a valuer_uid must keep showing up here — being

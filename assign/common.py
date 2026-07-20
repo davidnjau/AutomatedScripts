@@ -161,21 +161,29 @@ def load_saved_assignments() -> Dict:
     JSON consolidation) rather than a standalone file — dlv_core is imported
     locally (not at module level) since dlv_core.py itself imports from
     common.py, and a module-level import here would be circular. A record
-    is included exactly when it's ever been through persist_assignment,
-    tested via `assigned_at` (only persist_assignment ever sets it, and
-    it's never cleared by a later stage) rather than "has a valuer_uid" —
-    a merely-queued-but-not-yet-assigned DLV Batch item also carries a
-    valuer_uid and must NOT show up here (it belongs in "Currently
-    Queued," not "At Valuer's Desk"). A ref removed from the DLV queue or
-    released from hold stays included once assigned_at is set, since that
-    only means this bot stopped tracking/guarding it, not that the
-    underlying valuer assignment itself was undone."""
+    is included when it's ever been through persist_assignment (tested via
+    `assigned_at` — only persist_assignment ever sets it, and it's never
+    cleared by a later stage) AND its CURRENT status isn't "queued". Both
+    halves matter:
+    - `assigned_at` alone would wrongly include a merely-queued-but-
+      not-yet-assigned DLV Batch item, since that also carries a
+      valuer_uid but never went through persist_assignment.
+    - Excluding status=="queued" specifically (regression) handles a ref
+      that WAS assigned and later got re-queued into DLV Batch — assigned_at
+      is preserved across that transition (merge, not replace), so without
+      this check the ref would double-appear in both "Currently Queued"
+      (via load_dlv_batch, correct) and "At Valuer's Desk" (via this
+      function, stale) at once.
+    A ref removed from the DLV queue or released from hold (status=
+    "removed") stays included, since that only means this bot stopped
+    tracking/guarding it, not that the underlying valuer assignment itself
+    was undone."""
     import dlv_core
     store = dlv_core._load_consolidated()
     return {
         ref: dlv_core._project(r)
         for ref, r in store.items()
-        if r.get("assigned_at")
+        if r.get("assigned_at") and r.get("status") != "queued"
     }
 
 
