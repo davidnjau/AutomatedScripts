@@ -127,8 +127,8 @@ DAEMON_LOG_FILE = os.path.join(DATA_DIR, "daemon.log")
 #  the point of registration)
 
 
-# (LU enum + LUSession live in lookup_reference.py — imported by main() at
-#  the point of registration)
+# (LU enum lives in lookup_reference.py — imported by main() at the point
+#  of registration)
 
 
 # (VT enum + VTSession live in valuer_tasks.py — imported by main() at
@@ -615,11 +615,12 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # (Job Distribution's URL/worker constants — _TEAMS_URL, _TEAM_MEMBERS_URL,
 #  _JD_ONGOING_URL, _JD_DETAIL_URL, _JD_WORKERS — live in job_distribution.py)
 
-# (LUSession, _get_lu_sess, _LU_SEARCH_COMBOS, _lu_search_ref,
-#  _lu_fetch_detail, _lu_format_result live in lookup_reference.py;
-#  _lookup_one_ref/_post_assignment_report — built on those primitives —
-#  live in new_assignment.py, imported by main() at the point of
-#  registration)
+# (_LU_SEARCH_COMBOS, _lu_search_ref, _lu_fetch_detail, _lu_format_result
+#  (plus the County-ref equivalents, _lu_search_ref_county/
+#  _lu_fetch_detail_county/_lu_format_county_result) live in
+#  lookup_reference.py; _lookup_one_ref/_post_assignment_report — built on
+#  the non-county primitives — live in new_assignment.py, imported by
+#  main() at the point of registration)
 
 
 # (Job Distribution — _JD_COUNTIES, JDSession, _get_jd_sess,
@@ -629,9 +630,8 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  main() at the point of registration)
 
 
-# (Lookup Reference conversation handlers — cmd_lookup, recv_lu_cred,
-#  recv_lu_ref — live in lookup_reference.py, imported by main() at the
-#  point of registration)
+# (Lookup Reference conversation handlers — cmd_lookup, recv_lu_ref — live
+#  in lookup_reference.py, imported by main() at the point of registration)
 
 
 # (Valuer Tasks — VTSession, _get_vt_sess, _vt_fetch_all_tasks,
