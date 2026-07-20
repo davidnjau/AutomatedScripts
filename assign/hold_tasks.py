@@ -11,12 +11,19 @@ back automatically. Once a held ref moves past that stage for any reason
 (completed, returned, back to unassigned, or simply no longer found), it's
 released from the hold queue on its own — no manual cleanup needed.
 
+load_hold_tasks/save_hold_tasks are adapters over dlv_core's consolidated
+ref-keyed DLV-lifecycle store (Group A JSON consolidation, the last of its
+three phases) — a held ref's `hold` sub-object lives on the same record as
+its queue/assignment/closed state rather than in a separate file. Both
+release paths (auto-release in _process_hold_item, manual release in
+recv_ht_release_confirm) call dlv_core.clear_hold_and_remove before
+save_hold_tasks, since save_hold_tasks itself never removes a ref — it
+only ever adds/refreshes, same rule as dlv_core.save_dlv_batch.
+
 Call register(app) from bot.py's main() to wire this feature in.
 """
 
 import asyncio
-import json
-import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_completed
 from dataclasses import dataclass, field
@@ -41,9 +48,7 @@ from common import (
     ALLOWED_IDS,
     BTN_HOLD_TASKS,
     CPARAMS_DLV,
-    DATA_DIR,
     _any_valid_tokens,
-    _atomic_json_write,
     _be_cred_keyboard,
     _CANCEL_FILTER,
     _main_menu,
@@ -56,7 +61,14 @@ from common import (
     logger,
     md_escape,
 )
-from dlv_core import _classify_dlv_detail, _fetch_ref_detail_dlv, _search_ref_dlv
+from dlv_core import (
+    _classify_dlv_detail,
+    _fetch_ref_detail_dlv,
+    _load_consolidated,
+    _save_consolidated,
+    _search_ref_dlv,
+    clear_hold_and_remove,
+)
 from endpoints import (
     STAMP_DUTY_APPLICATION_DETAIL_URL,
     STAMP_DUTY_APPLICATION_LIST_URL,
@@ -64,7 +76,6 @@ from endpoints import (
 )
 from token_rotator import _AllTokensExhausted, _TokenRotator, fetch_with_rotation
 
-SAVED_HOLD_TASKS_FILE = os.path.join(DATA_DIR, "saved_hold_tasks.json")
 _HT_WORKERS = 5   # worker pool size for both live-candidate detail lookups and the guard job
 
 # (label, seconds) options for the check-interval picker — every whole minute from 1 to 10
@@ -103,21 +114,42 @@ def _get_ht_sess(ctx: ContextTypes.DEFAULT_TYPE) -> HTSession:
 
 
 # ──────────────────────────────────────────────────────────
-# Persistence
+# Persistence — adapters over dlv_core's consolidated ref-keyed store
+# (Group A JSON consolidation), preserving the original list-of-dicts
+# shape so every call site in this module is unaffected.
 # ──────────────────────────────────────────────────────────
 
 def load_hold_tasks() -> List[Dict]:
-    """Load the persisted hold queue, or [] if the file doesn't exist yet."""
-    try:
-        with open(SAVED_HOLD_TASKS_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+    """Every ref currently held (has a `hold` sub-object and isn't
+    status=="removed"), projected to the legacy saved_hold_tasks.json item
+    shape: {ref, held_valuer_name, held_valuer_uid, held_at, last_checked,
+    last_error}."""
+    store = _load_consolidated()
+    return [
+        {"ref": ref, **r["hold"]}
+        for ref, r in store.items()
+        if r.get("hold") and r.get("status") != "removed"
+    ]
 
 
 def save_hold_tasks(items: List[Dict]) -> None:
-    # Atomic write — mirrors dlv_core.save_dlv_batch's write-then-replace pattern.
-    _atomic_json_write(SAVED_HOLD_TASKS_FILE, items, indent=2)
+    """Upsert each item's hold fields onto whatever the store already knows
+    about that ref — creating a bare status="assigned" record if the ref
+    isn't tracked anywhere else yet (e.g. picked from a live DLV query this
+    bot never itself assigned). Deliberately never touches a ref that's
+    currently held but absent from `items` — same "add/refresh only, never
+    remove" rule dlv_core.save_dlv_batch follows; both release paths in
+    this module call dlv_core.clear_hold_and_remove first for exactly that
+    reason."""
+    store = _load_consolidated()
+    for item in items:
+        ref = item.get("ref")
+        if not ref:
+            continue
+        hold_fields = {k: v for k, v in item.items() if k != "ref"}
+        existing = store.get(ref) or {"ref": ref, "status": "assigned"}
+        store[ref] = {**existing, "hold": hold_fields}
+    _save_consolidated(store)
 
 
 # ──────────────────────────────────────────────────────────
@@ -338,6 +370,7 @@ def _process_hold_items(tokens: AuthTokens) -> str:
     http_sess = build_session()
     lines:     List[str]  = []
     remaining: List[Dict] = []
+    released:  List[str]  = []
 
     with ThreadPoolExecutor(max_workers=_HT_WORKERS) as pool:
         fut_map = {pool.submit(_process_hold_item, tokens, http_sess, item): item for item in items}
@@ -347,7 +380,14 @@ def _process_hold_items(tokens: AuthTokens) -> str:
                 lines.append(result["line"])
             if result["keep"]:
                 remaining.append(result["item"])
+            else:
+                released.append(result["item"].get("ref", ""))
 
+    # save_hold_tasks never removes a ref on its own (see its docstring) —
+    # an auto-release has no other status call updating these refs, so
+    # clear the hold explicitly before the trimmed list is saved.
+    if released:
+        clear_hold_and_remove(released)
     save_hold_tasks(remaining)
     return "\n".join(lines)
 
@@ -745,6 +785,9 @@ async def recv_ht_release_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         return HT.RELEASE_SELECT
 
     remaining = [i for i in load_hold_tasks() if i.get("ref") not in sess.release_selected]
+    # save_hold_tasks never removes a ref on its own — a bare manual release
+    # has no other status call, so clear the hold explicitly first.
+    clear_hold_and_remove(sess.release_selected)
     save_hold_tasks(remaining)
 
     released_refs = ", ".join(f"`{r}`" for r in sorted(sess.release_selected))

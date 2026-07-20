@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import dlv_core
 import hold_tasks as ht
 from ardhisasa_auth import AuthTokens
 
@@ -49,14 +50,25 @@ def _make_update_with_callback(data):
 # ── Persistence ──────────────────────────────────────────
 
 class TestHoldTasksPersistence(unittest.TestCase):
+    """load_hold_tasks/save_hold_tasks — adapters over dlv_core's
+    consolidated ref-keyed store (Group A JSON consolidation), so the
+    file constants to isolate live on dlv_core, not hold_tasks."""
+
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
-        self.hold_file = os.path.join(self.tmpdir.name, "saved_hold_tasks.json")
-        self._patch = patch.object(ht, "SAVED_HOLD_TASKS_FILE", self.hold_file)
-        self._patch.start()
+        self._patches = [
+            patch.object(dlv_core, "SAVED_HOLD_TASKS_FILE", os.path.join(self.tmpdir.name, "saved_hold_tasks.json")),
+            patch.object(dlv_core, "SAVED_DLV_BATCH_FILE", os.path.join(self.tmpdir.name, "saved_dlv_batch.json")),
+            patch.object(dlv_core, "SAVED_DLV_CLOSED_FILE", os.path.join(self.tmpdir.name, "saved_dlv_closed.json")),
+            patch.object(dlv_core, "SAVED_ASSIGNMENTS_FILE", os.path.join(self.tmpdir.name, "saved_assignments.json")),
+            patch.object(dlv_core, "SAVED_DLV_RECORDS_FILE", os.path.join(self.tmpdir.name, "saved_dlv_records.json")),
+        ]
+        for p in self._patches:
+            p.start()
 
     def tearDown(self):
-        self._patch.stop()
+        for p in self._patches:
+            p.stop()
         self.tmpdir.cleanup()
 
     def test_load_missing_file_returns_empty(self):
@@ -66,6 +78,28 @@ class TestHoldTasksPersistence(unittest.TestCase):
         items = [{"ref": "REG/TSFR/ABC123", "held_valuer_name": "Jane"}]
         ht.save_hold_tasks(items)
         self.assertEqual(ht.load_hold_tasks(), items)
+
+    def test_release_via_clear_hold_and_remove_excludes_from_load(self):
+        ht.save_hold_tasks([{"ref": "REG/TSFR/ABC123", "held_valuer_name": "Jane"}])
+        dlv_core.clear_hold_and_remove(["REG/TSFR/ABC123"])
+        self.assertEqual(ht.load_hold_tasks(), [])
+
+    def test_save_hold_tasks_never_touches_a_ref_already_released_this_cycle(self):
+        """Regression: save_hold_tasks(remaining) must not resurrect a ref
+        clear_hold_and_remove already released this same cycle, even though
+        the ref is (correctly) absent from `remaining`."""
+        ht.save_hold_tasks([{"ref": "A", "held_valuer_name": "Jane"}, {"ref": "B", "held_valuer_name": "Jane"}])
+        dlv_core.clear_hold_and_remove(["B"])
+        ht.save_hold_tasks([{"ref": "A", "held_valuer_name": "Jane"}])
+        self.assertEqual([i["ref"] for i in ht.load_hold_tasks()], ["A"])
+
+    def test_save_hold_tasks_creates_a_bare_record_for_an_untracked_ref(self):
+        """A ref picked from a live DLV query this bot never itself
+        assigned still needs a store record to attach its hold onto."""
+        ht.save_hold_tasks([{"ref": "NEW_REF", "held_valuer_name": "Jane"}])
+        store = dlv_core._load_consolidated()
+        self.assertEqual(store["NEW_REF"]["status"], "assigned")
+        self.assertEqual(store["NEW_REF"]["hold"]["held_valuer_name"], "Jane")
 
 
 # ── Candidate sources ────────────────────────────────────
@@ -225,6 +259,40 @@ class TestProcessHoldItem(unittest.TestCase):
             result = self._run_item()
         self.assertIn("taken over by *John\\_Roe*", result["line"])
         self.assertIn("reverted back to *Jane\\_Doe*", result["line"])
+
+
+class TestProcessHoldItems(unittest.TestCase):
+    """_process_hold_items (plural) — the per-cycle driver; specifically
+    that released refs go through clear_hold_and_remove before the trimmed
+    list is saved, since save_hold_tasks never removes a ref on its own."""
+
+    def test_released_refs_are_cleared_before_saving_the_trimmed_queue(self):
+        items = [{"ref": "A", "held_valuer_name": "Jane"}, {"ref": "B", "held_valuer_name": "Jane"}]
+        results = {
+            "A": {"item": items[0], "keep": True, "line": None},
+            "B": {"item": items[1], "keep": False, "line": "🔓 `B` — released"},
+        }
+        calls = []
+        with patch.object(ht, "load_hold_tasks", return_value=items), \
+             patch.object(ht, "build_session"), \
+             patch.object(ht, "_process_hold_item", side_effect=lambda tokens, sess, item: results[item["ref"]]), \
+             patch.object(ht, "clear_hold_and_remove", side_effect=lambda refs: calls.append(("clear_hold_and_remove", list(refs)))), \
+             patch.object(ht, "save_hold_tasks", side_effect=lambda remaining: calls.append(("save_hold_tasks", remaining))):
+            report = ht._process_hold_items(TOKENS)
+        self.assertIn("released", report)
+        self.assertEqual([c[0] for c in calls], ["clear_hold_and_remove", "save_hold_tasks"])
+        self.assertEqual(calls[0][1], ["B"])
+        self.assertEqual([i["ref"] for i in calls[1][1]], ["A"])
+
+    def test_nothing_released_does_not_call_clear_hold_and_remove(self):
+        items = [{"ref": "A", "held_valuer_name": "Jane"}]
+        with patch.object(ht, "load_hold_tasks", return_value=items), \
+             patch.object(ht, "build_session"), \
+             patch.object(ht, "_process_hold_item", return_value={"item": items[0], "keep": True, "line": None}), \
+             patch.object(ht, "clear_hold_and_remove") as mock_clear, \
+             patch.object(ht, "save_hold_tasks"):
+            ht._process_hold_items(TOKENS)
+        mock_clear.assert_not_called()
 
 
 class TestHtShowQueue(unittest.TestCase):
@@ -444,19 +512,39 @@ class TestRecvHtReleaseConfirm(unittest.TestCase):
         ctx.user_data = {"ht_session": sess}
         held = [{"ref": "REG/TSFR/A"}, {"ref": "REG/TSFR/B"}]
         with patch.object(ht, "load_hold_tasks", return_value=held), \
+             patch.object(ht, "clear_hold_and_remove") as mock_clear, \
              patch.object(ht, "save_hold_tasks") as mock_save:
             result = _run(ht.recv_ht_release_confirm(update, ctx))
         self.assertEqual(result, ht.ConversationHandler.END)
         mock_save.assert_called_once_with([{"ref": "REG/TSFR/B"}])
+        mock_clear.assert_called_once_with({"REG/TSFR/A"})
+
+    def test_clears_hold_before_saving_the_trimmed_queue(self):
+        """Regression: save_hold_tasks never removes a ref on its own — a
+        bare manual release has no other status call, so clear_hold_and_remove
+        must run, and specifically before save_hold_tasks."""
+        update = _make_update_with_callback("ht_relconfirm")
+        ctx = MagicMock()
+        sess = ht.HTSession(release_selected={"REG/TSFR/A"})
+        ctx.user_data = {"ht_session": sess}
+        held = [{"ref": "REG/TSFR/A"}, {"ref": "REG/TSFR/B"}]
+        calls = []
+        with patch.object(ht, "load_hold_tasks", return_value=held), \
+             patch.object(ht, "clear_hold_and_remove", side_effect=lambda refs: calls.append(("clear_hold_and_remove", set(refs)))), \
+             patch.object(ht, "save_hold_tasks", side_effect=lambda items: calls.append(("save_hold_tasks", items))):
+            _run(ht.recv_ht_release_confirm(update, ctx))
+        self.assertEqual([c[0] for c in calls], ["clear_hold_and_remove", "save_hold_tasks"])
 
     def test_cancel_ends_without_saving(self):
         update = _make_update_with_callback("ht_relcancel")
         ctx = MagicMock()
         ctx.user_data = {"ht_session": ht.HTSession()}
-        with patch.object(ht, "save_hold_tasks") as mock_save:
+        with patch.object(ht, "clear_hold_and_remove") as mock_clear, \
+             patch.object(ht, "save_hold_tasks") as mock_save:
             result = _run(ht.recv_ht_release_confirm(update, ctx))
         self.assertEqual(result, ht.ConversationHandler.END)
         mock_save.assert_not_called()
+        mock_clear.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -79,6 +79,7 @@ from dlv_core import (
     is_incremental_tag,
     load_dlv_batch,
     load_dlv_closed,
+    mark_removed,
     save_dlv_batch,
 )
 from email_service import _send_bulk_export_email
@@ -1007,6 +1008,10 @@ async def recv_dt_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         return DT.DELETE_SELECT
 
     remaining = [i for i in load_dlv_batch() if i.get("ref") not in sess.delete_selected]
+    # save_dlv_batch never removes a ref on its own (see dlv_core.save_dlv_batch) —
+    # a bare user deletion has no other status call updating these refs, so
+    # mark them removed explicitly before the trimmed list is saved.
+    mark_removed(sess.delete_selected)
     save_dlv_batch(remaining)
 
     removed_refs = ", ".join(f"`{r}`" for r in sorted(sess.delete_selected))
