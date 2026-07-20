@@ -7,7 +7,23 @@ features (and reusable by others, e.g. Auto Fetch, that need to know
 whether a reference number is already queued):
 
 - The persistent queue/closed-store files (`saved_dlv_batch.json`,
-  `saved_dlv_closed.json`) and their load/save helpers.
+  `saved_dlv_closed.json`) and their load/save helpers. As of the Group A
+  JSON consolidation, both are backed by one ref-keyed store,
+  `saved_dlv_records.json` (`_load_consolidated`/`_save_consolidated`),
+  with a `status` field (`queued`/`assigned`/`completed`/`returned`/
+  `removed`) replacing "which file is this ref in." `load_dlv_batch`/
+  `save_dlv_batch`/`load_dlv_closed`/`_append_dlv_closed` keep their exact
+  old signatures and return shapes as adapters over that store, so every
+  other module's call sites are unaffected. `common.py`'s
+  `load_saved_assignments`/`persist_assignment` are adapters over the same
+  store too (imported locally inside those two functions, not at module
+  level, to avoid a circular import — dlv_core.py already imports from
+  common.py). `hold_tasks.py`'s `load_hold_tasks`/`save_hold_tasks` are
+  adapters as well, projecting/merging against each record's `hold`
+  sub-object (imported at module level there, since that direction —
+  hold_tasks.py importing dlv_core.py — already existed and creates no
+  cycle). The legacy files are migrated into the consolidated store once,
+  on first read, and left on disk untouched.
 - Live search + classification against the two stages a stamp-duty
   reference can be at: the assessor/HQ stage (stampdutyservice) and the
   DLV stage (valuationservice).
@@ -25,13 +41,15 @@ one place instead of on each other.
 import json
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from ardhisasa_auth import AuthTokens, build_session
 
 from common import (
     CPARAMS_DLV,
     DATA_DIR,
+    SAVED_ASSIGNMENTS_FILE,
     _atomic_json_write,
     _ft_headers,
     logger,
@@ -43,8 +61,26 @@ from endpoints import (
     STAMP_DUTY_APPLICATION_LIST_URL,
 )
 
-SAVED_DLV_BATCH_FILE  = os.path.join(DATA_DIR, "saved_dlv_batch.json")
-SAVED_DLV_CLOSED_FILE = os.path.join(DATA_DIR, "saved_dlv_closed.json")
+SAVED_DLV_BATCH_FILE   = os.path.join(DATA_DIR, "saved_dlv_batch.json")
+SAVED_DLV_CLOSED_FILE  = os.path.join(DATA_DIR, "saved_dlv_closed.json")
+SAVED_DLV_RECORDS_FILE = os.path.join(DATA_DIR, "saved_dlv_records.json")
+# Own copy of hold_tasks.py's legacy file path, needed only for migration —
+# not imported from hold_tasks.py, since hold_tasks.py already imports from
+# dlv_core.py at module level and the reverse would be a circular import.
+SAVED_HOLD_TASKS_FILE = os.path.join(DATA_DIR, "saved_hold_tasks.json")
+
+# Fields that only exist on the consolidated store's internal record shape —
+# stripped out whenever a record is projected back to a legacy flat-item
+# shape, so code that spreads `**item` downstream never picks up a ghost
+# field left over from a different lifecycle stage.
+_STORE_INTERNAL_FIELDS = {"status", "hold", "removed_at"}
+# Additionally stripped only from the *batch* (queued) projection — these
+# never existed on a saved_dlv_batch.json item and only appear once a ref
+# has since been assigned/closed.
+_CLOSE_AND_ASSIGN_FIELDS = {
+    "assigned_at", "closed_reason", "application_status", "node",
+    "request_type", "consideration_amount", "closed_at",
+}
 
 # Fixed tag vocabulary — DLV Batch lets you tag each queued ref with one of
 # these (optional), and DLV Tasks' "By Tag" report filters on it. Kept as a
@@ -86,42 +122,216 @@ def is_incremental_tag(tag: Optional[str]) -> bool:
 
 
 # ──────────────────────────────────────────────────────────
-# DLV Batch — persistent queue helpers
+# Consolidated ref-keyed store — the one saved_dlv_records.json, with
+# load_dlv_batch/save_dlv_batch/load_dlv_closed/_append_dlv_closed below
+# acting as adapters over it that preserve their original signatures.
 # ──────────────────────────────────────────────────────────
 
-def load_dlv_batch() -> List[Dict]:
+def _load_consolidated() -> Dict[str, Dict]:
+    """The single ref-keyed DLV lifecycle store. Migrates it once from the
+    legacy saved_assignments.json/saved_dlv_batch.json/saved_dlv_closed.json
+    files the first time saved_dlv_records.json is missing or unreadable;
+    all legacy files are left on disk, untouched, per this codebase's
+    existing migration convention (e.g. Auto Fetch's bare-dict→list
+    migration)."""
     try:
-        with open(SAVED_DLV_BATCH_FILE) as f:
+        with open(SAVED_DLV_RECORDS_FILE) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return []
+        pass
+    merged = _migrate_legacy_stores()
+    _save_consolidated(merged)
+    return merged
+
+
+def _save_consolidated(store: Dict[str, Dict]) -> None:
+    """Atomically write the consolidated ref-keyed store."""
+    _atomic_json_write(SAVED_DLV_RECORDS_FILE, store, indent=2)
+
+
+_EMPTY_VALUES = (None, "", [], {})
+
+
+def _merge_enrich(existing: Dict, new_fields: Dict) -> Dict:
+    """Merge new_fields onto existing, field by field — a field is only
+    overwritten if the incoming value is non-empty, or the field doesn't
+    exist yet on `existing`. Used specifically for enriching one ref's
+    record from multiple legacy sources describing it independently (the
+    migration below), so a source that simply never captured a field
+    (empty string/None/[]/{})) can't blow away a value an earlier, richer
+    source already provided — "enrich with whichever source has more
+    data." Not used for live-app upserts (save_dlv_batch/persist_assignment/
+    etc.), where an explicitly-passed empty value is a real, current fact
+    about that ref, not a gap in a historical snapshot."""
+    merged = dict(existing)
+    for k, v in new_fields.items():
+        if k not in merged or v not in _EMPTY_VALUES:
+            merged[k] = v
+    return merged
+
+
+def _migrate_legacy_stores() -> Dict[str, Dict]:
+    """One-time rebuild of the consolidated store from all four legacy
+    files. Merge order matters: assignments is the base layer (the
+    bot-wide ledger), then queued, then closed — each step's `status` wins
+    over the previous for the same ref since it's more-progressed, even
+    though in practice a ref shouldn't appear in more than one legacy file
+    at once — but any field a later step doesn't actually know (empty/
+    missing) never erases a value an earlier step already captured (see
+    _merge_enrich). Hold items are folded in last, as a `hold` sub-object
+    attached onto whatever record already exists for that ref (or a bare
+    freshly-created one, since a held ref can come straight from a live
+    DLV query this bot never itself assigned)."""
+    merged: Dict[str, Dict] = {}
+
+    try:
+        with open(SAVED_ASSIGNMENTS_FILE) as f:
+            assignment_items = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        assignment_items = {}
+    for ref, info in assignment_items.items():
+        merged[ref] = _merge_enrich(merged.get(ref, {}), {**info, "ref": ref, "status": "assigned"})
+
+    try:
+        with open(SAVED_DLV_BATCH_FILE) as f:
+            batch_items = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        batch_items = []
+    for item in batch_items:
+        ref = item.get("ref")
+        if ref:
+            merged[ref] = _merge_enrich(merged.get(ref, {}), {**item, "ref": ref, "status": "queued"})
+
+    try:
+        with open(SAVED_DLV_CLOSED_FILE) as f:
+            closed_items = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        closed_items = []
+    for item in closed_items:
+        ref = item.get("ref")
+        if ref:
+            status = "completed" if item.get("closed_reason") == "completed" else "returned"
+            merged[ref] = _merge_enrich(merged.get(ref, {}), {**item, "ref": ref, "status": status})
+
+    try:
+        with open(SAVED_HOLD_TASKS_FILE) as f:
+            hold_items = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        hold_items = []
+    for item in hold_items:
+        ref = item.get("ref")
+        if not ref:
+            continue
+        hold_fields = {k: v for k, v in item.items() if k != "ref"}
+        existing = merged.get(ref, {"ref": ref, "status": "assigned"})
+        merged[ref] = {**existing, "hold": hold_fields}
+
+    return merged
+
+
+def _project(record: Dict, extra_strip: Iterable[str] = ()) -> Dict:
+    """A store record, projected back to a legacy flat-item shape — drops
+    internal-only keys (plus whatever extra_strip names) so callers that
+    spread `**item` downstream never leak a field left over from a
+    different lifecycle stage."""
+    drop = _STORE_INTERNAL_FIELDS | set(extra_strip)
+    return {k: v for k, v in record.items() if k not in drop}
+
+
+def load_dlv_batch() -> List[Dict]:
+    """Every ref currently status=="queued", projected to the legacy
+    saved_dlv_batch.json item shape."""
+    store = _load_consolidated()
+    return [
+        _project(r, _CLOSE_AND_ASSIGN_FIELDS)
+        for r in store.values() if r.get("status") == "queued"
+    ]
 
 
 def save_dlv_batch(items: List[Dict]) -> None:
-    _atomic_json_write(SAVED_DLV_BATCH_FILE, items, indent=2)
+    """Upsert every item as status="queued", merged onto whatever the store
+    already knows about that ref. Deliberately never touches a ref that's
+    currently "queued" in the store but absent from `items` — by the time a
+    call site drops a ref from its list, something else this same cycle
+    (persist_assignment/_append_dlv_closed/mark_removed) already set, or is
+    about to set, that ref's real new status; guessing here risks clobbering
+    it, so save_dlv_batch only ever adds/refreshes, never removes."""
+    store = _load_consolidated()
+    for item in items:
+        ref = item.get("ref")
+        if ref:
+            store[ref] = {**store.get(ref, {}), **item, "ref": ref, "status": "queued"}
+    _save_consolidated(store)
 
 
 def clear_dlv_batch() -> None:
-    save_dlv_batch([])
+    """Mark every currently-queued ref removed (bulk clear). Not called
+    anywhere in the live bot today, but must still leave a status="removed"
+    trace rather than silently erasing records."""
+    store = _load_consolidated()
+    mark_removed([ref for ref, r in store.items() if r.get("status") == "queued"])
 
 
 def load_dlv_closed() -> List[Dict]:
-    try:
-        with open(SAVED_DLV_CLOSED_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+    """Every ref currently status in (completed, returned), projected to the
+    legacy saved_dlv_closed.json item shape."""
+    store = _load_consolidated()
+    return [
+        _project(r, {"assigned_at"})
+        for r in store.values() if r.get("status") in ("completed", "returned")
+    ]
 
 
 def save_dlv_closed(items: List[Dict]) -> None:
-    _atomic_json_write(SAVED_DLV_CLOSED_FILE, items, indent=2)
+    """Upsert every item as its own closed status, merged onto whatever the
+    store already knows about that ref. No current call site uses this
+    directly (only _append_dlv_closed does) — kept for API parity."""
+    store = _load_consolidated()
+    for item in items:
+        ref = item.get("ref")
+        if ref:
+            status = "completed" if item.get("closed_reason") == "completed" else "returned"
+            store[ref] = {**store.get(ref, {}), **item, "ref": ref, "status": status}
+    _save_consolidated(store)
 
 
 def _append_dlv_closed(item: Dict) -> None:
-    """Move a ref into the closed store, replacing any prior record for the same ref."""
-    closed = [c for c in load_dlv_closed() if c.get("ref") != item.get("ref")]
-    closed.append(item)
-    save_dlv_closed(closed)
+    """Move a ref into the closed store, merging onto (not replacing) any
+    prior record for the same ref so earlier-known fields survive."""
+    save_dlv_closed([item])
+
+
+def mark_removed(refs: Iterable[str]) -> None:
+    """Mark each ref "removed" (manually dropped from the queue, or released
+    from hold — see clear_hold_and_remove) rather than deleting its record
+    outright — keeps a removed_at trace instead of silently losing history.
+    No-op for a ref not currently in the store."""
+    store = _load_consolidated()
+    now = datetime.now().isoformat(timespec="seconds")
+    changed = False
+    for ref in refs:
+        if ref in store:
+            store[ref] = {**store[ref], "status": "removed", "removed_at": now}
+            changed = True
+    if changed:
+        _save_consolidated(store)
+
+
+def clear_hold_and_remove(refs: Iterable[str]) -> None:
+    """Release each ref from its hold guard AND mark it "removed" in the
+    same write. Releasing a hold and manually deleting a queued ref are the
+    same kind of event (a tracking-queue exit, not a lifecycle change), so
+    they share the terminal "removed" status mark_removed also uses. No-op
+    for a ref not currently in the store."""
+    store = _load_consolidated()
+    now = datetime.now().isoformat(timespec="seconds")
+    changed = False
+    for ref in refs:
+        if ref in store:
+            store[ref] = {**store[ref], "hold": None, "status": "removed", "removed_at": now}
+            changed = True
+    if changed:
+        _save_consolidated(store)
 
 
 # Status filters to probe per DLV request type — a queued ref's current status

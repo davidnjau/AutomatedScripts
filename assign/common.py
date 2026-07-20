@@ -156,33 +156,53 @@ def persist_valuer(name: str, uid: str, account_number: str):
 # ── Assignments ───────────────────────────────────────────
 
 def load_saved_assignments() -> Dict:
-    """Return dict mapping reference_number → {valuer_name, valuer_uid, assigned_at}."""
-    try:
-        with open(SAVED_ASSIGNMENTS_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    """Return dict mapping reference_number → {valuer_name, valuer_uid, assigned_at, ...}.
+    Backed by dlv_core's consolidated ref-keyed DLV-lifecycle store (Group A
+    JSON consolidation) rather than a standalone file — dlv_core is imported
+    locally (not at module level) since dlv_core.py itself imports from
+    common.py, and a module-level import here would be circular. A record
+    is included exactly when it's ever been through persist_assignment,
+    tested via `assigned_at` (only persist_assignment ever sets it, and
+    it's never cleared by a later stage) rather than "has a valuer_uid" —
+    a merely-queued-but-not-yet-assigned DLV Batch item also carries a
+    valuer_uid and must NOT show up here (it belongs in "Currently
+    Queued," not "At Valuer's Desk"). A ref removed from the DLV queue or
+    released from hold stays included once assigned_at is set, since that
+    only means this bot stopped tracking/guarding it, not that the
+    underlying valuer assignment itself was undone."""
+    import dlv_core
+    store = dlv_core._load_consolidated()
+    return {
+        ref: dlv_core._project(r)
+        for ref, r in store.items()
+        if r.get("assigned_at")
+    }
 
 
 def persist_assignment(ref: str, valuer_name: str, valuer_uid: str, extra: Optional[Dict] = None):
-    """Record ref → valuer in saved_assignments.json. extra merges in any
-    additional context the caller already has on hand (e.g. DLV Batch's
-    queue item — parcel/consideration/tag/etc.) rather than losing it once
-    the ref moves out of its source's own tracking."""
+    """Record ref → valuer in the consolidated DLV-lifecycle store. Merges
+    onto whatever the store already knows about this ref (e.g. DLV Batch's
+    queue item — parcel/consideration/tag/etc.) rather than replacing the
+    record wholesale, so enrichment from an earlier stage is never dropped
+    just because this call's `extra` doesn't repeat it. No cap on the
+    number of tracked refs — unbounded retention matches the closed store's
+    existing behavior; a count-based cap risked evicting a still-active
+    record purely for being chronologically old."""
+    import dlv_core
     with _ASSIGN_LOCK:
-        assignments = load_saved_assignments()
+        store = dlv_core._load_consolidated()
         record = {
+            **store.get(ref, {}),
+            "ref":         ref,
+            "status":      "assigned",
             "valuer_name": valuer_name,
             "valuer_uid":  valuer_uid,
             "assigned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         if extra:
             record.update(extra)
-        assignments[ref] = record
-        # Keep only the most recent 500 assignments to prevent unbounded growth
-        if len(assignments) > 500:
-            assignments = dict(list(assignments.items())[-500:])
-        _atomic_json_write(SAVED_ASSIGNMENTS_FILE, assignments, indent=2)
+        store[ref] = record
+        dlv_core._save_consolidated(store)
     logger.info("Saved assignment %s → %s", ref, valuer_name)
 
 
