@@ -6,6 +6,7 @@ layer used by both DLV Batch and DLV Tasks.
 Run with: python3 -m unittest discover -s assign/tests -v
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -231,14 +232,22 @@ class TestDlvQueuePersistence(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.batch_file = os.path.join(self.tmpdir.name, "saved_dlv_batch.json")
         self.closed_file = os.path.join(self.tmpdir.name, "saved_dlv_closed.json")
-        self._batch_patch = patch.object(dlv_core, "SAVED_DLV_BATCH_FILE", self.batch_file)
-        self._closed_patch = patch.object(dlv_core, "SAVED_DLV_CLOSED_FILE", self.closed_file)
-        self._batch_patch.start()
-        self._closed_patch.start()
+        self.assign_file = os.path.join(self.tmpdir.name, "saved_assignments.json")
+        self.hold_file = os.path.join(self.tmpdir.name, "saved_hold_tasks.json")
+        self.records_file = os.path.join(self.tmpdir.name, "saved_dlv_records.json")
+        self._patches = [
+            patch.object(dlv_core, "SAVED_DLV_BATCH_FILE", self.batch_file),
+            patch.object(dlv_core, "SAVED_DLV_CLOSED_FILE", self.closed_file),
+            patch.object(dlv_core, "SAVED_ASSIGNMENTS_FILE", self.assign_file),
+            patch.object(dlv_core, "SAVED_HOLD_TASKS_FILE", self.hold_file),
+            patch.object(dlv_core, "SAVED_DLV_RECORDS_FILE", self.records_file),
+        ]
+        for p in self._patches:
+            p.start()
 
     def tearDown(self):
-        self._batch_patch.stop()
-        self._closed_patch.stop()
+        for p in self._patches:
+            p.stop()
         self.tmpdir.cleanup()
 
     def test_load_dlv_batch_missing_file_returns_empty(self):
@@ -254,6 +263,13 @@ class TestDlvQueuePersistence(unittest.TestCase):
         dlv_core.clear_dlv_batch()
         self.assertEqual(dlv_core.load_dlv_batch(), [])
 
+    def test_clear_dlv_batch_leaves_a_removed_trace(self):
+        dlv_core.save_dlv_batch([{"ref": "X"}])
+        dlv_core.clear_dlv_batch()
+        store = dlv_core._load_consolidated()
+        self.assertEqual(store["X"]["status"], "removed")
+        self.assertIsNotNone(store["X"]["removed_at"])
+
     def test_append_dlv_closed_dedupes_by_ref(self):
         dlv_core._append_dlv_closed({"ref": "REG/TSFR/ABC123", "closed_reason": "completed"})
         dlv_core._append_dlv_closed({"ref": "REG/TSFR/ABC123", "closed_reason": "returned"})
@@ -266,6 +282,159 @@ class TestDlvQueuePersistence(unittest.TestCase):
         dlv_core._append_dlv_closed({"ref": "B"})
         refs = {c["ref"] for c in dlv_core.load_dlv_closed()}
         self.assertEqual(refs, {"A", "B"})
+
+    def test_save_dlv_batch_never_touches_a_ref_already_transitioned_this_cycle(self):
+        """Regression: save_dlv_batch(remaining) must not clobber a ref that
+        _append_dlv_closed already moved to "completed"/"returned" this same
+        cycle, even though the ref is absent from `remaining`."""
+        dlv_core.save_dlv_batch([{"ref": "A"}, {"ref": "B"}])
+        dlv_core._append_dlv_closed({"ref": "B", "closed_reason": "completed"})
+        dlv_core.save_dlv_batch([{"ref": "A"}])   # B dropped from the list, as a real caller would
+        self.assertEqual([i["ref"] for i in dlv_core.load_dlv_batch()], ["A"])
+        closed = dlv_core.load_dlv_closed()
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(closed[0]["ref"], "B")
+
+    def test_append_dlv_closed_merges_onto_prior_queued_fields(self):
+        """"Enrich with highest data available": fields known while queued
+        (assessor/parcel/tag) must survive into the closed record even though
+        the caller's closed_record already spreads **item today — this
+        confirms the store itself also preserves them independently."""
+        dlv_core.save_dlv_batch([{"ref": "A", "assessor": "Jane", "tag": "Queue"}])
+        dlv_core._append_dlv_closed({"ref": "A", "closed_reason": "completed"})
+        closed = dlv_core.load_dlv_closed()[0]
+        self.assertEqual(closed["assessor"], "Jane")
+        self.assertEqual(closed["tag"], "Queue")
+
+    def test_mark_removed_sets_status_and_timestamp(self):
+        dlv_core.save_dlv_batch([{"ref": "A"}])
+        dlv_core.mark_removed(["A"])
+        self.assertEqual(dlv_core.load_dlv_batch(), [])
+        store = dlv_core._load_consolidated()
+        self.assertEqual(store["A"]["status"], "removed")
+        self.assertIsNotNone(store["A"]["removed_at"])
+
+    def test_mark_removed_is_a_noop_for_an_untracked_ref(self):
+        dlv_core.mark_removed(["NEVER_SEEN"])
+        self.assertEqual(dlv_core._load_consolidated(), {})
+
+    def test_migration_from_legacy_batch_and_closed_files(self):
+        """First read with no saved_dlv_records.json rebuilds it from the two
+        legacy files, deriving status per record, and leaves both legacy
+        files untouched on disk."""
+        with open(self.batch_file, "w") as f:
+            json.dump([{"ref": "Q1", "valuer_name": "Jane"}], f)
+        with open(self.closed_file, "w") as f:
+            json.dump([
+                {"ref": "C1", "closed_reason": "completed"},
+                {"ref": "C2", "closed_reason": "returned"},
+            ], f)
+
+        store = dlv_core._load_consolidated()
+
+        self.assertEqual(store["Q1"]["status"], "queued")
+        self.assertEqual(store["C1"]["status"], "completed")
+        self.assertEqual(store["C2"]["status"], "returned")
+        self.assertTrue(os.path.exists(self.batch_file))
+        self.assertTrue(os.path.exists(self.closed_file))
+        self.assertTrue(os.path.exists(self.records_file))
+        # legacy files themselves are untouched
+        with open(self.batch_file) as f:
+            self.assertEqual(json.load(f), [{"ref": "Q1", "valuer_name": "Jane"}])
+
+    def test_migration_folds_in_legacy_assignments_file(self):
+        with open(self.assign_file, "w") as f:
+            json.dump({"A1": {"valuer_name": "Jane", "valuer_uid": "u1", "assigned_at": "2026-01-01"}}, f)
+
+        store = dlv_core._load_consolidated()
+
+        self.assertEqual(store["A1"]["status"], "assigned")
+        self.assertEqual(store["A1"]["valuer_name"], "Jane")
+        self.assertTrue(os.path.exists(self.assign_file))
+
+    def test_migration_precedence_queued_and_closed_win_over_assigned(self):
+        """A ref present in both the assignments ledger and a more-progressed
+        legacy file (batch/closed) must end up with the more-progressed
+        status, since assignments is merged in as the base layer first."""
+        with open(self.assign_file, "w") as f:
+            json.dump({
+                "Q1": {"valuer_name": "Jane", "valuer_uid": "u1"},
+                "C1": {"valuer_name": "Jane", "valuer_uid": "u1"},
+            }, f)
+        with open(self.batch_file, "w") as f:
+            json.dump([{"ref": "Q1", "valuer_name": "Jane", "tag": "Queue"}], f)
+        with open(self.closed_file, "w") as f:
+            json.dump([{"ref": "C1", "closed_reason": "completed"}], f)
+
+        store = dlv_core._load_consolidated()
+
+        self.assertEqual(store["Q1"]["status"], "queued")
+        self.assertEqual(store["Q1"]["tag"], "Queue")
+        self.assertEqual(store["C1"]["status"], "completed")
+        # assignment-only fields survive even though a more-progressed file won
+        self.assertEqual(store["C1"]["valuer_uid"], "u1")
+
+    def test_migration_does_not_let_an_empty_later_field_erase_an_earlier_value(self):
+        """"Enrich with whichever source has more data": a more-progressed
+        legacy file's record for the same ref might simply never have
+        captured a field (empty string, not a deliberate blank) — that must
+        not erase a value an earlier, richer source already provided."""
+        with open(self.assign_file, "w") as f:
+            json.dump({"C1": {"valuer_name": "Jane", "parcel": "P1", "tag": "Queue"}}, f)
+        with open(self.closed_file, "w") as f:
+            json.dump([{"ref": "C1", "closed_reason": "completed", "parcel": "", "tag": None}], f)
+
+        store = dlv_core._load_consolidated()
+
+        self.assertEqual(store["C1"]["status"], "completed")
+        self.assertEqual(store["C1"]["parcel"], "P1")
+        self.assertEqual(store["C1"]["tag"], "Queue")
+
+    def test_migration_attaches_hold_onto_an_existing_assigned_record(self):
+        with open(self.assign_file, "w") as f:
+            json.dump({"A1": {"valuer_name": "Jane", "valuer_uid": "u1"}}, f)
+        with open(self.hold_file, "w") as f:
+            json.dump([{"ref": "A1", "held_valuer_name": "Jane", "held_valuer_uid": "u1"}], f)
+
+        store = dlv_core._load_consolidated()
+
+        self.assertEqual(store["A1"]["status"], "assigned")
+        self.assertEqual(store["A1"]["hold"]["held_valuer_name"], "Jane")
+
+    def test_migration_creates_a_bare_record_for_a_hold_only_ref(self):
+        """A ref held straight from a live DLV query, with no other legacy
+        file ever mentioning it, still needs a store record to exist."""
+        with open(self.hold_file, "w") as f:
+            json.dump([{"ref": "H1", "held_valuer_name": "Jane", "held_valuer_uid": "u1"}], f)
+
+        store = dlv_core._load_consolidated()
+
+        self.assertEqual(store["H1"]["status"], "assigned")
+        self.assertEqual(store["H1"]["hold"]["held_valuer_uid"], "u1")
+        self.assertTrue(os.path.exists(self.hold_file))
+
+    def test_full_four_file_migration_integration(self):
+        """All four legacy files at once — each ref lands with the right
+        status and its hold (if any) attached, and none of the four are
+        modified on disk."""
+        with open(self.assign_file, "w") as f:
+            json.dump({"A1": {"valuer_name": "Alice", "valuer_uid": "u1"}}, f)
+        with open(self.batch_file, "w") as f:
+            json.dump([{"ref": "Q1", "valuer_name": "Bob", "valuer_uid": "u2"}], f)
+        with open(self.closed_file, "w") as f:
+            json.dump([{"ref": "C1", "valuer_name": "Carl", "closed_reason": "returned"}], f)
+        with open(self.hold_file, "w") as f:
+            json.dump([{"ref": "A1", "held_valuer_name": "Alice", "held_valuer_uid": "u1"}], f)
+
+        store = dlv_core._load_consolidated()
+
+        self.assertEqual(store["A1"]["status"], "assigned")
+        self.assertEqual(store["A1"]["hold"]["held_valuer_name"], "Alice")
+        self.assertEqual(store["Q1"]["status"], "queued")
+        self.assertIsNone(store["Q1"].get("hold"))
+        self.assertEqual(store["C1"]["status"], "returned")
+        for path in (self.assign_file, self.batch_file, self.closed_file, self.hold_file):
+            self.assertTrue(os.path.exists(path))
 
 
 class TestDlvTags(unittest.TestCase):

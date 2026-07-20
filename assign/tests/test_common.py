@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import requests
 
 import common
+import dlv_core
 
 
 class TestSafeErr(unittest.TestCase):
@@ -83,16 +84,30 @@ class TestSectionalConfigPersistence(unittest.TestCase):
 
 class TestPersistAssignment(unittest.TestCase):
     """persist_assignment — ref -> valuer_name/valuer_uid/assigned_at, plus
-    whatever extra context a caller passes (e.g. DLV Batch's queue item)."""
+    whatever extra context a caller passes (e.g. DLV Batch's queue item).
+    Backed by dlv_core's consolidated ref-keyed store (Group A JSON
+    consolidation) — the file constants to isolate live on dlv_core, not
+    common, since common.SAVED_ASSIGNMENTS_FILE is only read by dlv_core's
+    legacy-migration path now, not by load/persist themselves."""
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
-        self.assign_file = os.path.join(self.tmpdir.name, "saved_assignments.json")
-        self._patch = patch.object(common, "SAVED_ASSIGNMENTS_FILE", self.assign_file)
-        self._patch.start()
+        self.assign_file  = os.path.join(self.tmpdir.name, "saved_assignments.json")
+        self.batch_file   = os.path.join(self.tmpdir.name, "saved_dlv_batch.json")
+        self.closed_file  = os.path.join(self.tmpdir.name, "saved_dlv_closed.json")
+        self.records_file = os.path.join(self.tmpdir.name, "saved_dlv_records.json")
+        self._patches = [
+            patch.object(dlv_core, "SAVED_ASSIGNMENTS_FILE", self.assign_file),
+            patch.object(dlv_core, "SAVED_DLV_BATCH_FILE", self.batch_file),
+            patch.object(dlv_core, "SAVED_DLV_CLOSED_FILE", self.closed_file),
+            patch.object(dlv_core, "SAVED_DLV_RECORDS_FILE", self.records_file),
+        ]
+        for p in self._patches:
+            p.start()
 
     def tearDown(self):
-        self._patch.stop()
+        for p in self._patches:
+            p.stop()
         self.tmpdir.cleanup()
 
     def test_basic_fields_saved_without_extra(self):
@@ -112,6 +127,43 @@ class TestPersistAssignment(unittest.TestCase):
         self.assertEqual(record["consideration"], "1000000")
         self.assertEqual(record["currency_code"], "KES")
         # core fields still present alongside extra
+        self.assertEqual(record["valuer_name"], "Jane Doe")
+
+    def test_second_call_without_extra_does_not_drop_first_calls_enrichment(self):
+        """Regression: persist_assignment used to overwrite the record
+        wholesale, so a caller with no `extra` (e.g. receive_tasks.py)
+        silently erased enrichment a prior richer call had added."""
+        common.persist_assignment("REF1", "Jane Doe", "uid-1", extra={"parcel": "P1", "tag": "Queue"})
+        common.persist_assignment("REF1", "Jane Doe", "uid-1")
+        record = common.load_saved_assignments()["REF1"]
+        self.assertEqual(record["parcel"], "P1")
+        self.assertEqual(record["tag"], "Queue")
+
+    def test_no_cap_on_number_of_tracked_assignments(self):
+        """The old 500-entry rotation is intentionally gone — a count-based
+        cap risked evicting a still-active record for being chronologically
+        old, not for being irrelevant."""
+        for i in range(510):
+            common.persist_assignment(f"REF{i}", "Jane Doe", "uid-1")
+        self.assertEqual(len(common.load_saved_assignments()), 510)
+
+    def test_merely_queued_ref_does_not_leak_into_assignments(self):
+        """Regression: a DLV Batch queue item always carries a valuer_uid
+        (the valuer it's queued FOR) even before it's actually assigned —
+        load_saved_assignments must not pick it up just because a
+        valuer_uid is present, or it would double-appear in both
+        "Currently Queued" and "At Valuer's Desk" in DLV Tasks reports."""
+        dlv_core.save_dlv_batch([{"ref": "Q1", "valuer_name": "Jane", "valuer_uid": "u1"}])
+        self.assertNotIn("Q1", common.load_saved_assignments())
+
+    def test_removed_ref_with_a_valuer_still_appears_in_assignments(self):
+        """A ref dropped from the DLV queue (status="removed") but that
+        still carries a valuer_uid must keep showing up here — being
+        removed from the queue doesn't mean the underlying assignment
+        itself was undone."""
+        common.persist_assignment("REF1", "Jane Doe", "uid-1")
+        dlv_core.mark_removed(["REF1"])
+        record = common.load_saved_assignments()["REF1"]
         self.assertEqual(record["valuer_name"], "Jane Doe")
 
 

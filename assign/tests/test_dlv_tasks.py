@@ -663,6 +663,63 @@ class TestRecvDtPickValuer(unittest.TestCase):
         self.assertIn("Jane\\_Doe", text)
 
 
+class TestRecvDtDeleteConfirm(unittest.TestCase):
+    """recv_dt_delete_confirm — bulk-delete from the open DLV queue."""
+
+    def test_cancel_ends_conversation_without_saving(self):
+        update = _make_query_update("dt_delcancel")
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        with patch.object(dlv_tasks, "allowed", return_value=True), \
+             patch.object(dlv_tasks, "save_dlv_batch") as mock_save, \
+             patch.object(dlv_tasks, "mark_removed") as mock_mark:
+            result = _run(dlv_tasks.recv_dt_delete_confirm(update, ctx))
+        self.assertEqual(result, dlv_tasks.ConversationHandler.END)
+        mock_save.assert_not_called()
+        mock_mark.assert_not_called()
+
+    def test_nothing_selected_reprompts_without_saving(self):
+        update = _make_query_update("dt_delconfirm")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = dlv_tasks._get_dt_sess(ctx)
+        sess.delete_items = [_batch_item(ref="R1")]
+        sess.delete_selected = set()
+        with patch.object(dlv_tasks, "allowed", return_value=True), \
+             patch.object(dlv_tasks, "save_dlv_batch") as mock_save, \
+             patch.object(dlv_tasks, "mark_removed") as mock_mark:
+            result = _run(dlv_tasks.recv_dt_delete_confirm(update, ctx))
+        self.assertEqual(result, dlv_tasks.DT.DELETE_SELECT)
+        mock_save.assert_not_called()
+        mock_mark.assert_not_called()
+
+    def test_confirm_marks_removed_before_saving_the_trimmed_batch(self):
+        """Regression: save_dlv_batch never removes a ref on its own (see
+        dlv_core.save_dlv_batch) — a bare deletion has no other status call,
+        so mark_removed must run, and specifically before save_dlv_batch, or
+        the deleted ref would just be silently forgotten."""
+        update = _make_query_update("dt_delconfirm")
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        ctx.user_data = {}
+        sess = dlv_tasks._get_dt_sess(ctx)
+        sess.delete_items = [_batch_item(ref="R1"), _batch_item(ref="R2")]
+        sess.delete_selected = {"R1"}
+
+        calls = []
+        with patch.object(dlv_tasks, "allowed", return_value=True), \
+             patch.object(dlv_tasks, "load_dlv_batch",
+                           return_value=[_batch_item(ref="R1"), _batch_item(ref="R2")]), \
+             patch.object(dlv_tasks, "mark_removed", side_effect=lambda refs: calls.append(("mark_removed", set(refs)))), \
+             patch.object(dlv_tasks, "save_dlv_batch", side_effect=lambda items: calls.append(("save_dlv_batch", items))):
+            result = _run(dlv_tasks.recv_dt_delete_confirm(update, ctx))
+
+        self.assertEqual(result, dlv_tasks.ConversationHandler.END)
+        self.assertEqual([c[0] for c in calls], ["mark_removed", "save_dlv_batch"])
+        self.assertEqual(calls[0][1], {"R1"})
+        self.assertEqual([i["ref"] for i in calls[1][1]], ["R2"])
+
+
 class TestDtGatherReportData(unittest.TestCase):
     """_dt_gather_report_data — the data-gathering half of recv_dt_period,
     factored out so dlv_report_schedule.py's background job can reuse it."""
