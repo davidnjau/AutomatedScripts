@@ -847,6 +847,19 @@ class TestIcNotifyJob(unittest.TestCase):
         self.assertEqual(ctx.bot.send_message.call_count, 1)
 
 
+class TestIcNotifyMenuKeyboard(unittest.TestCase):
+    def _callback_data(self, markup):
+        return [btn.callback_data for row in markup.inline_keyboard for btn in row]
+
+    def test_run_now_always_offered(self):
+        self.assertIn("ic_notify:run_now", self._callback_data(ic._ic_notify_menu_keyboard(enabled=False)))
+        self.assertIn("ic_notify:run_now", self._callback_data(ic._ic_notify_menu_keyboard(enabled=True)))
+
+    def test_disable_only_offered_when_enabled(self):
+        self.assertNotIn("ic_notify:disable", self._callback_data(ic._ic_notify_menu_keyboard(enabled=False)))
+        self.assertIn("ic_notify:disable", self._callback_data(ic._ic_notify_menu_keyboard(enabled=True)))
+
+
 class TestRecvIcNotifyMenu(unittest.TestCase):
     def test_cancel_ends_conversation(self):
         update = _make_query_update("ic_notify:cancel")
@@ -854,6 +867,50 @@ class TestRecvIcNotifyMenu(unittest.TestCase):
         with patch.object(ic, "allowed", return_value=True):
             result = _run(ic.recv_ic_notify_menu(update, ctx))
         self.assertEqual(result, ic.ConversationHandler.END)
+
+    def test_run_now_sends_report_and_reports_success(self):
+        update = _make_query_update("ic_notify:run_now")
+        ctx = MagicMock()
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "_ic_run_notify_cycle", new=AsyncMock(return_value=True)) as mock_cycle:
+            result = _run(ic.recv_ic_notify_menu(update, ctx))
+        mock_cycle.assert_called_once_with(ctx)
+        self.assertEqual(result, ic.ConversationHandler.END)
+        sent = update.callback_query.message.reply_text.call_args[0][0]
+        self.assertIn("sent", sent.lower())
+
+    def test_run_now_reports_nothing_new(self):
+        update = _make_query_update("ic_notify:run_now")
+        ctx = MagicMock()
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "_ic_run_notify_cycle", new=AsyncMock(return_value=False)):
+            result = _run(ic.recv_ic_notify_menu(update, ctx))
+        self.assertEqual(result, ic.ConversationHandler.END)
+        sent = update.callback_query.message.reply_text.call_args[0][0]
+        self.assertIn("nothing new", sent.lower())
+
+    def test_run_now_works_even_when_disabled(self):
+        """Regression: Run Now must trigger the cycle regardless of the
+        Notify on Fill enabled/disabled state — it's a manual on-demand
+        check, not gated by the schedule."""
+        update = _make_query_update("ic_notify:run_now")
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "queued", "valuer_name": "Jane Doe"}]
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "load_notify_config", return_value={"enabled": False, "emails": []}), \
+             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "_ic_gather_items", return_value=items), \
+             patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
+             patch.object(ic, "_ic_auto_close"), \
+             patch.object(ic, "load_closed_batches", return_value=[]), \
+             patch.object(ic, "load_notify_state",
+                           return_value={"closed_batches": [], "reported_cleared_refs": [], "reported_batches": []}), \
+             patch.object(ic, "save_notify_state"):
+            result = _run(ic.recv_ic_notify_menu(update, ctx))
+        self.assertEqual(result, ic.ConversationHandler.END)
+        ctx.bot.send_message.assert_called()
 
     def test_configure_moves_to_interval_state(self):
         update = _make_query_update("ic_notify:configure")

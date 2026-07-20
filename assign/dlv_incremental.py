@@ -457,16 +457,16 @@ def _ic_format_newly_cleared_section(new_cleared: List[Dict], batch_size: int) -
     return lines
 
 
-async def _ic_notify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Repeating job: check for newly-filled batches and newly-cleared
-    tasks since the last cycle, and — only if there's something new —
-    send a combined report (Available Batches + Newly Cleared) via
-    Telegram (every ALLOWED_IDS chat) and email (if configured)."""
+async def _ic_run_notify_cycle(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Core Notify on Fill cycle: check for newly-filled batches and
+    newly-cleared tasks since the last cycle, and — only if there's
+    something new — send a combined report (Available Batches + Newly
+    Cleared) via Telegram (every ALLOWED_IDS chat) and email (if
+    configured). Shared by the repeating job (_ic_notify_job) and the
+    manual ▶️ Run Now action, so both use the exact same report/skip/state
+    logic. Returns True if a report was sent, False if there was nothing
+    new to report."""
     cfg = load_notify_config()
-    if not cfg.get("enabled"):
-        context.job.schedule_removal()
-        return
-
     batch_size = get_batch_size()
     items      = _ic_gather_items()
     grouped    = _ic_group_by_batch(items)
@@ -481,7 +481,7 @@ async def _ic_notify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not newly_closed and not new_cleared and not new_batches:
         logger.info("Incremental Notify on Fill: nothing new this cycle — skipping.")
-        return
+        return False
 
     lines = ["🔔 *Incremental — Notify on Fill*\n"]
     if newly_closed:
@@ -519,6 +519,18 @@ async def _ic_notify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         "reported_cleared_refs": state.get("reported_cleared_refs", []) + [i["ref"] for i in new_cleared],
         "reported_batches":      sorted(set(state.get("reported_batches", [])) | set(new_batches)),
     })
+    return True
+
+
+async def _ic_notify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Repeating job wrapper: stops itself if Notify on Fill has been
+    disabled since it was scheduled, otherwise delegates to the shared
+    cycle logic."""
+    cfg = load_notify_config()
+    if not cfg.get("enabled"):
+        context.job.schedule_removal()
+        return
+    await _ic_run_notify_cycle(context)
 
 
 # ──────────────────────────────────────────────────────────
@@ -555,9 +567,14 @@ def _ic_close_pick_keyboard(batch_numbers: List[int]) -> InlineKeyboardMarkup:
 
 
 def _ic_notify_menu_keyboard(enabled: bool) -> InlineKeyboardMarkup:
-    """Enable/Configure is always offered (re-configuring replaces the
-    interval/email); Disable only makes sense when currently enabled."""
-    rows = [[InlineKeyboardButton("⚙️ Enable / Configure", callback_data="ic_notify:configure")]]
+    """Run Now is always offered — a manual on-demand check independent
+    of the schedule/enabled state. Enable/Configure is always offered too
+    (re-configuring replaces the interval/email); Disable only makes
+    sense when currently enabled."""
+    rows = [
+        [InlineKeyboardButton("▶️ Run Now", callback_data="ic_notify:run_now")],
+        [InlineKeyboardButton("⚙️ Enable / Configure", callback_data="ic_notify:configure")],
+    ]
     if enabled:
         rows.append([InlineKeyboardButton("🚫 Disable", callback_data="ic_notify:disable")])
     rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="ic_notify:cancel")])
@@ -748,7 +765,7 @@ async def recv_ic_set_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def recv_ic_notify_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle the Notify on Fill Enable/Configure/Disable/Cancel choice."""
+    """Handle the Notify on Fill Run Now/Enable/Configure/Disable/Cancel choice."""
     if not allowed(update): return await deny(update)
     query = update.callback_query
     await query.answer()
@@ -757,6 +774,13 @@ async def recv_ic_notify_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "cancel":
         await query.edit_message_text("❌ Cancelled.")
         await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    if action == "run_now":
+        await query.edit_message_text("⏳ Checking for newly-filled batches / newly-cleared tasks…")
+        sent = await _ic_run_notify_cycle(ctx)
+        result = "✅ Report sent." if sent else "ℹ️ Nothing new to report."
+        await query.message.reply_text(result, reply_markup=_main_menu())
         return ConversationHandler.END
 
     if action == "disable":
