@@ -29,14 +29,19 @@ different size before it was last changed. Each item within them is
 rendered as its own labeled block via task_block.format_labeled_block —
 the shared visual every report in the bot uses — not a packed one-liner:
 
-- 📦 By Batch — every incremental-tagged ref, grouped by its original
-  batch_number, sourced from saved_dlv_batch.json ("queued") and
-  saved_assignments.json ("cleared") only — deliberately not
-  saved_dlv_closed.json, since "cleared" here means "assigned", not
-  "DLV-completed". A batch auto-closes (a persisted status flag, not a
-  data move) the moment all of its task slots are found cleared; ✋ Close
-  Batch offers the same action manually for anyone impatient to see it
-  reflected without waiting for the next report view.
+- 📦 By Batch — tapping it shows a picker (_ic_batch_pick_keyboard) of
+  every available batch_number with its fill status, so one batch's tasks
+  can be viewed on their own (recv_ic_view_batch_pick) instead of always
+  dumping every batch at once; "📋 Show All" on that same picker still
+  sends the full multi-batch report (_ic_format_by_batch_report) for a
+  quick overall scan. Either way, tasks are sourced from
+  saved_dlv_batch.json ("queued") and saved_assignments.json ("cleared")
+  only — deliberately not saved_dlv_closed.json, since "cleared" here
+  means "assigned", not "DLV-completed". A batch auto-closes (a persisted
+  status flag, not a data move) the moment all of its task slots are
+  found cleared; ✋ Close Batch offers the same action manually for
+  anyone impatient to see it reflected without waiting for the next
+  report view.
 - ✅ Cleared — every cleared (assigned) incremental-tagged ref, sorted by
   assigned_at and chunked into groups of batch_size in clearance order
   (First Cleared, Second Cleared, ...) — independent of original batch
@@ -538,6 +543,7 @@ async def _ic_notify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ──────────────────────────────────────────────────────────
 class IC(Enum):
     MENU            = auto()   # By Batch / Cleared / Set Counter / Close Batch / Notify on Fill
+    VIEW_BATCH_PICK = auto()   # By Batch: pick one available batch to view, or Show All for the full dump
     SET_SIZE        = auto()   # enter tasks-per-batch (or skip to keep current)
     SET_BATCH       = auto()   # enter the batch number to seed
     SET_TASK        = auto()   # enter the task number to seed
@@ -563,6 +569,24 @@ def _ic_close_pick_keyboard(batch_numbers: List[int]) -> InlineKeyboardMarkup:
     """One button per eligible-but-unclosed batch, for the manual close picker."""
     rows = [[InlineKeyboardButton(f"Batch {b}", callback_data=f"ic_close:{b}")] for b in batch_numbers]
     rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="ic_close:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _ic_batch_pick_keyboard(grouped: Dict[int, List[Dict]], closed_batches: List[int], batch_size: int) -> InlineKeyboardMarkup:
+    """One button per available batch (open or closed), showing its fill
+    status, so 📦 By Batch can show one batch's tasks on their own instead
+    of always dumping every batch in one report. "📋 Show All" keeps the
+    original full-dump behavior available for a quick overall scan."""
+    closed_set = set(closed_batches)
+    rows = []
+    for batch_number in sorted(grouped):
+        flag = " ✅" if batch_number in closed_set else ""
+        rows.append([InlineKeyboardButton(
+            f"Batch {batch_number} — {len(grouped[batch_number])}/{batch_size}{flag}",
+            callback_data=f"ic_viewbatch:{batch_number}",
+        )])
+    rows.append([InlineKeyboardButton("📋 Show All", callback_data="ic_viewbatch:all")])
+    rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="ic_viewbatch:cancel")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -665,13 +689,16 @@ async def recv_ic_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "bybatch":
         _ic_auto_close(grouped, batch_size)
-        lines = _ic_format_by_batch_report(grouped, load_closed_batches(), batch_size)
-        await query.edit_message_text("⏳ Building report…")
-
-        async def _send(text, reply_markup):
-            await query.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-        await _send_chunked_report(_send, lines, reply_markup=_main_menu())
-        return ConversationHandler.END
+        if not grouped:
+            await query.edit_message_text("ℹ️ No incremental-tagged tasks yet.")
+            await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+            return ConversationHandler.END
+        await query.edit_message_text(
+            "📦 *Available Batches* — pick one to see its tasks, or Show All for the full report:",
+            parse_mode="Markdown",
+            reply_markup=_ic_batch_pick_keyboard(grouped, load_closed_batches(), batch_size),
+        )
+        return IC.VIEW_BATCH_PICK
 
     if action == "cleared":
         lines = _ic_format_cleared_report(items, batch_size)
@@ -691,6 +718,47 @@ async def recv_ic_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     await query.edit_message_text("🔓 Pick a batch to close:", reply_markup=_ic_close_pick_keyboard(sorted(eligible)))
     return IC.CLOSE_PICK
+
+
+async def recv_ic_view_batch_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show either one picked batch's tasks on their own, or the full
+    By Batch dump if "Show All" was tapped instead. Re-gathers fresh from
+    disk rather than reusing whatever was shown when the picker was built,
+    same as every other picker in this module — a batch's contents can't
+    meaningfully change in the few seconds before a tap, but there's no
+    reason to risk it going stale either."""
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    data = query.data.split(":", 1)[1]
+
+    if data == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    batch_size     = get_batch_size()
+    items          = _ic_gather_items()
+    grouped        = _ic_group_by_batch(items)
+    closed_batches = load_closed_batches()
+
+    if data == "all":
+        lines = _ic_format_by_batch_report(grouped, closed_batches, batch_size)
+    else:
+        # _ic_format_batch_section always includes the "Batch N — X/Y
+        # tagged" header line even for an empty item list, so a batch
+        # that's emptied out since the picker was built still renders a
+        # clear "0/Y tagged" line rather than an empty message.
+        batch_number = int(data)
+        section = _ic_format_batch_section({batch_number: grouped.get(batch_number, [])}, closed_batches, batch_size)
+        lines = [f"📦 *Incremental Report — Batch {batch_number}*\n"] + section
+
+    await query.edit_message_text("⏳ Building report…")
+
+    async def _send(text, reply_markup):
+        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+    await _send_chunked_report(_send, lines, reply_markup=_main_menu())
+    return ConversationHandler.END
 
 
 async def recv_ic_close_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -853,6 +921,7 @@ def register(app: Application) -> None:
         ],
         states={
             IC.MENU:            [CallbackQueryHandler(recv_ic_menu, pattern=r"^ic_menu:")],
+            IC.VIEW_BATCH_PICK: [CallbackQueryHandler(recv_ic_view_batch_pick, pattern=r"^ic_viewbatch:")],
             IC.SET_SIZE:        [MessageHandler(not_cancel, recv_ic_set_size)],
             IC.SET_BATCH:       [MessageHandler(not_cancel, recv_ic_set_batch)],
             IC.SET_TASK:        [MessageHandler(not_cancel, recv_ic_set_task)],
