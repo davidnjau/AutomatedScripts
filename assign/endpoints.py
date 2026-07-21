@@ -146,6 +146,41 @@ STAMP_DUTY_OFFICE_REPORT_URL = f"{BASE_URL}/valuationservice/api/v1/stamp-duty/o
 
 
 # ──────────────────────────────────────────────────────────
+# Land Rent Determination (LRD) Valuation Service — a second, structurally
+# similar workflow alongside Stamp Duty above; refs use different prefixes
+# (e.g. "REG/SECT/...", "DLA/LEASE/...") with no confirmed exhaustive list.
+# ──────────────────────────────────────────────────────────
+
+# GET — params: {"filter": one of "Pending"/"Ongoing"/"Completed"/
+# "Returned"/"On-hold", "role": "DLV", "search", "page"} (no "request_type"
+# — LRD has no Stamp-Duty-style County/non-County split at this endpoint).
+# Response: {"count", "results": [{"id", "reference_number",
+# "application_status", "node", "date_created", "valuation_request_type",
+# "parcel_number"}], "next"}. node here is one of "VALUATION_LRD_CREATED"
+# (pending/unassigned) / "VALUATION_LRD_VALUER_REPORT" (assigned) /
+# "VALUATION_LRD_COMPLETED". Used by lookup_reference.py's LRD search.
+LRD_APPLICATION_LIST_URL = f"{BASE_URL}/valuationservice/api/v1/lrd/application"
+
+# GET — params: {"request_id": <id>}. Response body is the detail record
+# directly (not wrapped in a "details" key, unlike ASSESSOR_STAGE_DETAIL_URL
+# below): {"reference_number", "application_status", "node", "parcel_number",
+# "mother_parcels", "child_parcels": [{"parcel_number", "area",
+# "area_units", ...}], "actors", "external_process_details": {"node_code",
+# "location_details": {"county", "registry"}, ...}}. Note "node_code"
+# (inside external_process_details) is a more granular internal-process
+# stage, distinct from the top-level "node" that drives the
+# VALUATION_LRD_* assignment stage. Used by lookup_reference.py's LRD search.
+LRD_APPLICATION_DETAIL_URL = f"{BASE_URL}/valuationservice/api/v1/lrd/application/detail-view"
+
+# Assign a valuer to an LRD reference — the LRD equivalent of
+# STAMP_DUTY_FIX_APPLICATION_URL above, but with a narrower body: no
+# "node" field, per confirmed working usage.
+# POST body: {"reference_number", "valuation_officer"}.
+# Used by new_assignment.py's Land Rent Determination workflow.
+LRD_FIX_PARCEL_NUMBER_URL = f"{BASE_URL}/valuationservice/api/v1/lrd/fix_parcel_number"
+
+
+# ──────────────────────────────────────────────────────────
 # Assessor / HQ stage (stampdutyservice) & county transfer (registrationservice)
 # ──────────────────────────────────────────────────────────
 # These cover the pre-DLV stage — a task lives here before an assessor

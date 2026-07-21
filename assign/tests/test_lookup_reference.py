@@ -2,9 +2,13 @@
 """
 Unit tests for lookup_reference.py — _lu_search_ref's filter/role combo
 fallback (and _lu_search_ref_county's TO_VALUATION/Ongoing fallback for
-County refs), _lu_format_result/_lu_format_county_result's field
-extraction, and the cmd_lookup/recv_lu_ref conversation handlers,
-including recv_lu_ref's County-vs-default credential/endpoint routing.
+County refs, _lu_search_ref_lrd's 5-filter fallback for Land Rent
+Determination refs), _lu_format_result/_lu_format_county_result/
+_lu_format_lrd_result's field extraction, and the cmd_lookup/recv_lu_ref
+conversation handlers, including recv_lu_ref's County-vs-default
+credential/endpoint routing. LRD primitives are exercised directly here
+since they're not wired into recv_lu_ref's own routing (only
+new_assignment.py calls them, covered in tests/test_new_assignment.py).
 
 Run with: python3 -m unittest discover -s assign/tests -v
 """
@@ -129,6 +133,129 @@ class TestLuExtractContext(unittest.TestCase):
         self.assertEqual(ctx["parcel"], "NEW")
         self.assertEqual(ctx["consideration"], "500000")
         self.assertEqual(ctx["currency_code"], "KES")
+
+
+class TestLuSearchRefLrd(unittest.TestCase):
+    def test_returns_none_when_no_filter_matches(self):
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(
+            raise_for_status=lambda: None, json=lambda: {"results": []}
+        )
+        with patch.object(lu, "build_session", return_value=fake_session):
+            result = lu._lu_search_ref_lrd(TOKENS, "REG/SECT/AB12CD")
+        self.assertIsNone(result)
+        self.assertEqual(fake_session.get.call_count, len(lu._LU_LRD_FILTERS))
+
+    def test_returns_first_matching_filter(self):
+        fake_session = MagicMock()
+        fake_session.get.side_effect = [
+            MagicMock(raise_for_status=lambda: None, json=lambda: {"results": []}),
+            MagicMock(raise_for_status=lambda: None,
+                      json=lambda: {"results": [{"reference_number": "REG/SECT/AB12CD", "id": "app-1"}]}),
+        ]
+        with patch.object(lu, "build_session", return_value=fake_session):
+            result = lu._lu_search_ref_lrd(TOKENS, "REG/SECT/AB12CD")
+        self.assertEqual(result["id"], "app-1")
+        self.assertEqual(result["_matched_filter"], lu._LU_LRD_FILTERS[1])
+        params = fake_session.get.call_args[1]["params"]
+        self.assertEqual(params["role"], "DLV")
+
+    def test_exception_on_one_filter_continues_to_next(self):
+        fake_session = MagicMock()
+        fake_session.get.side_effect = [
+            RuntimeError("network blip"),
+            MagicMock(raise_for_status=lambda: None,
+                      json=lambda: {"results": [{"reference_number": "REG/SECT/AB12CD", "id": "app-2"}]}),
+        ]
+        with patch.object(lu, "build_session", return_value=fake_session):
+            result = lu._lu_search_ref_lrd(TOKENS, "REG/SECT/AB12CD")
+        self.assertEqual(result["id"], "app-2")
+
+
+class TestLuExtractContextLrd(unittest.TestCase):
+    def test_no_detail_falls_back_to_item_fields(self):
+        item = {"application_status": "ONGOING", "date_created": "2026-07-20", "parcel_number": "P1"}
+        ctx = lu._lu_extract_context_lrd(item, None)
+        self.assertEqual(ctx["application_status"], "ONGOING")
+        self.assertEqual(ctx["date_created"], "2026-07-20")
+        self.assertEqual(ctx["parcel_number"], "P1")
+        self.assertEqual(ctx["node_code"], "")
+        self.assertEqual(ctx["child_parcels"], [])
+
+    def test_detail_fields_take_priority_and_node_code_is_nested(self):
+        """node_code lives under external_process_details — a different,
+        more granular field than the top-level "node" (which drives
+        VALUATION_LRD_* assignment logic and is deliberately not extracted here)."""
+        item = {"application_status": "ONGOING", "parcel_number": "OLD"}
+        detail = {
+            "node": "VALUATION_LRD_CREATED",
+            "application_status": "ONGOING",
+            "parcel_number": "NEW",
+            "child_parcels": [{"parcel_number": "NEW/1", "area": "10", "area_units": "MSQ"}],
+            "external_process_details": {"node_code": "APPLICATION_AWAITING_LAND_ADMIN"},
+        }
+        ctx = lu._lu_extract_context_lrd(item, detail)
+        self.assertEqual(ctx["parcel_number"], "NEW")
+        self.assertEqual(ctx["node_code"], "APPLICATION_AWAITING_LAND_ADMIN")
+        self.assertEqual(ctx["child_parcels"], [{"parcel_number": "NEW/1", "area": "10", "area_units": "MSQ"}])
+        self.assertNotIn("node", ctx)
+
+
+class TestLuSummarizeChildParcels(unittest.TestCase):
+    def test_empty_list_returns_dash(self):
+        self.assertEqual(lu._lu_summarize_child_parcels([]), "—")
+
+    def test_sums_area_by_unit(self):
+        parcels = [
+            {"area": "100", "area_units": "MSQ"},
+            {"area": "50.5", "area_units": "MSQ"},
+        ]
+        result = lu._lu_summarize_child_parcels(parcels)
+        self.assertIn("2 parcel(s)", result)
+        self.assertIn("150.50 MSQ", result)
+
+    def test_distinct_units_summed_separately(self):
+        parcels = [{"area": "100", "area_units": "MSQ"}, {"area": "1", "area_units": "HA"}]
+        result = lu._lu_summarize_child_parcels(parcels)
+        self.assertIn("100.00 MSQ", result)
+        self.assertIn("1.00 HA", result)
+
+    def test_unparseable_area_is_skipped_not_fatal(self):
+        parcels = [{"area": "not-a-number", "area_units": "MSQ"}, {"area": "10", "area_units": "MSQ"}]
+        result = lu._lu_summarize_child_parcels(parcels)
+        self.assertIn("10.00 MSQ", result)
+
+
+class TestLuFormatLrdResult(unittest.TestCase):
+    def test_formats_with_no_detail(self):
+        item = {"application_status": "ongoing", "date_created": "2026-07-20", "parcel_number": "P1"}
+        result = lu._lu_format_lrd_result("REG/SECT/AB12CD", item, None)
+        self.assertIn("REG/SECT/AB12CD", result)
+        self.assertIn("ONGOING", result)
+        self.assertIn("Land Rent", result)
+        self.assertIn("—", result)   # child parcels default when no detail
+
+    def test_formats_with_detail_extracts_location_and_child_parcels(self):
+        item = {"application_status": "ongoing", "date_created": "2026-07-20"}
+        detail = {
+            "node": "VALUATION_LRD_CREATED",
+            "parcel_number": "NAIROBI/BLOCK188/1697",
+            "child_parcels": [
+                {"parcel_number": "P/1", "area": "100", "area_units": "MSQ"},
+                {"parcel_number": "P/2", "area": "50", "area_units": "MSQ"},
+            ],
+            "external_process_details": {
+                "node_code": "APPLICATION_AWAITING_LAND_ADMIN",
+                "location_details": {"county": "NAIROBI", "registry": "CENTRAL"},
+            },
+        }
+        result = lu._lu_format_lrd_result("REG/SECT/AB12CD", item, detail)
+        self.assertIn("CENTRAL", result)
+        self.assertIn("NAIROBI", result)
+        self.assertIn("NAIROBI/BLOCK188/1697", result)
+        self.assertIn("2 parcel(s)", result)
+        self.assertIn("150.00 MSQ", result)
+        self.assertNotIn("Consideration", result)   # LRD has no monetary consideration
 
 
 class TestLuIsCountyRef(unittest.TestCase):
