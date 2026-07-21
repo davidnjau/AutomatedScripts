@@ -363,7 +363,7 @@ class TestRecvIcMenu(unittest.TestCase):
             result = _run(ic.recv_ic_menu(update, ctx))
         self.assertEqual(result, ic.IC.SET_SIZE)
 
-    def test_bybatch_sends_report_and_ends(self):
+    def test_bybatch_with_no_tagged_tasks_shows_message_and_ends(self):
         update = _make_query_update("ic_menu:bybatch")
         ctx = MagicMock()
         with patch.object(ic, "allowed", return_value=True), \
@@ -374,6 +374,20 @@ class TestRecvIcMenu(unittest.TestCase):
             result = _run(ic.recv_ic_menu(update, ctx))
         self.assertEqual(result, ic.ConversationHandler.END)
         update.callback_query.message.reply_text.assert_called()
+
+    def test_bybatch_with_tasks_shows_batch_picker(self):
+        """Regression: 📦 By Batch used to dump every batch's tasks in one
+        report immediately — it must now show a picker first."""
+        update = _make_query_update("ic_menu:bybatch")
+        ctx = MagicMock()
+        batch = [{"ref": "REG/TSFR/ABC", "valuer_name": "Jane", "tag": "B2-T1", "queued_at": "2026-07-17T09:00:00"}]
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "load_dlv_batch", return_value=batch), \
+             patch.object(ic, "load_saved_assignments", return_value={}), \
+             patch.object(ic, "load_closed_batches", return_value=[]):
+            result = _run(ic.recv_ic_menu(update, ctx))
+        self.assertEqual(result, ic.IC.VIEW_BATCH_PICK)
 
     def test_cleared_sends_report_and_ends(self):
         update = _make_query_update("ic_menu:cleared")
@@ -407,6 +421,73 @@ class TestRecvIcMenu(unittest.TestCase):
              patch.object(ic, "load_closed_batches", return_value=[]):
             result = _run(ic.recv_ic_menu(update, ctx))
         self.assertEqual(result, ic.IC.CLOSE_PICK)
+
+
+class TestRecvIcViewBatchPick(unittest.TestCase):
+    """recv_ic_view_batch_pick — show one picked batch's tasks on their
+    own, or the full multi-batch dump via "Show All"."""
+
+    def test_cancel_ends_conversation(self):
+        update = _make_query_update("ic_viewbatch:cancel")
+        ctx = MagicMock()
+        with patch.object(ic, "allowed", return_value=True):
+            result = _run(ic.recv_ic_view_batch_pick(update, ctx))
+        self.assertEqual(result, ic.ConversationHandler.END)
+
+    def test_show_all_sends_the_full_multi_batch_report(self):
+        update = _make_query_update("ic_viewbatch:all")
+        ctx = MagicMock()
+        batch = [
+            {"ref": "REF1", "valuer_name": "Jane", "tag": "B2-T1", "queued_at": "2026-07-17T09:00:00"},
+            {"ref": "REF2", "valuer_name": "Jane", "tag": "B3-T1", "queued_at": "2026-07-18T09:00:00"},
+        ]
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "load_dlv_batch", return_value=batch), \
+             patch.object(ic, "load_saved_assignments", return_value={}), \
+             patch.object(ic, "load_closed_batches", return_value=[]):
+            result = _run(ic.recv_ic_view_batch_pick(update, ctx))
+        self.assertEqual(result, ic.ConversationHandler.END)
+        sent = "\n".join(c.args[0] for c in update.callback_query.message.reply_text.call_args_list)
+        self.assertIn("Batch 2", sent)
+        self.assertIn("Batch 3", sent)
+
+    def test_specific_batch_sends_only_that_batchs_tasks(self):
+        update = _make_query_update("ic_viewbatch:2")
+        ctx = MagicMock()
+        batch = [
+            {"ref": "REF1", "valuer_name": "Jane", "tag": "B2-T1", "queued_at": "2026-07-17T09:00:00"},
+            {"ref": "REF2", "valuer_name": "Jane", "tag": "B3-T1", "queued_at": "2026-07-18T09:00:00"},
+        ]
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "load_dlv_batch", return_value=batch), \
+             patch.object(ic, "load_saved_assignments", return_value={}), \
+             patch.object(ic, "load_closed_batches", return_value=[]):
+            result = _run(ic.recv_ic_view_batch_pick(update, ctx))
+        self.assertEqual(result, ic.ConversationHandler.END)
+        sent = "\n".join(c.args[0] for c in update.callback_query.message.reply_text.call_args_list)
+        self.assertIn("Batch 2", sent)
+        self.assertIn("REF1", sent)
+        self.assertNotIn("REF2", sent)
+        self.assertNotIn("Batch 3", sent)
+
+    def test_batch_that_no_longer_has_items_shows_zero_tagged(self):
+        """A batch shown in the picker snapshot could theoretically have
+        emptied out by the time it's tapped (e.g. cleared/removed) — must
+        not crash, just render its "0/6 tagged" header with no task blocks."""
+        update = _make_query_update("ic_viewbatch:9")
+        ctx = MagicMock()
+        with patch.object(ic, "allowed", return_value=True), \
+             patch.object(ic, "get_batch_size", return_value=6), \
+             patch.object(ic, "load_dlv_batch", return_value=[]), \
+             patch.object(ic, "load_saved_assignments", return_value={}), \
+             patch.object(ic, "load_closed_batches", return_value=[]):
+            result = _run(ic.recv_ic_view_batch_pick(update, ctx))
+        self.assertEqual(result, ic.ConversationHandler.END)
+        sent = "\n".join(c.args[0] for c in update.callback_query.message.reply_text.call_args_list)
+        self.assertIn("Batch 9", sent)
+        self.assertIn("0/6 tagged", sent)
 
 
 class TestRecvIcClosePick(unittest.TestCase):
