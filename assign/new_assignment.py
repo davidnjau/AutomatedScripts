@@ -2,10 +2,22 @@
 """
 new_assignment.py
 ==================
-New Assignment — the original core flow: collect reference numbers (typed
-or via OCR on photos), pick or search a valuer, authenticate, confirm, and
-assign (/assign or "📋 New Assignment"). Also owns /assignments' history
-viewer ("📜 Assignments" button).
+New Assignment — the original core flow: pick a workflow (Stamp Duty or
+Land Rent Determination), collect reference numbers (typed or via OCR on
+photos), pick or search a valuer, authenticate, confirm, and assign
+(/assign or "📋 New Assignment"). Also owns /assignments' history viewer
+("📜 Assignments" button).
+
+The workflow choice (Session.workflow, "stamp_duty" or "land_rent") is the
+very first step and drives which endpoint recv_confirm assigns through —
+Stamp Duty POSTs to STAMP_DUTY_FIX_APPLICATION_URL with a "node" field;
+Land Rent Determination (LRD) POSTs to LRD_FIX_PARCEL_NUMBER_URL with no
+"node" field (confirmed working shape — narrower body than Stamp Duty's).
+Everything else in the flow (input method, OCR, valuer search, credential/
+OTP, confirmation) is identical for both workflows. persist_assignment's
+saved record gets a "workflow" field so the two are distinguishable in
+saved_dlv_records.json — this is separate from "tag" (still defaults to
+"Direct" regardless of workflow, unaffected by this).
 
 Reference numbers can be typed manually or extracted from photos via
 pytesseract, falling back to Claude Vision (Anthropic API) when OCR finds
@@ -13,9 +25,14 @@ nothing. Already-assigned references are detected before proceeding and
 the user is asked whether to reassign.
 
 _lookup_one_ref/_post_assignment_report (the post-assignment verification
-step shown after a successful run) build on Lookup Reference's
-_lu_search_ref/_lu_fetch_detail/_lu_format_result, imported directly from
-lookup_reference.py.
+step shown after a successful run) take a workflow parameter and build on
+Lookup Reference's non-county Stamp Duty primitives
+(_lu_search_ref/_lu_fetch_detail/_lu_format_result/_lu_extract_context)
+or its LRD primitives (_lu_search_ref_lrd/_lu_fetch_detail_lrd/
+_lu_format_lrd_result/_lu_extract_context_lrd) accordingly, both imported
+directly from lookup_reference.py — LRD auto-routing lives only here,
+not in lookup_reference.py's own /lookup conversation, since this module
+already knows the workflow from its own picker.
 
 Call register(app) from bot.py's main() to wire this feature in.
 """
@@ -78,10 +95,24 @@ from endpoints import (
     ACCOUNTS_LIST_URL,
     AUTH_LOGIN_URL,
     AUTH_OTP_VERIFY_URL,
+    LRD_FIX_PARCEL_NUMBER_URL,
     STAMP_DUTY_FIX_APPLICATION_URL,
 )
-from lookup_reference import _lu_extract_context, _lu_fetch_detail, _lu_format_result, _lu_search_ref
+from lookup_reference import (
+    _lu_extract_context,
+    _lu_extract_context_lrd,
+    _lu_fetch_detail,
+    _lu_fetch_detail_lrd,
+    _lu_format_lrd_result,
+    _lu_format_result,
+    _lu_search_ref,
+    _lu_search_ref_lrd,
+)
 from telegram_report import _send_chunked_report
+
+# Human-facing labels for Session.workflow's two values, shared by the
+# workflow-type picker and the /assignments history viewer.
+_WORKFLOW_LABELS = {"stamp_duty": "📋 Stamp Duty", "land_rent": "🏘 Land Rent"}
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
@@ -90,6 +121,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # States
 # ──────────────────────────────────────────────────────────
 class S(Enum):
+    WORKFLOW_TYPE      = auto()   # choose Stamp Duty or Land Rent Determination
     INPUT_METHOD       = auto()   # choose text or photo input
     REF_NUMBERS        = auto()   # typing refs manually
     RECV_PHOTOS        = auto()   # receiving photo(s) for OCR
@@ -108,6 +140,7 @@ class S(Enum):
 # ──────────────────────────────────────────────────────────
 @dataclass
 class Session:
+    workflow:         str = "stamp_duty"   # "stamp_duty" or "land_rent" — set by recv_workflow_type
     refs:             List[str] = field(default_factory=list)
     extracted_refs:   List[str] = field(default_factory=list)   # OCR-extracted refs awaiting confirmation
     already_assigned: List[Dict] = field(default_factory=list)  # [{ref, valuer_name, assigned_at}]
@@ -264,9 +297,14 @@ async def cmd_assignments(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"📜 *Assignments ({len(sorted_items)} total)*"]
     for ref, info in sorted_items:
-        valuer = info.get("valuer_name", "Unknown")
-        when   = info.get("assigned_at", "—")
-        lines.append(f"• `{ref}`\n  👤 {valuer} | 🕐 {when}")
+        valuer   = info.get("valuer_name", "Unknown")
+        when     = info.get("assigned_at", "—")
+        # Every other assignment source (DLV Batch, Receive Tasks, Auto
+        # Fetch's sectional auto-route) is Stamp-Duty-only and predates this
+        # field, so a missing "workflow" defaults to Stamp Duty rather than
+        # showing as unknown.
+        workflow = _WORKFLOW_LABELS.get(info.get("workflow"), _WORKFLOW_LABELS["stamp_duty"])
+        lines.append(f"• `{ref}`\n  👤 {valuer} | 🕐 {when} | {workflow}")
 
     async def _send(text, reply_markup):
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
@@ -275,18 +313,42 @@ async def cmd_assignments(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────
-# Step 1 — /assign → ask reference numbers
+# Step 0 — /assign → ask which workflow this batch belongs to
 # ──────────────────────────────────────────────────────────
 async def cmd_assign(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     ctx.user_data["session"] = Session()
     await update.message.reply_text(
         "📋 *New Assignment Flow*\n\n"
-        "Step 1 — How would you like to provide the reference numbers?",
+        "Step 0 — Which workflow is this?",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove(),
     )
     await update.message.reply_text(
+        "Choose a workflow:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Stamp Duty",              callback_data="workflow:stamp_duty")],
+            [InlineKeyboardButton("🏘 Land Rent Determination", callback_data="workflow:land_rent")],
+        ]),
+    )
+    return S.WORKFLOW_TYPE
+
+
+# ──────────────────────────────────────────────────────────
+# Step 1 — workflow chosen → ask reference numbers
+# ──────────────────────────────────────────────────────────
+async def recv_workflow_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    sess = get_sess(ctx)
+    sess.workflow = query.data.split(":")[1]
+
+    await query.edit_message_text(
+        f"✅ Workflow: *{_WORKFLOW_LABELS[sess.workflow]}*\n\n"
+        "Step 1 — How would you like to provide the reference numbers?",
+        parse_mode="Markdown",
+    )
+    await query.message.reply_text(
         "Choose an input method:",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ Type Reference Numbers", callback_data="input:text")],
@@ -788,9 +850,17 @@ async def recv_valuer_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────
 # Post-assignment verification — built on Lookup Reference's primitives
 # ──────────────────────────────────────────────────────────
-def _lookup_one_ref(tokens: AuthTokens, ref: str) -> Tuple[str, Dict]:
-    """Search + detail-fetch for a single ref. Returns (formatted result
-    string for display, raw context dict for persist_assignment enrichment)."""
+def _lookup_one_ref(tokens: AuthTokens, ref: str, workflow: str) -> Tuple[str, Dict]:
+    """Search + detail-fetch for a single ref, via the Stamp Duty or LRD
+    primitives per workflow. Returns (formatted result string for display,
+    raw context dict for persist_assignment enrichment)."""
+    if workflow == "land_rent":
+        item = _lu_search_ref_lrd(tokens, ref)
+        if not item:
+            return f"⚠️ `{ref}` — not found in post-assignment lookup", {}
+        detail = _lu_fetch_detail_lrd(tokens, item["id"])
+        return _lu_format_lrd_result(ref, item, detail), _lu_extract_context_lrd(item, detail)
+
     item = _lu_search_ref(tokens, ref)
     if not item:
         return f"⚠️ `{ref}` — not found in post-assignment lookup", {}
@@ -798,18 +868,19 @@ def _lookup_one_ref(tokens: AuthTokens, ref: str) -> Tuple[str, Dict]:
     return _lu_format_result(ref, item, detail), _lu_extract_context(item, detail)
 
 
-def _post_assignment_report(tokens: AuthTokens, ok_refs: List[str]) -> Tuple[List[str], Dict[str, Dict]]:
+def _post_assignment_report(tokens: AuthTokens, ok_refs: List[str], workflow: str) -> Tuple[List[str], Dict[str, Dict]]:
     """
     Run lookups for all successfully assigned refs in parallel. Returns
     (chunked message pages ready for Telegram, each ok ref's raw
-    parcel/consideration/registry/county context for enriching its
-    saved_assignments.json record — see recv_confirm).
+    enrichment context for its saved_dlv_records.json record — see
+    recv_confirm). workflow picks Stamp Duty vs LRD lookup primitives,
+    same as _lookup_one_ref.
     """
     results: Dict[str, str] = {}
     extras:  Dict[str, Dict] = {}
     workers = min(len(ok_refs), 10)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        fut_map = {pool.submit(_lookup_one_ref, tokens, ref): ref for ref in ok_refs}
+        fut_map = {pool.submit(_lookup_one_ref, tokens, ref, workflow): ref for ref in ok_refs}
         for fut in _futures_as_completed(fut_map):
             ref = fut_map[fut]
             try:
@@ -871,22 +942,27 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-    url     = STAMP_DUTY_FIX_APPLICATION_URL
     headers = {
         "Authorization": f"Bearer {sess.tokens.access_token}",
         "JWTAUTH":       f"Bearer {sess.tokens.jwt}",
     }
+    # Land Rent Determination's fix_parcel_number endpoint takes a narrower
+    # body than Stamp Duty's — no "node" field, per confirmed working usage.
+    if sess.workflow == "land_rent":
+        url = LRD_FIX_PARCEL_NUMBER_URL
+    else:
+        url = STAMP_DUTY_FIX_APPLICATION_URL
 
     ok_refs, fail_refs = [], []
     result_lines = []
 
     for ref in sess.refs:
         try:
-            r = sess.session.post(
-                url, headers=headers,
-                json={"reference_number": ref, "valuation_officer": uid, "node": "VALUATION_STAMP_DUTY_VALUER_REPORT"},
-                timeout=30,
-            )
+            if sess.workflow == "land_rent":
+                body = {"reference_number": ref, "valuation_officer": uid}
+            else:
+                body = {"reference_number": ref, "valuation_officer": uid, "node": "VALUATION_STAMP_DUTY_VALUER_REPORT"}
+            r = sess.session.post(url, headers=headers, json=body, timeout=30)
             r.raise_for_status()
             ok_refs.append(ref)
             result_lines.append(f"✅ `{ref}`")
@@ -900,8 +976,9 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for ref in ok_refs:
             # "Direct" distinguishes this from DLV Batch's queue-assigned refs
             # (tagged "Queue" or a user-chosen dlv_core.DLV_TAGS value) — New
-            # Assignment always assigns immediately, never via a queue.
-            persist_assignment(ref, name, uid, extra={"valuer_acct": acct, "tag": "Direct"})
+            # Assignment always assigns immediately, never via a queue. "workflow"
+            # is separate from "tag" — it's Stamp Duty vs Land Rent, not queue-vs-direct.
+            persist_assignment(ref, name, uid, extra={"valuer_acct": acct, "tag": "Direct", "workflow": sess.workflow})
 
     header = (
         f"🏁 *Assignment Complete*\n\n"
@@ -923,25 +1000,29 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if ok_refs:
         await query.message.reply_text("🔍 Fetching post-assignment status…", parse_mode="Markdown")
-        pages, extras = await asyncio.to_thread(_post_assignment_report, sess.tokens, ok_refs)
+        pages, extras = await asyncio.to_thread(_post_assignment_report, sess.tokens, ok_refs, sess.workflow)
         for i, page in enumerate(pages):
             markup = _main_menu() if i == len(pages) - 1 else None
             await query.message.reply_text(page, parse_mode="Markdown", reply_markup=markup)
 
-        # Enrich each already-persisted assignment with parcel/consideration/
-        # registry/county now that the post-assignment lookup has them —
-        # best-effort, so a lookup/write hiccup here doesn't affect the
-        # assignment itself, which was already recorded above.
+        # Enrich each already-persisted assignment with whatever the
+        # post-assignment lookup found (parcel/consideration/registry/county
+        # for Stamp Duty, or parcel_number/child_parcels/node_code for LRD)
+        # now that it's available — best-effort, so a lookup/write hiccup
+        # here doesn't affect the assignment itself, already recorded above.
         for ref in ok_refs:
             ctx_extra = extras.get(ref)
             if not ctx_extra:
                 continue
             try:
-                # Re-passes valuer_acct/tag since persist_assignment rebuilds
-                # the record from scratch each call rather than merging with
-                # what's already saved — this second call would otherwise
-                # drop them.
-                persist_assignment(ref, name, uid, extra={"valuer_acct": acct, "tag": "Direct", **ctx_extra})
+                # persist_assignment merges onto the existing record rather
+                # than replacing it, so valuer_acct/tag/workflow from the
+                # first call already survive without being repeated here —
+                # re-passed anyway for explicitness/defensiveness, harmless
+                # since the values are identical either way.
+                persist_assignment(ref, name, uid, extra={
+                    "valuer_acct": acct, "tag": "Direct", "workflow": sess.workflow, **ctx_extra,
+                })
             except Exception as e:
                 logger.error("persist_assignment enrichment failed for %s: %s", ref, e)
 
@@ -961,6 +1042,7 @@ def register(app: Application) -> None:
             MessageHandler(filters.Regex(f"^{re.escape(BTN_ASSIGN)}$"), cmd_assign),
         ],
         states={
+            S.WORKFLOW_TYPE:      [CallbackQueryHandler(recv_workflow_type, pattern=r"^workflow:")],
             S.INPUT_METHOD:       [CallbackQueryHandler(recv_input_method, pattern=r"^input:")],
             S.REF_NUMBERS:        [MessageHandler(not_cancel, recv_refs)],
             S.RECV_PHOTOS:        [

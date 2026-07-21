@@ -26,13 +26,24 @@ own format, not picked by the user — no credential-picker step:
   application-list/detail-view endpoints (`_LU_SEARCH_COMBOS`) under the
   Staff Valuer (`staff_valuer`) credential exclusively.
 
-_lu_search_ref/_lu_fetch_detail/_lu_format_result (the non-county path) are
-exported as this module's public API — bot.py's
-_post_assignment_report/_lookup_one_ref (used by New Assignment's
-post-assignment verification, which always looks up non-county refs it
-just assigned) import them from here rather than duplicating the search/
-detail/format logic; they're unaffected by the county-routing change above
-since that only applies to this module's own /lookup conversation.
+_lu_search_ref/_lu_fetch_detail/_lu_format_result/_lu_extract_context (the
+non-county Stamp Duty path) are exported as this module's public API —
+new_assignment.py's _post_assignment_report/_lookup_one_ref import them
+directly rather than duplicating the search/detail/format logic; they're
+unaffected by the county-routing change above since that only applies to
+this module's own /lookup conversation.
+
+_lu_search_ref_lrd/_lu_fetch_detail_lrd/_lu_extract_context_lrd/
+_lu_format_lrd_result are the Land Rent Determination (LRD) equivalent of
+the non-county Stamp Duty primitives above — a second, structurally
+similar workflow with its own valuationservice endpoints
+(LRD_APPLICATION_LIST_URL/LRD_APPLICATION_DETAIL_URL) and no monetary
+consideration (LRD reports on parcel subdivision instead — child_parcels'
+count/area). Also exported for new_assignment.py, which is the only
+current caller — LRD is not wired into this module's own /lookup
+auto-routing, since New Assignment already knows which workflow a ref
+belongs to from its own explicit picker, unlike /lookup which would have
+to guess from ref format alone.
 
 Call register(app) from bot.py's main() to wire this feature in.
 """
@@ -40,7 +51,7 @@ Call register(app) from bot.py's main() to wire this feature in.
 import asyncio
 import re
 from enum import Enum, auto
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from telegram import Update
 from telegram.ext import (
@@ -73,6 +84,8 @@ from common import (
 from endpoints import (
     ASSESSOR_STAGE_DETAIL_URL,
     ASSESSOR_STAGE_LIST_URL,
+    LRD_APPLICATION_DETAIL_URL,
+    LRD_APPLICATION_LIST_URL,
     STAMP_DUTY_APPLICATION_DETAIL_URL,
     STAMP_DUTY_APPLICATION_LIST_URL,
 )
@@ -267,6 +280,132 @@ def _lu_format_result(ref: str, item: Dict, detail: Optional[Dict]) -> str:
         f"📍 *County:* {county}",
         f"💰 *Consideration:* {consideration}",
         f"📋 *Parcel:* {parcel}",
+        f"📅 *Created:* {created}",
+    ]
+    return "\n".join(lines)
+
+
+# Land Rent Determination (LRD) — a second, structurally similar workflow
+# to Stamp Duty above, with its own valuationservice endpoints and no
+# monetary consideration (LRD is about parcel subdivision, not payment).
+# Same "no cparams, role=DLV" header/param style as _lu_search_ref/
+# _lu_fetch_detail above, since it's the same valuationservice root.
+_LU_LRD_FILTERS = ["Pending", "Ongoing", "Completed", "Returned", "On-hold"]
+
+
+def _lu_search_ref_lrd(tokens: AuthTokens, ref: str) -> Optional[Dict]:
+    """Search all 5 LRD filters for ref. Returns the list-item dict (with 'id') or None."""
+    http_sess = build_session()
+    hdrs = {
+        "Authorization": f"Bearer {tokens.access_token}",
+        "JWTAUTH":       f"Bearer {tokens.jwt}",
+    }
+    for filt in _LU_LRD_FILTERS:
+        try:
+            resp = http_sess.get(
+                LRD_APPLICATION_LIST_URL,
+                headers=hdrs,
+                params={"filter": filt, "role": "DLV", "search": ref, "page": 1},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            for item in resp.json().get("results", []):
+                if item.get("reference_number") == ref:
+                    item["_matched_filter"] = filt
+                    return item
+        except Exception as e:
+            logger.warning("LU LRD search filter=%s failed: %s", filt, e)
+    return None
+
+
+def _lu_fetch_detail_lrd(tokens: AuthTokens, app_id: str) -> Optional[Dict]:
+    """Fetch detail-view for a given LRD application ID. Response is the
+    detail record directly (no wrapping "details" key, unlike the
+    stampdutyservice county detail-view)."""
+    http_sess = build_session()
+    try:
+        resp = http_sess.get(
+            LRD_APPLICATION_DETAIL_URL,
+            headers={
+                "Authorization": f"Bearer {tokens.access_token}",
+                "JWTAUTH":       f"Bearer {tokens.jwt}",
+            },
+            params={"request_id": app_id},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.warning("LU LRD detail fetch failed for id=%s: %s", app_id, e)
+        return None
+
+
+def _lu_extract_context_lrd(item: Dict, detail: Optional[Dict]) -> Dict:
+    """Pull application_status/date_created/node_code/parcel_number/
+    child_parcels out of a search item + detail-view pair as raw values,
+    for callers that persist them (new_assignment.py enriching
+    saved_dlv_records.json) rather than display them. node_code comes
+    from external_process_details — a more granular stage than the
+    top-level "node" (which drives VALUATION_LRD_* assignment logic and is
+    deliberately left out of this enrichment payload). child_parcels is
+    stored as the raw list ({parcel_number, area, area_units} per item) —
+    no summarization here, that's _lu_format_lrd_result's job for display."""
+    ext = (detail or {}).get("external_process_details") or {}
+    return {
+        "application_status": (detail or item).get("application_status") or item.get("application_status") or "",
+        "date_created":       (detail or item).get("date_created") or item.get("date_created") or "",
+        "node_code":          ext.get("node_code", ""),
+        "parcel_number":      (detail or item).get("parcel_number") or item.get("parcel_number") or "",
+        "child_parcels":      (detail or {}).get("child_parcels") or [],
+    }
+
+
+def _lu_summarize_child_parcels(child_parcels: List[Dict]) -> str:
+    """"N parcel(s) — X UNIT total" per distinct area_units (child parcels
+    within one application are expected to share units, but summing per
+    unit rather than assuming it avoids silently mixing e.g. MSQ and HA)."""
+    if not child_parcels:
+        return "—"
+    totals: Dict[str, float] = {}
+    for cp in child_parcels:
+        units = cp.get("area_units") or "?"
+        try:
+            totals[units] = totals.get(units, 0.0) + float(cp.get("area") or 0)
+        except (ValueError, TypeError):
+            continue
+    parts = [f"{total:,.2f} {units}" for units, total in totals.items()]
+    return f"{len(child_parcels)} parcel(s) — {', '.join(parts) or 'area unknown'} total"
+
+
+def _lu_format_lrd_result(ref: str, item: Dict, detail: Optional[Dict]) -> str:
+    """Build the lookup result message for an LRD reference — same visual
+    as _lu_format_result, but a "Child Parcels" summary line instead of
+    Consideration (LRD has no monetary consideration)."""
+    status = (item.get("application_status") or "—").upper()
+    node_raw = ""
+    ext: Dict = {}
+
+    if detail:
+        node_raw = detail.get("node", "")
+        ext      = detail.get("external_process_details") or {}
+
+    node_label     = _NODE_LABELS.get(node_raw, node_raw or "—")
+    location       = ext.get("location_details") or {}
+    registry       = location.get("registry") or (detail or item).get("registry") or "—"
+    county         = location.get("county")   or (detail or item).get("county")   or "—"
+    parcel         = (detail or item).get("parcel_number") or item.get("parcel_number") or "—"
+    child_parcels  = _lu_summarize_child_parcels((detail or {}).get("child_parcels") or [])
+    created        = item.get("date_created", "—")
+
+    lines = [
+        "🔎 *Reference Lookup — Land Rent Determination*\n",
+        f"📌 *Ref:* `{ref}`",
+        f"📊 *Status:* {status}",
+        f"🔄 *Node:* {node_label}",
+        f"🏢 *Registry:* {registry}",
+        f"📍 *County:* {county}",
+        f"📋 *Parcel:* {parcel}",
+        f"🧩 *Child Parcels:* {child_parcels}",
         f"📅 *Created:* {created}",
     ]
     return "\n".join(lines)
