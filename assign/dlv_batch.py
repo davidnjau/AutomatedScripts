@@ -8,7 +8,10 @@ viewer.
 
 Users send lines like "REF1, REF2 : Valuer Name"; refs are queued into
 saved_dlv_batch.json (via dlv_core) and a repeating background job tries
-to find + assign each one in DLV until it succeeds or closes out.
+to find + assign each one in DLV until it succeeds or closes out. Every
+newly-queued ref is also auto-enrolled into Hold Tasks' guard queue
+(hold_tasks.add_to_hold) at confirm time, so it's protected against
+takeover from the moment it's queued rather than only once assigned.
 
 Before confirming, refs can optionally be tagged (one of dlv_core.DLV_TAGS,
 or 🔢 Incremental — dlv_incremental.py's auto-sequenced "B{batch}-T{task}"
@@ -80,6 +83,7 @@ from dlv_core import (
 from dlv_incremental import next_incremental_tag
 from endpoints import ACCOUNTS_LIST_URL, STAMP_DUTY_FIX_APPLICATION_URL
 from fetch_tasks_cache import _fetch_tasks_log_lookup, _fetch_tasks_log_remove
+from hold_tasks import add_to_hold
 from task_block import format_labeled_block
 from telegram_report import _send_chunked_report
 
@@ -750,6 +754,9 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # The Fetch Tasks cache has now been folded into the batch item itself —
     # drop it so the cache doesn't keep growing with refs already queued.
     _fetch_tasks_log_remove([i["ref"] for i in new_items])
+    # Guard every freshly-queued ref against takeover from the moment it's
+    # queued, not just once someone manually adds it via Hold Tasks.
+    add_to_hold(new_items)
 
     tokens = _any_valid_tokens()
     if not tokens:
