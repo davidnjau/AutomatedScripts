@@ -367,16 +367,16 @@ async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # DLV Queue viewer
 # ──────────────────────────────────────────────────────────
 
-# Current DLV batch job interval in seconds (default 5 min); updated by user choice
-_dlv_batch_interval: int = 300
+# Current DLV batch job interval in seconds (default 1 min); updated by user choice
+_dlv_batch_interval: int = 60
 
 
 def _dlv_queue_keyboard(current_interval: int) -> InlineKeyboardMarkup:
     options = [
-        ("1 min",       60),
+        ("Default (1 min)", 60),
         ("2 min",       120),
         ("3 min",       180),
-        ("Default (5 min)", 300),
+        ("5 min",       300),
     ]
     interval_row = [
         InlineKeyboardButton(
@@ -874,6 +874,6 @@ def register(app: Application) -> None:
         per_message=False,
     )
     app.add_handler(db_conv)
-    app.job_queue.run_repeating(_dlv_batch_job, interval=300, first=300, name="dlv_batch_job")
+    app.job_queue.run_repeating(_dlv_batch_job, interval=60, first=60, name="dlv_batch_job")
     app.add_handler(CallbackQueryHandler(recv_dlv_queue_action, pattern=r"^dlvq:"))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_QUEUE)}$"), cmd_dlv_queue))
