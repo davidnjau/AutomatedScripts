@@ -9,7 +9,14 @@ re-checking them: if the ref is still at the "valuer report pending" stage
 but the current valuer differs from who it was held for, it's reassigned
 back automatically. Once a held ref moves past that stage for any reason
 (completed, returned, back to unassigned, or simply no longer found), it's
-released from the hold queue on its own — no manual cleanup needed.
+released from the hold queue on its own — no manual cleanup needed. The
+guard job's default check interval is 1 minute (adjustable 1-10 min from
+the Held Queue viewer).
+
+add_to_hold() is a public entry point dlv_batch.py calls for every
+freshly-queued ref the moment it lands in saved_dlv_batch.json — so a DLV
+Batch submission is guarded from the instant it's queued, not only once
+someone separately adds it via ➕ Add Tasks to Hold.
 
 load_hold_tasks/save_hold_tasks are adapters over dlv_core's consolidated
 ref-keyed DLV-lifecycle store (Group A JSON consolidation, the last of its
@@ -81,8 +88,8 @@ _HT_WORKERS = 5   # worker pool size for both live-candidate detail lookups and 
 # (label, seconds) options for the check-interval picker — every whole minute from 1 to 10
 _HT_INTERVAL_OPTIONS = [(f"{m} min", m * 60) for m in range(1, 11)]
 
-# Current guard-job interval in seconds (default 5 min); changed via the Held Queue viewer
-_hold_tasks_interval: int = 300
+# Current guard-job interval in seconds (default 1 min); changed via the Held Queue viewer
+_hold_tasks_interval: int = 60
 
 
 # ──────────────────────────────────────────────────────────
@@ -130,6 +137,33 @@ def load_hold_tasks() -> List[Dict]:
         for ref, r in store.items()
         if r.get("hold") and r.get("status") != "removed"
     ]
+
+
+def add_to_hold(items: List[Dict]) -> None:
+    """Auto-enroll freshly-queued refs into the hold queue — called by
+    dlv_batch.py the moment new items land in saved_dlv_batch.json, so a
+    DLV Batch queue submission is guarded against takeover from the instant
+    it's queued rather than only after it's been manually added via
+    ➕ Add Tasks to Hold. Each item is {ref, valuer_name, valuer_uid, ...}
+    (the same shape dlv_batch's new-item dicts already have); refs already
+    held are left untouched."""
+    held      = load_hold_tasks()
+    held_refs = {i.get("ref") for i in held}
+    now       = datetime.now().isoformat(timespec="seconds")
+    for item in items:
+        ref = item.get("ref")
+        if not ref or ref in held_refs:
+            continue
+        held.append({
+            "ref":              ref,
+            "held_valuer_name": item.get("valuer_name", ""),
+            "held_valuer_uid":  item.get("valuer_uid", ""),
+            "held_at":          now,
+            "last_checked":     "",
+            "last_error":       "",
+        })
+        held_refs.add(ref)
+    save_hold_tasks(held)
 
 
 def save_hold_tasks(items: List[Dict]) -> None:
