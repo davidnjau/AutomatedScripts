@@ -21,6 +21,15 @@ Refresh strategy:
   bot flows (assign / receive / fetch).  Once those flows save tokens via
   persist_tokens(), the daemon picks them up and keeps them fresh.
 
+  A failed refresh (network blip, transient 5xx, etc.) is retried up to
+  RETRY_MAX times, RETRY_INTERVAL seconds apart, rather than giving up
+  immediately — a single transient failure must not permanently disable
+  auto-refresh for a credential. Only once retries are exhausted is the
+  credential marked failed (no further attempts until the bot saves fresh
+  tokens for it via OTP) and a Telegram alert sent to ALLOWED_IDS, so a
+  dead credential is surfaced immediately rather than discovered later
+  when its token has already expired.
+
 Usage:
     python token_refresh_daemon.py              # foreground
     nohup python token_refresh_daemon.py &      # background
@@ -36,7 +45,7 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -67,6 +76,11 @@ LOG_FILE   = os.path.join(_BASE_DIR, "data", "daemon.log")
 REFRESH_BEFORE  = 10 * 60   # 10 minutes
 # How often to scan cache for new / changed credentials
 SCAN_INTERVAL   = 5 * 60    # 5 minutes
+
+# Bounded retry on a failed refresh — a transient network/API blip shouldn't
+# permanently disable auto-refresh for a credential.
+RETRY_MAX       = 5    # attempts after the first failure before giving up
+RETRY_INTERVAL  = 90   # seconds between retry attempts
 
 TELEGRAM_API = "https://api.telegram.org"
 BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -226,8 +240,11 @@ scheduler = BackgroundScheduler(timezone="UTC")
 # so we don't double-schedule for the same expiry window.
 _scheduled: Dict[str, int] = {}   # cred_type → expiry_bucket (int(exp // 60))
 
-# Credentials that failed to refresh — never retried until new tokens are saved by the bot.
+# Credentials that exhausted their retries — not scheduled again until new tokens are saved by the bot.
 _failed: set = set()
+
+# In-flight retry attempt count per credential, since its first failed refresh this expiry window.
+_retry_count: Dict[str, int] = {}
 
 
 def _schedule_refresh(cred_type: str, exp: float) -> None:
@@ -289,7 +306,7 @@ def _refresh_job(cred_type: str) -> None:
     if not refresh_token:
         logger.warning(
             "[%s] No refresh_token stored — attempting header-only refresh. "
-            "If this fails the credential will be skipped until the bot re-authenticates via OTP.",
+            "If this keeps failing the credential will need to be re-authenticated via OTP.",
             cred_type,
         )
 
@@ -307,15 +324,41 @@ def _refresh_job(cred_type: str) -> None:
         _save_cache(cache)
 
         _scheduled.pop(cred_type, None)
-        _failed.discard(cred_type)   # clear any previous failure flag
+        _failed.discard(cred_type)      # clear any previous failure flag
+        _retry_count.pop(cred_type, None)
         logger.info("[%s] ✅ Token refreshed. New expiry: %s", cred_type, _fmt_ts(new_exp))
 
         # Schedule next refresh for the new expiry
         _schedule_refresh(cred_type, new_exp)
     else:
-        logger.warning("[%s] ❌ Refresh failed — will not retry until new tokens are saved.", cred_type)
-        _failed.add(cred_type)
-        _scheduled.pop(cred_type, None)
+        attempt = _retry_count.get(cred_type, 0) + 1
+        if attempt <= RETRY_MAX:
+            _retry_count[cred_type] = attempt
+            logger.warning(
+                "[%s] ❌ Refresh attempt %d/%d failed — retrying in %ds.",
+                cred_type, attempt, RETRY_MAX, RETRY_INTERVAL,
+            )
+            scheduler.add_job(
+                _refresh_job,
+                trigger=DateTrigger(run_date=datetime.now(tz=timezone.utc) + timedelta(seconds=RETRY_INTERVAL)),
+                id=f"refresh_{cred_type}",
+                args=[cred_type],
+                replace_existing=True,
+                misfire_grace_time=300,
+            )
+        else:
+            logger.warning(
+                "[%s] ❌ Refresh failed after %d attempts — will not retry until new tokens are saved.",
+                cred_type, RETRY_MAX,
+            )
+            _failed.add(cred_type)
+            _retry_count.pop(cred_type, None)
+            _scheduled.pop(cred_type, None)
+            _tg_broadcast(
+                f"⚠️ *Token Refresh Failed*\n\n"
+                f"*{label}* (`{cred_type}`) could not be auto-refreshed after {RETRY_MAX} attempts.\n"
+                f"Please re-authenticate it manually via *🔑 Refresh Auth* before its token expires."
+            )
 
 
 def _scan_cache() -> None:

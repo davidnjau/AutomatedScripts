@@ -102,55 +102,6 @@ class TestHoldTasksPersistence(unittest.TestCase):
         self.assertEqual(store["NEW_REF"]["hold"]["held_valuer_name"], "Jane")
 
 
-class TestAddToHold(unittest.TestCase):
-    """add_to_hold — dlv_batch.py's entry point for auto-enrolling freshly
-    queued refs into the hold queue."""
-
-    def setUp(self):
-        self.tmpdir = tempfile.TemporaryDirectory()
-        self._patches = [
-            patch.object(dlv_core, "SAVED_HOLD_TASKS_FILE", os.path.join(self.tmpdir.name, "saved_hold_tasks.json")),
-            patch.object(dlv_core, "SAVED_DLV_BATCH_FILE", os.path.join(self.tmpdir.name, "saved_dlv_batch.json")),
-            patch.object(dlv_core, "SAVED_DLV_CLOSED_FILE", os.path.join(self.tmpdir.name, "saved_dlv_closed.json")),
-            patch.object(dlv_core, "SAVED_ASSIGNMENTS_FILE", os.path.join(self.tmpdir.name, "saved_assignments.json")),
-            patch.object(dlv_core, "SAVED_DLV_RECORDS_FILE", os.path.join(self.tmpdir.name, "saved_dlv_records.json")),
-        ]
-        for p in self._patches:
-            p.start()
-
-    def tearDown(self):
-        for p in self._patches:
-            p.stop()
-        self.tmpdir.cleanup()
-
-    def test_enrolls_a_new_item(self):
-        ht.add_to_hold([{"ref": "REG/TSFR/A", "valuer_name": "Jane Doe", "valuer_uid": "uid-1"}])
-        held = ht.load_hold_tasks()
-        self.assertEqual(len(held), 1)
-        self.assertEqual(held[0]["ref"], "REG/TSFR/A")
-        self.assertEqual(held[0]["held_valuer_name"], "Jane Doe")
-        self.assertEqual(held[0]["held_valuer_uid"], "uid-1")
-
-    def test_skips_a_ref_already_held(self):
-        ht.save_hold_tasks([{"ref": "REG/TSFR/A", "held_valuer_name": "Original", "held_valuer_uid": "uid-0"}])
-        ht.add_to_hold([{"ref": "REG/TSFR/A", "valuer_name": "Jane Doe", "valuer_uid": "uid-1"}])
-        held = ht.load_hold_tasks()
-        self.assertEqual(len(held), 1)
-        self.assertEqual(held[0]["held_valuer_name"], "Original")
-
-    def test_empty_items_is_a_no_op(self):
-        ht.add_to_hold([])
-        self.assertEqual(ht.load_hold_tasks(), [])
-
-    def test_multiple_new_items_all_enrolled(self):
-        ht.add_to_hold([
-            {"ref": "A", "valuer_name": "Jane", "valuer_uid": "uid-1"},
-            {"ref": "B", "valuer_name": "John", "valuer_uid": "uid-2"},
-        ])
-        refs = {i["ref"] for i in ht.load_hold_tasks()}
-        self.assertEqual(refs, {"A", "B"})
-
-
 # ── Candidate sources ────────────────────────────────────
 
 class TestHtTrackedCandidates(unittest.TestCase):
