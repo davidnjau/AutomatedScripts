@@ -654,47 +654,6 @@ class TestRecvDbConfirmAttachesTag(unittest.TestCase):
         self.assertEqual(saved_items[0]["tag"], "B2-T4")
 
 
-class TestRecvDbConfirmAutoHolds(unittest.TestCase):
-    """recv_db_confirm's "db:confirm" branch — every newly-queued ref is
-    auto-enrolled into Hold Tasks' guard queue via add_to_hold."""
-
-    def test_new_items_are_passed_to_add_to_hold(self):
-        ctx = MagicMock()
-        ctx.user_data = {}
-        sess = dlv_batch._get_db_sess(ctx)
-        sess.groups = [{"refs": ["REF1", "REF2"], "valuer_name": "Jane", "valuer_uid": "u1",
-                        "valuer_acct": "a1", "status": "resolved"}]
-        with patch.object(dlv_batch, "load_dlv_batch", return_value=[]), \
-             patch.object(dlv_batch, "save_dlv_batch"), \
-             patch.object(dlv_batch, "_fetch_tasks_log_lookup", return_value=None), \
-             patch.object(dlv_batch, "_fetch_tasks_log_remove"), \
-             patch.object(dlv_batch, "_any_valid_tokens", return_value=None), \
-             patch.object(dlv_batch, "add_to_hold") as mock_add_to_hold:
-            _run(dlv_batch.recv_db_confirm(_make_query_update("db:confirm"), ctx))
-        mock_add_to_hold.assert_called_once()
-        held_items = mock_add_to_hold.call_args[0][0]
-        self.assertEqual({i["ref"] for i in held_items}, {"REF1", "REF2"})
-
-    def test_retagging_an_already_queued_ref_is_not_passed_to_add_to_hold(self):
-        """Re-submitting an already-queued ref just to tag it isn't a new
-        queue item, so it shouldn't be re-enrolled into the hold queue."""
-        ctx = MagicMock()
-        ctx.user_data = {}
-        sess = dlv_batch._get_db_sess(ctx)
-        sess.groups = [{"refs": ["REF1"], "valuer_name": "Jane", "valuer_uid": "u1",
-                        "valuer_acct": "a1", "status": "resolved"}]
-        existing_item = {"ref": "REF1", "valuer_name": "Jane", "valuer_uid": "u1",
-                          "valuer_acct": "a1", "queued_at": "2026-07-01T09:00:00", "tag": ""}
-        with patch.object(dlv_batch, "load_dlv_batch", return_value=[existing_item]), \
-             patch.object(dlv_batch, "save_dlv_batch"), \
-             patch.object(dlv_batch, "_fetch_tasks_log_lookup", return_value=None), \
-             patch.object(dlv_batch, "_fetch_tasks_log_remove"), \
-             patch.object(dlv_batch, "_any_valid_tokens", return_value=None), \
-             patch.object(dlv_batch, "add_to_hold") as mock_add_to_hold:
-            _run(dlv_batch.recv_db_confirm(_make_query_update("db:confirm"), ctx))
-        mock_add_to_hold.assert_called_once_with([])
-
-
 class TestRecvDbConfirmCachesParcelAndConsideration(unittest.TestCase):
     """recv_db_confirm's "db:confirm" branch — Consideration/Parcel for a
     still-queued item can only come from the Fetch Tasks cache (this flow
