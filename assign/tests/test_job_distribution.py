@@ -15,12 +15,23 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import openpyxl
+
 import job_distribution as jd
 import token_rotator
 from ardhisasa_auth import AuthTokens
 from token_rotator import _AllTokensExhausted, _TokenRotator
 
 TOKENS = AuthTokens(access_token="acc", jwt="jwt")
+
+
+def _load_workbook(xlsx_bytes):
+    import io
+    return openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
+
+
+def _sheet_rows(ws):
+    return [list(row) for row in ws.iter_rows(min_row=1, values_only=True)]
 
 
 def _run(coro):
@@ -139,6 +150,96 @@ class TestRecvJdCred(unittest.TestCase):
             result = _run(jd.recv_jd_cred(update, ctx))
         self.assertEqual(result, jd.JD.COUNTY)
         self.assertEqual(ctx.user_data["jd_session"].counties, jd._JD_COUNTY_KEYS)
+
+
+class TestJdBuildExcel(unittest.TestCase):
+    def setUp(self):
+        self.teams = [
+            {"id": "t1", "team_name": "Team A", "min_amount": 0, "max_amount": 1000000},
+            {"id": "t2", "team_name": "Team B", "min_amount": 0, "max_amount": 1000000},
+        ]
+        self.members_by_team = {
+            "t1": [
+                {"userid": "u1", "name": "Alice", "account_number": "A1",
+                 "availability": "AVAILABLE", "registry": "R1"},
+                {"userid": "u2", "name": "Bob", "account_number": "A2",
+                 "availability": "AVAILABLE", "registry": "R1"},
+            ],
+            "t2": [
+                {"userid": "u3", "name": "Carol", "account_number": "A3",
+                 "availability": "AVAILABLE", "registry": "R2"},
+            ],
+        }
+        # u1: 4 tasks, u2: 0 tasks, u3: 2 tasks → total assigned = 6
+        self.tasks_by_userid = {
+            "u1": [{"reference_number": f"REF-{i}"} for i in range(4)],
+            "u3": [{"reference_number": f"REF-C{i}"} for i in range(2)],
+        }
+        self.unassigned_tasks = [
+            {"reference_number": "PEND-1"}, {"reference_number": "PEND-2"},
+        ]
+
+    def _build(self):
+        xlsx_bytes = jd._jd_build_excel(
+            self.teams, self.members_by_team, self.tasks_by_userid, self.unassigned_tasks
+        )
+        return _load_workbook(xlsx_bytes)
+
+    def test_team_summary_has_pending_tasks_column_on_every_row(self):
+        wb   = self._build()
+        rows = _sheet_rows(wb["Team Summary"])
+        header = rows[0]
+        self.assertIn("Pending Tasks", header)
+        pending_col = header.index("Pending Tasks")
+        assigned_col = header.index("Assigned Tasks")
+
+        # Team A row and Team B row must both show the true pending total (2), not blank.
+        team_rows = [r for r in rows[1:] if r[0] in ("Team A", "Team B")]
+        self.assertEqual(len(team_rows), 2)
+        for r in team_rows:
+            self.assertEqual(r[pending_col], 2)
+
+        # Team A: assigned=4, Team B: assigned=2
+        by_name = {r[0]: r for r in team_rows}
+        self.assertEqual(by_name["Team A"][assigned_col], 4)
+        self.assertEqual(by_name["Team B"][assigned_col], 2)
+
+    def test_team_summary_has_grand_total_row(self):
+        wb   = self._build()
+        rows = _sheet_rows(wb["Team Summary"])
+        header = rows[0]
+        pending_col  = header.index("Pending Tasks")
+        assigned_col = header.index("Assigned Tasks")
+
+        total_row = next(r for r in rows if r[0] == "TOTAL")
+        self.assertEqual(total_row[assigned_col], 6)
+        self.assertEqual(total_row[pending_col], 2)
+
+    def test_member_distribution_lists_below_average_members(self):
+        wb   = self._build()
+        rows = _sheet_rows(wb["Member Distribution"])
+        first_cells = [r[0] for r in rows]
+
+        overall_idx = next(
+            i for i, v in enumerate(first_cells)
+            if isinstance(v, str) and v.startswith("MEMBERS BELOW OVERALL AVERAGE")
+        )
+        team_idx = next(
+            i for i, v in enumerate(first_cells)
+            if v == "MEMBERS BELOW THEIR OWN TEAM'S AVERAGE"
+        )
+
+        # overall avg = 6 tasks / 3 members = 2.0 → only Bob (0 tasks) is below it
+        overall_section = rows[overall_idx:team_idx]
+        self.assertIn("Bob", [r[0] for r in overall_section])
+        self.assertNotIn("Alice", [r[0] for r in overall_section])
+        self.assertNotIn("Carol", [r[0] for r in overall_section])
+
+        # Team A avg = 4/2 = 2.0, Team B avg = 2/1 = 2.0 → only Bob (0) is below its team avg
+        team_section = rows[team_idx:]
+        self.assertIn("Bob", [r[0] for r in team_section])
+        self.assertNotIn("Alice", [r[0] for r in team_section])
+        self.assertNotIn("Carol", [r[0] for r in team_section])
 
 
 class TestRecvJdCounty(unittest.TestCase):
