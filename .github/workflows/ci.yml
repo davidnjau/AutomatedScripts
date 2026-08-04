@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main, assign]
+    paths: ["assign/**", ".github/workflows/ci.yml"]
   pull_request:
     branches: [main, assign]
+    paths: ["assign/**", ".github/workflows/ci.yml"]
   workflow_dispatch:
 
 jobs:
@@ -44,3 +46,20 @@ jobs:
 
       - name: Run test suite
         run: python3 -m unittest discover -s tests -v
+
+  deploy-assign:
+    needs: test
+    if: github.ref == 'refs/heads/assign' && github.event_name == 'push'
+    runs-on: [self-hosted, ardhisasa-bot]
+    defaults:
+      run:
+        working-directory: assign
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Rebuild and restart bot
+        run: docker-compose up --build -d
+
+      - name: Prune dangling images
+        run: docker image prune -f

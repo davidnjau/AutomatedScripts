@@ -1,0 +1,27 @@
+name: Entries CI
+
+on:
+  push:
+    branches: [main, entries]
+    paths: ["entries/**", ".github/workflows/entries-ci.yml"]
+  pull_request:
+    branches: [main, entries]
+    paths: ["entries/**", ".github/workflows/entries-ci.yml"]
+  workflow_dispatch:
+
+jobs:
+  deploy-entries:
+    if: github.ref == 'refs/heads/entries' && github.event_name == 'push'
+    runs-on: [self-hosted, ardhisasa-bot]
+    defaults:
+      run:
+        working-directory: entries
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Rebuild and restart bot
+        run: docker-compose up --build -d
+
+      - name: Prune dangling images
+        run: docker image prune -f
