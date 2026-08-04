@@ -218,10 +218,15 @@ def _jd_build_excel(
     _header_row(ws1, [
         "Team Name", "Min Amount (KES)", "Max Amount (KES)",
         "Total Members", "Available", "Not Available",
-        "Assigned Tasks", "Unassigned Tasks", "Assigned %",
+        "Assigned Tasks", "Pending Tasks", "Assigned %",
     ])
 
-    total_unassigned = len(unassigned_tasks)
+    total_unassigned    = len(unassigned_tasks)
+    total_assigned_all  = sum(
+        len(tasks_by_userid.get(m.get("userid", ""), []))
+        for team in teams for m in members_by_team.get(team["id"], [])
+    )
+    grand_total = total_assigned_all + total_unassigned
 
     for i, team in enumerate(teams, start=2):
         tid     = team["id"]
@@ -229,8 +234,7 @@ def _jd_build_excel(
         available     = sum(1 for m in members if m.get("availability") == "AVAILABLE")
         not_available = len(members) - available
         assigned      = sum(len(tasks_by_userid.get(m["userid"], [])) for m in members)
-        total_for_team = assigned + (total_unassigned if i == 2 else 0)
-        pct = f"{assigned / total_for_team * 100:.1f}%" if total_for_team else "N/A"
+        pct = f"{assigned / grand_total * 100:.1f}%" if grand_total else "N/A"
 
         row = [
             team.get("team_name", ""),
@@ -240,13 +244,31 @@ def _jd_build_excel(
             available,
             not_available,
             assigned,
-            total_unassigned if i == 2 else "",
+            total_unassigned,
             pct,
         ]
         ws1.append(row)
         if i % 2 == 0:
             for c in range(1, 10):
                 ws1.cell(row=i, column=c).fill = alt_fill
+
+    # ── Grand total row — Pending tasks have no team, so they're
+    # shown once per row above; this row makes the aggregate explicit. ──
+    total_row_idx = ws1.max_row + 1
+    ws1.append([
+        "TOTAL", "", "",
+        sum(len(members_by_team.get(t["id"], [])) for t in teams),
+        sum(1 for t in teams for m in members_by_team.get(t["id"], []) if m.get("availability") == "AVAILABLE"),
+        sum(1 for t in teams for m in members_by_team.get(t["id"], []) if m.get("availability") != "AVAILABLE"),
+        total_assigned_all,
+        total_unassigned,
+        f"{total_assigned_all / grand_total * 100:.1f}%" if grand_total else "N/A",
+    ])
+    for c in range(1, 10):
+        cell      = ws1.cell(row=total_row_idx, column=c)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="BDD7EE")
+
     _autofit(ws1)
 
     # ── Sheet 2: Member Distribution ──────────────────────
@@ -259,6 +281,8 @@ def _jd_build_excel(
     warn_fill = PatternFill("solid", fgColor="FFE0B2")   # amber for out-of-range rows
 
     row_idx = 2
+    all_member_rows: List[dict] = []   # collected here, used by the below-average sections below
+    total_members_all = 0
     for team in teams:
         tid     = team["id"]
         members = members_by_team.get(tid, [])
@@ -268,6 +292,9 @@ def _jd_build_excel(
         )
         team_min = float(team.get("min_amount") or 0)
         team_max = float(team.get("max_amount") or float("inf"))
+        team_assigned = sum(len(tasks_by_userid.get(m.get("userid", ""), [])) for m in members)
+        team_avg = team_assigned / len(members) if members else None
+        total_members_all += len(members)
 
         for m in members_sorted:
             uid   = m.get("userid", "")
@@ -320,6 +347,51 @@ def _jd_build_excel(
                 for c in range(1, 9):
                     ws2.cell(row=row_idx, column=c).fill = fill
             row_idx += 1
+            all_member_rows.append({
+                "name":     m.get("name", ""),
+                "team":     team.get("team_name", ""),
+                "tasks":    len(tasks),
+                "team_avg": team_avg,
+            })
+
+    # ── Below-average sections ─────────────────────────────
+    def _section_header(title):
+        ws2.append([])
+        ws2.append([title])
+        ws2.cell(row=ws2.max_row, column=1).font = Font(bold=True, size=13)
+
+    def _sub_header(cols):
+        ws2.append(cols)
+        for c in range(1, len(cols) + 1):
+            cell      = ws2.cell(row=ws2.max_row, column=c)
+            cell.font = hdr_font
+            cell.fill = PatternFill("solid", fgColor="D9E1F2")
+
+    overall_avg = total_assigned_all / total_members_all if total_members_all else None
+
+    if overall_avg is not None:
+        _section_header(f"MEMBERS BELOW OVERALL AVERAGE ({overall_avg:.1f} tasks/member)")
+        _sub_header(["Name", "Team", "Tasks Assigned", "Overall Average"])
+        below_overall = sorted(
+            (r for r in all_member_rows if r["tasks"] < overall_avg),
+            key=lambda r: r["tasks"],
+        )
+        for r in below_overall:
+            ws2.append([r["name"], r["team"], r["tasks"], round(overall_avg, 1)])
+        if not below_overall:
+            ws2.append(["No members are below the overall average."])
+
+    _section_header("MEMBERS BELOW THEIR OWN TEAM'S AVERAGE")
+    _sub_header(["Name", "Team", "Tasks Assigned", "Team Average"])
+    below_team = sorted(
+        (r for r in all_member_rows if r["team_avg"] is not None and r["tasks"] < r["team_avg"]),
+        key=lambda r: (r["team"], r["tasks"]),
+    )
+    for r in below_team:
+        ws2.append([r["name"], r["team"], r["tasks"], round(r["team_avg"], 1)])
+    if not below_team:
+        ws2.append(["No members are below their team's average."])
+
     _autofit(ws2)
 
     # ── Sheet 3: Unassigned / No Valuer Tasks ─────────────
@@ -568,7 +640,7 @@ def _jd_run(tokens: AuthTokens, chat_id: int, bot, loop, counties: Optional[List
         _tg(
             f"✅ Analysis complete.\n"
             f"• Assigned: *{assigned_count}* tasks\n"
-            f"• Unassigned / no VO: *{unassigned_count}* tasks\n"
+            f"• Pending / no VO: *{unassigned_count}* tasks\n"
             f"Building Excel report…"
         )
 
@@ -584,7 +656,7 @@ def _jd_run(tokens: AuthTokens, chat_id: int, bot, loop, counties: Optional[List
                     f"🏆 Job Distribution Report\n"
                     + (f"Counties: {', '.join(counties)}\n" if counties else "")
                     + f"Teams: {len(teams)} | Members: {total_members} | "
-                    f"Assigned: {assigned_count} | Unassigned: {unassigned_count}"
+                    f"Assigned: {assigned_count} | Pending: {unassigned_count}"
                 ),
             ),
             loop,
