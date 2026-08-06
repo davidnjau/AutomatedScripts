@@ -104,8 +104,7 @@ from common import (
     _ft_county_keyboard,
     _ft_registry_keyboard,
     _main_menu,
-    _apartment_multiselect_keyboard,
-    _sectional_keyboard,
+    _af_exclusion_multiselect_keyboard,
     allowed,
     cmd_cancel,
     deny,
@@ -144,8 +143,8 @@ class AF(Enum):
     REGISTRY    = auto()   # registry filter
     AMOUNT      = auto()   # pick amount range button
     AMOUNT_TEXT = auto()   # custom amount text entry
-    SECTIONAL   = auto()   # exclude / only / all sectional
-    APARTMENT   = auto()   # exclude / only / all apartment
+    EXCLUSION_MODE = auto()  # Allow All / Exclude All / Exclude (pick specific types)
+    EXCLUSION_PICK = auto()  # multi-select of Section + apartment-variant keywords
     EMAIL       = auto()   # optional recipient email address
     REPORT_FORMAT = auto()  # block (text) or Excel — asked unconditionally, governs Telegram + email alike
 
@@ -184,12 +183,22 @@ _AF_INTERVALS = [
 ]
 
 # Every parcel_number substring (case-insensitive) that marks a task as an
-# apartment task for the apartment filter and auto-routing below. Kept as one
-# list rather than repeating an inline check at each of the 4 call sites, so
-# adding/removing a variant is a one-line edit.
+# apartment task for apartment auto-routing below. Kept as one list rather
+# than repeating an inline check at each call site, so adding/removing a
+# variant is a one-line edit.
 _AF_APARTMENT_KEYWORDS = (
     "APARTMENT", "APPARTMENT", "FLAT", "BUILDING", "MASSIONNAITE", "LTL", "LTB", "APT",
 )
+
+# SECTION is a symbolic keyword, not a parcel_number substring — it stands
+# for the structural sectional-title rule (≥3 slashes) rather than literal
+# text, so the unified Exclude multi-select can offer it alongside the
+# apartment keywords in one list. _AF_EXCLUSION_KEYWORDS is that full list
+# (Section first, then every apartment variant) for the schedule-creation
+# "Exclude" step below; it has nothing to do with the separate, standalone
+# Sectional Properties/Apartments specialist-routing config modules.
+_AF_SECTION_KEYWORD = "SECTION"
+_AF_EXCLUSION_KEYWORDS = (_AF_SECTION_KEYWORD,) + _AF_APARTMENT_KEYWORDS
 
 
 def _af_is_apartment_task(t: Dict) -> bool:
@@ -198,32 +207,58 @@ def _af_is_apartment_task(t: Dict) -> bool:
     return any(kw in parcel for kw in _AF_APARTMENT_KEYWORDS)
 
 
-def _af_matches_excluded_apartment_keyword(t: Dict, excluded) -> bool:
-    """True if t's parcel_number contains any of the given excluded keywords."""
-    parcel = str(t.get("parcel_number") or "").upper()
-    return any(kw in parcel for kw in excluded)
+def _af_is_sectional_task(t: Dict) -> bool:
+    """True if t's parcel_number has the sectional-title shape (≥3 slashes),
+    e.g. Nairobi/Block12/345/888."""
+    return str(t.get("parcel_number") or "").count("/") >= 3
 
 
-def _af_get_apartment_excluded_keywords(cfg: Dict) -> set:
-    """Which apartment-variant keywords this schedule excludes. A schedule
-    created via the current multi-select step stores an explicit (possibly
-    empty) list under apartment_excluded_keywords. A schedule saved before
-    that step existed only has the old single-choice apartment_filter
-    ("exclude"/"only"/"all") — "exclude" (its default) maps to every
-    keyword, since that was the old default behavior; "only"/"all" have no
-    keyword-list equivalent, so they fall back to no exclusions."""
+def _af_task_matches_keyword(t: Dict, keyword: str) -> bool:
+    """True if t matches this single exclusion keyword. SECTION uses the
+    structural slash-count rule; every other keyword is a parcel_number
+    substring match."""
+    if keyword == _AF_SECTION_KEYWORD:
+        return _af_is_sectional_task(t)
+    return keyword in str(t.get("parcel_number") or "").upper()
+
+
+def _af_task_matches_excluded(t: Dict, excluded) -> bool:
+    """True if t matches any of the given excluded keywords."""
+    return any(_af_task_matches_keyword(t, kw) for kw in excluded)
+
+
+def _af_get_excluded_keywords(cfg: Dict) -> set:
+    """Which of the 9 exclusion keywords (SECTION + the 8 apartment
+    variants) this schedule excludes. Current schedules store one explicit
+    (possibly empty) list under excluded_keywords. A schedule saved before
+    Sectional and Apartment were unified into one Exclude step instead has
+    separate sectional_filter (the old ternary) and apartment_excluded_
+    keywords/apartment_filter fields, translated here: sectional_filter
+    == "exclude" (its old default) adds SECTION; "only"/"all" have no
+    keyword-list equivalent and add nothing — the same lossy fallback rule
+    already established for apartment_filter's own "only"/"all" values."""
+    if "excluded_keywords" in cfg:
+        return set(cfg["excluded_keywords"])
+
+    excluded = set()
+    if cfg.get("sectional_filter", "exclude") == "exclude":
+        excluded.add(_AF_SECTION_KEYWORD)
+
     if "apartment_excluded_keywords" in cfg:
-        return set(cfg["apartment_excluded_keywords"])
-    return set(_AF_APARTMENT_KEYWORDS) if cfg.get("apartment_filter", "exclude") == "exclude" else set()
+        excluded |= set(cfg["apartment_excluded_keywords"])
+    elif cfg.get("apartment_filter", "exclude") == "exclude":
+        excluded |= set(_AF_APARTMENT_KEYWORDS)
+
+    return excluded
 
 
-def _af_apartment_label(excluded) -> str:
-    """Human-readable summary of which apartment keywords a schedule excludes."""
+def _af_exclusion_label(excluded) -> str:
+    """Human-readable summary of a schedule's exclusion set."""
     excluded = set(excluded)
     if not excluded:
-        return "No apartment exclusions"
-    if excluded == set(_AF_APARTMENT_KEYWORDS):
-        return "All apartment variants excluded"
+        return "Allow All"
+    if excluded == set(_AF_EXCLUSION_KEYWORDS):
+        return "Exclude All"
     return "Excludes " + ", ".join(sorted(excluded))
 
 
@@ -282,14 +317,12 @@ def _af_format_schedule_summary(cfg: Dict) -> str:
     county  = cfg.get("county_filter", "") or "All"
     reg     = cfg.get("registry_filter", "") or "All"
     days    = cfg.get("days_back", 2)
-    sec     = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(
-                  cfg.get("sectional_filter", "exclude"), "Exclude Sectional")
-    ap      = _af_apartment_label(_af_get_apartment_excluded_keywords(cfg))
+    excl    = _af_exclusion_label(_af_get_excluded_keywords(cfg))
     email_s = cfg.get("email") or "Telegram only"
     return (
         f"📧 *{md_escape(email_s)}* — every {mins} min, days back: {days}\n"
         f"   County: {county.title()} | Registry: {reg.title()}\n"
-        f"   Amount: {lo_s} – {hi_s} | {sec} | {ap}"
+        f"   Amount: {lo_s} – {hi_s} | {excl}"
     )
 
 
@@ -320,8 +353,7 @@ def persist_af_result(run_id: str, run_at: str, tasks: List[Dict], cfg: Dict) ->
             "amount_min":       cfg.get("amount_min"),
             "amount_max":       cfg.get("amount_max"),
             "days_back":        cfg.get("days_back", 2),
-            "sectional_filter": cfg.get("sectional_filter", "exclude"),
-            "apartment_excluded_keywords": sorted(_af_get_apartment_excluded_keywords(cfg)),
+            "excluded_keywords": sorted(_af_get_excluded_keywords(cfg)),
         },
         "tasks": [
             {
@@ -581,11 +613,11 @@ async def recv_af_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["af_amount_max"] = amount_max
 
     await query.edit_message_text(
-        "Include sectional properties?\n_(Sectional: parcel has 4 parts e.g. Nairobi/Block12/345/888)_",
+        "Filter out sectional/apartment-type tasks?",
         parse_mode="Markdown",
-        reply_markup=_sectional_keyboard(),
+        reply_markup=_af_exclusion_mode_keyboard(),
     )
-    return AF.SECTIONAL
+    return AF.EXCLUSION_MODE
 
 
 async def recv_af_amount_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -611,43 +643,63 @@ async def recv_af_amount_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["af_amount_min"] = amount_min
     ctx.user_data["af_amount_max"] = amount_max
     await update.message.reply_text(
-        "Include sectional properties?\n_(Sectional: parcel has 4 parts e.g. Nairobi/Block12/345/888)_",
+        "Filter out sectional/apartment-type tasks?",
         parse_mode="Markdown",
-        reply_markup=_sectional_keyboard(),
+        reply_markup=_af_exclusion_mode_keyboard(),
     )
-    return AF.SECTIONAL
+    return AF.EXCLUSION_MODE
 
 
-async def recv_af_sectional(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+def _af_exclusion_mode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Allow All",   callback_data="ft_excl_mode:allow_all"),
+        InlineKeyboardButton("🚫 Exclude All", callback_data="ft_excl_mode:exclude_all"),
+        InlineKeyboardButton("🔧 Exclude",     callback_data="ft_excl_mode:pick"),
+    ]])
+
+
+async def _af_send_email_prompt(message) -> None:
+    """Shared tail of the exclusion step, however it was resolved — always
+    a new message, never editing whatever step (mode choice or multi-
+    select) just finished."""
+    await message.reply_text(
+        "📧 *Send results to email?*\n\n"
+        "Enter an email address, or send `skip` to notify via Telegram only.",
+        parse_mode="Markdown",
+    )
+
+
+async def recv_af_exclusion_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    choice = query.data.split(":", 1)[1]  # "allow_all" | "exclude_all" | "pick"
 
-    choice = query.data.split(":")[1]  # "exclude" | "only" | "all"
-    ctx.user_data["af_sectional"] = choice
-    label = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(choice, choice)
-    await query.edit_message_text(f"✅ Sectional: *{label}*", parse_mode="Markdown")
+    if choice == "pick":
+        # Starts empty (not everything checked) — Exclude All already covers
+        # "check everything"; this step is for building up a smaller,
+        # specific subset instead.
+        ctx.user_data["af_excluded_keywords"] = set()
+        await query.edit_message_text(
+            "🔧 *Exclude specific types*\n\n"
+            "Tap an item to toggle whether tasks matching it are excluded, "
+            "then tap ✅ Done.",
+            parse_mode="Markdown",
+            reply_markup=_af_exclusion_multiselect_keyboard(_AF_EXCLUSION_KEYWORDS, ctx.user_data["af_excluded_keywords"]),
+        )
+        return AF.EXCLUSION_PICK
 
-    # Apartments gets its own message rather than reusing/editing this one —
-    # its multi-select keyboard evolves over several taps before Done, which
-    # would otherwise churn the sectional confirmation text on every toggle.
-    ctx.user_data["af_apartment_excluded"] = set(_AF_APARTMENT_KEYWORDS)
-    await query.message.reply_text(
-        "🏬 *Apartment filter*\n\n"
-        "Tap a keyword to toggle whether tasks matching it are excluded, "
-        "then tap ✅ Done. All keywords start checked (excluded) — untap "
-        "any you want to keep in results.",
-        parse_mode="Markdown",
-        reply_markup=_apartment_multiselect_keyboard(_AF_APARTMENT_KEYWORDS, ctx.user_data["af_apartment_excluded"]),
-    )
-    return AF.APARTMENT
+    ctx.user_data["af_excluded_keywords"] = set(_AF_EXCLUSION_KEYWORDS) if choice == "exclude_all" else set()
+    label = "Allow All" if choice == "allow_all" else "Exclude All"
+    await query.edit_message_text(f"✅ Filter: *{label}*", parse_mode="Markdown")
+    await _af_send_email_prompt(query.message)
+    return AF.EMAIL
 
 
-async def recv_af_apartment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def recv_af_exclusion_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     choice = query.data.split(":", 1)[1]  # a keyword, or "done"
-    excluded = ctx.user_data.setdefault("af_apartment_excluded", set(_AF_APARTMENT_KEYWORDS))
+    excluded = ctx.user_data.setdefault("af_excluded_keywords", set())
 
     if choice != "done":
         if choice in excluded:
@@ -655,16 +707,12 @@ async def recv_af_apartment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             excluded.add(choice)
         await query.edit_message_reply_markup(
-            reply_markup=_apartment_multiselect_keyboard(_AF_APARTMENT_KEYWORDS, excluded),
+            reply_markup=_af_exclusion_multiselect_keyboard(_AF_EXCLUSION_KEYWORDS, excluded),
         )
-        return AF.APARTMENT
+        return AF.EXCLUSION_PICK
 
-    await query.edit_message_text(f"✅ Apartments: *{_af_apartment_label(excluded)}*", parse_mode="Markdown")
-    await query.message.reply_text(
-        "📧 *Send results to email?*\n\n"
-        "Enter an email address, or send `skip` to notify via Telegram only.",
-        parse_mode="Markdown",
-    )
+    await query.edit_message_text(f"✅ Filter: *{_af_exclusion_label(excluded)}*", parse_mode="Markdown")
+    await _af_send_email_prompt(query.message)
     return AF.EMAIL
 
 
@@ -693,8 +741,7 @@ def _af_create_schedule(ctx: ContextTypes.DEFAULT_TYPE, email: str, report_forma
     registry   = ctx.user_data.get("af_registry", "")
     amount_min = ctx.user_data.get("af_amount_min")
     amount_max = ctx.user_data.get("af_amount_max")
-    sectional          = ctx.user_data.get("af_sectional", "exclude")
-    apartment_excluded = sorted(ctx.user_data.get("af_apartment_excluded", set(_AF_APARTMENT_KEYWORDS)))
+    excluded_keywords = sorted(ctx.user_data.get("af_excluded_keywords", set()))
 
     cfg = {
         "interval_minutes": interval,
@@ -703,8 +750,7 @@ def _af_create_schedule(ctx: ContextTypes.DEFAULT_TYPE, email: str, report_forma
         "registry_filter":  registry,
         "amount_min":       amount_min,
         "amount_max":       amount_max,
-        "sectional_filter": sectional,
-        "apartment_excluded_keywords": apartment_excluded,
+        "excluded_keywords": excluded_keywords,
         "email":            email,
         "report_format":    report_format,
     }
@@ -727,10 +773,7 @@ def _af_schedule_created_text(cfg: Dict) -> str:
     hi_s      = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
     co_label  = (cfg.get("county_filter") or "").title() or "All"
     re_label  = (cfg.get("registry_filter") or "").title() or "All"
-    sec_label = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(
-        cfg.get("sectional_filter", "exclude"), cfg.get("sectional_filter", "exclude"),
-    )
-    ap_label = _af_apartment_label(_af_get_apartment_excluded_keywords(cfg))
+    excl_label = _af_exclusion_label(_af_get_excluded_keywords(cfg))
     email_label  = cfg.get("email") or "Telegram only"
     format_label = "Excel" if _af_get_report_format(cfg) == "excel" else "Text blocks"
     interval     = cfg.get("interval_minutes", 60)
@@ -738,7 +781,7 @@ def _af_schedule_created_text(cfg: Dict) -> str:
         f"✅ *Auto Fetch schedule added*\n"
         f"Every *{interval} min* | Days back: *{cfg.get('days_back', 2)}*\n"
         f"County: *{co_label}* | Registry: *{re_label}*\n"
-        f"Amount: {lo_s} – {hi_s} | Sectional: *{sec_label}* | Apartments: *{ap_label}*\n"
+        f"Amount: {lo_s} – {hi_s} | Filter: *{excl_label}*\n"
         f"Email: *{md_escape(email_label)}*\n"
         f"Format: *{format_label}*\n"
         f"Account: *{CRED_LABELS[_AF_CRED_TYPE]}* (requires a cached, valid login — check 🔒 Token Status)\n"
@@ -889,19 +932,12 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             return True
         tasks = [t for t in tasks if _in_range(t)]
 
-    # Sectional filter
-    sf = cfg.get("sectional_filter", "exclude")
-    if sf == "exclude":
-        tasks = [t for t in tasks if str(t.get("parcel_number") or "").count("/") < 3]
-    elif sf == "only":
-        tasks = [t for t in tasks if str(t.get("parcel_number") or "").count("/") >= 3]
-    # "all" → no filter
-
-    # Apartment filter — excludes any task whose parcel_number matches a
-    # keyword the schedule chose to exclude; an empty selection filters nothing.
-    apartment_excluded = _af_get_apartment_excluded_keywords(cfg)
-    if apartment_excluded:
-        tasks = [t for t in tasks if not _af_matches_excluded_apartment_keyword(t, apartment_excluded)]
+    # Exclusion filter (Section + apartment variants) — removes any task
+    # matching a keyword the schedule chose to exclude; an empty selection
+    # (Allow All) filters nothing.
+    excluded_keywords = _af_get_excluded_keywords(cfg)
+    if excluded_keywords:
+        tasks = [t for t in tasks if not _af_task_matches_excluded(t, excluded_keywords)]
 
     # Exclude already-queued refs
     queued_refs = {item.get("ref", "") for item in load_dlv_batch()}
@@ -914,8 +950,8 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         sc_cred_type = sc_cfg["cred_type"]
         sc_tokens    = get_valid_tokens(sc_cred_type)
         if sc_tokens:
-            sectional_tasks  = [t for t in tasks if str(t.get("parcel_number") or "").count("/") >= 3]
-            remaining_tasks  = [t for t in tasks if str(t.get("parcel_number") or "").count("/") < 3]
+            sectional_tasks  = [t for t in tasks if _af_is_sectional_task(t)]
+            remaining_tasks  = [t for t in tasks if not _af_is_sectional_task(t)]
             if sectional_tasks:
                 assigned_sc = []
                 failed_sc   = []
@@ -1024,12 +1060,11 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     hi_s     = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
     co_label  = county_filter.title() or "All"
     re_label  = registry_filter.title() or "All"
-    sec_label = {"exclude": "No Sectional", "only": "Sectional Only", "all": "All"}.get(sf, sf)
-    ap_label  = _af_apartment_label(apartment_excluded)
+    excl_label = _af_exclusion_label(excluded_keywords)
     header    = (
         f"⏰ *Auto Fetch — {len(tasks)} task(s)*\n"
         f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | "
-        f"{sec_label} | {ap_label}\n\n"
+        f"{excl_label}\n\n"
     )
 
     report_format = _af_get_report_format(cfg)
@@ -1081,7 +1116,7 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 plain_header = (
                     f"Auto Fetch — {len(new_tasks)} task(s)\n"
                     f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | "
-                    f"{sec_label} | {ap_label}\n"
+                    f"{excl_label}\n"
                     + "─" * 60 + "\n\n"
                 )
                 plain_sorted_tasks = sorted(new_tasks, key=_af_consideration_value, reverse=True)
@@ -1158,16 +1193,13 @@ async def recv_af_result_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lo_s  = f"KES {int(f['amount_min']):,}" if f.get("amount_min") is not None else "0"
     hi_s  = f"KES {int(f['amount_max']):,}" if f.get("amount_max") is not None else "∞"
-    sec_label = {"exclude": "No Sectional", "only": "Sectional Only", "all": "All"}.get(
-        f.get("sectional_filter", "exclude"), f.get("sectional_filter", "exclude")
-    )
-    ap_label = _af_apartment_label(_af_get_apartment_excluded_keywords(f))
+    excl_label = _af_exclusion_label(_af_get_excluded_keywords(f))
     header = (
         f"🗂 *AF Run — {run['run_at']}*\n"
         f"Schedule: *{md_escape(run.get('schedule_label', 'Telegram only'))}*\n"
         f"Tasks found: *{run['count']}*\n"
         f"Filters: County={f.get('county','All') or 'All'} | Registry={f.get('registry','All') or 'All'}\n"
-        f"Amount: {lo_s}–{hi_s} | {sec_label} | {ap_label}\n\n"
+        f"Amount: {lo_s}–{hi_s} | {excl_label}\n\n"
     )
 
     if not tasks:
@@ -1226,8 +1258,8 @@ def register(app: Application) -> None:
             AF.REGISTRY:    [CallbackQueryHandler(recv_af_registry,     pattern=r"^ft_registry:")],
             AF.AMOUNT:      [CallbackQueryHandler(recv_af_amount,       pattern=r"^ft_amount:")],
             AF.AMOUNT_TEXT: [MessageHandler(not_cancel, recv_af_amount_text)],
-            AF.SECTIONAL:   [CallbackQueryHandler(recv_af_sectional,    pattern=r"^ft_sectional:")],
-            AF.APARTMENT:   [CallbackQueryHandler(recv_af_apartment,    pattern=r"^ft_apt:")],
+            AF.EXCLUSION_MODE: [CallbackQueryHandler(recv_af_exclusion_mode, pattern=r"^ft_excl_mode:")],
+            AF.EXCLUSION_PICK: [CallbackQueryHandler(recv_af_exclusion_pick, pattern=r"^ft_excl_pick:")],
             AF.EMAIL:       [MessageHandler(not_cancel, recv_af_email)],
             AF.REPORT_FORMAT: [CallbackQueryHandler(recv_af_report_format, pattern=r"^af_reportfmt:")],
         },
