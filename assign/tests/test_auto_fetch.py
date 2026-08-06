@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Unit tests for auto_fetch.py — schedule/results persistence, the
-_auto_fetch_job pipeline (filters, sectional auto-routing, chunked
-notify, email), and the bundled AF Results viewer.
+_auto_fetch_job pipeline (filters, sectional/apartment auto-routing,
+chunked notify, email), and the bundled AF Results viewer.
 
 Run with: python3 -m unittest discover -s assign/tests -v
 """
@@ -598,6 +598,67 @@ class TestAutoFetchJob(unittest.TestCase):
         persisted_tasks = mock_persist_result.call_args[0][2]
         self.assertEqual(persisted_tasks, [])
 
+    def test_apartment_filter_exclude_removes_apartment_tasks(self):
+        cfg = {"days_back": 2, "apartment_filter": "exclude"}
+        tasks = [
+            _task(ref="R1", parcel_number="APARTMENT NO. 403 BLOCK 'G'"),
+            _task(ref="R2", parcel_number="NAIROBI/BLOCK1/1"),
+        ]
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "load_apartments_config", return_value=None), \
+             patch.object(af, "persist_af_result") as mock_persist:
+            _run(af._auto_fetch_job(self.context))
+        persisted_tasks = mock_persist.call_args[0][2]
+        self.assertEqual([t["reference_number"] for t in persisted_tasks], ["R2"])
+
+    def test_apartment_filter_only_keeps_apartment_tasks(self):
+        cfg = {"days_back": 2, "apartment_filter": "only"}
+        tasks = [
+            _task(ref="R1", parcel_number="APARTMENT NO. 403 BLOCK 'G'"),
+            _task(ref="R2", parcel_number="NAIROBI/BLOCK1/1"),
+        ]
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "load_apartments_config", return_value=None), \
+             patch.object(af, "persist_af_result") as mock_persist:
+            _run(af._auto_fetch_job(self.context))
+        persisted_tasks = mock_persist.call_args[0][2]
+        self.assertEqual([t["reference_number"] for t in persisted_tasks], ["R1"])
+
+    def test_apartment_auto_routes_when_specialist_configured(self):
+        # apartment_filter="all" so the earlier main filter step doesn't
+        # strip the apartment task before auto-routing gets a chance to see it
+        cfg = {"days_back": 2, "apartment_filter": "all"}
+        apartment_task = _task(ref="R-APT", parcel_number="APARTMENT NO. 403 BLOCK 'G'")
+        ap_cfg = {
+            "auto_route": True, "cred_type": "staff2",
+            "specialist": {"name": "John Specialist", "uid": "uid-2"},
+        }
+        fake_session = MagicMock()
+        fake_session.put.return_value = MagicMock(status_code=200)
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "_load_fetch_tasks", return_value=([apartment_task], {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "load_apartments_config", return_value=ap_cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "build_session", return_value=fake_session), \
+             patch.object(af, "persist_assignment") as mock_persist_assign, \
+             patch.object(af, "persist_af_result") as mock_persist_result, \
+             patch.object(af, "ALLOWED_IDS", set()):
+            _run(af._auto_fetch_job(self.context))
+        mock_persist_assign.assert_called_once_with("R-APT", "John Specialist", "uid-2")
+        # apartment task should be removed from the remaining/persisted set
+        persisted_tasks = mock_persist_result.call_args[0][2]
+        self.assertEqual(persisted_tasks, [])
+
 
 class TestCmdAfResults(unittest.TestCase):
     def test_no_results_shows_empty_message(self):
@@ -891,6 +952,44 @@ class TestAfBuildExcel(unittest.TestCase):
         self.assertIn("Jane Doe", ws.cell(row=2, column=3).value)
 
 
+class TestAfIsApartmentTask(unittest.TestCase):
+    """_af_is_apartment_task — matches any of _AF_APARTMENT_KEYWORDS in
+    parcel_number, case-insensitively."""
+
+    def test_matches_apartment(self):
+        self.assertTrue(af._af_is_apartment_task({"parcel_number": "APARTMENT NO. 403 BLOCK 'G'"}))
+
+    def test_matches_lowercase(self):
+        self.assertTrue(af._af_is_apartment_task({"parcel_number": "apartment no. 403"}))
+
+    def test_matches_appartment_misspelling(self):
+        self.assertTrue(af._af_is_apartment_task({"parcel_number": "APPARTMENT NO. 12"}))
+
+    def test_matches_flat(self):
+        self.assertTrue(af._af_is_apartment_task({"parcel_number": "FLAT NO. 5"}))
+
+    def test_matches_building(self):
+        self.assertTrue(af._af_is_apartment_task({"parcel_number": "BUILDING A UNIT 2"}))
+
+    def test_matches_massionnaite(self):
+        self.assertTrue(af._af_is_apartment_task({"parcel_number": "MASSIONNAITE NO. 7"}))
+
+    def test_matches_ltl(self):
+        self.assertTrue(af._af_is_apartment_task({"parcel_number": "NAIROBI/LTL/123"}))
+
+    def test_matches_ltb(self):
+        self.assertTrue(af._af_is_apartment_task({"parcel_number": "NAIROBI/LTB/123"}))
+
+    def test_matches_apt(self):
+        self.assertTrue(af._af_is_apartment_task({"parcel_number": "APT 3B"}))
+
+    def test_no_match_for_ordinary_parcel(self):
+        self.assertFalse(af._af_is_apartment_task({"parcel_number": "NAIROBI/BLOCK1/1"}))
+
+    def test_missing_parcel_number_does_not_match(self):
+        self.assertFalse(af._af_is_apartment_task({}))
+
+
 class TestAfConsiderationValue(unittest.TestCase):
     """_af_consideration_value — sort key for the email body, missing/
     unparseable amounts sort last (below every real amount)."""
@@ -1005,6 +1104,52 @@ class TestRecvAfAmount(unittest.TestCase):
         self.assertEqual(result, af.AF.SECTIONAL)
         self.assertEqual(ctx.user_data["af_amount_min"], 10_000_000.0)
         self.assertEqual(ctx.user_data["af_amount_max"], 50_000_000.0)
+
+
+class TestRecvAfSectional(unittest.TestCase):
+    """recv_af_sectional — stores the sectional choice, then moves on to
+    the apartment filter step (not straight to email anymore)."""
+
+    def _make_query(self, data):
+        update = MagicMock()
+        query = update.callback_query
+        query.data = data
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        return update
+
+    def test_stores_choice_and_moves_to_apartment_step(self):
+        update = self._make_query("ft_sectional:only")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        result = _run(af.recv_af_sectional(update, ctx))
+        self.assertEqual(result, af.AF.APARTMENT)
+        self.assertEqual(ctx.user_data["af_sectional"], "only")
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("apartment", text.lower())
+
+
+class TestRecvAfApartment(unittest.TestCase):
+    """recv_af_apartment — stores the apartment choice, then moves on to
+    the email step, same as the old sectional-to-email transition."""
+
+    def _make_query(self, data):
+        update = MagicMock()
+        query = update.callback_query
+        query.data = data
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        return update
+
+    def test_stores_choice_and_moves_to_email_step(self):
+        update = self._make_query("ft_apartment:only")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        result = _run(af.recv_af_apartment(update, ctx))
+        self.assertEqual(result, af.AF.EMAIL)
+        self.assertEqual(ctx.user_data["af_apartment"], "only")
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("email", text.lower())
 
 
 class TestRecvAfMenu(unittest.TestCase):

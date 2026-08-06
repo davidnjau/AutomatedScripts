@@ -10,7 +10,7 @@ docstrings and assign/CLAUDE.md's Architecture section for the full list
 (new_assignment.py, receive_tasks.py, lookup_reference.py, valuer_tasks.py,
 job_distribution.py, bulk_export.py, dlv_batch.py, dlv_tasks.py,
 fetch_tasks.py, auto_fetch.py, refresh_auth.py, sectional_properties.py,
-morning_briefing.py).
+apartments.py, morning_briefing.py).
 
 bot.py itself is now a thin orchestrator: cmd_start/cmd_help, saved-valuers
 management, daemon control, token/error-report status, cmd_restart, and
@@ -75,6 +75,7 @@ import dlv_report_schedule
 import dlv_tasks
 import hold_tasks
 import morning_briefing
+import apartments
 import fetch_tasks
 import job_distribution
 import lookup_reference
@@ -729,6 +730,7 @@ def main():
 
     dlv_tasks.register(app)
     sectional_properties.register(app)
+    apartments.register(app)
     morning_briefing.register(app)
     hold_tasks.register(app)
     dlv_incremental.register(app)
