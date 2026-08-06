@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main, assign]
+    paths: ["assign/**", ".github/workflows/ci.yml"]
   pull_request:
     branches: [main, assign]
+    paths: ["assign/**", ".github/workflows/ci.yml"]
   workflow_dispatch:
 
 jobs:
@@ -44,3 +46,27 @@ jobs:
 
       - name: Run test suite
         run: python3 -m unittest discover -s tests -v
+
+  deploy-assign:
+    needs: test
+    if: github.ref == 'refs/heads/assign' && github.event_name == 'push'
+    runs-on: [self-hosted, ardhisasa-bot]
+    defaults:
+      run:
+        working-directory: assign
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Default clean=true runs `git clean -ffdx`, which deletes
+          # ignored files too — including the .env this runner's checked-out
+          # assign/ directory holds (env_file: .env in docker-compose.yml).
+          # Without this, every deploy after the first wipes .env right
+          # before docker-compose runs, breaking the container's env vars.
+          clean: false
+
+      - name: Rebuild and restart bot
+        run: docker-compose up --build -d
+
+      - name: Prune dangling images
+        run: docker image prune -f

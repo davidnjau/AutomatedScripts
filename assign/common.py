@@ -82,6 +82,7 @@ SAVED_VALUERS_FILE          = os.path.join(DATA_DIR, "saved_valuers.json")
 SAVED_TOKENS_FILE           = os.path.join(DATA_DIR, "saved_tokens.json")
 SAVED_ASSIGNMENTS_FILE      = os.path.join(DATA_DIR, "saved_assignments.json")
 SAVED_SECTIONAL_CONFIG_FILE = os.path.join(DATA_DIR, "saved_sectional_config.json")
+SAVED_APARTMENTS_CONFIG_FILE = os.path.join(DATA_DIR, "saved_apartments_config.json")
 
 # base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
 CPARAMS_DLV          = base64.b64encode(b'{"active_role":"DLV"}').decode()
@@ -229,6 +230,24 @@ def load_sectional_config() -> Optional[Dict]:
 
 def save_sectional_config(cfg: Dict) -> None:
     _atomic_json_write(SAVED_SECTIONAL_CONFIG_FILE, cfg, indent=2)
+
+
+# ── Apartments config ───────────────────────────────────────
+# Same shape and purpose as Sectional Properties' config above, for
+# apartment-title tasks instead — read by Auto Fetch (for apartment-task
+# auto-routing) as well as by Apartments itself, so it lives here rather
+# than in either feature module.
+
+def load_apartments_config() -> Optional[Dict]:
+    try:
+        with open(SAVED_APARTMENTS_CONFIG_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_apartments_config(cfg: Dict) -> None:
+    _atomic_json_write(SAVED_APARTMENTS_CONFIG_FILE, cfg, indent=2)
 
 
 # ── Tokens ────────────────────────────────────────────────
@@ -414,6 +433,14 @@ def _sectional_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
+def _apartment_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🚫 Exclude Apartments", callback_data="ft_apartment:exclude"),
+        InlineKeyboardButton("🏬 Apartments Only",    callback_data="ft_apartment:only"),
+        InlineKeyboardButton("📋 All",                callback_data="ft_apartment:all"),
+    ]])
+
+
 # ──────────────────────────────────────────────────────────
 # Main menu button labels & keyboard
 # ──────────────────────────────────────────────────────────
@@ -441,6 +468,7 @@ BTN_RESTART       = "🔁 Restart Bot"
 BTN_CANCEL        = "🛑 Cancel"
 BTN_BRIEFING      = "🌅 Morning Briefing"
 BTN_SECTIONAL     = "🔲 Sectional"
+BTN_APARTMENTS    = "🏬 Apartments"
 BTN_HOLD_TASKS    = "✋ Hold Tasks"
 BTN_INCREMENTAL   = "🔢 Incremental"
 BTN_DLV_REPORT_SCHEDULE = "📧 DLV Report Schedule"
@@ -455,6 +483,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_EXPORT_STATUS)}|{re.escape(BTN_JOB_DIST)}|{re.escape(BTN_LOOKUP)}"
     f"|{re.escape(BTN_VALUER_TASKS)}"
     f"|{re.escape(BTN_DLV_TASKS)}|{re.escape(BTN_BRIEFING)}|{re.escape(BTN_SECTIONAL)}"
+    f"|{re.escape(BTN_APARTMENTS)}"
     f"|{re.escape(BTN_HOLD_TASKS)}|{re.escape(BTN_INCREMENTAL)}|{re.escape(BTN_DLV_REPORT_SCHEDULE)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
@@ -474,7 +503,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(BTN_BULK_EXPORT),    KeyboardButton(BTN_EXPORT_STATUS)],
             [KeyboardButton(BTN_JOB_DIST),       KeyboardButton(BTN_VALUER_TASKS)],
             [KeyboardButton(BTN_DLV_TASKS),      KeyboardButton(BTN_SECTIONAL)],
-            [KeyboardButton(BTN_BRIEFING)],
+            [KeyboardButton(BTN_APARTMENTS),     KeyboardButton(BTN_BRIEFING)],
             [KeyboardButton(BTN_HOLD_TASKS)],
             [KeyboardButton(BTN_INCREMENTAL)],
             [KeyboardButton(BTN_DLV_REPORT_SCHEDULE)],
