@@ -25,6 +25,7 @@ COPY telegram_report.py .
 COPY excel_report.py .
 COPY refresh_auth.py .
 COPY sectional_properties.py .
+COPY apartments.py .
 COPY auto_fetch.py .
 COPY receive_tasks.py .
 COPY token_rotator.py .

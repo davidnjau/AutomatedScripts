@@ -19,8 +19,11 @@ one another.
 Depends on fetch_tasks.py's _load_fetch_tasks for the actual live fetch and
 _ft_format_task_block for the email body's per-task layout (shared since
 both features fetch the same task schema), dlv_core.py's load_dlv_batch to
-exclude already-queued refs, and common.py's load_sectional_config for
-optional sectional-task auto-routing to a configured specialist valuer.
+exclude already-queued refs, and common.py's load_sectional_config/
+load_apartments_config for optional sectional-task/apartment-task
+auto-routing to a configured specialist valuer — the two are independent
+of each other (a task can be sectional, apartment, both, or neither), each
+with its own filter step, filter keyboard, and auto-routing block.
 
 The background job always fetches under the Support Reg credential (see
 _AF_CRED_TYPE below) — the HQ/County list endpoints are queried with
@@ -101,12 +104,14 @@ from common import (
     _ft_county_keyboard,
     _ft_registry_keyboard,
     _main_menu,
+    _apartment_keyboard,
     _sectional_keyboard,
     allowed,
     cmd_cancel,
     deny,
     fallback,
     get_valid_tokens,
+    load_apartments_config,
     load_saved_assignments,
     load_sectional_config,
     logger,
@@ -140,6 +145,7 @@ class AF(Enum):
     AMOUNT      = auto()   # pick amount range button
     AMOUNT_TEXT = auto()   # custom amount text entry
     SECTIONAL   = auto()   # exclude / only / all sectional
+    APARTMENT   = auto()   # exclude / only / all apartment
     EMAIL       = auto()   # optional recipient email address
     REPORT_FORMAT = auto()  # block (text) or Excel — asked unconditionally, governs Telegram + email alike
 
@@ -176,6 +182,20 @@ _AF_INTERVALS = [
     ("12 hr",  720),
     ("24 hr", 1440),
 ]
+
+# Every parcel_number substring (case-insensitive) that marks a task as an
+# apartment task for the apartment filter and auto-routing below. Kept as one
+# list rather than repeating an inline check at each of the 4 call sites, so
+# adding/removing a variant is a one-line edit.
+_AF_APARTMENT_KEYWORDS = (
+    "APARTMENT", "APPARTMENT", "FLAT", "BUILDING", "MASSIONNAITE", "LTL", "LTB", "APT",
+)
+
+
+def _af_is_apartment_task(t: Dict) -> bool:
+    """True if t's parcel_number contains any apartment-variant keyword (case-insensitive)."""
+    parcel = str(t.get("parcel_number") or "").upper()
+    return any(kw in parcel for kw in _AF_APARTMENT_KEYWORDS)
 
 
 def load_auto_fetch_schedules() -> List[Dict]:
@@ -235,11 +255,13 @@ def _af_format_schedule_summary(cfg: Dict) -> str:
     days    = cfg.get("days_back", 2)
     sec     = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(
                   cfg.get("sectional_filter", "exclude"), "Exclude Sectional")
+    ap      = {"exclude": "Exclude Apartments", "only": "Apartments Only", "all": "All"}.get(
+                  cfg.get("apartment_filter", "exclude"), "Exclude Apartments")
     email_s = cfg.get("email") or "Telegram only"
     return (
         f"📧 *{md_escape(email_s)}* — every {mins} min, days back: {days}\n"
         f"   County: {county.title()} | Registry: {reg.title()}\n"
-        f"   Amount: {lo_s} – {hi_s} | {sec}"
+        f"   Amount: {lo_s} – {hi_s} | {sec} | {ap}"
     )
 
 
@@ -271,6 +293,7 @@ def persist_af_result(run_id: str, run_at: str, tasks: List[Dict], cfg: Dict) ->
             "amount_max":       cfg.get("amount_max"),
             "days_back":        cfg.get("days_back", 2),
             "sectional_filter": cfg.get("sectional_filter", "exclude"),
+            "apartment_filter": cfg.get("apartment_filter", "exclude"),
         },
         "tasks": [
             {
@@ -574,6 +597,21 @@ async def recv_af_sectional(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["af_sectional"] = query.data.split(":")[1]  # "exclude" | "only" | "all"
 
     await query.edit_message_text(
+        "Include apartment properties?\n_(Apartment: parcel_number contains APARTMENT, "
+        "APPARTMENT, FLAT, BUILDING, MASSIONNAITE, LTL, LTB, or APT)_",
+        parse_mode="Markdown",
+        reply_markup=_apartment_keyboard(),
+    )
+    return AF.APARTMENT
+
+
+async def recv_af_apartment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    ctx.user_data["af_apartment"] = query.data.split(":")[1]  # "exclude" | "only" | "all"
+
+    await query.edit_message_text(
         "📧 *Send results to email?*\n\n"
         "Enter an email address, or send `skip` to notify via Telegram only.",
         parse_mode="Markdown",
@@ -607,6 +645,7 @@ def _af_create_schedule(ctx: ContextTypes.DEFAULT_TYPE, email: str, report_forma
     amount_min = ctx.user_data.get("af_amount_min")
     amount_max = ctx.user_data.get("af_amount_max")
     sectional  = ctx.user_data.get("af_sectional", "exclude")
+    apartment  = ctx.user_data.get("af_apartment", "exclude")
 
     cfg = {
         "interval_minutes": interval,
@@ -616,6 +655,7 @@ def _af_create_schedule(ctx: ContextTypes.DEFAULT_TYPE, email: str, report_forma
         "amount_min":       amount_min,
         "amount_max":       amount_max,
         "sectional_filter": sectional,
+        "apartment_filter": apartment,
         "email":            email,
         "report_format":    report_format,
     }
@@ -641,6 +681,9 @@ def _af_schedule_created_text(cfg: Dict) -> str:
     sec_label = {"exclude": "Exclude Sectional", "only": "Sectional Only", "all": "All"}.get(
         cfg.get("sectional_filter", "exclude"), cfg.get("sectional_filter", "exclude"),
     )
+    ap_label = {"exclude": "Exclude Apartments", "only": "Apartments Only", "all": "All"}.get(
+        cfg.get("apartment_filter", "exclude"), cfg.get("apartment_filter", "exclude"),
+    )
     email_label  = cfg.get("email") or "Telegram only"
     format_label = "Excel" if _af_get_report_format(cfg) == "excel" else "Text blocks"
     interval     = cfg.get("interval_minutes", 60)
@@ -648,7 +691,7 @@ def _af_schedule_created_text(cfg: Dict) -> str:
         f"✅ *Auto Fetch schedule added*\n"
         f"Every *{interval} min* | Days back: *{cfg.get('days_back', 2)}*\n"
         f"County: *{co_label}* | Registry: *{re_label}*\n"
-        f"Amount: {lo_s} – {hi_s} | Sectional: *{sec_label}*\n"
+        f"Amount: {lo_s} – {hi_s} | Sectional: *{sec_label}* | Apartments: *{ap_label}*\n"
         f"Email: *{md_escape(email_label)}*\n"
         f"Format: *{format_label}*\n"
         f"Account: *{CRED_LABELS[_AF_CRED_TYPE]}* (requires a cached, valid login — check 🔒 Token Status)\n"
@@ -807,6 +850,14 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         tasks = [t for t in tasks if str(t.get("parcel_number") or "").count("/") >= 3]
     # "all" → no filter
 
+    # Apartment filter
+    apf = cfg.get("apartment_filter", "exclude")
+    if apf == "exclude":
+        tasks = [t for t in tasks if not _af_is_apartment_task(t)]
+    elif apf == "only":
+        tasks = [t for t in tasks if _af_is_apartment_task(t)]
+    # "all" → no filter
+
     # Exclude already-queued refs
     queued_refs = {item.get("ref", "") for item in load_dlv_batch()}
     tasks = [t for t in tasks if t.get("reference_number", "") not in queued_refs]
@@ -863,6 +914,58 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                             logger.warning("Sectional auto-assign notify error for %s: %s", chat_id, e)
                 tasks = remaining_tasks
 
+    # Apartment auto-routing: if a specialist is configured, auto-assign apartment tasks
+    ap_cfg = load_apartments_config()
+    if ap_cfg and ap_cfg.get("auto_route") and ap_cfg.get("specialist") and ap_cfg.get("cred_type"):
+        specialist   = ap_cfg["specialist"]
+        ap_cred_type = ap_cfg["cred_type"]
+        ap_tokens    = get_valid_tokens(ap_cred_type)
+        if ap_tokens:
+            apartment_tasks = [t for t in tasks if _af_is_apartment_task(t)]
+            remaining_tasks = [t for t in tasks if not _af_is_apartment_task(t)]
+            if apartment_tasks:
+                assigned_ap = []
+                failed_ap   = []
+                ap_sess     = build_session()
+                ap_hdrs     = {
+                    "Authorization": f"Bearer {ap_tokens.access_token}",
+                    "JWTAUTH":       f"Bearer {ap_tokens.jwt}",
+                    "cparams":       CPARAMS_VALUER_ROLE,
+                }
+                for t in apartment_tasks:
+                    ref = t.get("reference_number", "")
+                    try:
+                        r = ap_sess.put(
+                            STAMP_DUTY_FIX_APPLICATION_URL,
+                            headers=ap_hdrs,
+                            json={"request_id": t.get("id", ""), "valuation_officer": specialist["uid"]},
+                            timeout=30,
+                        )
+                        if r.status_code in (200, 201):
+                            assigned_ap.append(ref)
+                            persist_assignment(ref, specialist["name"], specialist["uid"])
+                        else:
+                            failed_ap.append(ref)
+                    except Exception as e:
+                        logger.warning("Apartment auto-assign failed for %s: %s", ref, e)
+                        failed_ap.append(ref)
+
+                if assigned_ap or failed_ap:
+                    ap_msg = (
+                        f"🏬 *Apartment Auto-Assign* — {specialist['name']}\n"
+                        f"✅ Assigned: {len(assigned_ap)} | ❌ Failed: {len(failed_ap)}\n"
+                    )
+                    if assigned_ap:
+                        ap_msg += "\n".join(f"  ✅ {r}" for r in assigned_ap[:10])
+                    if failed_ap:
+                        ap_msg += "\n" + "\n".join(f"  ❌ {r}" for r in failed_ap[:5])
+                    for chat_id in ALLOWED_IDS:
+                        try:
+                            await context.bot.send_message(chat_id, ap_msg, parse_mode="Markdown")
+                        except Exception as e:
+                            logger.warning("Apartment auto-assign notify error for %s: %s", chat_id, e)
+                tasks = remaining_tasks
+
     # Persist result history (record even if empty so the run appears in AF Results)
     _af_run_id = str(uuid.uuid4())[:8]
     _af_run_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -877,9 +980,11 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     co_label  = county_filter.title() or "All"
     re_label  = registry_filter.title() or "All"
     sec_label = {"exclude": "No Sectional", "only": "Sectional Only", "all": "All"}.get(sf, sf)
+    ap_label  = {"exclude": "No Apartments", "only": "Apartments Only", "all": "All"}.get(apf, apf)
     header    = (
         f"⏰ *Auto Fetch — {len(tasks)} task(s)*\n"
-        f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | {sec_label}\n\n"
+        f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | "
+        f"{sec_label} | {ap_label}\n\n"
     )
 
     report_format = _af_get_report_format(cfg)
@@ -930,7 +1035,8 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 plain_header = (
                     f"Auto Fetch — {len(new_tasks)} task(s)\n"
-                    f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | {sec_label}\n"
+                    f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | "
+                    f"{sec_label} | {ap_label}\n"
                     + "─" * 60 + "\n\n"
                 )
                 plain_sorted_tasks = sorted(new_tasks, key=_af_consideration_value, reverse=True)
@@ -1010,12 +1116,15 @@ async def recv_af_result_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sec_label = {"exclude": "No Sectional", "only": "Sectional Only", "all": "All"}.get(
         f.get("sectional_filter", "exclude"), f.get("sectional_filter", "exclude")
     )
+    ap_label = {"exclude": "No Apartments", "only": "Apartments Only", "all": "All"}.get(
+        f.get("apartment_filter", "exclude"), f.get("apartment_filter", "exclude")
+    )
     header = (
         f"🗂 *AF Run — {run['run_at']}*\n"
         f"Schedule: *{md_escape(run.get('schedule_label', 'Telegram only'))}*\n"
         f"Tasks found: *{run['count']}*\n"
         f"Filters: County={f.get('county','All') or 'All'} | Registry={f.get('registry','All') or 'All'}\n"
-        f"Amount: {lo_s}–{hi_s} | {sec_label}\n\n"
+        f"Amount: {lo_s}–{hi_s} | {sec_label} | {ap_label}\n\n"
     )
 
     if not tasks:
@@ -1075,6 +1184,7 @@ def register(app: Application) -> None:
             AF.AMOUNT:      [CallbackQueryHandler(recv_af_amount,       pattern=r"^ft_amount:")],
             AF.AMOUNT_TEXT: [MessageHandler(not_cancel, recv_af_amount_text)],
             AF.SECTIONAL:   [CallbackQueryHandler(recv_af_sectional,    pattern=r"^ft_sectional:")],
+            AF.APARTMENT:   [CallbackQueryHandler(recv_af_apartment,    pattern=r"^ft_apartment:")],
             AF.EMAIL:       [MessageHandler(not_cancel, recv_af_email)],
             AF.REPORT_FORMAT: [CallbackQueryHandler(recv_af_report_format, pattern=r"^af_reportfmt:")],
         },
