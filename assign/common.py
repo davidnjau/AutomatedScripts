@@ -505,25 +505,25 @@ not_cancel = filters.TEXT & ~filters.COMMAND & ~_CANCEL_FILTER
 
 
 def _main_menu() -> ReplyKeyboardMarkup:
+    # Apartments, Sectional, AF Results, Valuer Tasks, and Assignments are
+    # intentionally left off this grid — hidden from the menu, but each
+    # still has its own working /command entry point and MessageHandler,
+    # so nothing about their functionality changed.
     return ReplyKeyboardMarkup(
         [
             # ── Assignment ──────────────────────────────────
             [KeyboardButton(BTN_ASSIGN)],
             [KeyboardButton(BTN_FETCH_TASKS),    KeyboardButton(BTN_AUTO_FETCH)],
-            [KeyboardButton(BTN_AF_RESULTS),     KeyboardButton(BTN_ASSIGNMENTS)],
             # ── DLV & Export ────────────────────────────────
             [KeyboardButton(BTN_DLV_BATCH)],
-            [KeyboardButton(BTN_BULK_EXPORT),    KeyboardButton(BTN_EXPORT_STATUS)],
-            [KeyboardButton(BTN_JOB_DIST),       KeyboardButton(BTN_VALUER_TASKS)],
-            [KeyboardButton(BTN_DLV_TASKS),      KeyboardButton(BTN_SECTIONAL)],
-            [KeyboardButton(BTN_APARTMENTS),     KeyboardButton(BTN_BRIEFING)],
-            [KeyboardButton(BTN_HOLD_TASKS)],
-            [KeyboardButton(BTN_INCREMENTAL)],
-            [KeyboardButton(BTN_DLV_REPORT_SCHEDULE)],
+            [KeyboardButton(BTN_BULK_EXPORT),    KeyboardButton(BTN_JOB_DIST)],
+            [KeyboardButton(BTN_EXPORT_STATUS),  KeyboardButton(BTN_ERROR_REPORT)],
+            [KeyboardButton(BTN_DLV_TASKS),      KeyboardButton(BTN_HOLD_TASKS)],
+            [KeyboardButton(BTN_BRIEFING)],
+            [KeyboardButton(BTN_DLV_REPORT_SCHEDULE), KeyboardButton(BTN_INCREMENTAL)],
             # ── Lookup ──────────────────────────────────────
             [KeyboardButton(BTN_LOOKUP)],
             [KeyboardButton(BTN_AUTH),           KeyboardButton(BTN_TOKEN_STATUS)],
-            [KeyboardButton(BTN_ERROR_REPORT)],
             [KeyboardButton(BTN_VALUERS),        KeyboardButton(BTN_DELETE)],
             # ── System ──────────────────────────────────────
             [KeyboardButton(BTN_DAEMON)],

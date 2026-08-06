@@ -220,5 +220,54 @@ class TestNodeLabels(unittest.TestCase):
         self.assertIn("STAMP_DUTY_PAYMENT_DEFINITION", common._NODE_LABELS)
 
 
+class TestMainMenu(unittest.TestCase):
+    """_main_menu — Apartments/Sectional/AF Results/Valuer Tasks/
+    Assignments are hidden from the grid (each still has its own working
+    /command or MessageHandler elsewhere — this only covers the keyboard
+    layout), and several buttons are paired on shared rows."""
+
+    def _rows(self):
+        return common._main_menu().keyboard
+
+    def _all_texts(self):
+        return [b.text for row in self._rows() for b in row]
+
+    def test_hidden_buttons_are_absent(self):
+        texts = self._all_texts()
+        for btn in (common.BTN_APARTMENTS, common.BTN_SECTIONAL, common.BTN_AF_RESULTS,
+                    common.BTN_VALUER_TASKS, common.BTN_ASSIGNMENTS):
+            self.assertNotIn(btn, texts)
+
+    def test_every_other_button_still_present(self):
+        texts = self._all_texts()
+        for btn in (common.BTN_ASSIGN, common.BTN_FETCH_TASKS, common.BTN_AUTO_FETCH,
+                    common.BTN_DLV_BATCH, common.BTN_BULK_EXPORT, common.BTN_EXPORT_STATUS,
+                    common.BTN_JOB_DIST, common.BTN_DLV_TASKS, common.BTN_BRIEFING,
+                    common.BTN_HOLD_TASKS, common.BTN_INCREMENTAL, common.BTN_DLV_REPORT_SCHEDULE,
+                    common.BTN_LOOKUP, common.BTN_AUTH, common.BTN_TOKEN_STATUS,
+                    common.BTN_ERROR_REPORT, common.BTN_VALUERS, common.BTN_DELETE,
+                    common.BTN_DAEMON, common.BTN_RESTART, common.BTN_HELP, common.BTN_CANCEL):
+            self.assertIn(btn, texts)
+
+    def _row_for(self, btn_text):
+        return next(row for row in self._rows() if any(b.text == btn_text for b in row))
+
+    def test_bulk_export_and_job_dist_share_a_row(self):
+        row = self._row_for(common.BTN_BULK_EXPORT)
+        self.assertEqual([b.text for b in row], [common.BTN_BULK_EXPORT, common.BTN_JOB_DIST])
+
+    def test_export_status_and_error_report_share_a_row(self):
+        row = self._row_for(common.BTN_EXPORT_STATUS)
+        self.assertEqual([b.text for b in row], [common.BTN_EXPORT_STATUS, common.BTN_ERROR_REPORT])
+
+    def test_dlv_tasks_and_hold_tasks_share_a_row(self):
+        row = self._row_for(common.BTN_DLV_TASKS)
+        self.assertEqual([b.text for b in row], [common.BTN_DLV_TASKS, common.BTN_HOLD_TASKS])
+
+    def test_dlv_report_schedule_and_incremental_share_a_row(self):
+        row = self._row_for(common.BTN_DLV_REPORT_SCHEDULE)
+        self.assertEqual([b.text for b in row], [common.BTN_DLV_REPORT_SCHEDULE, common.BTN_INCREMENTAL])
+
+
 if __name__ == "__main__":
     unittest.main()
