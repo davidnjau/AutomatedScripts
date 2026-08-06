@@ -1128,6 +1128,21 @@ class TestRecvAfSectional(unittest.TestCase):
         text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("apartment", text.lower())
 
+    def test_prompt_text_has_no_unbalanced_underscore(self):
+        """Regression: the prompt used to say "parcel_number" inside a
+        single-underscore Markdown italic span — the literal underscore
+        closed the span early, leaving a dangling `_` that made Telegram
+        raise BadRequest ("can't find end of the entity") and, since that
+        exception happens before `return AF.APARTMENT`, silently stuck the
+        conversation in AF.SECTIONAL forever. An even underscore count is a
+        cheap proxy for "every _..._ span is closed"."""
+        update = self._make_query("ft_sectional:exclude")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        _run(af.recv_af_sectional(update, ctx))
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertEqual(text.count("_") % 2, 0)
+
 
 class TestRecvAfApartment(unittest.TestCase):
     """recv_af_apartment — stores the apartment choice, then moves on to

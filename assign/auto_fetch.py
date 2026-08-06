@@ -597,7 +597,7 @@ async def recv_af_sectional(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["af_sectional"] = query.data.split(":")[1]  # "exclude" | "only" | "all"
 
     await query.edit_message_text(
-        "Include apartment properties?\n_(Apartment: parcel_number contains APARTMENT, "
+        "Include apartment properties?\n_(Apartment: parcel number contains APARTMENT, "
         "APPARTMENT, FLAT, BUILDING, MASSIONNAITE, LTL, LTB, or APT)_",
         parse_mode="Markdown",
         reply_markup=_apartment_keyboard(),
