@@ -573,9 +573,9 @@ class TestAutoFetchJob(unittest.TestCase):
         )
 
     def test_section_exclusion_removes_sectional_shaped_tasks(self):
-        """SECTION is the symbolic keyword for the structural ≥3-slash rule
+        """SECTIONAL is the symbolic keyword for the structural ≥3-slash rule
         — excluding it shouldn't touch an apartment-keyword match."""
-        cfg = {"days_back": 2, "excluded_keywords": ["SECTION"]}
+        cfg = {"days_back": 2, "excluded_keywords": ["SECTIONAL"]}
         tasks = [
             _task(ref="R1", parcel_number="NAIROBI/BLOCK1/1/888"),
             _task(ref="R2", parcel_number="APARTMENT NO. 5"),
@@ -1064,12 +1064,12 @@ class TestAfIsSectionalTask(unittest.TestCase):
 
 
 class TestAfTaskMatchesKeyword(unittest.TestCase):
-    """_af_task_matches_keyword — SECTION dispatches to the structural
+    """_af_task_matches_keyword — SECTIONAL dispatches to the structural
     rule, every other keyword is a substring match."""
 
     def test_section_uses_slash_count_rule(self):
-        self.assertTrue(af._af_task_matches_keyword({"parcel_number": "NAIROBI/BLOCK1/1/888"}, "SECTION"))
-        self.assertFalse(af._af_task_matches_keyword({"parcel_number": "NAIROBI/BLOCK1/1"}, "SECTION"))
+        self.assertTrue(af._af_task_matches_keyword({"parcel_number": "NAIROBI/BLOCK1/1/888"}, "SECTIONAL"))
+        self.assertFalse(af._af_task_matches_keyword({"parcel_number": "NAIROBI/BLOCK1/1"}, "SECTIONAL"))
 
     def test_apartment_keyword_uses_substring_match(self):
         self.assertTrue(af._af_task_matches_keyword({"parcel_number": "FLAT 5B"}, "FLAT"))
@@ -1086,7 +1086,7 @@ class TestAfTaskMatchesExcluded(unittest.TestCase):
 
     def test_matches_via_section_in_the_excluded_set(self):
         self.assertTrue(af._af_task_matches_excluded(
-            {"parcel_number": "NAIROBI/BLOCK1/1/888"}, {"SECTION"}))
+            {"parcel_number": "NAIROBI/BLOCK1/1/888"}, {"SECTIONAL"}))
 
     def test_no_match_when_parcel_matches_a_non_excluded_keyword(self):
         self.assertFalse(af._af_task_matches_excluded(
@@ -1103,8 +1103,8 @@ class TestAfGetExcludedKeywords(unittest.TestCase):
     for schedules saved before the two were merged into one Exclude step."""
 
     def test_reads_current_list_format(self):
-        result = af._af_get_excluded_keywords({"excluded_keywords": ["SECTION", "FLAT", "APT"]})
-        self.assertEqual(result, {"SECTION", "FLAT", "APT"})
+        result = af._af_get_excluded_keywords({"excluded_keywords": ["SECTIONAL", "FLAT", "APT"]})
+        self.assertEqual(result, {"SECTIONAL", "FLAT", "APT"})
 
     def test_empty_list_means_no_exclusions(self):
         result = af._af_get_excluded_keywords({"excluded_keywords": []})
@@ -1112,7 +1112,7 @@ class TestAfGetExcludedKeywords(unittest.TestCase):
 
     def test_legacy_sectional_exclude_adds_section(self):
         result = af._af_get_excluded_keywords({"sectional_filter": "exclude", "apartment_filter": "all"})
-        self.assertEqual(result, {"SECTION"})
+        self.assertEqual(result, {"SECTIONAL"})
 
     def test_legacy_sectional_only_has_no_equivalent(self):
         result = af._af_get_excluded_keywords({"sectional_filter": "only", "apartment_filter": "all"})
@@ -1128,7 +1128,7 @@ class TestAfGetExcludedKeywords(unittest.TestCase):
 
     def test_legacy_sectional_and_apartment_combine(self):
         result = af._af_get_excluded_keywords({"sectional_filter": "exclude", "apartment_excluded_keywords": ["FLAT"]})
-        self.assertEqual(result, {"SECTION", "FLAT"})
+        self.assertEqual(result, {"SECTIONAL", "FLAT"})
 
     def test_missing_keys_default_to_legacy_exclude_behavior(self):
         """No fields at all is the oldest possible schedule shape — both
@@ -1354,9 +1354,9 @@ class TestRecvAfExclusionPick(unittest.TestCase):
         update.callback_query.edit_message_reply_markup.assert_called_once()
 
     def test_toggling_an_excluded_keyword_unexcludes_it(self):
-        update = self._make_query("ft_excl_pick:SECTION")
+        update = self._make_query("ft_excl_pick:SECTIONAL")
         ctx = MagicMock()
-        ctx.user_data = {"af_excluded_keywords": {"SECTION", "FLAT"}}
+        ctx.user_data = {"af_excluded_keywords": {"SECTIONAL", "FLAT"}}
         result = _run(af.recv_af_exclusion_pick(update, ctx))
         self.assertEqual(result, af.AF.EXCLUSION_PICK)
         self.assertEqual(ctx.user_data["af_excluded_keywords"], {"FLAT"})

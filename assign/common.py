@@ -437,7 +437,7 @@ def _af_exclusion_multiselect_keyboard(keywords, excluded) -> InlineKeyboardMark
     """One toggle button per exclusion keyword (☑ excluded / ☐ kept), two
     per row, plus a trailing Done button. `excluded` is the in-progress set
     of keywords the user has checked off so far. Used by Auto Fetch's
-    schedule-creation "Exclude" step for its unified Section + apartment-
+    schedule-creation "Exclude" step for its unified Sectional + apartment-
     variant keyword list — not apartment-specific despite the name
     similarity to load_apartments_config elsewhere in this file."""
     rows = []

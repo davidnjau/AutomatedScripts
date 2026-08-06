@@ -144,7 +144,7 @@ class AF(Enum):
     AMOUNT      = auto()   # pick amount range button
     AMOUNT_TEXT = auto()   # custom amount text entry
     EXCLUSION_MODE = auto()  # Allow All / Exclude All / Exclude (pick specific types)
-    EXCLUSION_PICK = auto()  # multi-select of Section + apartment-variant keywords
+    EXCLUSION_PICK = auto()  # multi-select of Sectional + apartment-variant keywords
     EMAIL       = auto()   # optional recipient email address
     REPORT_FORMAT = auto()  # block (text) or Excel — asked unconditionally, governs Telegram + email alike
 
@@ -190,15 +190,15 @@ _AF_APARTMENT_KEYWORDS = (
     "APARTMENT", "APPARTMENT", "FLAT", "BUILDING", "MASSIONNAITE", "LTL", "LTB", "APT",
 )
 
-# SECTION is a symbolic keyword, not a parcel_number substring — it stands
+# SECTIONAL is a symbolic keyword, not a parcel_number substring — it stands
 # for the structural sectional-title rule (≥3 slashes) rather than literal
 # text, so the unified Exclude multi-select can offer it alongside the
 # apartment keywords in one list. _AF_EXCLUSION_KEYWORDS is that full list
-# (Section first, then every apartment variant) for the schedule-creation
+# (Sectional first, then every apartment variant) for the schedule-creation
 # "Exclude" step below; it has nothing to do with the separate, standalone
 # Sectional Properties/Apartments specialist-routing config modules.
-_AF_SECTION_KEYWORD = "SECTION"
-_AF_EXCLUSION_KEYWORDS = (_AF_SECTION_KEYWORD,) + _AF_APARTMENT_KEYWORDS
+_AF_SECTIONAL_KEYWORD = "SECTIONAL"
+_AF_EXCLUSION_KEYWORDS = (_AF_SECTIONAL_KEYWORD,) + _AF_APARTMENT_KEYWORDS
 
 
 def _af_is_apartment_task(t: Dict) -> bool:
@@ -214,10 +214,10 @@ def _af_is_sectional_task(t: Dict) -> bool:
 
 
 def _af_task_matches_keyword(t: Dict, keyword: str) -> bool:
-    """True if t matches this single exclusion keyword. SECTION uses the
+    """True if t matches this single exclusion keyword. SECTIONAL uses the
     structural slash-count rule; every other keyword is a parcel_number
     substring match."""
-    if keyword == _AF_SECTION_KEYWORD:
+    if keyword == _AF_SECTIONAL_KEYWORD:
         return _af_is_sectional_task(t)
     return keyword in str(t.get("parcel_number") or "").upper()
 
@@ -228,13 +228,13 @@ def _af_task_matches_excluded(t: Dict, excluded) -> bool:
 
 
 def _af_get_excluded_keywords(cfg: Dict) -> set:
-    """Which of the 9 exclusion keywords (SECTION + the 8 apartment
+    """Which of the 9 exclusion keywords (SECTIONAL + the 8 apartment
     variants) this schedule excludes. Current schedules store one explicit
     (possibly empty) list under excluded_keywords. A schedule saved before
     Sectional and Apartment were unified into one Exclude step instead has
     separate sectional_filter (the old ternary) and apartment_excluded_
     keywords/apartment_filter fields, translated here: sectional_filter
-    == "exclude" (its old default) adds SECTION; "only"/"all" have no
+    == "exclude" (its old default) adds SECTIONAL; "only"/"all" have no
     keyword-list equivalent and add nothing — the same lossy fallback rule
     already established for apartment_filter's own "only"/"all" values."""
     if "excluded_keywords" in cfg:
@@ -242,7 +242,7 @@ def _af_get_excluded_keywords(cfg: Dict) -> set:
 
     excluded = set()
     if cfg.get("sectional_filter", "exclude") == "exclude":
-        excluded.add(_AF_SECTION_KEYWORD)
+        excluded.add(_AF_SECTIONAL_KEYWORD)
 
     if "apartment_excluded_keywords" in cfg:
         excluded |= set(cfg["apartment_excluded_keywords"])
@@ -932,7 +932,7 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             return True
         tasks = [t for t in tasks if _in_range(t)]
 
-    # Exclusion filter (Section + apartment variants) — removes any task
+    # Exclusion filter (Sectional + apartment variants) — removes any task
     # matching a keyword the schedule chose to exclude; an empty selection
     # (Allow All) filters nothing.
     excluded_keywords = _af_get_excluded_keywords(cfg)
