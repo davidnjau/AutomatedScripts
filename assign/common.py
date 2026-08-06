@@ -433,21 +433,24 @@ def _sectional_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
-def _apartment_multiselect_keyboard(keywords, excluded) -> InlineKeyboardMarkup:
-    """One toggle button per apartment-variant keyword (☑ excluded / ☐ kept),
-    two per row, plus a trailing Done button. `excluded` is the in-progress
-    set of keywords the user has checked off so far."""
+def _af_exclusion_multiselect_keyboard(keywords, excluded) -> InlineKeyboardMarkup:
+    """One toggle button per exclusion keyword (☑ excluded / ☐ kept), two
+    per row, plus a trailing Done button. `excluded` is the in-progress set
+    of keywords the user has checked off so far. Used by Auto Fetch's
+    schedule-creation "Exclude" step for its unified Section + apartment-
+    variant keyword list — not apartment-specific despite the name
+    similarity to load_apartments_config elsewhere in this file."""
     rows = []
     row = []
     for kw in keywords:
         mark = "☑" if kw in excluded else "☐"
-        row.append(InlineKeyboardButton(f"{mark} {kw}", callback_data=f"ft_apt:{kw}"))
+        row.append(InlineKeyboardButton(f"{mark} {kw}", callback_data=f"ft_excl_pick:{kw}"))
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("✅ Done", callback_data="ft_apt:done")])
+    rows.append([InlineKeyboardButton("✅ Done", callback_data="ft_excl_pick:done")])
     return InlineKeyboardMarkup(rows)
 
 

@@ -572,10 +572,30 @@ class TestAutoFetchJob(unittest.TestCase):
             parse_mode="Markdown",
         )
 
+    def test_section_exclusion_removes_sectional_shaped_tasks(self):
+        """SECTION is the symbolic keyword for the structural ≥3-slash rule
+        — excluding it shouldn't touch an apartment-keyword match."""
+        cfg = {"days_back": 2, "excluded_keywords": ["SECTION"]}
+        tasks = [
+            _task(ref="R1", parcel_number="NAIROBI/BLOCK1/1/888"),
+            _task(ref="R2", parcel_number="APARTMENT NO. 5"),
+        ]
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "load_apartments_config", return_value=None), \
+             patch.object(af, "persist_af_result") as mock_persist:
+            _run(af._auto_fetch_job(self.context))
+        persisted_tasks = mock_persist.call_args[0][2]
+        self.assertEqual([t["reference_number"] for t in persisted_tasks], ["R2"])
+
     def test_sectional_auto_routes_when_specialist_configured(self):
-        # sectional_filter="all" so the earlier main filter step doesn't
-        # strip the sectional task before auto-routing gets a chance to see it
-        cfg = {"days_back": 2, "sectional_filter": "all"}
+        # Empty exclusion list (Allow All) so the earlier main filter step
+        # doesn't strip the sectional task before auto-routing gets a
+        # chance to see it
+        cfg = {"days_back": 2, "excluded_keywords": []}
         sectional_task = _task(ref="R-SEC", parcel_number="NAIROBI/BLOCK1/1/888")
         sc_cfg = {
             "auto_route": True, "cred_type": "staff2",
@@ -599,7 +619,7 @@ class TestAutoFetchJob(unittest.TestCase):
         self.assertEqual(persisted_tasks, [])
 
     def test_apartment_exclusion_list_removes_matching_tasks(self):
-        cfg = {"days_back": 2, "apartment_excluded_keywords": ["APARTMENT"]}
+        cfg = {"days_back": 2, "excluded_keywords": ["APARTMENT"]}
         tasks = [
             _task(ref="R1", parcel_number="APARTMENT NO. 403 BLOCK 'G'"),
             _task(ref="R2", parcel_number="NAIROBI/BLOCK1/1"),
@@ -619,7 +639,7 @@ class TestAutoFetchJob(unittest.TestCase):
         """Excluding FLAT shouldn't touch a task that only matches a
         different apartment keyword (APARTMENT) — exclusions are per-keyword,
         not "any apartment-like task"."""
-        cfg = {"days_back": 2, "apartment_excluded_keywords": ["FLAT"]}
+        cfg = {"days_back": 2, "excluded_keywords": ["FLAT"]}
         tasks = [
             _task(ref="R1", parcel_number="APARTMENT NO. 403 BLOCK 'G'"),
             _task(ref="R2", parcel_number="FLAT 5B"),
@@ -636,7 +656,7 @@ class TestAutoFetchJob(unittest.TestCase):
         self.assertEqual([t["reference_number"] for t in persisted_tasks], ["R1"])
 
     def test_empty_apartment_exclusion_list_keeps_all_tasks(self):
-        cfg = {"days_back": 2, "apartment_excluded_keywords": []}
+        cfg = {"days_back": 2, "excluded_keywords": []}
         tasks = [
             _task(ref="R1", parcel_number="APARTMENT NO. 403 BLOCK 'G'"),
             _task(ref="R2", parcel_number="NAIROBI/BLOCK1/1"),
@@ -675,7 +695,7 @@ class TestAutoFetchJob(unittest.TestCase):
     def test_apartment_auto_routes_when_specialist_configured(self):
         # Empty exclusion list so the earlier main filter step doesn't strip
         # the apartment task before auto-routing gets a chance to see it
-        cfg = {"days_back": 2, "apartment_excluded_keywords": []}
+        cfg = {"days_back": 2, "excluded_keywords": []}
         apartment_task = _task(ref="R-APT", parcel_number="APARTMENT NO. 403 BLOCK 'G'")
         ap_cfg = {
             "auto_route": True, "cred_type": "staff2",
@@ -1030,64 +1050,104 @@ class TestAfIsApartmentTask(unittest.TestCase):
         self.assertFalse(af._af_is_apartment_task({}))
 
 
-class TestAfMatchesExcludedApartmentKeyword(unittest.TestCase):
-    """_af_matches_excluded_apartment_keyword — matches only against the
-    given excluded set, not every apartment keyword."""
+class TestAfIsSectionalTask(unittest.TestCase):
+    """_af_is_sectional_task — the structural ≥3-slash rule."""
+
+    def test_matches_four_part_parcel(self):
+        self.assertTrue(af._af_is_sectional_task({"parcel_number": "NAIROBI/BLOCK1/1/888"}))
+
+    def test_no_match_for_two_part_parcel(self):
+        self.assertFalse(af._af_is_sectional_task({"parcel_number": "NAIROBI/BLOCK1/1"}))
+
+    def test_missing_parcel_number_does_not_match(self):
+        self.assertFalse(af._af_is_sectional_task({}))
+
+
+class TestAfTaskMatchesKeyword(unittest.TestCase):
+    """_af_task_matches_keyword — SECTION dispatches to the structural
+    rule, every other keyword is a substring match."""
+
+    def test_section_uses_slash_count_rule(self):
+        self.assertTrue(af._af_task_matches_keyword({"parcel_number": "NAIROBI/BLOCK1/1/888"}, "SECTION"))
+        self.assertFalse(af._af_task_matches_keyword({"parcel_number": "NAIROBI/BLOCK1/1"}, "SECTION"))
+
+    def test_apartment_keyword_uses_substring_match(self):
+        self.assertTrue(af._af_task_matches_keyword({"parcel_number": "FLAT 5B"}, "FLAT"))
+        self.assertFalse(af._af_task_matches_keyword({"parcel_number": "NAIROBI/BLOCK1/1"}, "FLAT"))
+
+
+class TestAfTaskMatchesExcluded(unittest.TestCase):
+    """_af_task_matches_excluded — matches only against the given excluded
+    set, not every possible keyword."""
 
     def test_matches_when_parcel_contains_an_excluded_keyword(self):
-        self.assertTrue(af._af_matches_excluded_apartment_keyword(
+        self.assertTrue(af._af_task_matches_excluded(
             {"parcel_number": "FLAT 5B"}, {"FLAT", "BUILDING"}))
 
+    def test_matches_via_section_in_the_excluded_set(self):
+        self.assertTrue(af._af_task_matches_excluded(
+            {"parcel_number": "NAIROBI/BLOCK1/1/888"}, {"SECTION"}))
+
     def test_no_match_when_parcel_matches_a_non_excluded_keyword(self):
-        self.assertFalse(af._af_matches_excluded_apartment_keyword(
+        self.assertFalse(af._af_task_matches_excluded(
             {"parcel_number": "APARTMENT NO. 5"}, {"FLAT", "BUILDING"}))
 
     def test_no_match_with_empty_excluded_set(self):
-        self.assertFalse(af._af_matches_excluded_apartment_keyword(
+        self.assertFalse(af._af_task_matches_excluded(
             {"parcel_number": "APARTMENT NO. 5"}, set()))
 
 
-class TestAfGetApartmentExcludedKeywords(unittest.TestCase):
-    """_af_get_apartment_excluded_keywords — reads the current multi-select
-    list, falling back to the legacy ternary apartment_filter for schedules
-    saved before the multi-select step existed."""
+class TestAfGetExcludedKeywords(unittest.TestCase):
+    """_af_get_excluded_keywords — reads the current unified list, falling
+    back to the legacy separate sectional_filter/apartment_filter fields
+    for schedules saved before the two were merged into one Exclude step."""
 
     def test_reads_current_list_format(self):
-        result = af._af_get_apartment_excluded_keywords({"apartment_excluded_keywords": ["FLAT", "APT"]})
-        self.assertEqual(result, {"FLAT", "APT"})
+        result = af._af_get_excluded_keywords({"excluded_keywords": ["SECTION", "FLAT", "APT"]})
+        self.assertEqual(result, {"SECTION", "FLAT", "APT"})
 
     def test_empty_list_means_no_exclusions(self):
-        result = af._af_get_apartment_excluded_keywords({"apartment_excluded_keywords": []})
+        result = af._af_get_excluded_keywords({"excluded_keywords": []})
         self.assertEqual(result, set())
 
-    def test_legacy_exclude_maps_to_every_keyword(self):
-        result = af._af_get_apartment_excluded_keywords({"apartment_filter": "exclude"})
+    def test_legacy_sectional_exclude_adds_section(self):
+        result = af._af_get_excluded_keywords({"sectional_filter": "exclude", "apartment_filter": "all"})
+        self.assertEqual(result, {"SECTION"})
+
+    def test_legacy_sectional_only_has_no_equivalent(self):
+        result = af._af_get_excluded_keywords({"sectional_filter": "only", "apartment_filter": "all"})
+        self.assertEqual(result, set())
+
+    def test_legacy_apartment_exclude_maps_to_every_apartment_keyword(self):
+        result = af._af_get_excluded_keywords({"sectional_filter": "all", "apartment_filter": "exclude"})
         self.assertEqual(result, set(af._AF_APARTMENT_KEYWORDS))
 
-    def test_legacy_only_has_no_equivalent_and_falls_back_to_empty(self):
-        result = af._af_get_apartment_excluded_keywords({"apartment_filter": "only"})
+    def test_legacy_apartment_only_has_no_equivalent(self):
+        result = af._af_get_excluded_keywords({"sectional_filter": "all", "apartment_filter": "only"})
         self.assertEqual(result, set())
 
-    def test_legacy_all_falls_back_to_empty(self):
-        result = af._af_get_apartment_excluded_keywords({"apartment_filter": "all"})
-        self.assertEqual(result, set())
+    def test_legacy_sectional_and_apartment_combine(self):
+        result = af._af_get_excluded_keywords({"sectional_filter": "exclude", "apartment_excluded_keywords": ["FLAT"]})
+        self.assertEqual(result, {"SECTION", "FLAT"})
 
-    def test_missing_key_defaults_to_legacy_exclude_behavior(self):
-        result = af._af_get_apartment_excluded_keywords({})
-        self.assertEqual(result, set(af._AF_APARTMENT_KEYWORDS))
+    def test_missing_keys_default_to_legacy_exclude_behavior(self):
+        """No fields at all is the oldest possible schedule shape — both
+        legacy defaults ("exclude") apply, so everything is excluded."""
+        result = af._af_get_excluded_keywords({})
+        self.assertEqual(result, set(af._AF_EXCLUSION_KEYWORDS))
 
 
-class TestAfApartmentLabel(unittest.TestCase):
-    """_af_apartment_label — human-readable summary of the exclusion set."""
+class TestAfExclusionLabel(unittest.TestCase):
+    """_af_exclusion_label — human-readable summary of the exclusion set."""
 
     def test_empty_set(self):
-        self.assertEqual(af._af_apartment_label(set()), "No apartment exclusions")
+        self.assertEqual(af._af_exclusion_label(set()), "Allow All")
 
     def test_full_set(self):
-        self.assertEqual(af._af_apartment_label(set(af._AF_APARTMENT_KEYWORDS)), "All apartment variants excluded")
+        self.assertEqual(af._af_exclusion_label(set(af._AF_EXCLUSION_KEYWORDS)), "Exclude All")
 
     def test_partial_set_lists_keywords_sorted(self):
-        self.assertEqual(af._af_apartment_label({"FLAT", "APT"}), "Excludes APT, FLAT")
+        self.assertEqual(af._af_exclusion_label({"FLAT", "APT"}), "Excludes APT, FLAT")
 
 
 class TestAfConsiderationValue(unittest.TestCase):
@@ -1201,15 +1261,15 @@ class TestRecvAfAmount(unittest.TestCase):
         ctx = MagicMock()
         ctx.user_data = {}
         result = _run(af.recv_af_amount(update, ctx))
-        self.assertEqual(result, af.AF.SECTIONAL)
+        self.assertEqual(result, af.AF.EXCLUSION_MODE)
         self.assertEqual(ctx.user_data["af_amount_min"], 10_000_000.0)
         self.assertEqual(ctx.user_data["af_amount_max"], 50_000_000.0)
 
 
-class TestRecvAfSectional(unittest.TestCase):
-    """recv_af_sectional — stores the sectional choice, confirms it in
-    place, then sends the apartment multi-select step as its own new
-    message (not editing the sectional message in place)."""
+class TestRecvAfExclusionMode(unittest.TestCase):
+    """recv_af_exclusion_mode — Allow All / Exclude All finish the filter
+    step outright (own confirmation message + email prompt); Exclude opens
+    the multi-select instead, starting from an empty selection."""
 
     def _make_query(self, data):
         update = MagicMock()
@@ -1220,52 +1280,59 @@ class TestRecvAfSectional(unittest.TestCase):
         query.message.reply_text = AsyncMock()
         return update
 
-    def test_stores_choice_and_confirms_in_place(self):
-        update = self._make_query("ft_sectional:only")
+    def test_allow_all_sets_empty_exclusion_and_moves_to_email(self):
+        update = self._make_query("ft_excl_mode:allow_all")
         ctx = MagicMock()
         ctx.user_data = {}
-        result = _run(af.recv_af_sectional(update, ctx))
-        self.assertEqual(result, af.AF.APARTMENT)
-        self.assertEqual(ctx.user_data["af_sectional"], "only")
+        result = _run(af.recv_af_exclusion_mode(update, ctx))
+        self.assertEqual(result, af.AF.EMAIL)
+        self.assertEqual(ctx.user_data["af_excluded_keywords"], set())
         confirm_text = update.callback_query.edit_message_text.call_args[0][0]
-        self.assertIn("sectional", confirm_text.lower())
+        self.assertIn("Allow All", confirm_text)
+        email_text = update.callback_query.message.reply_text.call_args[0][0]
+        self.assertIn("email", email_text.lower())
 
-    def test_apartment_step_sent_as_its_own_message(self):
-        update = self._make_query("ft_sectional:exclude")
+    def test_exclude_all_sets_full_exclusion_and_moves_to_email(self):
+        update = self._make_query("ft_excl_mode:exclude_all")
         ctx = MagicMock()
         ctx.user_data = {}
-        _run(af.recv_af_sectional(update, ctx))
-        update.callback_query.message.reply_text.assert_called_once()
-        text = update.callback_query.message.reply_text.call_args[0][0]
-        self.assertIn("apartment", text.lower())
+        result = _run(af.recv_af_exclusion_mode(update, ctx))
+        self.assertEqual(result, af.AF.EMAIL)
+        self.assertEqual(ctx.user_data["af_excluded_keywords"], set(af._AF_EXCLUSION_KEYWORDS))
+        confirm_text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Exclude All", confirm_text)
 
-    def test_apartment_exclusion_set_starts_full(self):
-        update = self._make_query("ft_sectional:exclude")
+    def test_pick_starts_empty_and_moves_to_exclusion_pick(self):
+        """Starts empty rather than fully checked — Exclude All already
+        covers "check everything"; this step builds up a smaller subset."""
+        update = self._make_query("ft_excl_mode:pick")
         ctx = MagicMock()
         ctx.user_data = {}
-        _run(af.recv_af_sectional(update, ctx))
-        self.assertEqual(ctx.user_data["af_apartment_excluded"], set(af._AF_APARTMENT_KEYWORDS))
+        result = _run(af.recv_af_exclusion_mode(update, ctx))
+        self.assertEqual(result, af.AF.EXCLUSION_PICK)
+        self.assertEqual(ctx.user_data["af_excluded_keywords"], set())
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Exclude", text)
 
-    def test_apartment_prompt_text_has_no_unbalanced_underscore(self):
-        """Regression: the prompt used to say "parcel_number" inside a
-        single-underscore Markdown italic span — the literal underscore
-        closed the span early, leaving a dangling `_` that made Telegram
-        raise BadRequest ("can't find end of the entity") and, since that
-        exception happened before `return AF.APARTMENT`, silently stuck the
-        conversation in AF.SECTIONAL forever. An even underscore count is a
-        cheap proxy for "every _..._ span is closed"."""
-        update = self._make_query("ft_sectional:exclude")
+    def test_pick_prompt_text_has_no_unbalanced_underscore(self):
+        """Regression guard: a prior version of this codebase's apartment
+        prompt wrapped a literal underscore inside a Markdown italic span,
+        raising telegram.error.BadRequest and silently stalling the
+        conversation before its state transition ever ran. Every message
+        this module sends should stay clear of that failure mode."""
+        update = self._make_query("ft_excl_mode:pick")
         ctx = MagicMock()
         ctx.user_data = {}
-        _run(af.recv_af_sectional(update, ctx))
-        text = update.callback_query.message.reply_text.call_args[0][0]
+        _run(af.recv_af_exclusion_mode(update, ctx))
+        text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertEqual(text.count("_") % 2, 0)
 
 
-class TestRecvAfApartment(unittest.TestCase):
-    """recv_af_apartment — toggles one keyword's excluded state per tap
-    (re-rendering the same multi-select message), and on "done" confirms
-    the final selection then sends the email step as its own message."""
+class TestRecvAfExclusionPick(unittest.TestCase):
+    """recv_af_exclusion_pick — toggles one keyword's excluded state per
+    tap (re-rendering the same multi-select message), and on "done"
+    confirms the final selection then sends the email step as its own
+    message."""
 
     def _make_query(self, data):
         update = MagicMock()
@@ -1277,41 +1344,38 @@ class TestRecvAfApartment(unittest.TestCase):
         query.message.reply_text = AsyncMock()
         return update
 
-    def test_toggling_an_excluded_keyword_unexcludes_it(self):
-        update = self._make_query("ft_apt:APARTMENT")
+    def test_toggling_a_kept_keyword_excludes_it(self):
+        update = self._make_query("ft_excl_pick:FLAT")
         ctx = MagicMock()
-        ctx.user_data = {"af_apartment_excluded": set(af._AF_APARTMENT_KEYWORDS)}
-        result = _run(af.recv_af_apartment(update, ctx))
-        self.assertEqual(result, af.AF.APARTMENT)
-        self.assertNotIn("APARTMENT", ctx.user_data["af_apartment_excluded"])
+        ctx.user_data = {"af_excluded_keywords": set()}
+        result = _run(af.recv_af_exclusion_pick(update, ctx))
+        self.assertEqual(result, af.AF.EXCLUSION_PICK)
+        self.assertIn("FLAT", ctx.user_data["af_excluded_keywords"])
         update.callback_query.edit_message_reply_markup.assert_called_once()
 
-    def test_toggling_a_kept_keyword_excludes_it(self):
-        update = self._make_query("ft_apt:FLAT")
+    def test_toggling_an_excluded_keyword_unexcludes_it(self):
+        update = self._make_query("ft_excl_pick:SECTION")
         ctx = MagicMock()
-        ctx.user_data = {"af_apartment_excluded": set()}
-        result = _run(af.recv_af_apartment(update, ctx))
-        self.assertEqual(result, af.AF.APARTMENT)
-        self.assertIn("FLAT", ctx.user_data["af_apartment_excluded"])
+        ctx.user_data = {"af_excluded_keywords": {"SECTION", "FLAT"}}
+        result = _run(af.recv_af_exclusion_pick(update, ctx))
+        self.assertEqual(result, af.AF.EXCLUSION_PICK)
+        self.assertEqual(ctx.user_data["af_excluded_keywords"], {"FLAT"})
 
-    def test_missing_excluded_set_defaults_to_full(self):
-        """Defensive: if this handler somehow fires before recv_af_sectional
-        initialized the set, it shouldn't crash — start from "everything
-        excluded", same as the normal entry point."""
-        update = self._make_query("ft_apt:APARTMENT")
+    def test_missing_excluded_set_defaults_to_empty(self):
+        """Defensive: if this handler somehow fires before
+        recv_af_exclusion_mode initialized the set, it shouldn't crash —
+        start from empty, same as the normal "pick" entry point."""
+        update = self._make_query("ft_excl_pick:FLAT")
         ctx = MagicMock()
         ctx.user_data = {}
-        _run(af.recv_af_apartment(update, ctx))
-        self.assertEqual(
-            ctx.user_data["af_apartment_excluded"],
-            set(af._AF_APARTMENT_KEYWORDS) - {"APARTMENT"},
-        )
+        _run(af.recv_af_exclusion_pick(update, ctx))
+        self.assertEqual(ctx.user_data["af_excluded_keywords"], {"FLAT"})
 
     def test_done_moves_to_email_step(self):
-        update = self._make_query("ft_apt:done")
+        update = self._make_query("ft_excl_pick:done")
         ctx = MagicMock()
-        ctx.user_data = {"af_apartment_excluded": {"FLAT"}}
-        result = _run(af.recv_af_apartment(update, ctx))
+        ctx.user_data = {"af_excluded_keywords": {"FLAT"}}
+        result = _run(af.recv_af_exclusion_pick(update, ctx))
         self.assertEqual(result, af.AF.EMAIL)
         confirm_text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("FLAT", confirm_text)
