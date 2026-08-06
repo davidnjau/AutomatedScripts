@@ -433,12 +433,22 @@ def _sectional_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
-def _apartment_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🚫 Exclude Apartments", callback_data="ft_apartment:exclude"),
-        InlineKeyboardButton("🏬 Apartments Only",    callback_data="ft_apartment:only"),
-        InlineKeyboardButton("📋 All",                callback_data="ft_apartment:all"),
-    ]])
+def _apartment_multiselect_keyboard(keywords, excluded) -> InlineKeyboardMarkup:
+    """One toggle button per apartment-variant keyword (☑ excluded / ☐ kept),
+    two per row, plus a trailing Done button. `excluded` is the in-progress
+    set of keywords the user has checked off so far."""
+    rows = []
+    row = []
+    for kw in keywords:
+        mark = "☑" if kw in excluded else "☐"
+        row.append(InlineKeyboardButton(f"{mark} {kw}", callback_data=f"ft_apt:{kw}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✅ Done", callback_data="ft_apt:done")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ──────────────────────────────────────────────────────────
