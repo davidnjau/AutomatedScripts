@@ -50,6 +50,8 @@ class TestCmdExclusions(unittest.TestCase):
         self.assertEqual(result, ce.CE.ACTION)
         text = update.message.reply_text.call_args[0][0]
         self.assertIn("No custom keywords yet", text)
+        self.assertIn("SECTIONAL", text)
+        self.assertIn("FLAT", text)
         markup = update.message.reply_text.call_args[1]["reply_markup"]
         button_data = [b.callback_data for row in markup.inline_keyboard for b in row]
         self.assertNotIn("ce:remove", button_data)
@@ -63,6 +65,7 @@ class TestCmdExclusions(unittest.TestCase):
         self.assertEqual(result, ce.CE.ACTION)
         text = update.message.reply_text.call_args[0][0]
         self.assertIn("MAISONETTE", text)
+        self.assertIn("SECTIONAL", text)
         markup = update.message.reply_text.call_args[1]["reply_markup"]
         button_data = [b.callback_data for row in markup.inline_keyboard for b in row]
         self.assertIn("ce:remove", button_data)

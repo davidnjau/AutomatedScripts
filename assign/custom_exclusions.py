@@ -78,24 +78,25 @@ def _ce_remove_keyboard(keywords) -> InlineKeyboardMarkup:
 
 
 async def cmd_exclusions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Show the current custom exclusion list with Add/Remove/Close actions.
+    # Show the full current exclusion list (built-in + custom) with Add/Remove/Close actions.
     if not allowed(update): return await deny(update)
     custom = load_custom_exclusions()
+    builtin_listing = ", ".join(_AF_EXCLUSION_KEYWORDS)
     if custom:
-        listing = "\n".join(f"• {kw}" for kw in custom)
+        custom_listing = "\n".join(f"• {kw}" for kw in custom)
         status = (
             f"🚫 *Manage Exclusions*\n\n"
-            f"Custom keywords (on top of Auto Fetch's built-in SECTIONAL + "
-            f"apartment variants):\n{md_escape(listing)}\n\n"
+            f"Built-in (always available): {md_escape(builtin_listing)}\n\n"
+            f"Your custom keywords:\n{md_escape(custom_listing)}\n\n"
             f"Choose an action:"
         )
     else:
         status = (
-            "🚫 *Manage Exclusions*\n\n"
-            "No custom keywords yet. Anything you add here shows up in Auto "
-            "Fetch's Exclude checklist alongside the built-in SECTIONAL and "
-            "apartment variants.\n\n"
-            "Choose an action:"
+            f"🚫 *Manage Exclusions*\n\n"
+            f"Built-in (always available): {md_escape(builtin_listing)}\n\n"
+            f"No custom keywords yet. Anything you add here shows up in Auto "
+            f"Fetch's Exclude checklist alongside these.\n\n"
+            f"Choose an action:"
         )
     await update.message.reply_text(
         status, parse_mode="Markdown", reply_markup=_ce_action_keyboard(bool(custom)),
