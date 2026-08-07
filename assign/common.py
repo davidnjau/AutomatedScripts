@@ -83,6 +83,7 @@ SAVED_TOKENS_FILE           = os.path.join(DATA_DIR, "saved_tokens.json")
 SAVED_ASSIGNMENTS_FILE      = os.path.join(DATA_DIR, "saved_assignments.json")
 SAVED_SECTIONAL_CONFIG_FILE = os.path.join(DATA_DIR, "saved_sectional_config.json")
 SAVED_APARTMENTS_CONFIG_FILE = os.path.join(DATA_DIR, "saved_apartments_config.json")
+SAVED_CUSTOM_EXCLUSIONS_FILE = os.path.join(DATA_DIR, "saved_custom_exclusions.json")
 
 # base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
 CPARAMS_DLV          = base64.b64encode(b'{"active_role":"DLV"}').decode()
@@ -248,6 +249,25 @@ def load_apartments_config() -> Optional[Dict]:
 
 def save_apartments_config(cfg: Dict) -> None:
     _atomic_json_write(SAVED_APARTMENTS_CONFIG_FILE, cfg, indent=2)
+
+
+# ── Custom exclusion keywords ────────────────────────────────
+# User-managed additions to Auto Fetch's 9 built-in exclusion keywords
+# (custom_exclusions.py's Manage Exclusions menu) — read by Auto Fetch's
+# Exclude multi-select step as well as by Manage Exclusions itself, so it
+# lives here rather than in either feature module, same reasoning as
+# Sectional/Apartments' config above.
+
+def load_custom_exclusions() -> List[str]:
+    try:
+        with open(SAVED_CUSTOM_EXCLUSIONS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_custom_exclusions(keywords: List[str]) -> None:
+    _atomic_json_write(SAVED_CUSTOM_EXCLUSIONS_FILE, keywords, indent=2)
 
 
 # ── Tokens ────────────────────────────────────────────────
@@ -485,6 +505,7 @@ BTN_APARTMENTS    = "🏬 Apartments"
 BTN_HOLD_TASKS    = "✋ Hold Tasks"
 BTN_INCREMENTAL   = "🔢 Incremental"
 BTN_DLV_REPORT_SCHEDULE = "📧 DLV Report Schedule"
+BTN_CUSTOM_EXCLUSIONS = "🚫 Exclusions"
 
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
@@ -498,6 +519,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_DLV_TASKS)}|{re.escape(BTN_BRIEFING)}|{re.escape(BTN_SECTIONAL)}"
     f"|{re.escape(BTN_APARTMENTS)}"
     f"|{re.escape(BTN_HOLD_TASKS)}|{re.escape(BTN_INCREMENTAL)}|{re.escape(BTN_DLV_REPORT_SCHEDULE)}"
+    f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -519,7 +541,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(BTN_BULK_EXPORT),    KeyboardButton(BTN_JOB_DIST)],
             [KeyboardButton(BTN_EXPORT_STATUS),  KeyboardButton(BTN_ERROR_REPORT)],
             [KeyboardButton(BTN_DLV_TASKS),      KeyboardButton(BTN_HOLD_TASKS)],
-            [KeyboardButton(BTN_BRIEFING)],
+            [KeyboardButton(BTN_BRIEFING),       KeyboardButton(BTN_CUSTOM_EXCLUSIONS)],
             [KeyboardButton(BTN_DLV_REPORT_SCHEDULE), KeyboardButton(BTN_INCREMENTAL)],
             # ── Lookup ──────────────────────────────────────
             [KeyboardButton(BTN_LOOKUP)],

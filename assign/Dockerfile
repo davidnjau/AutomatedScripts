@@ -27,6 +27,7 @@ COPY refresh_auth.py .
 COPY sectional_properties.py .
 COPY apartments.py .
 COPY auto_fetch.py .
+COPY custom_exclusions.py .
 COPY receive_tasks.py .
 COPY token_rotator.py .
 COPY lookup_reference.py .

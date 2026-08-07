@@ -573,9 +573,9 @@ class TestAutoFetchJob(unittest.TestCase):
         )
 
     def test_section_exclusion_removes_sectional_shaped_tasks(self):
-        """SECTION is the symbolic keyword for the structural ≥3-slash rule
+        """SECTIONAL is the symbolic keyword for the structural ≥3-slash rule
         — excluding it shouldn't touch an apartment-keyword match."""
-        cfg = {"days_back": 2, "excluded_keywords": ["SECTION"]}
+        cfg = {"days_back": 2, "excluded_keywords": ["SECTIONAL"]}
         tasks = [
             _task(ref="R1", parcel_number="NAIROBI/BLOCK1/1/888"),
             _task(ref="R2", parcel_number="APARTMENT NO. 5"),
@@ -1064,12 +1064,12 @@ class TestAfIsSectionalTask(unittest.TestCase):
 
 
 class TestAfTaskMatchesKeyword(unittest.TestCase):
-    """_af_task_matches_keyword — SECTION dispatches to the structural
+    """_af_task_matches_keyword — SECTIONAL dispatches to the structural
     rule, every other keyword is a substring match."""
 
     def test_section_uses_slash_count_rule(self):
-        self.assertTrue(af._af_task_matches_keyword({"parcel_number": "NAIROBI/BLOCK1/1/888"}, "SECTION"))
-        self.assertFalse(af._af_task_matches_keyword({"parcel_number": "NAIROBI/BLOCK1/1"}, "SECTION"))
+        self.assertTrue(af._af_task_matches_keyword({"parcel_number": "NAIROBI/BLOCK1/1/888"}, "SECTIONAL"))
+        self.assertFalse(af._af_task_matches_keyword({"parcel_number": "NAIROBI/BLOCK1/1"}, "SECTIONAL"))
 
     def test_apartment_keyword_uses_substring_match(self):
         self.assertTrue(af._af_task_matches_keyword({"parcel_number": "FLAT 5B"}, "FLAT"))
@@ -1086,7 +1086,7 @@ class TestAfTaskMatchesExcluded(unittest.TestCase):
 
     def test_matches_via_section_in_the_excluded_set(self):
         self.assertTrue(af._af_task_matches_excluded(
-            {"parcel_number": "NAIROBI/BLOCK1/1/888"}, {"SECTION"}))
+            {"parcel_number": "NAIROBI/BLOCK1/1/888"}, {"SECTIONAL"}))
 
     def test_no_match_when_parcel_matches_a_non_excluded_keyword(self):
         self.assertFalse(af._af_task_matches_excluded(
@@ -1103,8 +1103,8 @@ class TestAfGetExcludedKeywords(unittest.TestCase):
     for schedules saved before the two were merged into one Exclude step."""
 
     def test_reads_current_list_format(self):
-        result = af._af_get_excluded_keywords({"excluded_keywords": ["SECTION", "FLAT", "APT"]})
-        self.assertEqual(result, {"SECTION", "FLAT", "APT"})
+        result = af._af_get_excluded_keywords({"excluded_keywords": ["SECTIONAL", "FLAT", "APT"]})
+        self.assertEqual(result, {"SECTIONAL", "FLAT", "APT"})
 
     def test_empty_list_means_no_exclusions(self):
         result = af._af_get_excluded_keywords({"excluded_keywords": []})
@@ -1112,7 +1112,7 @@ class TestAfGetExcludedKeywords(unittest.TestCase):
 
     def test_legacy_sectional_exclude_adds_section(self):
         result = af._af_get_excluded_keywords({"sectional_filter": "exclude", "apartment_filter": "all"})
-        self.assertEqual(result, {"SECTION"})
+        self.assertEqual(result, {"SECTIONAL"})
 
     def test_legacy_sectional_only_has_no_equivalent(self):
         result = af._af_get_excluded_keywords({"sectional_filter": "only", "apartment_filter": "all"})
@@ -1128,13 +1128,27 @@ class TestAfGetExcludedKeywords(unittest.TestCase):
 
     def test_legacy_sectional_and_apartment_combine(self):
         result = af._af_get_excluded_keywords({"sectional_filter": "exclude", "apartment_excluded_keywords": ["FLAT"]})
-        self.assertEqual(result, {"SECTION", "FLAT"})
+        self.assertEqual(result, {"SECTIONAL", "FLAT"})
 
     def test_missing_keys_default_to_legacy_exclude_behavior(self):
         """No fields at all is the oldest possible schedule shape — both
         legacy defaults ("exclude") apply, so everything is excluded."""
         result = af._af_get_excluded_keywords({})
         self.assertEqual(result, set(af._AF_EXCLUSION_KEYWORDS))
+
+
+class TestAfAllExclusionKeywords(unittest.TestCase):
+    """_af_all_exclusion_keywords — the 9 built-in keywords plus whatever
+    custom ones Manage Exclusions has saved."""
+
+    def test_no_custom_keywords_returns_just_the_built_ins(self):
+        with patch.object(af, "load_custom_exclusions", return_value=[]):
+            self.assertEqual(af._af_all_exclusion_keywords(), af._AF_EXCLUSION_KEYWORDS)
+
+    def test_custom_keywords_are_appended(self):
+        with patch.object(af, "load_custom_exclusions", return_value=["MAISONETTE", "TOWNHOUSE"]):
+            result = af._af_all_exclusion_keywords()
+        self.assertEqual(result, af._AF_EXCLUSION_KEYWORDS + ("MAISONETTE", "TOWNHOUSE"))
 
 
 class TestAfExclusionLabel(unittest.TestCase):
@@ -1144,10 +1158,24 @@ class TestAfExclusionLabel(unittest.TestCase):
         self.assertEqual(af._af_exclusion_label(set()), "Allow All")
 
     def test_full_set(self):
-        self.assertEqual(af._af_exclusion_label(set(af._AF_EXCLUSION_KEYWORDS)), "Exclude All")
+        with patch.object(af, "load_custom_exclusions", return_value=[]):
+            self.assertEqual(af._af_exclusion_label(set(af._AF_EXCLUSION_KEYWORDS)), "Exclude All")
 
     def test_partial_set_lists_keywords_sorted(self):
         self.assertEqual(af._af_exclusion_label({"FLAT", "APT"}), "Excludes APT, FLAT")
+
+    def test_full_built_in_set_is_partial_once_a_custom_keyword_exists(self):
+        """Exclude All is judged against the CURRENT universe — if a custom
+        keyword now exists that this schedule's saved set doesn't include,
+        it's no longer everything, just a (large) subset."""
+        with patch.object(af, "load_custom_exclusions", return_value=["MAISONETTE"]):
+            result = af._af_exclusion_label(set(af._AF_EXCLUSION_KEYWORDS))
+        self.assertNotEqual(result, "Exclude All")
+
+    def test_custom_keyword_included_in_exclude_all(self):
+        with patch.object(af, "load_custom_exclusions", return_value=["MAISONETTE"]):
+            result = af._af_exclusion_label(set(af._AF_EXCLUSION_KEYWORDS) | {"MAISONETTE"})
+        self.assertEqual(result, "Exclude All")
 
 
 class TestAfConsiderationValue(unittest.TestCase):
@@ -1296,11 +1324,20 @@ class TestRecvAfExclusionMode(unittest.TestCase):
         update = self._make_query("ft_excl_mode:exclude_all")
         ctx = MagicMock()
         ctx.user_data = {}
-        result = _run(af.recv_af_exclusion_mode(update, ctx))
+        with patch.object(af, "load_custom_exclusions", return_value=[]):
+            result = _run(af.recv_af_exclusion_mode(update, ctx))
         self.assertEqual(result, af.AF.EMAIL)
         self.assertEqual(ctx.user_data["af_excluded_keywords"], set(af._AF_EXCLUSION_KEYWORDS))
         confirm_text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("Exclude All", confirm_text)
+
+    def test_exclude_all_includes_custom_keywords(self):
+        update = self._make_query("ft_excl_mode:exclude_all")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        with patch.object(af, "load_custom_exclusions", return_value=["MAISONETTE"]):
+            _run(af.recv_af_exclusion_mode(update, ctx))
+        self.assertIn("MAISONETTE", ctx.user_data["af_excluded_keywords"])
 
     def test_pick_starts_empty_and_moves_to_exclusion_pick(self):
         """Starts empty rather than fully checked — Exclude All already
@@ -1308,11 +1345,22 @@ class TestRecvAfExclusionMode(unittest.TestCase):
         update = self._make_query("ft_excl_mode:pick")
         ctx = MagicMock()
         ctx.user_data = {}
-        result = _run(af.recv_af_exclusion_mode(update, ctx))
+        with patch.object(af, "load_custom_exclusions", return_value=[]):
+            result = _run(af.recv_af_exclusion_mode(update, ctx))
         self.assertEqual(result, af.AF.EXCLUSION_PICK)
         self.assertEqual(ctx.user_data["af_excluded_keywords"], set())
         text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("Exclude", text)
+
+    def test_pick_keyboard_includes_custom_keywords(self):
+        update = self._make_query("ft_excl_mode:pick")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        with patch.object(af, "load_custom_exclusions", return_value=["MAISONETTE"]):
+            _run(af.recv_af_exclusion_mode(update, ctx))
+        markup = update.callback_query.edit_message_text.call_args[1]["reply_markup"]
+        button_data = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertIn("ft_excl_pick:MAISONETTE", button_data)
 
     def test_pick_prompt_text_has_no_unbalanced_underscore(self):
         """Regression guard: a prior version of this codebase's apartment
@@ -1354,12 +1402,24 @@ class TestRecvAfExclusionPick(unittest.TestCase):
         update.callback_query.edit_message_reply_markup.assert_called_once()
 
     def test_toggling_an_excluded_keyword_unexcludes_it(self):
-        update = self._make_query("ft_excl_pick:SECTION")
+        update = self._make_query("ft_excl_pick:SECTIONAL")
         ctx = MagicMock()
-        ctx.user_data = {"af_excluded_keywords": {"SECTION", "FLAT"}}
+        ctx.user_data = {"af_excluded_keywords": {"SECTIONAL", "FLAT"}}
         result = _run(af.recv_af_exclusion_pick(update, ctx))
         self.assertEqual(result, af.AF.EXCLUSION_PICK)
         self.assertEqual(ctx.user_data["af_excluded_keywords"], {"FLAT"})
+
+    def test_toggling_a_custom_keyword_works_like_a_built_in_one(self):
+        update = self._make_query("ft_excl_pick:MAISONETTE")
+        ctx = MagicMock()
+        ctx.user_data = {"af_excluded_keywords": set()}
+        with patch.object(af, "load_custom_exclusions", return_value=["MAISONETTE"]):
+            result = _run(af.recv_af_exclusion_pick(update, ctx))
+        self.assertEqual(result, af.AF.EXCLUSION_PICK)
+        self.assertIn("MAISONETTE", ctx.user_data["af_excluded_keywords"])
+        markup = update.callback_query.edit_message_reply_markup.call_args[1]["reply_markup"]
+        button_data = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertIn("ft_excl_pick:MAISONETTE", button_data)
 
     def test_missing_excluded_set_defaults_to_empty(self):
         """Defensive: if this handler somehow fires before

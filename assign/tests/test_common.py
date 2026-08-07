@@ -82,6 +82,25 @@ class TestSectionalConfigPersistence(unittest.TestCase):
         self.assertEqual(cfg["cred_type"], "staff2")
 
 
+class TestCustomExclusionsPersistence(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.data_file = os.path.join(self.tmpdir.name, "saved_custom_exclusions.json")
+        self._patch = patch.object(common, "SAVED_CUSTOM_EXCLUSIONS_FILE", self.data_file)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self.tmpdir.cleanup()
+
+    def test_load_missing_file_returns_empty_list(self):
+        self.assertEqual(common.load_custom_exclusions(), [])
+
+    def test_save_then_load_roundtrip(self):
+        common.save_custom_exclusions(["MAISONETTE", "TOWNHOUSE"])
+        self.assertEqual(common.load_custom_exclusions(), ["MAISONETTE", "TOWNHOUSE"])
+
+
 class TestPersistAssignment(unittest.TestCase):
     """persist_assignment — ref -> valuer_name/valuer_uid/assigned_at, plus
     whatever extra context a caller passes (e.g. DLV Batch's queue item).
@@ -244,9 +263,10 @@ class TestMainMenu(unittest.TestCase):
                     common.BTN_DLV_BATCH, common.BTN_BULK_EXPORT, common.BTN_EXPORT_STATUS,
                     common.BTN_JOB_DIST, common.BTN_DLV_TASKS, common.BTN_BRIEFING,
                     common.BTN_HOLD_TASKS, common.BTN_INCREMENTAL, common.BTN_DLV_REPORT_SCHEDULE,
-                    common.BTN_LOOKUP, common.BTN_AUTH, common.BTN_TOKEN_STATUS,
-                    common.BTN_ERROR_REPORT, common.BTN_VALUERS, common.BTN_DELETE,
-                    common.BTN_DAEMON, common.BTN_RESTART, common.BTN_HELP, common.BTN_CANCEL):
+                    common.BTN_CUSTOM_EXCLUSIONS, common.BTN_LOOKUP, common.BTN_AUTH,
+                    common.BTN_TOKEN_STATUS, common.BTN_ERROR_REPORT, common.BTN_VALUERS,
+                    common.BTN_DELETE, common.BTN_DAEMON, common.BTN_RESTART, common.BTN_HELP,
+                    common.BTN_CANCEL):
             self.assertIn(btn, texts)
 
     def _row_for(self, btn_text):
@@ -267,6 +287,10 @@ class TestMainMenu(unittest.TestCase):
     def test_dlv_report_schedule_and_incremental_share_a_row(self):
         row = self._row_for(common.BTN_DLV_REPORT_SCHEDULE)
         self.assertEqual([b.text for b in row], [common.BTN_DLV_REPORT_SCHEDULE, common.BTN_INCREMENTAL])
+
+    def test_briefing_and_custom_exclusions_share_a_row(self):
+        row = self._row_for(common.BTN_BRIEFING)
+        self.assertEqual([b.text for b in row], [common.BTN_BRIEFING, common.BTN_CUSTOM_EXCLUSIONS])
 
 
 if __name__ == "__main__":
