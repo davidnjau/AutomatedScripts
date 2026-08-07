@@ -111,6 +111,7 @@ from common import (
     fallback,
     get_valid_tokens,
     load_apartments_config,
+    load_custom_exclusions,
     load_saved_assignments,
     load_sectional_config,
     logger,
@@ -190,15 +191,16 @@ _AF_APARTMENT_KEYWORDS = (
     "APARTMENT", "APPARTMENT", "FLAT", "BUILDING", "MASSIONNAITE", "LTL", "LTB", "APT",
 )
 
-# SECTION is a symbolic keyword, not a parcel_number substring — it stands
-# for the structural sectional-title rule (≥3 slashes) rather than literal
-# text, so the unified Exclude multi-select can offer it alongside the
-# apartment keywords in one list. _AF_EXCLUSION_KEYWORDS is that full list
-# (Section first, then every apartment variant) for the schedule-creation
-# "Exclude" step below; it has nothing to do with the separate, standalone
-# Sectional Properties/Apartments specialist-routing config modules.
-_AF_SECTION_KEYWORD = "SECTION"
-_AF_EXCLUSION_KEYWORDS = (_AF_SECTION_KEYWORD,) + _AF_APARTMENT_KEYWORDS
+# SECTIONAL is a symbolic keyword, not a parcel_number substring — it
+# stands for the structural sectional-title rule (≥3 slashes) rather than
+# literal text, so the unified Exclude multi-select can offer it alongside
+# the apartment keywords in one list. _AF_EXCLUSION_KEYWORDS is that full
+# built-in list (Sectional first, then every apartment variant) for the
+# schedule-creation "Exclude" step below; it has nothing to do with the
+# separate, standalone Sectional Properties/Apartments specialist-routing
+# config modules.
+_AF_SECTIONAL_KEYWORD = "SECTIONAL"
+_AF_EXCLUSION_KEYWORDS = (_AF_SECTIONAL_KEYWORD,) + _AF_APARTMENT_KEYWORDS
 
 
 def _af_is_apartment_task(t: Dict) -> bool:
@@ -213,11 +215,18 @@ def _af_is_sectional_task(t: Dict) -> bool:
     return str(t.get("parcel_number") or "").count("/") >= 3
 
 
+def _af_all_exclusion_keywords() -> tuple:
+    """The full exclusion-keyword universe offered in the Exclude multi-
+    select: the 9 built-in keywords plus whatever custom ones have been
+    added via custom_exclusions.py's Manage Exclusions menu."""
+    return _AF_EXCLUSION_KEYWORDS + tuple(load_custom_exclusions())
+
+
 def _af_task_matches_keyword(t: Dict, keyword: str) -> bool:
-    """True if t matches this single exclusion keyword. SECTION uses the
-    structural slash-count rule; every other keyword is a parcel_number
-    substring match."""
-    if keyword == _AF_SECTION_KEYWORD:
+    """True if t matches this single exclusion keyword. SECTIONAL uses the
+    structural slash-count rule; every other keyword (built-in or custom)
+    is a parcel_number substring match."""
+    if keyword == _AF_SECTIONAL_KEYWORD:
         return _af_is_sectional_task(t)
     return keyword in str(t.get("parcel_number") or "").upper()
 
@@ -228,21 +237,23 @@ def _af_task_matches_excluded(t: Dict, excluded) -> bool:
 
 
 def _af_get_excluded_keywords(cfg: Dict) -> set:
-    """Which of the 9 exclusion keywords (SECTION + the 8 apartment
-    variants) this schedule excludes. Current schedules store one explicit
-    (possibly empty) list under excluded_keywords. A schedule saved before
-    Sectional and Apartment were unified into one Exclude step instead has
-    separate sectional_filter (the old ternary) and apartment_excluded_
-    keywords/apartment_filter fields, translated here: sectional_filter
-    == "exclude" (its old default) adds SECTION; "only"/"all" have no
-    keyword-list equivalent and add nothing — the same lossy fallback rule
-    already established for apartment_filter's own "only"/"all" values."""
+    """Which exclusion keywords (built-in and/or custom) this schedule
+    excludes. Current schedules store one explicit (possibly empty) list
+    under excluded_keywords. A schedule saved before Sectional and
+    Apartment were unified into one Exclude step instead has separate
+    sectional_filter (the old ternary) and apartment_excluded_keywords/
+    apartment_filter fields, translated here: sectional_filter == "exclude"
+    (its old default) adds SECTIONAL; "only"/"all" have no keyword-list
+    equivalent and add nothing — the same lossy fallback rule already
+    established for apartment_filter's own "only"/"all" values. Custom
+    keywords didn't exist for schedules old enough to need this fallback,
+    so there's nothing to add for them here."""
     if "excluded_keywords" in cfg:
         return set(cfg["excluded_keywords"])
 
     excluded = set()
     if cfg.get("sectional_filter", "exclude") == "exclude":
-        excluded.add(_AF_SECTION_KEYWORD)
+        excluded.add(_AF_SECTIONAL_KEYWORD)
 
     if "apartment_excluded_keywords" in cfg:
         excluded |= set(cfg["apartment_excluded_keywords"])
@@ -253,11 +264,16 @@ def _af_get_excluded_keywords(cfg: Dict) -> set:
 
 
 def _af_exclusion_label(excluded) -> str:
-    """Human-readable summary of a schedule's exclusion set."""
+    """Human-readable summary of a schedule's exclusion set. "Exclude All"
+    is judged against the CURRENT keyword universe (built-in + whatever
+    custom keywords exist right now), so a schedule saved as "exclude every
+    keyword" before a new custom one was added will read as a partial
+    "Excludes ..." list afterward — the underlying filtering behavior is
+    unaffected either way, only this label is relative to today's universe."""
     excluded = set(excluded)
     if not excluded:
         return "Allow All"
-    if excluded == set(_AF_EXCLUSION_KEYWORDS):
+    if excluded == set(_af_all_exclusion_keywords()):
         return "Exclude All"
     return "Excludes " + ", ".join(sorted(excluded))
 
@@ -684,11 +700,11 @@ async def recv_af_exclusion_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             "Tap an item to toggle whether tasks matching it are excluded, "
             "then tap ✅ Done.",
             parse_mode="Markdown",
-            reply_markup=_af_exclusion_multiselect_keyboard(_AF_EXCLUSION_KEYWORDS, ctx.user_data["af_excluded_keywords"]),
+            reply_markup=_af_exclusion_multiselect_keyboard(_af_all_exclusion_keywords(), ctx.user_data["af_excluded_keywords"]),
         )
         return AF.EXCLUSION_PICK
 
-    ctx.user_data["af_excluded_keywords"] = set(_AF_EXCLUSION_KEYWORDS) if choice == "exclude_all" else set()
+    ctx.user_data["af_excluded_keywords"] = set(_af_all_exclusion_keywords()) if choice == "exclude_all" else set()
     label = "Allow All" if choice == "allow_all" else "Exclude All"
     await query.edit_message_text(f"✅ Filter: *{label}*", parse_mode="Markdown")
     await _af_send_email_prompt(query.message)
@@ -707,7 +723,7 @@ async def recv_af_exclusion_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         else:
             excluded.add(choice)
         await query.edit_message_reply_markup(
-            reply_markup=_af_exclusion_multiselect_keyboard(_AF_EXCLUSION_KEYWORDS, excluded),
+            reply_markup=_af_exclusion_multiselect_keyboard(_af_all_exclusion_keywords(), excluded),
         )
         return AF.EXCLUSION_PICK
 
