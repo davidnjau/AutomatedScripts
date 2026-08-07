@@ -76,6 +76,7 @@ import dlv_tasks
 import hold_tasks
 import morning_briefing
 import apartments
+import custom_exclusions
 import fetch_tasks
 import job_distribution
 import lookup_reference
@@ -731,6 +732,7 @@ def main():
     dlv_tasks.register(app)
     sectional_properties.register(app)
     apartments.register(app)
+    custom_exclusions.register(app)
     morning_briefing.register(app)
     hold_tasks.register(app)
     dlv_incremental.register(app)
