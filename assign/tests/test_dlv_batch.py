@@ -191,7 +191,11 @@ class TestProcessDlvBatchItem(unittest.TestCase):
         })
         self.http_sess.post.assert_called_once()
 
-    def test_already_assigned_to_someone_else_reports_and_skips(self):
+    def test_already_assigned_to_someone_else_flags_awaiting_decision(self):
+        """Regression: this used to be dropped from the queue silently
+        (keep=False) — now it's kept, flagged awaiting_decision, and the
+        actor's uid is captured for a later Reassign decision (see
+        recv_db_taken_decision)."""
         with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
              patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={
                  "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
@@ -203,10 +207,13 @@ class TestProcessDlvBatchItem(unittest.TestCase):
                  "consideration_amount": "", "currency_code": "", "actor_name": "",
              }):
             result = self._run()
-        self.assertFalse(result["keep"])
+        self.assertTrue(result["keep"])
         self.assertIn("Taken by another valuer", result["outcome"]["status"])
         self.assertEqual(result["outcome"]["held_by"], "EXISTING VALUER")
         self.assertEqual(result["outcome"]["valuer_name"], "Jane Doe")
+        self.assertTrue(result["item"]["awaiting_decision"])
+        self.assertEqual(result["item"]["held_by"], "EXISTING VALUER")
+        self.assertEqual(result["item"]["held_by_uid"], "uid-2")
         self.http_sess.post.assert_not_called()
 
     def test_already_assigned_to_intended_valuer_reports_success(self):
@@ -284,14 +291,17 @@ class TestDbFormatOutcomeBlock(unittest.TestCase):
 
 class TestProcessDlvBatchItems(unittest.TestCase):
     """_process_dlv_batch_items — aggregates per-ref outcomes into a list of
-    numbered blocks (for _send_chunked_report, no manual truncation)."""
+    numbered blocks (for _send_chunked_report, no manual truncation), and
+    separately returns refs newly flagged awaiting_decision this cycle."""
 
-    def _item(self, ref, valuer_name="Jane Doe"):
-        return {"ref": ref, "valuer_name": valuer_name, "valuer_uid": "uid-1"}
+    def _item(self, ref, valuer_name="Jane Doe", **overrides):
+        item = {"ref": ref, "valuer_name": valuer_name, "valuer_uid": "uid-1"}
+        item.update(overrides)
+        return item
 
     def test_empty_queue_returns_empty_list(self):
         with patch.object(dlv_batch, "load_dlv_batch", return_value=[]):
-            self.assertEqual(dlv_batch._process_dlv_batch_items(TOKENS), [])
+            self.assertEqual(dlv_batch._process_dlv_batch_items(TOKENS), ([], []))
 
     def test_completed_outcomes_become_numbered_blocks(self):
         items = [self._item("REF1"), self._item("REF2")]
@@ -306,8 +316,9 @@ class TestProcessDlvBatchItems(unittest.TestCase):
                  "currency_code": "", "actor_name": "",
              }), \
              patch.object(dlv_batch, "persist_assignment"):
-            lines = dlv_batch._process_dlv_batch_items(TOKENS)
+            lines, newly_awaiting = dlv_batch._process_dlv_batch_items(TOKENS)
         self.assertEqual(len(lines), 2)
+        self.assertEqual(newly_awaiting, [])
         refs_in_lines = {l.split("`")[1] for l in lines}
         self.assertEqual(refs_in_lines, {"REF1", "REF2"})
         for line in lines:
@@ -320,10 +331,47 @@ class TestProcessDlvBatchItems(unittest.TestCase):
              patch.object(dlv_batch, "save_dlv_batch"), \
              patch.object(dlv_batch, "build_session", return_value=MagicMock()), \
              patch.object(dlv_batch, "_search_ref_dlv", return_value=None):
-            lines = dlv_batch._process_dlv_batch_items(TOKENS)
+            lines, newly_awaiting = dlv_batch._process_dlv_batch_items(TOKENS)
         self.assertEqual(len(lines), 1)
         self.assertIn("Still pending", lines[0])
         self.assertIn("REF1", lines[0])
+        self.assertEqual(newly_awaiting, [])
+
+    def test_taken_by_another_valuer_returned_as_newly_awaiting_not_still_pending(self):
+        items = [self._item("REF1")]
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save, \
+             patch.object(dlv_batch, "build_session", return_value=MagicMock()), \
+             patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                 "actors": [{"role": "VALUATION OFFICER", "user_details": {"id": "uid-2", "names": "EXISTING VALUER"}}],
+             }), \
+             patch.object(dlv_batch, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT", "assessor_name": "",
+                 "consideration_amount": "", "currency_code": "", "actor_name": "",
+             }):
+            lines, newly_awaiting = dlv_batch._process_dlv_batch_items(TOKENS)
+        self.assertEqual(len(newly_awaiting), 1)
+        self.assertEqual(newly_awaiting[0]["ref"], "REF1")
+        self.assertTrue(newly_awaiting[0]["awaiting_decision"])
+        # kept in the queue (still saved), not reported as a retry candidate
+        saved_refs = [i["ref"] for i in mock_save.call_args[0][0]]
+        self.assertEqual(saved_refs, ["REF1"])
+        self.assertFalse(any("Still pending" in l for l in lines))
+
+    def test_already_awaiting_items_are_not_reprocessed_or_renotified(self):
+        items = [self._item("REF1", awaiting_decision=True, held_by="EXISTING VALUER", held_by_uid="uid-2")]
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save, \
+             patch.object(dlv_batch, "build_session") as mock_build_session, \
+             patch.object(dlv_batch, "_search_ref_dlv") as mock_search:
+            lines, newly_awaiting = dlv_batch._process_dlv_batch_items(TOKENS)
+        self.assertEqual((lines, newly_awaiting), ([], []))
+        mock_search.assert_not_called()
+        mock_build_session.assert_not_called()
+        mock_save.assert_not_called()
 
 
 class TestDlvBatchJob(unittest.TestCase):
@@ -343,12 +391,29 @@ class TestDlvBatchJob(unittest.TestCase):
         outcome_lines = ["  1. 📌 *Ref:* `REF1`\n     📊 Status: ✅ Assigned"]
         with patch.object(dlv_batch, "load_dlv_batch", side_effect=[[{"ref": "REF1"}], []]), \
              patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
-             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=outcome_lines), \
+             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=(outcome_lines, [])), \
              patch.object(dlv_batch, "ALLOWED_IDS", {111}):
             _run(dlv_batch._dlv_batch_job(ctx))
         sent = "\n".join(c.args[1] for c in ctx.bot.send_message.call_args_list)
         self.assertIn("📋 *DLV Batch (auto)*", sent)
         self.assertIn("📌 *Ref:* `REF1`", sent)
+
+    def test_newly_awaiting_refs_get_a_taken_prompt_to_every_allowed_id(self):
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        newly_awaiting = [{"ref": "REF1", "valuer_name": "Jane Doe", "held_by": "EXISTING VALUER",
+                            "held_by_uid": "uid-2"}]
+        with patch.object(dlv_batch, "load_dlv_batch", side_effect=[[{"ref": "REF1"}], [{"ref": "REF1"}]]), \
+             patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
+             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], newly_awaiting)), \
+             patch.object(dlv_batch, "ALLOWED_IDS", {111, 222}):
+            _run(dlv_batch._dlv_batch_job(ctx))
+        chat_ids = {c.args[0] for c in ctx.bot.send_message.call_args_list}
+        self.assertEqual(chat_ids, {111, 222})
+        for call in ctx.bot.send_message.call_args_list:
+            self.assertIn("REF1", call.args[1])
+            self.assertIn("EXISTING VALUER", call.args[1])
+            self.assertIn("reply_markup", call.kwargs)
 
 
 class TestRunDlvBatchBg(unittest.TestCase):
@@ -358,7 +423,7 @@ class TestRunDlvBatchBg(unittest.TestCase):
     def test_empty_report_sends_batch_already_empty_message(self):
         ctx = MagicMock()
         ctx.bot.send_message = AsyncMock()
-        with patch.object(dlv_batch, "_process_dlv_batch_items", return_value=[]):
+        with patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], [])):
             _run(dlv_batch._run_dlv_batch_bg(ctx, 111, TOKENS))
         ctx.bot.send_message.assert_called_once()
         self.assertIn("already empty", ctx.bot.send_message.call_args[0][1])
@@ -367,11 +432,24 @@ class TestRunDlvBatchBg(unittest.TestCase):
         ctx = MagicMock()
         ctx.bot.send_message = AsyncMock()
         outcome_lines = ["  1. 📌 *Ref:* `REF1`\n     📊 Status: ✅ Assigned"]
-        with patch.object(dlv_batch, "_process_dlv_batch_items", return_value=outcome_lines):
+        with patch.object(dlv_batch, "_process_dlv_batch_items", return_value=(outcome_lines, [])):
             _run(dlv_batch._run_dlv_batch_bg(ctx, 111, TOKENS))
         sent = "\n".join(c.args[1] for c in ctx.bot.send_message.call_args_list)
         self.assertIn("📋 *DLV Batch Report*", sent)
         self.assertIn("📌 *Ref:* `REF1`", sent)
+
+    def test_newly_awaiting_ref_gets_a_taken_prompt(self):
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        outcome_lines = ["  1. 📌 *Ref:* `REF1`\n     📊 Status: ⚠️ Taken by another valuer — awaiting your decision"]
+        newly_awaiting = [{"ref": "REF1", "valuer_name": "Jane Doe", "held_by": "EXISTING VALUER",
+                            "held_by_uid": "uid-2"}]
+        with patch.object(dlv_batch, "_process_dlv_batch_items", return_value=(outcome_lines, newly_awaiting)):
+            _run(dlv_batch._run_dlv_batch_bg(ctx, 111, TOKENS))
+        prompt_call = ctx.bot.send_message.call_args_list[-1]
+        self.assertEqual(prompt_call.args[0], 111)
+        self.assertIn("REF1", prompt_call.args[1])
+        self.assertIn("reply_markup", prompt_call.kwargs)
 
     def test_processing_exception_reports_failure(self):
         ctx = MagicMock()
@@ -380,6 +458,116 @@ class TestRunDlvBatchBg(unittest.TestCase):
             _run(dlv_batch._run_dlv_batch_bg(ctx, 111, TOKENS))
         ctx.bot.send_message.assert_called_once()
         self.assertIn("processing failed", ctx.bot.send_message.call_args[0][1])
+
+
+class TestDbTakenKeyboard(unittest.TestCase):
+    """_db_taken_keyboard — Reassign/Remove buttons, keyed by the literal ref
+    (not an index) since this prompt can be answered long after it's sent."""
+
+    def test_buttons_carry_the_ref_in_callback_data(self):
+        markup = dlv_batch._db_taken_keyboard("REG/TSFR/ABC123")
+        buttons = markup.inline_keyboard[0]
+        callback_data = [b.callback_data for b in buttons]
+        self.assertIn("dbtaken:reassign:REG/TSFR/ABC123", callback_data)
+        self.assertIn("dbtaken:remove:REG/TSFR/ABC123", callback_data)
+
+
+class TestDbTakenPromptText(unittest.TestCase):
+    """_db_taken_prompt_text — shown alongside _db_taken_keyboard."""
+
+    def test_includes_ref_held_by_and_queued_for(self):
+        text = dlv_batch._db_taken_prompt_text(
+            {"ref": "REF1", "valuer_name": "Jane Doe", "held_by": "EXISTING VALUER"})
+        self.assertIn("REF1", text)
+        self.assertIn("EXISTING VALUER", text)
+        self.assertIn("Jane Doe", text)
+
+    def test_special_chars_in_names_are_escaped(self):
+        text = dlv_batch._db_taken_prompt_text(
+            {"ref": "REF1", "valuer_name": "Jane_Doe", "held_by": "John_Otieno"})
+        self.assertIn("Jane\\_Doe", text)
+        self.assertIn("John\\_Otieno", text)
+
+
+class TestSendDbTakenPrompts(unittest.TestCase):
+    """_send_db_taken_prompts — one prompt per newly-awaiting ref, to every given chat."""
+
+    def test_sends_one_prompt_per_item_per_chat(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        newly_awaiting = [{"ref": "REF1", "valuer_name": "Jane Doe", "held_by": "X"},
+                           {"ref": "REF2", "valuer_name": "John", "held_by": "Y"}]
+        _run(dlv_batch._send_db_taken_prompts(bot, [111, 222], newly_awaiting))
+        self.assertEqual(bot.send_message.call_count, 4)
+
+    def test_one_bad_chat_does_not_block_the_rest(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock(side_effect=[RuntimeError("blocked"), None])
+        newly_awaiting = [{"ref": "REF1", "valuer_name": "Jane Doe", "held_by": "X"}]
+        _run(dlv_batch._send_db_taken_prompts(bot, [111, 222], newly_awaiting))
+        self.assertEqual(bot.send_message.call_count, 2)
+
+
+class TestRecvDbTakenDecision(unittest.TestCase):
+    """recv_db_taken_decision — the global Reassign/Remove handler for a ref
+    DLV Batch found held by someone other than its queued valuer."""
+
+    def _item(self, **overrides):
+        item = {"ref": "REF1", "valuer_name": "Jane Doe", "valuer_uid": "uid-1",
+                "awaiting_decision": True, "held_by": "EXISTING VALUER", "held_by_uid": "uid-2"}
+        item.update(overrides)
+        return item
+
+    def test_reassign_persists_the_new_holder_and_drops_from_queue(self):
+        update = _make_query_update("dbtaken:reassign:REF1")
+        ctx = MagicMock()
+        items = [self._item(), {"ref": "REF2", "valuer_name": "Other"}]
+        with patch.object(dlv_batch, "allowed", return_value=True), \
+             patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save, \
+             patch.object(dlv_batch, "persist_assignment") as mock_persist, \
+             patch.object(dlv_batch, "mark_removed") as mock_remove:
+            _run(dlv_batch.recv_db_taken_decision(update, ctx))
+        mock_persist.assert_called_once_with("REF1", "EXISTING VALUER", "uid-2", extra={
+            "valuer_acct": "", "tag": "", "assessor": "", "parcel": "",
+            "consideration": "", "currency_code": "", "queued_at": "",
+        })
+        mock_remove.assert_not_called()
+        saved_refs = [i["ref"] for i in mock_save.call_args[0][0]]
+        self.assertEqual(saved_refs, ["REF2"])
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("REF1", text)
+        self.assertIn("EXISTING VALUER", text)
+
+    def test_remove_marks_removed_and_drops_from_queue(self):
+        update = _make_query_update("dbtaken:remove:REF1")
+        ctx = MagicMock()
+        items = [self._item(), {"ref": "REF2", "valuer_name": "Other"}]
+        with patch.object(dlv_batch, "allowed", return_value=True), \
+             patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save, \
+             patch.object(dlv_batch, "persist_assignment") as mock_persist, \
+             patch.object(dlv_batch, "mark_removed") as mock_remove:
+            _run(dlv_batch.recv_db_taken_decision(update, ctx))
+        mock_remove.assert_called_once_with({"REF1"})
+        mock_persist.assert_not_called()
+        saved_refs = [i["ref"] for i in mock_save.call_args[0][0]]
+        self.assertEqual(saved_refs, ["REF2"])
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("REF1", text)
+        self.assertIn("removed", text)
+
+    def test_ref_no_longer_awaiting_reports_already_resolved(self):
+        update = _make_query_update("dbtaken:reassign:REF1")
+        ctx = MagicMock()
+        with patch.object(dlv_batch, "allowed", return_value=True), \
+             patch.object(dlv_batch, "load_dlv_batch", return_value=[]), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save, \
+             patch.object(dlv_batch, "persist_assignment") as mock_persist:
+            _run(dlv_batch.recv_db_taken_decision(update, ctx))
+        mock_save.assert_not_called()
+        mock_persist.assert_not_called()
+        self.assertIn("Already resolved", update.callback_query.edit_message_text.call_args[0][0])
 
 
 class TestDbFormatBatchSummary(unittest.TestCase):
@@ -438,6 +626,37 @@ class TestDbFormatBatchSummary(unittest.TestCase):
             summary = dlv_batch._db_format_batch_summary(sess)
         self.assertIn("🔢 Incremental (auto)", summary)
         self.assertNotIn(dlv_batch.INCREMENTAL_TAG_SENTINEL, summary)
+
+
+class TestCmdDlvQueue(unittest.TestCase):
+    """cmd_dlv_queue — the 🔍 DLV Queue viewer; awaiting-decision refs are
+    annotated distinctly from a plain last_error."""
+
+    def _update(self):
+        update = MagicMock()
+        update.message.reply_text = AsyncMock()
+        return update
+
+    def test_awaiting_decision_ref_shown_with_held_by(self):
+        update = self._update()
+        items = [{"ref": "REF1", "valuer_name": "Jane Doe", "awaiting_decision": True,
+                  "held_by": "EXISTING VALUER", "last_error": "stale error"}]
+        with patch.object(dlv_batch, "allowed", return_value=True), \
+             patch.object(dlv_batch, "load_dlv_batch", return_value=items):
+            _run(dlv_batch.cmd_dlv_queue(update, MagicMock()))
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("⏸ Held by *EXISTING VALUER* — awaiting your decision", text)
+        self.assertNotIn("stale error", text)
+
+    def test_last_error_shown_when_not_awaiting_decision(self):
+        update = self._update()
+        items = [{"ref": "REF1", "valuer_name": "Jane Doe", "last_error": "Not found in DLV endpoint"}]
+        with patch.object(dlv_batch, "allowed", return_value=True), \
+             patch.object(dlv_batch, "load_dlv_batch", return_value=items):
+            _run(dlv_batch.cmd_dlv_queue(update, MagicMock()))
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("Not found in DLV endpoint", text)
+        self.assertNotIn("awaiting your decision", text)
 
 
 class TestDbTagKeyboards(unittest.TestCase):

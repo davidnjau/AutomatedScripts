@@ -21,6 +21,17 @@ ref rather than a small filterable vocabulary. An Incremental pick is
 only resolved to a real tag value at confirm time (see recv_db_confirm),
 not when picked — see dlv_incremental.py's module docstring for why.
 
+If a queued ref turns out to already be held by a valuer other than the
+one it was queued for, it's no longer silently dropped — the item is
+flagged `awaiting_decision` (held in the queue, excluded from further
+processing) and a Reassign/Remove prompt is sent to Telegram
+(_db_taken_keyboard / recv_db_taken_decision, callback prefix "dbtaken:").
+Reassign accepts the drift — persists an assignment record for the actual
+current holder and drops the ref from the queue; Remove marks it removed
+(dlv_core.mark_removed) and drops it too. This decision handler is
+registered globally (not part of the DB conversation), since the prompt
+can be answered long after the run that sent it and by any allowed user.
+
 Call register(app) from bot.py's main() to wire this feature in.
 """
 
@@ -30,7 +41,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_c
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from telegram import (
     InlineKeyboardButton,
@@ -75,6 +86,7 @@ from dlv_core import (
     _fetch_ref_detail_dlv,
     _search_ref_dlv,
     load_dlv_batch,
+    mark_removed,
     save_dlv_batch,
 )
 from dlv_incremental import next_incremental_tag
@@ -253,8 +265,17 @@ def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth
                 outcome = {"ref": ref, "status": "✅ Already correctly assigned",
                            "valuer_name": valuer_name, "held_by": ""}
             elif actor_name:
-                outcome = {"ref": ref, "status": "⚠️ Taken by another valuer — skipped (not reassigned)",
+                # Don't silently drop it — flag for a Reassign/Remove decision
+                # (see recv_db_taken_decision) and keep it in the queue so it
+                # isn't lost while awaiting an answer. _process_dlv_batch_items
+                # excludes already-flagged items from further processing/
+                # re-notification until the decision is made.
+                item["awaiting_decision"] = True
+                item["held_by"]     = actor_name
+                item["held_by_uid"] = actor_uid
+                outcome = {"ref": ref, "status": "⚠️ Taken by another valuer — awaiting your decision",
                            "valuer_name": valuer_name, "held_by": actor_name}
+                return {"item": item, "keep": True, "outcome": outcome, "closed": None}
             else:
                 outcome = {"ref": ref, "status": "📋 At valuer-report stage, no actor listed",
                            "valuer_name": valuer_name, "held_by": ""}
@@ -284,19 +305,29 @@ def _db_format_outcome_block(i: int, outcome: Dict) -> str:
     return format_labeled_block(i, outcome["ref"], fields)
 
 
-def _process_dlv_batch_items(tokens: AuthTokens) -> List[str]:
+def _process_dlv_batch_items(tokens: AuthTokens) -> Tuple[List[str], List[Dict]]:
     """
     Process the flat batch queue (list of {ref, valuer_name, valuer_uid, valuer_acct})
     across worker threads — each ref's search/detail-view/assign calls are
     independent I/O, same as the parallel fetch used elsewhere (e.g. Fetch Tasks).
     Refs not found in DLV are kept in the queue for the next 5-minute retry cycle.
-    Returns a list of report lines/blocks for completed items only (for
-    _send_chunked_report — callers must not manually truncate this), or []
-    if nothing was processed.
+    Refs already flagged awaiting_decision (found held by someone else on a
+    prior cycle, still waiting on a Reassign/Remove answer — see
+    recv_db_taken_decision) are held out of processing entirely, so they're
+    neither re-searched nor re-prompted every cycle.
+    Returns (report lines/blocks for completed items — for
+    _send_chunked_report, callers must not manually truncate this — or []
+    if nothing was processed, newly-flagged awaiting_decision items this
+    cycle, for callers to send a Reassign/Remove prompt for).
     """
     items = load_dlv_batch()
     if not items:
-        return []
+        return [], []
+
+    to_process = [i for i in items if not i.get("awaiting_decision")]
+    held_back  = [i for i in items if i.get("awaiting_decision")]
+    if not to_process:
+        return [], []
 
     http_sess = build_session()
     assign_url = STAMP_DUTY_FIX_APPLICATION_URL
@@ -305,14 +336,15 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> List[str]:
         "JWTAUTH":       f"Bearer {tokens.jwt}",
     }
 
-    outcomes:     List[Dict] = []
-    remaining:    List[Dict] = []
-    closed_items: List[Dict] = []
+    outcomes:       List[Dict] = []
+    remaining:      List[Dict] = []
+    closed_items:   List[Dict] = []
+    newly_awaiting: List[Dict] = []
 
     with ThreadPoolExecutor(max_workers=_DLV_BATCH_WORKERS) as pool:
         fut_map = {
             pool.submit(_process_dlv_batch_item, tokens, http_sess, assign_url, auth_hdrs, item): item
-            for item in items
+            for item in to_process
         }
         for fut in _futures_as_completed(fut_map):
             result = fut.result()
@@ -320,21 +352,109 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> List[str]:
                 outcomes.append(result["outcome"])
             if result["keep"]:
                 remaining.append(result["item"])
+                if result["item"].get("awaiting_decision"):
+                    newly_awaiting.append(result["item"])
             if result["closed"]:
                 closed_items.append(result["closed"])
 
-    # Save only refs that still need processing
-    save_dlv_batch(remaining)
+    # Save only refs that still need processing, plus those already awaiting a decision
+    save_dlv_batch(remaining + held_back)
     for closed_record in closed_items:
         _append_dlv_closed(closed_record)
 
     completed_lines = [_db_format_outcome_block(i, o) for i, o in enumerate(outcomes, 1)]
 
-    if remaining:
-        pending_refs = ", ".join(f"`{i['ref']}`" for i in remaining)
+    still_pending = [i for i in remaining if not i.get("awaiting_decision")]
+    if still_pending:
+        pending_refs = ", ".join(f"`{i['ref']}`" for i in still_pending)
         completed_lines.append(f"⏳ Still pending (retry in 5 min): {pending_refs}")
 
-    return completed_lines
+    return completed_lines, newly_awaiting
+
+
+def _db_taken_keyboard(ref: str) -> InlineKeyboardMarkup:
+    """Reassign (accept the current live holder as the new owner in our own
+    records) or Remove (drop the ref from the queue outright) — offered per
+    ref once DLV Batch finds it held by someone other than who it was
+    queued for. Uses the literal ref (not an index) since, unlike this
+    module's other pickers, this prompt can be answered long after the run
+    that sent it, with no live session/ordered list to index into."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Reassign to them",  callback_data=f"dbtaken:reassign:{ref}"),
+        InlineKeyboardButton("🗑 Remove from Queue", callback_data=f"dbtaken:remove:{ref}"),
+    ]])
+
+
+def _db_taken_prompt_text(item: Dict) -> str:
+    """Prompt text for one ref found held by someone else, shown alongside _db_taken_keyboard."""
+    return (
+        f"⚠️ `{item.get('ref', '')}` is now held by *{md_escape(item.get('held_by', ''))}*"
+        f" — it was queued for *{md_escape(item.get('valuer_name', ''))}*.\n\n"
+        "Reassign our record to the new holder, or remove this ref from the queue?"
+    )
+
+
+async def _send_db_taken_prompts(bot, chat_ids: List[int], newly_awaiting: List[Dict]) -> None:
+    """Send one Reassign/Remove prompt per newly-awaiting ref to each given
+    chat — best-effort per chat, matching the other notify loops in this
+    module (one bad chat must not block the rest)."""
+    for item in newly_awaiting:
+        text   = _db_taken_prompt_text(item)
+        markup = _db_taken_keyboard(item.get("ref", ""))
+        for chat_id in chat_ids:
+            try:
+                await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
+            except Exception as e:
+                logger.warning("DLV batch taken-prompt send error for %s: %s", chat_id, e)
+
+
+async def recv_db_taken_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle the Reassign/Remove decision for a ref DLV Batch found held by
+    someone other than its queued valuer. A global (non-conversation)
+    handler — the prompt can be answered long after the run that sent it,
+    and by any allowed user, not just whoever triggered that run. Reassign
+    persists an assignment record for the actual current holder (accepting
+    the drift, not moving the task via the API); Remove marks the ref
+    removed (dlv_core.mark_removed) rather than dropping it silently. Both
+    then drop the ref from the active queue."""
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    _, action, ref = query.data.split(":", 2)
+
+    items = load_dlv_batch()
+    item  = next((i for i in items if i.get("ref") == ref and i.get("awaiting_decision")), None)
+    if not item:
+        await query.edit_message_text("ℹ️ Already resolved — nothing to do.")
+        return
+
+    remaining = [i for i in items if i.get("ref") != ref]
+
+    if action == "reassign":
+        held_by     = item.get("held_by", "")
+        held_by_uid = item.get("held_by_uid", "")
+        try:
+            persist_assignment(ref, held_by, held_by_uid, extra={
+                "valuer_acct":   "",
+                "tag":           item.get("tag", ""),
+                "assessor":      item.get("assessor", ""),
+                "parcel":        item.get("parcel", ""),
+                "consideration": item.get("consideration", ""),
+                "currency_code": item.get("currency_code", ""),
+                "queued_at":     item.get("queued_at", ""),
+            })
+        except Exception as e:
+            logger.error("persist_assignment failed for %s: %s", ref, e)
+        save_dlv_batch(remaining)
+        await query.edit_message_text(
+            f"✅ `{ref}` reassigned to *{md_escape(held_by)}* in our records and removed from the queue.",
+            parse_mode="Markdown",
+        )
+        return
+
+    mark_removed({ref})
+    save_dlv_batch(remaining)
+    await query.edit_message_text(f"🗑 `{ref}` removed from the DLV queue.", parse_mode="Markdown")
 
 
 async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -349,7 +469,7 @@ async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     before_count = len(items)
-    report_lines = await asyncio.to_thread(_process_dlv_batch_items, tokens)
+    report_lines, newly_awaiting = await asyncio.to_thread(_process_dlv_batch_items, tokens)
     after_count  = len(load_dlv_batch())
 
     # Only notify if something was actually completed (queue shrank)
@@ -361,6 +481,9 @@ async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 except Exception as e:
                     logger.warning("DLV batch job notify error for %s: %s", chat_id, e)
             await _send_chunked_report(_send, ["📋 *DLV Batch (auto)*"] + report_lines, join="\n\n")
+
+    if newly_awaiting:
+        await _send_db_taken_prompts(context.bot, ALLOWED_IDS, newly_awaiting)
 
 
 # ──────────────────────────────────────────────────────────
@@ -412,7 +535,9 @@ async def cmd_dlv_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         line = f"• `{ref}` → *{valuer_name}*"
         if tag:
             line += f" 🏷 {tag}"
-        if last_error:
+        if item.get("awaiting_decision"):
+            line += f"\n  ⏸ Held by *{md_escape(item.get('held_by', '?'))}* — awaiting your decision"
+        elif last_error:
             line += f"\n  ⚠️ _{last_error}_"
         lines.append(line)
 
@@ -454,7 +579,7 @@ async def recv_dlv_queue_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("✅ Queue is empty — nothing to process.")
             return
         await query.edit_message_text(f"⏳ Processing {len(items_before)} ref(s), please wait…")
-        report_lines = await asyncio.to_thread(_process_dlv_batch_items, tokens)
+        report_lines, newly_awaiting = await asyncio.to_thread(_process_dlv_batch_items, tokens)
         remaining = load_dlv_batch()
 
         if not report_lines:
@@ -475,6 +600,9 @@ async def recv_dlv_queue_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text(text, parse_mode="Markdown")
 
         await _send_chunked_report(_send, ["📋 *DLV Queue — Query Result*"] + report_lines, join="\n\n")
+
+        if newly_awaiting:
+            await _send_db_taken_prompts(ctx.bot, [query.message.chat_id], newly_awaiting)
         return
 
     if data.startswith("dlvq:interval:"):
@@ -829,9 +957,11 @@ async def recv_db_tag_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _run_dlv_batch_bg(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, tokens: AuthTokens) -> None:
-    """Process the DLV batch queue off the event loop, then message the report back."""
+    """Process the DLV batch queue off the event loop, then message the report
+    back, followed by a Reassign/Remove prompt for any ref newly found held
+    by someone else."""
     try:
-        report_lines = await asyncio.to_thread(_process_dlv_batch_items, tokens)
+        report_lines, newly_awaiting = await asyncio.to_thread(_process_dlv_batch_items, tokens)
     except Exception as e:
         logger.error("DLV batch background processing failed: %s", e, exc_info=True)
         await ctx.bot.send_message(chat_id, f"❌ DLV Batch processing failed: `{e}`", parse_mode="Markdown")
@@ -845,6 +975,9 @@ async def _run_dlv_batch_bg(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, tokens
         await ctx.bot.send_message(chat_id, text, parse_mode="Markdown")
 
     await _send_chunked_report(_send, ["📋 *DLV Batch Report*"] + report_lines, join="\n\n")
+
+    if newly_awaiting:
+        await _send_db_taken_prompts(ctx.bot, [chat_id], newly_awaiting)
 
 
 # ──────────────────────────────────────────────────────────
@@ -877,3 +1010,4 @@ def register(app: Application) -> None:
     app.job_queue.run_repeating(_dlv_batch_job, interval=60, first=60, name="dlv_batch_job")
     app.add_handler(CallbackQueryHandler(recv_dlv_queue_action, pattern=r"^dlvq:"))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_QUEUE)}$"), cmd_dlv_queue))
+    app.add_handler(CallbackQueryHandler(recv_db_taken_decision, pattern=r"^dbtaken:"))
