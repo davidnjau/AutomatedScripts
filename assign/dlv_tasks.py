@@ -80,6 +80,7 @@ from dlv_core import (
     load_dlv_batch,
     load_dlv_closed,
     mark_removed,
+    parse_incremental_tag,
     save_dlv_batch,
 )
 from email_service import _send_bulk_export_email
@@ -107,6 +108,7 @@ class DT(Enum):
     DELETE_SELECT   = auto()   # multi-select which queued refs to delete
     PICK_VALUER     = auto()   # By Valuer: choose which valuer to report on
     PICK_TAG        = auto()   # By Tag: choose which tag to report on
+    PICK_VIEW       = auto()   # By Tag + Incremental only: choose Flat/By Valuer/By Batch rendering
     PICK_PERIOD     = auto()   # By Valuer/By Tag: choose the history look-back period
 
 
@@ -124,6 +126,7 @@ class DTSession:
     selected_valuer:  dict       = field(default_factory=dict)   # By Valuer: {key, name} chosen
     report_mode:      str        = "valuer"                      # "valuer" | "tag" — disambiguates PICK_PERIOD
     selected_tag:     str        = ""                             # By Tag: the chosen tag
+    report_view:      str        = "flat"                         # By Tag + Incremental: "flat" | "valuer" | "batch"
 
 
 def _get_dt_sess(ctx: ContextTypes.DEFAULT_TYPE) -> DTSession:
@@ -546,6 +549,20 @@ def _dt_tag_display(tag: str) -> str:
     return "🔢 Incremental" if tag == INCREMENTAL_TAG_SENTINEL else tag
 
 
+def _dt_view_keyboard() -> InlineKeyboardMarkup:
+    """Report-view picker shown only for the Incremental tag (a single
+    fixed tag has nothing to usefully sub-group by) — Flat (today's
+    single combined list), By Valuer (all 3 sections sub-grouped per
+    valuer), or By Batch (sections per batch number, "B2 tasks" etc.)."""
+    rows = [
+        [InlineKeyboardButton("📋 Flat List", callback_data="dt_pickview:flat")],
+        [InlineKeyboardButton("👤 By Valuer",  callback_data="dt_pickview:valuer")],
+        [InlineKeyboardButton("📦 By Batch",   callback_data="dt_pickview:batch")],
+        [InlineKeyboardButton("🛑 Cancel",     callback_data="dt_pickview_cancel")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
 async def _dt_run_valuer_select(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
     """Show the valuer picker built from everyone currently queued or in closed history."""
     valuers = _dt_collect_valuers()
@@ -691,6 +708,104 @@ def _dt_format_tag_report(tag: str, queued: List[dict], desk: List[dict], closed
                                     period_label, show_valuer=True)
 
 
+def _dt_format_tag_report_by_valuer(tag: str, queued: List[dict], desk: List[dict], closed: List[dict],
+                                     period_label: str) -> List[str]:
+    """By Tag "By Valuer" view (Incremental only) — same 3 sections as the
+    flat report (Currently Queued / At Valuer's Desk / Valuer Completed),
+    but each section's items are sub-grouped under a per-valuer heading
+    instead of one flat list, since the flat view mixes every valuer's
+    tasks together and the Valuer field alone doesn't let you scan one
+    valuer's load at a glance."""
+    lines = [f"🏷 *DLV Report — Tag: {_dt_tag_display(tag)}* (view: By Valuer)"]
+
+    def _section(header: str, items: List[dict], sort_key, reverse: bool, section: str):
+        lines.append(header)
+        if not items:
+            lines.append("  _none_")
+            return
+        by_valuer: dict = {}
+        for item in items:
+            by_valuer.setdefault(item.get("valuer_name") or "—", []).append(item)
+        for valuer_name in sorted(by_valuer):
+            group = sorted(by_valuer[valuer_name], key=sort_key, reverse=reverse)
+            lines.append(f"👤 *{md_escape(valuer_name)}* ({len(group)})")
+            for i, item in enumerate(group, start=1):
+                lines.append(_dt_format_report_item_block(i, item, show_valuer=False, section=section))
+
+    _section(f"⏳ *Currently Queued* ({len(queued)}) — Total: {_dt_sum_consideration(queued)}",
+              queued, lambda i: i.get("queued_at", ""), False, "queued")
+    _section(f"🏢 *At Valuer's Desk* ({len(desk)}) — Total: {_dt_sum_consideration(desk)}",
+              desk, lambda i: i.get("assigned_at", ""), True, "desk")
+    _section(f"📜 *Valuer Completed* ({period_label}) — {len(closed)} — Total: {_dt_sum_consideration(closed)}",
+              closed, lambda i: i.get("closed_at", ""), True, "closed")
+
+    return lines
+
+
+def _dt_batch_status_label(item: dict) -> str:
+    """Status label for one item in the By Batch view, derived from which
+    section it came from ("queued"/"desk" are self-explanatory; "closed"
+    items carry their own completed/returned outcome)."""
+    if item["section"] == "queued":
+        return "⏳ Queued"
+    if item["section"] == "desk":
+        return "🏢 At Desk"
+    label_for = {"completed": "✅ Completed", "returned": "↩️ Returned"}
+    return label_for.get(item.get("closed_reason"), "❓ Unknown")
+
+
+def _dt_group_by_batch(queued: List[dict], desk: List[dict], closed: List[dict]) -> dict:
+    """Merge queued/desk/closed items tagged with an incremental "B{n}-T{n}"
+    value into one dict keyed by batch number, each item annotated with its
+    parsed batch_number/task_number/section, sorted by task_number within
+    a batch. Items whose tag isn't a valid incremental tag (shouldn't
+    happen — this view is only reachable via the Incremental tag filter,
+    which already restricts to those — but tags can be edited/removed
+    between queueing and this report running) are skipped."""
+    groups: dict = {}
+    for items, section in ((queued, "queued"), (desk, "desk"), (closed, "closed")):
+        for item in items:
+            parsed = parse_incremental_tag(item.get("tag", ""))
+            if not parsed:
+                continue
+            batch_number, task_number = parsed
+            groups.setdefault(batch_number, []).append({**item, "batch_number": batch_number,
+                                                          "task_number": task_number, "section": section})
+    for batch_number in groups:
+        groups[batch_number].sort(key=lambda i: i["task_number"])
+    return groups
+
+
+def _dt_format_tag_report_by_batch(tag: str, queued: List[dict], desk: List[dict], closed: List[dict],
+                                    period_label: str) -> List[str]:
+    """By Tag "By Batch" view (Incremental only) — one section per batch
+    number ("Batch 2" etc., dlv_incremental.py's 📦 By Batch style) instead
+    of the flat report's Queued/Desk/Completed split, so all of one
+    batch's tasks (wherever each currently sits in its own lifecycle) show
+    together."""
+    grouped = _dt_group_by_batch(queued, desk, closed)
+    lines = [f"🏷 *DLV Report — Tag: {_dt_tag_display(tag)}* (view: By Batch, {period_label})"]
+    if not grouped:
+        lines.append("  _none_")
+        return lines
+
+    for batch_number in sorted(grouped):
+        items = grouped[batch_number]
+        lines.append(f"*Batch {batch_number}* — {len(items)} task(s)")
+        for item in items:
+            fields = [
+                ("🔢 Batch/Task", f"B{batch_number}-T{item['task_number']}"),
+                ("📊 Status", _dt_batch_status_label(item)),
+                ("👤 Valuer", item.get("valuer_name") or "—"),
+                assessor_field(item),
+                consideration_field(item),
+                parcel_field(item),
+            ]
+            lines.append(format_labeled_block(item["task_number"], item.get("ref"), fields))
+
+    return lines
+
+
 async def _dt_send_valuer_report(chat_id: int, valuer_name: str, queued: List[dict], desk: List[dict],
                                   closed: List[dict], period_label: str, bot) -> None:
     """Send the By Valuer DLV report (queued + at-desk + closed-history) as chunked Telegram messages."""
@@ -703,9 +818,17 @@ async def _dt_send_valuer_report(chat_id: int, valuer_name: str, queued: List[di
 
 
 async def _dt_send_tag_report(chat_id: int, tag: str, queued: List[dict], desk: List[dict],
-                               closed: List[dict], period_label: str, bot) -> None:
-    """Send the By Tag DLV report (queued + at-desk + closed-history, spanning every valuer) as chunked Telegram messages."""
-    lines = _dt_format_tag_report(tag, queued, desk, closed, period_label)
+                               closed: List[dict], period_label: str, bot, view: str = "flat") -> None:
+    """Send the By Tag DLV report as chunked Telegram messages — view selects
+    Flat (default, spanning every valuer in one list), By Valuer (all 3
+    sections sub-grouped per valuer), or By Batch (Incremental only —
+    sections per batch number) rendering."""
+    if view == "valuer":
+        lines = _dt_format_tag_report_by_valuer(tag, queued, desk, closed, period_label)
+    elif view == "batch":
+        lines = _dt_format_tag_report_by_batch(tag, queued, desk, closed, period_label)
+    else:
+        lines = _dt_format_tag_report(tag, queued, desk, closed, period_label)
 
     async def _send(text, reply_markup):
         await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
@@ -753,6 +876,37 @@ async def recv_dt_pick_tag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess = _get_dt_sess(ctx)
     sess.selected_tag = query.data.split(":", 1)[1]
     sess.report_mode  = "tag"
+    sess.report_view  = "flat"
+
+    if sess.selected_tag == INCREMENTAL_TAG_SENTINEL:
+        await query.edit_message_text(
+            f"🏷 *{_dt_tag_display(sess.selected_tag)}*\n\nChoose how to view this report:",
+            parse_mode="Markdown",
+            reply_markup=_dt_view_keyboard(),
+        )
+        return DT.PICK_VIEW
+
+    await query.edit_message_text(
+        f"🏷 *{_dt_tag_display(sess.selected_tag)}*\n\nFilter history by period:",
+        parse_mode="Markdown",
+        reply_markup=_dt_period_keyboard(),
+    )
+    return DT.PICK_PERIOD
+
+
+async def recv_dt_pick_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """By Tag + Incremental only: handle the report-view picker tap, then show the history-period picker."""
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "dt_pickview_cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    sess = _get_dt_sess(ctx)
+    sess.report_view = query.data.split(":", 1)[1]
 
     await query.edit_message_text(
         f"🏷 *{_dt_tag_display(sess.selected_tag)}*\n\nFilter history by period:",
@@ -822,7 +976,8 @@ async def recv_dt_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tag = sess.selected_tag
         queued, desk, closed = _dt_gather_report_data("tag", tag, days)
         await query.edit_message_text(f"⏳ Building report for tag *{_dt_tag_display(tag)}*…", parse_mode="Markdown")
-        await _dt_send_tag_report(query.message.chat_id, tag, queued, desk, closed, period_label, ctx.bot)
+        await _dt_send_tag_report(query.message.chat_id, tag, queued, desk, closed, period_label, ctx.bot,
+                                   view=sess.report_view)
     else:
         valuer = sess.selected_valuer
         key    = valuer["key"]
@@ -1109,6 +1264,7 @@ def register(app: Application) -> None:
             ],
             DT.PICK_VALUER: [CallbackQueryHandler(recv_dt_pick_valuer, pattern=r"^dt_pickvaluer")],
             DT.PICK_TAG:    [CallbackQueryHandler(recv_dt_pick_tag,    pattern=r"^dt_picktag")],
+            DT.PICK_VIEW:   [CallbackQueryHandler(recv_dt_pick_view,   pattern=r"^dt_pickview")],
             DT.PICK_PERIOD: [CallbackQueryHandler(recv_dt_period,     pattern=r"^dt_period")],
         },
         fallbacks=[

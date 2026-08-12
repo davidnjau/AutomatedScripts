@@ -535,6 +535,128 @@ class TestDtFormatTagReport(unittest.TestCase):
         self.assertEqual(lines.count("_none_"), 3)
 
 
+class TestDtFormatTagReportByValuer(unittest.TestCase):
+    """_dt_format_tag_report_by_valuer — By Tag's "By Valuer" view, sub-
+    grouping all 3 sections per valuer instead of one flat list."""
+
+    def test_items_grouped_under_per_valuer_headers(self):
+        queued = [{"ref": "REF1", "valuer_name": "Amara Kip", "tag": "B1-T1", "queued_at": "2026-07-10T10:00:00"},
+                  {"ref": "REF2", "valuer_name": "Jane Doe", "tag": "B1-T2", "queued_at": "2026-07-11T10:00:00"}]
+        lines = "\n".join(dlv_tasks._dt_format_tag_report_by_valuer(
+            dlv_tasks.INCREMENTAL_TAG_SENTINEL, queued, [], [], "All time"))
+        self.assertIn("(view: By Valuer)", lines)
+        self.assertIn("👤 *Amara Kip* (1)", lines)
+        self.assertIn("👤 *Jane Doe* (1)", lines)
+        # per-item Valuer field is redundant once grouped under a valuer heading
+        self.assertNotIn("👤 Valuer:", lines)
+
+    def test_valuer_name_with_special_chars_is_escaped(self):
+        queued = [{"ref": "REF1", "valuer_name": "Jane_Doe", "tag": "B1-T1", "queued_at": "2026-07-10T10:00:00"}]
+        lines = "\n".join(dlv_tasks._dt_format_tag_report_by_valuer(
+            dlv_tasks.INCREMENTAL_TAG_SENTINEL, queued, [], [], "All time"))
+        self.assertIn("Jane\\_Doe", lines)
+
+    def test_empty_sections_render_none_placeholder(self):
+        lines = "\n".join(dlv_tasks._dt_format_tag_report_by_valuer(
+            dlv_tasks.INCREMENTAL_TAG_SENTINEL, [], [], [], "All time"))
+        self.assertEqual(lines.count("_none_"), 3)
+
+
+class TestDtGroupByBatch(unittest.TestCase):
+    """_dt_group_by_batch — merges queued/desk/closed into batch-number groups."""
+
+    def test_groups_by_batch_and_sorts_by_task_number(self):
+        queued = [{"ref": "REF1", "tag": "B2-T2"}]
+        desk   = [{"ref": "REF2", "tag": "B2-T1"}]
+        closed = [{"ref": "REF3", "tag": "B5-T1"}]
+        grouped = dlv_tasks._dt_group_by_batch(queued, desk, closed)
+        self.assertEqual(set(grouped.keys()), {2, 5})
+        self.assertEqual([i["ref"] for i in grouped[2]], ["REF2", "REF1"])
+        self.assertEqual(grouped[2][0]["section"], "desk")
+        self.assertEqual(grouped[2][1]["section"], "queued")
+
+    def test_items_with_non_incremental_tags_are_skipped(self):
+        queued = [{"ref": "REF1", "tag": "Queue"}, {"ref": "REF2", "tag": ""}]
+        grouped = dlv_tasks._dt_group_by_batch(queued, [], [])
+        self.assertEqual(grouped, {})
+
+
+class TestDtBatchStatusLabel(unittest.TestCase):
+    """_dt_batch_status_label — derives a status label from section + closed_reason."""
+
+    def test_queued_and_desk_sections(self):
+        self.assertEqual(dlv_tasks._dt_batch_status_label({"section": "queued"}), "⏳ Queued")
+        self.assertEqual(dlv_tasks._dt_batch_status_label({"section": "desk"}), "🏢 At Desk")
+
+    def test_closed_section_uses_closed_reason(self):
+        self.assertEqual(dlv_tasks._dt_batch_status_label({"section": "closed", "closed_reason": "completed"}),
+                          "✅ Completed")
+        self.assertEqual(dlv_tasks._dt_batch_status_label({"section": "closed", "closed_reason": "returned"}),
+                          "↩️ Returned")
+        self.assertEqual(dlv_tasks._dt_batch_status_label({"section": "closed", "closed_reason": "weird"}),
+                          "❓ Unknown")
+
+
+class TestDtFormatTagReportByBatch(unittest.TestCase):
+    """_dt_format_tag_report_by_batch — By Tag's "By Batch" view, sections
+    per batch number regardless of each item's current queued/desk/closed
+    lifecycle stage."""
+
+    def test_sections_per_batch_number(self):
+        queued = [{"ref": "REF1", "tag": "B2-T1", "valuer_name": "Amara Kip",
+                   "consideration": "1000000", "currency_code": "KES", "parcel": "P1"}]
+        closed = [{"ref": "REF2", "tag": "B2-T2", "valuer_name": "Jane Doe", "closed_reason": "completed",
+                   "consideration_amount": "2000000", "currency_code": "KES", "parcel": "P2"}]
+        lines = "\n".join(dlv_tasks._dt_format_tag_report_by_batch(
+            dlv_tasks.INCREMENTAL_TAG_SENTINEL, queued, [], closed, "All time"))
+        self.assertIn("(view: By Batch, All time)", lines)
+        self.assertIn("*Batch 2* — 2 task(s)", lines)
+        self.assertIn("🔢 Batch/Task: B2-T1", lines)
+        self.assertIn("⏳ Queued", lines)
+        self.assertIn("🔢 Batch/Task: B2-T2", lines)
+        self.assertIn("✅ Completed", lines)
+
+    def test_no_incremental_items_renders_none_placeholder(self):
+        lines = "\n".join(dlv_tasks._dt_format_tag_report_by_batch(
+            dlv_tasks.INCREMENTAL_TAG_SENTINEL, [], [], [], "All time"))
+        self.assertIn("_none_", lines)
+
+
+class TestDtSendTagReportView(unittest.TestCase):
+    """_dt_send_tag_report's view routing — flat (default), valuer, batch."""
+
+    def test_defaults_to_flat_report(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        with patch.object(dlv_tasks, "_dt_format_tag_report", return_value=["flat"]) as mock_flat, \
+             patch.object(dlv_tasks, "_dt_format_tag_report_by_valuer") as mock_valuer, \
+             patch.object(dlv_tasks, "_dt_format_tag_report_by_batch") as mock_batch:
+            _run(dlv_tasks._dt_send_tag_report(123, "Queue", [], [], [], "All time", bot))
+        mock_flat.assert_called_once()
+        mock_valuer.assert_not_called()
+        mock_batch.assert_not_called()
+
+    def test_valuer_view_calls_by_valuer_formatter(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        with patch.object(dlv_tasks, "_dt_format_tag_report") as mock_flat, \
+             patch.object(dlv_tasks, "_dt_format_tag_report_by_valuer", return_value=["valuer"]) as mock_valuer:
+            _run(dlv_tasks._dt_send_tag_report(123, dlv_tasks.INCREMENTAL_TAG_SENTINEL, [], [], [], "All time",
+                                                bot, view="valuer"))
+        mock_valuer.assert_called_once()
+        mock_flat.assert_not_called()
+
+    def test_batch_view_calls_by_batch_formatter(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        with patch.object(dlv_tasks, "_dt_format_tag_report") as mock_flat, \
+             patch.object(dlv_tasks, "_dt_format_tag_report_by_batch", return_value=["batch"]) as mock_batch:
+            _run(dlv_tasks._dt_send_tag_report(123, dlv_tasks.INCREMENTAL_TAG_SENTINEL, [], [], [], "All time",
+                                                bot, view="batch"))
+        mock_batch.assert_called_once()
+        mock_flat.assert_not_called()
+
+
 class TestDtSendTelegram(unittest.TestCase):
     """_dt_send_telegram — Open Tasks' Telegram delivery, grouped by valuer."""
 
@@ -643,6 +765,41 @@ class TestRecvDtPickTag(unittest.TestCase):
         sess = dlv_tasks._get_dt_sess(ctx)
         self.assertEqual(sess.report_mode, "tag")
         self.assertEqual(sess.selected_tag, "Queue")
+        self.assertEqual(sess.report_view, "flat")
+
+    def test_picking_incremental_moves_to_view_picker_instead_of_period(self):
+        update = _make_query_update(f"dt_picktag:{dlv_tasks.INCREMENTAL_TAG_SENTINEL}")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        with patch.object(dlv_tasks, "allowed", return_value=True):
+            result = _run(dlv_tasks.recv_dt_pick_tag(update, ctx))
+        self.assertEqual(result, dlv_tasks.DT.PICK_VIEW)
+        sess = dlv_tasks._get_dt_sess(ctx)
+        self.assertEqual(sess.selected_tag, dlv_tasks.INCREMENTAL_TAG_SENTINEL)
+
+
+class TestRecvDtPickView(unittest.TestCase):
+    """recv_dt_pick_view — the Incremental-only report-view picker, hands
+    off to the shared period step."""
+
+    def test_cancel_ends_conversation(self):
+        update = _make_query_update("dt_pickview_cancel")
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        with patch.object(dlv_tasks, "allowed", return_value=True):
+            result = _run(dlv_tasks.recv_dt_pick_view(update, ctx))
+        self.assertEqual(result, dlv_tasks.ConversationHandler.END)
+
+    def test_picking_a_view_sets_report_view_and_moves_to_period(self):
+        update = _make_query_update("dt_pickview:batch")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = dlv_tasks._get_dt_sess(ctx)
+        sess.selected_tag = dlv_tasks.INCREMENTAL_TAG_SENTINEL
+        with patch.object(dlv_tasks, "allowed", return_value=True):
+            result = _run(dlv_tasks.recv_dt_pick_view(update, ctx))
+        self.assertEqual(result, dlv_tasks.DT.PICK_PERIOD)
+        self.assertEqual(sess.report_view, "batch")
 
 
 class TestRecvDtPickValuer(unittest.TestCase):
