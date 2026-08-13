@@ -96,6 +96,23 @@ from endpoints import (
 _LU_CRED_COUNTY  = "staff2"
 _LU_CRED_DEFAULT = "staff_valuer"
 
+_LU_MD_SPECIAL_CHARS = re.compile(r"([\\_*`\[])")
+
+
+def _lu_md_escape(text: str) -> str:
+    """Escape backslash, underscore, asterisk, backtick, and open bracket
+    before interpolating an API-sourced value into a parse_mode="Markdown"
+    reply. Without this, a value containing one of these (a valuer name,
+    parcel number, or any other free-text API field) raises
+    telegram.error.BadRequest: Can't parse entities — caught by the bot's
+    generic error handler and surfaced as a misleading "Something went
+    wrong processing that (likely a network hiccup)" message that hides
+    the real cause. Distinct from common.py's md_escape (used for valuer/
+    assessor names elsewhere in the bot) in also escaping a literal
+    backslash first, since these are arbitrary API-sourced values (parcel
+    numbers, node/status strings, the ref itself) rather than just names."""
+    return _LU_MD_SPECIAL_CHARS.sub(r"\\\1", text or "")
+
 
 # ──────────────────────────────────────────────────────────
 # States — Lookup Reference conversation
@@ -272,15 +289,15 @@ def _lu_format_result(ref: str, item: Dict, detail: Optional[Dict]) -> str:
 
     lines = [
         "🔎 *Reference Lookup*\n",
-        f"📌 *Ref:* `{ref}`",
-        f"📊 *Status:* {status}",
-        f"🔄 *Node:* {node_label}",
-        f"👤 *Valuer:* {valuer_name}",
-        f"🏢 *Registry:* {registry}",
-        f"📍 *County:* {county}",
-        f"💰 *Consideration:* {consideration}",
-        f"📋 *Parcel:* {parcel}",
-        f"📅 *Created:* {created}",
+        f"📌 *Ref:* `{_lu_md_escape(ref)}`",
+        f"📊 *Status:* {_lu_md_escape(status)}",
+        f"🔄 *Node:* {_lu_md_escape(node_label)}",
+        f"👤 *Valuer:* {_lu_md_escape(valuer_name)}",
+        f"🏢 *Registry:* {_lu_md_escape(registry)}",
+        f"📍 *County:* {_lu_md_escape(county)}",
+        f"💰 *Consideration:* {_lu_md_escape(consideration)}",
+        f"📋 *Parcel:* {_lu_md_escape(parcel)}",
+        f"📅 *Created:* {_lu_md_escape(created)}",
     ]
     return "\n".join(lines)
 
@@ -399,14 +416,14 @@ def _lu_format_lrd_result(ref: str, item: Dict, detail: Optional[Dict]) -> str:
 
     lines = [
         "🔎 *Reference Lookup — Land Rent Determination*\n",
-        f"📌 *Ref:* `{ref}`",
-        f"📊 *Status:* {status}",
-        f"🔄 *Node:* {node_label}",
-        f"🏢 *Registry:* {registry}",
-        f"📍 *County:* {county}",
-        f"📋 *Parcel:* {parcel}",
-        f"🧩 *Child Parcels:* {child_parcels}",
-        f"📅 *Created:* {created}",
+        f"📌 *Ref:* `{_lu_md_escape(ref)}`",
+        f"📊 *Status:* {_lu_md_escape(status)}",
+        f"🔄 *Node:* {_lu_md_escape(node_label)}",
+        f"🏢 *Registry:* {_lu_md_escape(registry)}",
+        f"📍 *County:* {_lu_md_escape(county)}",
+        f"📋 *Parcel:* {_lu_md_escape(parcel)}",
+        f"🧩 *Child Parcels:* {_lu_md_escape(child_parcels)}",
+        f"📅 *Created:* {_lu_md_escape(created)}",
     ]
     return "\n".join(lines)
 
@@ -496,15 +513,15 @@ def _lu_format_county_result(ref: str, item: Dict, detail: Optional[Dict]) -> st
 
     lines = [
         "🔎 *Reference Lookup*\n",
-        f"📌 *Ref:* `{ref}`",
-        f"📊 *Status:* {status}",
-        f"🔄 *Node:* {node_label}",
-        f"👤 *Valuer:* {valuer_name}",
-        f"🏢 *Registry:* {registry}",
-        f"📍 *County:* {county}",
-        f"💰 *Consideration:* {consideration}",
-        f"📋 *Parcel:* {parcel}",
-        f"📅 *Created:* {created}",
+        f"📌 *Ref:* `{_lu_md_escape(ref)}`",
+        f"📊 *Status:* {_lu_md_escape(status)}",
+        f"🔄 *Node:* {_lu_md_escape(node_label)}",
+        f"👤 *Valuer:* {_lu_md_escape(valuer_name)}",
+        f"🏢 *Registry:* {_lu_md_escape(registry)}",
+        f"📍 *County:* {_lu_md_escape(county)}",
+        f"💰 *Consideration:* {_lu_md_escape(consideration)}",
+        f"📋 *Parcel:* {_lu_md_escape(parcel)}",
+        f"📅 *Created:* {_lu_md_escape(created)}",
     ]
     return "\n".join(lines)
 
@@ -534,13 +551,29 @@ async def _lu_lookup_county(ref: str) -> Optional[str]:
     stage only searches — and needs a cached token for — its own
     credential; a stage with no cached token is silently skipped, not
     treated as an error, since the other stage alone may still succeed).
+
+    Finding the ref at the assessor stage isn't enough on its own to stop
+    there: its detail-view may not list a VALUATION OFFICER yet even
+    though the ref has already moved on to the DLV/valuation stage (the
+    same source of truth dlv_batch.py uses) — reporting the assessor
+    stage's valuer-less result in that case used to read as "Valuer: -"
+    for a ref the DLV Batch Report correctly showed as already assigned.
+    So a valuer-less assessor-stage find is kept only as a last-resort
+    fallback, tried after the DLV stage — returned only if the DLV stage
+    can't find the ref either.
+
     Returns None if neither stage finds the ref."""
+    assessor_item, assessor_detail = None, None
+
     support_tokens = get_valid_tokens(_LU_CRED_COUNTY)
     if support_tokens:
         item = await asyncio.to_thread(_lu_search_ref_county, support_tokens, ref)
         if item:
             detail = await asyncio.to_thread(_lu_fetch_detail_county, support_tokens, item["id"])
-            return _lu_format_county_result(ref, item, detail)
+            officers = (detail or {}).get("officers") or []
+            if any(o.get("role") == "VALUATION OFFICER" for o in officers):
+                return _lu_format_county_result(ref, item, detail)
+            assessor_item, assessor_detail = item, detail
 
     valuer_tokens = get_valid_tokens(_LU_CRED_DEFAULT)
     if valuer_tokens:
@@ -549,6 +582,8 @@ async def _lu_lookup_county(ref: str) -> Optional[str]:
             detail = await asyncio.to_thread(_lu_fetch_detail, valuer_tokens, item["id"])
             return _lu_format_result(ref, item, detail)
 
+    if assessor_item:
+        return _lu_format_county_result(ref, assessor_item, assessor_detail)
     return None
 
 
@@ -584,13 +619,13 @@ async def recv_lu_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    await update.message.reply_text(f"🔍 Searching for `{ref}`…", parse_mode="Markdown")
+    await update.message.reply_text(f"🔍 Searching for `{_lu_md_escape(ref)}`…", parse_mode="Markdown")
 
     if is_county:
         result = await _lu_lookup_county(ref)
         if not result:
             await update.message.reply_text(
-                f"❌ Reference `{ref}` not found at either the assessor stage "
+                f"❌ Reference `{_lu_md_escape(ref)}` not found at either the assessor stage "
                 "(TO_VALUATION, Ongoing) or the DLV/valuation stage (Ongoing, "
                 "Completed, Returned).\n\nCheck the reference number and try again.",
                 parse_mode="Markdown",
@@ -603,7 +638,7 @@ async def recv_lu_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     item = await asyncio.to_thread(_lu_search_ref, tokens, ref)
     if not item:
         await update.message.reply_text(
-            f"❌ Reference `{ref}` not found across all filters (Ongoing, Pending, Completed).\n\n"
+            f"❌ Reference `{_lu_md_escape(ref)}` not found across all filters (Ongoing, Pending, Completed).\n\n"
             "Check the reference number and try again.",
             parse_mode="Markdown",
             reply_markup=_main_menu(),
