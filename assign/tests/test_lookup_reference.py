@@ -83,6 +83,27 @@ class TestLuSearchRef(unittest.TestCase):
         self.assertEqual(result["id"], "app-2")
 
 
+class TestLuMdEscape(unittest.TestCase):
+    """_lu_md_escape — escapes backslash, underscore, asterisk, backtick,
+    and open bracket before interpolating an API-sourced value into a
+    parse_mode="Markdown" reply, so a stray special character doesn't
+    raise telegram.error.BadRequest: Can't parse entities."""
+
+    def test_escapes_each_special_char(self):
+        self.assertEqual(lu._lu_md_escape("a_b"), "a\\_b")
+        self.assertEqual(lu._lu_md_escape("a*b"), "a\\*b")
+        self.assertEqual(lu._lu_md_escape("a`b"), "a\\`b")
+        self.assertEqual(lu._lu_md_escape("a[b"), "a\\[b")
+        self.assertEqual(lu._lu_md_escape("a\\b"), "a\\\\b")
+
+    def test_plain_text_unchanged(self):
+        self.assertEqual(lu._lu_md_escape("JANE DOE"), "JANE DOE")
+
+    def test_none_and_empty_return_empty_string(self):
+        self.assertEqual(lu._lu_md_escape(None), "")
+        self.assertEqual(lu._lu_md_escape(""), "")
+
+
 class TestLuFormatResult(unittest.TestCase):
     def test_formats_with_no_detail(self):
         item = {"application_status": "ongoing", "registry": "NAIROBI",
@@ -104,6 +125,20 @@ class TestLuFormatResult(unittest.TestCase):
         self.assertIn("JANE DOE", result)
         self.assertIn("KES 500,000.00", result)
         self.assertIn("Unassigned", result)   # node label lookup
+
+    def test_valuer_name_with_markdown_chars_is_escaped(self):
+        """Regression: an unescaped underscore/asterisk/backtick in an
+        API-sourced value raised telegram.error.BadRequest: Can't parse
+        entities, surfaced to the user as a misleading generic error."""
+        item = {"application_status": "ongoing", "date_created": "2026-01-01",
+                 "registry": "NAI_ROBI", "county": "NAIROBI"}
+        detail = {
+            "node": "VALUATION_STAMP_DUTY_CREATED",
+            "actors": [{"role": "VALUATION OFFICER", "user_details": {"names": "Jane_Doe *Esq*"}}],
+        }
+        result = lu._lu_format_result("R1", item, detail)
+        self.assertIn("Jane\\_Doe \\*Esq\\*", result)
+        self.assertIn("NAI\\_ROBI", result)
 
 
 class TestLuExtractContext(unittest.TestCase):
@@ -257,6 +292,15 @@ class TestLuFormatLrdResult(unittest.TestCase):
         self.assertIn("150.00 MSQ", result)
         self.assertNotIn("Consideration", result)   # LRD has no monetary consideration
 
+    def test_registry_with_markdown_chars_is_escaped(self):
+        item = {"application_status": "ongoing", "date_created": "2026-07-20"}
+        detail = {
+            "node": "VALUATION_LRD_CREATED",
+            "external_process_details": {"location_details": {"county": "NAIROBI", "registry": "NORTH_ZONE"}},
+        }
+        result = lu._lu_format_lrd_result("REG/SECT/AB12CD", item, detail)
+        self.assertIn("NORTH\\_ZONE", result)
+
 
 class TestLuIsCountyRef(unittest.TestCase):
     def test_cntyinv_prefix_is_county(self):
@@ -345,6 +389,15 @@ class TestLuFormatCountyResult(unittest.TestCase):
         result = lu._lu_format_county_result("CNTYINV/AB12CD34EF", item, detail)
         self.assertIn("JANE DOE", result)
 
+    def test_valuer_name_with_markdown_chars_is_escaped(self):
+        item = {"application_status": "ongoing", "date_created": "2026-07-15"}
+        detail = {
+            "node": "STAMP_DUTY_VALUATION",
+            "officers": [{"role": "VALUATION OFFICER", "names": "Jane_Doe"}],
+        }
+        result = lu._lu_format_county_result("CNTYINV/AB12CD34EF", item, detail)
+        self.assertIn("Jane\\_Doe", result)
+
 
 class TestLuSearchRefCountyDlv(unittest.TestCase):
     """_lu_search_ref_county_dlv — the DLV/valuation-stage fallback for a
@@ -427,21 +480,67 @@ class TestRecvLuRef(unittest.TestCase):
         mock_search.assert_called_once()
         mock_search_county.assert_not_called()
 
-    def test_county_ref_tries_assessor_stage_first_with_support_reg(self):
+    def test_county_ref_with_valuation_officer_returns_immediately_without_dlv_fallback(self):
+        """Assessor stage found it AND already lists a VALUATION OFFICER —
+        no need to check the DLV stage at all."""
         update = _make_update_with_message("CNTYINV/AB12CD34EF")
         ctx = MagicMock()
-        item = {"id": "app-1", "reference_number": "CNTYINV/AB12CD34EF"}
+        item   = {"id": "app-1", "reference_number": "CNTYINV/AB12CD34EF"}
+        detail = {"officers": [{"role": "VALUATION OFFICER", "names": "JANE DOE"}]}
         with patch.object(lu, "allowed", return_value=True), \
              patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
              patch.object(lu, "_lu_search_ref_county", return_value=item) as mock_search_county, \
-             patch.object(lu, "_lu_fetch_detail_county", return_value=None), \
+             patch.object(lu, "_lu_fetch_detail_county", return_value=detail), \
              patch.object(lu, "_lu_search_ref_county_dlv") as mock_search_dlv, \
              patch.object(lu, "_lu_search_ref") as mock_search:
             _run(lu.recv_lu_ref(update, ctx))
         mock_search_county.assert_called_once_with(TOKENS, "CNTYINV/AB12CD34EF")
-        # assessor stage found it -> DLV fallback and the non-county path never run
+        # assessor stage found a valuer -> DLV fallback and the non-county path never run
         mock_search_dlv.assert_not_called()
         mock_search.assert_not_called()
+
+    def test_county_ref_without_valuation_officer_falls_through_to_dlv_stage(self):
+        """Regression: a ref found at the assessor stage with no
+        VALUATION OFFICER listed yet (already moved on to DLV) used to be
+        reported as "Valuer: -" instead of checking the DLV stage, which
+        the DLV Batch Report correctly showed as already assigned."""
+        update = _make_update_with_message("CNTYINV/AB12CD34EF")
+        ctx = MagicMock()
+        assessor_item   = {"id": "app-1", "reference_number": "CNTYINV/AB12CD34EF"}
+        assessor_detail = {"officers": [{"role": "COUNTY_REGISTRAR", "names": "SOMEONE ELSE"}]}
+        dlv_item        = {"id": "app-2", "reference_number": "CNTYINV/AB12CD34EF"}
+        with patch.object(lu, "allowed", return_value=True), \
+             patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref_county", return_value=assessor_item), \
+             patch.object(lu, "_lu_fetch_detail_county", return_value=assessor_detail), \
+             patch.object(lu, "_lu_search_ref_county_dlv", return_value=dlv_item) as mock_search_dlv, \
+             patch.object(lu, "_lu_fetch_detail", return_value=None), \
+             patch.object(lu, "_lu_format_result", return_value="dlv result") as mock_fmt_dlv, \
+             patch.object(lu, "_lu_format_county_result") as mock_fmt_county:
+            result = _run(lu.recv_lu_ref(update, ctx))
+        mock_search_dlv.assert_called_once_with(TOKENS, "CNTYINV/AB12CD34EF")
+        mock_fmt_dlv.assert_called_once()
+        # valuer-less assessor result is never rendered once the DLV stage finds it
+        mock_fmt_county.assert_not_called()
+        self.assertEqual(result, lu.ConversationHandler.END)
+
+    def test_county_ref_without_valuer_falls_back_to_assessor_result_when_dlv_stage_also_fails(self):
+        """Last resort: neither stage has a valuer to report, so the
+        valuer-less assessor-stage result is used rather than reporting
+        not-found outright."""
+        update = _make_update_with_message("CNTYINV/AB12CD34EF")
+        ctx = MagicMock()
+        assessor_item   = {"id": "app-1", "reference_number": "CNTYINV/AB12CD34EF"}
+        assessor_detail = {"officers": [{"role": "COUNTY_REGISTRAR", "names": "SOMEONE ELSE"}]}
+        with patch.object(lu, "allowed", return_value=True), \
+             patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref_county", return_value=assessor_item), \
+             patch.object(lu, "_lu_fetch_detail_county", return_value=assessor_detail), \
+             patch.object(lu, "_lu_search_ref_county_dlv", return_value=None), \
+             patch.object(lu, "_lu_format_county_result", return_value="assessor fallback") as mock_fmt_county:
+            result = _run(lu.recv_lu_ref(update, ctx))
+        mock_fmt_county.assert_called_once_with("CNTYINV/AB12CD34EF", assessor_item, assessor_detail)
+        self.assertEqual(result, lu.ConversationHandler.END)
 
     def test_county_ref_falls_back_to_dlv_stage_when_assessor_stage_finds_nothing(self):
         update = _make_update_with_message("CNTYINV/AB12CD34EF")
@@ -488,6 +587,21 @@ class TestRecvLuRef(unittest.TestCase):
             result = _run(lu.recv_lu_ref(update, ctx))
         self.assertEqual(result, lu.ConversationHandler.END)
 
+    def test_ref_with_markdown_chars_is_escaped_in_searching_and_not_found_messages(self):
+        """Regression: an unescaped underscore in the user-entered ref
+        itself (echoed back verbatim in these two messages) raised
+        telegram.error.BadRequest: Can't parse entities."""
+        update = _make_update_with_message("REG_TSFR/ABC123")
+        ctx = MagicMock()
+        with patch.object(lu, "allowed", return_value=True), \
+             patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref", return_value=None):
+            _run(lu.recv_lu_ref(update, ctx))
+        searching_text  = update.message.reply_text.call_args_list[0][0][0]
+        not_found_text  = update.message.reply_text.call_args_list[1][0][0]
+        self.assertIn("REG\\_TSFR/ABC123", searching_text)
+        self.assertIn("REG\\_TSFR/ABC123", not_found_text)
+
     def test_ref_found_formats_and_ends_conversation(self):
         update = _make_update_with_message("R1")
         ctx = MagicMock()
@@ -504,11 +618,12 @@ class TestRecvLuRef(unittest.TestCase):
     def test_county_ref_found_uses_county_detail_and_formatter(self):
         update = _make_update_with_message("CNTYINV/AB12CD34EF")
         ctx = MagicMock()
-        item = {"id": "app-1", "reference_number": "CNTYINV/AB12CD34EF"}
+        item   = {"id": "app-1", "reference_number": "CNTYINV/AB12CD34EF"}
+        detail = {"officers": [{"role": "VALUATION OFFICER", "names": "JANE DOE"}]}
         with patch.object(lu, "allowed", return_value=True), \
              patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
              patch.object(lu, "_lu_search_ref_county", return_value=item), \
-             patch.object(lu, "_lu_fetch_detail_county", return_value=None) as mock_detail, \
+             patch.object(lu, "_lu_fetch_detail_county", return_value=detail) as mock_detail, \
              patch.object(lu, "_lu_format_county_result", return_value="formatted") as mock_fmt, \
              patch.object(lu, "_lu_format_result") as mock_fmt_default:
             result = _run(lu.recv_lu_ref(update, ctx))
