@@ -24,13 +24,17 @@ not when picked — see dlv_incremental.py's module docstring for why.
 If a queued ref turns out to already be held by a valuer other than the
 one it was queued for, it's no longer silently dropped — the item is
 flagged `awaiting_decision` (held in the queue, excluded from further
-processing) and a Reassign/Remove prompt is sent to Telegram
-(_db_taken_keyboard / recv_db_taken_decision, callback prefix "dbtaken:").
-Reassign accepts the drift — persists an assignment record for the actual
-current holder and drops the ref from the queue; Remove marks it removed
-(dlv_core.mark_removed) and drops it too. This decision handler is
-registered globally (not part of the DB conversation), since the prompt
-can be answered long after the run that sent it and by any allowed user.
+processing) and a three-way decision prompt is sent to Telegram
+(_db_taken_keyboard / recv_db_taken_decision, callback prefix "dbtaken:"):
+Reassign to New Valuer clears the held-by flag and marks the item
+force_reassign so the next processing cycle calls the assign API against
+the originally-queued valuer, overriding whoever currently holds it;
+Maintain Current Valuer accepts the drift — persists an assignment record
+for the actual current holder (no API call) and drops the ref from the
+queue; Delete from Queue marks it removed (dlv_core.mark_removed) and
+drops it too. This decision handler is registered globally (not part of
+the DB conversation), since the prompt can be answered long after the run
+that sent it and by any allowed user.
 
 Call register(app) from bot.py's main() to wire this feature in.
 """
@@ -258,6 +262,37 @@ def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth
             vo_details = (vo.get("user_details") or {}) if vo else {}
             actor_name = vo_details.get("names", "")
             actor_uid  = vo_details.get("id", "")
+
+            if item.get("force_reassign"):
+                # User chose "Reassign to New Valuer" on a ref previously found
+                # held by someone else (see recv_db_taken_decision) — force the
+                # assign call to the originally-queued valuer regardless of who
+                # currently holds it.
+                r = http_sess.post(
+                    assign_url, headers=auth_hdrs,
+                    json={
+                        "reference_number":  ref,
+                        "valuation_officer": valuer_uid,
+                        "node":              "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                    },
+                    timeout=30,
+                )
+                r.raise_for_status()
+                try:
+                    persist_assignment(ref, valuer_name, valuer_uid, extra={
+                        "valuer_acct":   item.get("valuer_acct", ""),
+                        "tag":           item.get("tag", ""),
+                        "assessor":      item.get("assessor", ""),
+                        "parcel":        item.get("parcel", ""),
+                        "consideration": item.get("consideration", ""),
+                        "currency_code": item.get("currency_code", ""),
+                        "queued_at":     item.get("queued_at", ""),
+                    })
+                except Exception as _pe:
+                    logger.error("persist_assignment failed for %s: %s", ref, _pe)
+                outcome = {"ref": ref, "status": "✅ Reassigned", "valuer_name": valuer_name, "held_by": ""}
+                return {"item": item, "keep": False, "outcome": outcome, "closed": None}
+
             if actor_name and str(actor_uid) == str(valuer_uid):
                 # Distinguish "correctly assigned already" from "taken by someone
                 # else" — both used to render identically as "already with X",
@@ -373,16 +408,19 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> Tuple[List[str], List[Dict]]
 
 
 def _db_taken_keyboard(ref: str) -> InlineKeyboardMarkup:
-    """Reassign (accept the current live holder as the new owner in our own
-    records) or Remove (drop the ref from the queue outright) — offered per
-    ref once DLV Batch finds it held by someone other than who it was
-    queued for. Uses the literal ref (not an index) since, unlike this
-    module's other pickers, this prompt can be answered long after the run
-    that sent it, with no live session/ordered list to index into."""
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Reassign to them",  callback_data=f"dbtaken:reassign:{ref}"),
-        InlineKeyboardButton("🗑 Remove from Queue", callback_data=f"dbtaken:remove:{ref}"),
-    ]])
+    """Reassign to New Valuer (force the assign API to the originally-queued
+    valuer on the next processing cycle), Maintain Current Valuer (accept the
+    current holder into our own records, no API call), or Delete from Queue
+    (drop the ref outright) — offered per ref once DLV Batch finds it held by
+    someone other than who it was queued for. Uses the literal ref (not an
+    index) since, unlike this module's other pickers, this prompt can be
+    answered long after the run that sent it, with no live session/ordered
+    list to index into."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Reassign to New Valuer",  callback_data=f"dbtaken:reassign_new:{ref}")],
+        [InlineKeyboardButton("🤝 Maintain Current Valuer", callback_data=f"dbtaken:maintain:{ref}")],
+        [InlineKeyboardButton("🗑 Delete from Queue",        callback_data=f"dbtaken:remove:{ref}")],
+    ])
 
 
 def _db_taken_prompt_text(item: Dict) -> str:
@@ -390,7 +428,7 @@ def _db_taken_prompt_text(item: Dict) -> str:
     return (
         f"⚠️ `{item.get('ref', '')}` is now held by *{md_escape(item.get('held_by', ''))}*"
         f" — it was queued for *{md_escape(item.get('valuer_name', ''))}*.\n\n"
-        "Reassign our record to the new holder, or remove this ref from the queue?"
+        "Reassign it to the new valuer, keep the current holder, or remove this ref from the queue?"
     )
 
 
@@ -409,14 +447,19 @@ async def _send_db_taken_prompts(bot, chat_ids: List[int], newly_awaiting: List[
 
 
 async def recv_db_taken_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle the Reassign/Remove decision for a ref DLV Batch found held by
-    someone other than its queued valuer. A global (non-conversation)
-    handler — the prompt can be answered long after the run that sent it,
-    and by any allowed user, not just whoever triggered that run. Reassign
-    persists an assignment record for the actual current holder (accepting
-    the drift, not moving the task via the API); Remove marks the ref
-    removed (dlv_core.mark_removed) rather than dropping it silently. Both
-    then drop the ref from the active queue."""
+    """Handle the Reassign-to-New-Valuer / Maintain-Current-Valuer / Delete
+    decision for a ref DLV Batch found held by someone other than its queued
+    valuer. A global (non-conversation) handler — the prompt can be answered
+    long after the run that sent it, and by any allowed user, not just
+    whoever triggered that run. Reassign to New Valuer clears the held-by
+    flag and marks the item force_reassign, so the next processing cycle
+    calls the assign API against the originally-queued valuer, overriding
+    whoever currently holds it — it stays in the queue rather than being
+    resolved here. Maintain Current Valuer persists an assignment record for
+    the actual current holder (accepting the drift, no API call) and drops
+    the ref from the queue. Delete from Queue marks the ref removed
+    (dlv_core.mark_removed) rather than dropping it silently, and also drops
+    it from the queue."""
     if not allowed(update): return await deny(update)
     query = update.callback_query
     await query.answer()
@@ -430,7 +473,17 @@ async def recv_db_taken_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
     remaining = [i for i in items if i.get("ref") != ref]
 
-    if action == "reassign":
+    if action == "reassign_new":
+        valuer_name = item.get("valuer_name", "")
+        requeued = {**item, "awaiting_decision": False, "held_by": "", "held_by_uid": "", "force_reassign": True}
+        save_dlv_batch(remaining + [requeued])
+        await query.edit_message_text(
+            f"🔄 `{ref}` will be reassigned to *{md_escape(valuer_name)}* on the next processing cycle.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "maintain":
         held_by     = item.get("held_by", "")
         held_by_uid = item.get("held_by_uid", "")
         try:
@@ -447,7 +500,7 @@ async def recv_db_taken_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             logger.error("persist_assignment failed for %s: %s", ref, e)
         save_dlv_batch(remaining)
         await query.edit_message_text(
-            f"✅ `{ref}` reassigned to *{md_escape(held_by)}* in our records and removed from the queue.",
+            f"🤝 `{ref}` kept with *{md_escape(held_by)}* in our records and removed from the queue.",
             parse_mode="Markdown",
         )
         return
