@@ -237,6 +237,38 @@ class TestProcessDlvBatchItem(unittest.TestCase):
         self.assertEqual(result["outcome"]["valuer_name"], "Jane Doe")
         self.http_sess.post.assert_not_called()
 
+    def test_force_reassign_calls_assign_api_regardless_of_current_actor(self):
+        """Reassign to New Valuer (recv_db_taken_decision) sets force_reassign
+        on the requeued item — the next cycle must call the assign API against
+        the originally-queued valuer even though the node shows someone else
+        already holding it."""
+        self.item["force_reassign"] = True
+        with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                 "actors": [{"role": "VALUATION OFFICER", "user_details": {"id": "uid-2", "names": "EXISTING VALUER"}}],
+             }), \
+             patch.object(dlv_batch, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT", "assessor_name": "",
+                 "consideration_amount": "", "currency_code": "", "actor_name": "",
+             }), \
+             patch.object(dlv_batch, "persist_assignment") as mock_persist:
+            self.http_sess.post.return_value = MagicMock(raise_for_status=lambda: None)
+            result = self._run()
+        self.assertFalse(result["keep"])
+        self.assertIn("Reassigned", result["outcome"]["status"])
+        self.http_sess.post.assert_called_once_with(
+            self.assign_url, headers=self.auth_hdrs,
+            json={"reference_number": "REG/TSFR/ABC123", "valuation_officer": "uid-1",
+                  "node": "VALUATION_STAMP_DUTY_VALUER_REPORT"},
+            timeout=30,
+        )
+        mock_persist.assert_called_once_with("REG/TSFR/ABC123", "Jane Doe", "uid-1", extra={
+            "valuer_acct": "", "tag": "", "assessor": "", "parcel": "",
+            "consideration": "", "currency_code": "", "queued_at": "",
+        })
+
     def test_no_valuation_officer_actor_reports_no_actor_listed(self):
         with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
              patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={
@@ -461,14 +493,15 @@ class TestRunDlvBatchBg(unittest.TestCase):
 
 
 class TestDbTakenKeyboard(unittest.TestCase):
-    """_db_taken_keyboard — Reassign/Remove buttons, keyed by the literal ref
-    (not an index) since this prompt can be answered long after it's sent."""
+    """_db_taken_keyboard — Reassign to New Valuer / Maintain Current Valuer /
+    Delete from Queue buttons, keyed by the literal ref (not an index) since
+    this prompt can be answered long after it's sent."""
 
     def test_buttons_carry_the_ref_in_callback_data(self):
         markup = dlv_batch._db_taken_keyboard("REG/TSFR/ABC123")
-        buttons = markup.inline_keyboard[0]
-        callback_data = [b.callback_data for b in buttons]
-        self.assertIn("dbtaken:reassign:REG/TSFR/ABC123", callback_data)
+        callback_data = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertIn("dbtaken:reassign_new:REG/TSFR/ABC123", callback_data)
+        self.assertIn("dbtaken:maintain:REG/TSFR/ABC123", callback_data)
         self.assertIn("dbtaken:remove:REG/TSFR/ABC123", callback_data)
 
 
@@ -509,8 +542,9 @@ class TestSendDbTakenPrompts(unittest.TestCase):
 
 
 class TestRecvDbTakenDecision(unittest.TestCase):
-    """recv_db_taken_decision — the global Reassign/Remove handler for a ref
-    DLV Batch found held by someone other than its queued valuer."""
+    """recv_db_taken_decision — the global Reassign-to-New-Valuer /
+    Maintain-Current-Valuer / Delete-from-Queue handler for a ref DLV Batch
+    found held by someone other than its queued valuer."""
 
     def _item(self, **overrides):
         item = {"ref": "REF1", "valuer_name": "Jane Doe", "valuer_uid": "uid-1",
@@ -518,8 +552,32 @@ class TestRecvDbTakenDecision(unittest.TestCase):
         item.update(overrides)
         return item
 
-    def test_reassign_persists_the_new_holder_and_drops_from_queue(self):
-        update = _make_query_update("dbtaken:reassign:REF1")
+    def test_reassign_new_requeues_with_force_reassign_and_keeps_it_pending(self):
+        update = _make_query_update("dbtaken:reassign_new:REF1")
+        ctx = MagicMock()
+        items = [self._item(), {"ref": "REF2", "valuer_name": "Other"}]
+        with patch.object(dlv_batch, "allowed", return_value=True), \
+             patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save, \
+             patch.object(dlv_batch, "persist_assignment") as mock_persist, \
+             patch.object(dlv_batch, "mark_removed") as mock_remove:
+            _run(dlv_batch.recv_db_taken_decision(update, ctx))
+        mock_persist.assert_not_called()
+        mock_remove.assert_not_called()
+        saved = mock_save.call_args[0][0]
+        saved_refs = [i["ref"] for i in saved]
+        self.assertEqual(sorted(saved_refs), ["REF1", "REF2"])
+        requeued = next(i for i in saved if i["ref"] == "REF1")
+        self.assertTrue(requeued["force_reassign"])
+        self.assertFalse(requeued["awaiting_decision"])
+        self.assertEqual(requeued["held_by"], "")
+        self.assertEqual(requeued["held_by_uid"], "")
+        text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("REF1", text)
+        self.assertIn("Jane Doe", text)
+
+    def test_maintain_persists_the_current_holder_and_drops_from_queue(self):
+        update = _make_query_update("dbtaken:maintain:REF1")
         ctx = MagicMock()
         items = [self._item(), {"ref": "REF2", "valuer_name": "Other"}]
         with patch.object(dlv_batch, "allowed", return_value=True), \
@@ -558,7 +616,7 @@ class TestRecvDbTakenDecision(unittest.TestCase):
         self.assertIn("removed", text)
 
     def test_ref_no_longer_awaiting_reports_already_resolved(self):
-        update = _make_query_update("dbtaken:reassign:REF1")
+        update = _make_query_update("dbtaken:reassign_new:REF1")
         ctx = MagicMock()
         with patch.object(dlv_batch, "allowed", return_value=True), \
              patch.object(dlv_batch, "load_dlv_batch", return_value=[]), \
