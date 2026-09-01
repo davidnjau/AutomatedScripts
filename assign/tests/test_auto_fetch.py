@@ -1062,6 +1062,12 @@ class TestAfIsSectionalTask(unittest.TestCase):
     def test_missing_parcel_number_does_not_match(self):
         self.assertFalse(af._af_is_sectional_task({}))
 
+    def test_real_world_sectional_example(self):
+        self.assertTrue(af._af_is_sectional_task({"parcel_number": "NAIROBI/BLOCK24/1715/219"}))
+
+    def test_real_world_non_sectional_example(self):
+        self.assertFalse(af._af_is_sectional_task({"parcel_number": "NAIROBI/BLOCK105/570"}))
+
 
 class TestAfTaskMatchesKeyword(unittest.TestCase):
     """_af_task_matches_keyword — SECTIONAL dispatches to the structural
