@@ -84,6 +84,7 @@ import new_assignment
 import receive_tasks
 import refresh_auth
 import sectional_properties
+import task_analytics
 import valuer_tasks
 
 load_dotenv()
@@ -720,6 +721,7 @@ def main():
     valuer_tasks.register(app)
     job_distribution.register(app)
     bulk_export.register(app)
+    task_analytics.register(app)
 
     # DLV Batch: 5-minute repeating job + DLV Queue handlers registered via
     # dlv_batch.register(app) above.
