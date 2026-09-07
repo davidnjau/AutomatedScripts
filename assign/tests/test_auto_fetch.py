@@ -174,6 +174,29 @@ class TestAfEmailStatePersistence(unittest.TestCase):
         self.assertEqual(af.load_af_email_state(), {"sched-1": ["REF1", "REF2"]})
 
 
+class TestAfTelegramStatePersistence(unittest.TestCase):
+    """load/save_af_telegram_state — per-schedule cumulative record of every
+    ref ever actually posted to Telegram, used to drop already-notified
+    refs from later cycles (mirrors TestAfEmailStatePersistence)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.state_file = os.path.join(self.tmpdir.name, "saved_af_telegram_state.json")
+        self._patch = patch.object(af, "SAVED_AF_TELEGRAM_STATE_FILE", self.state_file)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self.tmpdir.cleanup()
+
+    def test_load_missing_file_returns_empty_dict(self):
+        self.assertEqual(af.load_af_telegram_state(), {})
+
+    def test_save_then_load_roundtrip(self):
+        af.save_af_telegram_state({"sched-1": ["REF1", "REF2"]})
+        self.assertEqual(af.load_af_telegram_state(), {"sched-1": ["REF1", "REF2"]})
+
+
 class TestAutoFetchJob(unittest.TestCase):
     """_auto_fetch_job runs for exactly one schedule per invocation — the id
     it operates on comes from context.job.data (see recv_af_email/register,
@@ -183,13 +206,18 @@ class TestAutoFetchJob(unittest.TestCase):
         self.context = MagicMock()
         self.context.bot.send_message = AsyncMock()
         self.context.job.data = "sched-1"
-        # Isolate email-dedup state per test — a real/shared file here would
-        # let one test's send leak into another's "already sent" check.
+        # Isolate email-dedup and telegram-dedup state per test — a real/
+        # shared file here would let one test's send leak into another's
+        # "already sent" check.
         self.tmpdir = tempfile.TemporaryDirectory()
         self.email_state_file = os.path.join(self.tmpdir.name, "saved_af_email_state.json")
         self._patch_email_state = patch.object(af, "SAVED_AF_EMAIL_STATE_FILE", self.email_state_file)
         self._patch_email_state.start()
         self.addCleanup(self._patch_email_state.stop)
+        self.telegram_state_file = os.path.join(self.tmpdir.name, "saved_af_telegram_state.json")
+        self._patch_telegram_state = patch.object(af, "SAVED_AF_TELEGRAM_STATE_FILE", self.telegram_state_file)
+        self._patch_telegram_state.start()
+        self.addCleanup(self._patch_telegram_state.stop)
         self.addCleanup(self.tmpdir.cleanup)
 
     def test_schedule_removed_since_last_run_cancels_the_job(self):
@@ -533,6 +561,49 @@ class TestAutoFetchJob(unittest.TestCase):
 
         mock_email_2 = self._run_email_cycle(cfg, tasks)
         mock_email_2.assert_called_once()
+
+    def _run_telegram_cycle(self, cfg, tasks, job_data="sched-1"):
+        self.context.job.data = job_data
+        self.context.bot.send_message = AsyncMock()
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "persist_af_result"), \
+             patch.object(af, "ALLOWED_IDS", {111}):
+            _run(af._auto_fetch_job(self.context))
+        return self.context.bot.send_message
+
+    def test_second_cycle_with_identical_tasks_skips_telegram(self):
+        """This is the reported bug: the same unassigned task kept getting
+        re-posted to the chat every cycle. Once a ref has been shown on
+        Telegram for this schedule, an unchanged later cycle must not
+        re-post it."""
+        cfg = {"id": "sched-1", "days_back": 2}
+        tasks = [_task(ref="REG/TSFR/ABC123")]
+        self._run_telegram_cycle(cfg, tasks).assert_called()
+        mock_send_2 = self._run_telegram_cycle(cfg, tasks)
+        mock_send_2.assert_not_called()
+
+    def test_new_task_added_notifies_telegram_of_only_the_new_task(self):
+        cfg = {"id": "sched-1", "days_back": 2}
+        self._run_telegram_cycle(cfg, [_task(ref="123")])
+        mock_send_2 = self._run_telegram_cycle(cfg, [_task(ref="123"), _task(ref="456")])
+        mock_send_2.assert_called()
+        sent = "\n".join(c.args[1] for c in mock_send_2.call_args_list)
+        self.assertNotIn("`123`", sent)
+        self.assertIn("`456`", sent)
+
+    def test_telegram_dedup_independent_of_email_dedup(self):
+        """Reusing the email dedup state for Telegram would suppress a ref
+        on one channel just because the other channel already saw it — the
+        two channels must track separately."""
+        cfg = {"id": "sched-1", "days_back": 2, "email": "ops@example.com"}
+        tasks = [_task(ref="123")]
+        self._run_email_cycle(cfg, tasks).assert_called_once()
+        mock_send_2 = self._run_telegram_cycle(cfg, tasks)
+        mock_send_2.assert_called()
 
     def test_email_failure_notifies_telegram_instead_of_failing_silently(self):
         """Regression test: an SMTP error used to be swallowed by a log line only,
@@ -1515,13 +1586,16 @@ class TestRecvAfRemove(unittest.TestCase):
                            return_value={"id": "sched-1", "email": "abc@gmail.com"}), \
              patch.object(af, "remove_auto_fetch_schedule", return_value=True) as mock_remove, \
              patch.object(af, "load_af_email_state", return_value={}), \
-             patch.object(af, "save_af_email_state") as mock_save_state:
+             patch.object(af, "save_af_email_state") as mock_save_state, \
+             patch.object(af, "load_af_telegram_state", return_value={}), \
+             patch.object(af, "save_af_telegram_state") as mock_save_tg_state:
             result = _run(af.recv_af_remove(update, ctx))
         self.assertEqual(result, af.ConversationHandler.END)
         ctx.job_queue.get_jobs_by_name.assert_called_once_with("auto_fetch_job:sched-1")
         fake_job.schedule_removal.assert_called_once()
         mock_remove.assert_called_once_with("sched-1")
         mock_save_state.assert_not_called()   # nothing to clean up — state was already empty
+        mock_save_tg_state.assert_not_called()
         self.assertIn("abc@gmail.com", update.callback_query.edit_message_text.call_args[0][0])
 
     def test_removed_schedule_email_with_special_chars_is_escaped(self):
@@ -1532,7 +1606,9 @@ class TestRecvAfRemove(unittest.TestCase):
                            return_value={"id": "sched-1", "email": "john_doe@example.com"}), \
              patch.object(af, "remove_auto_fetch_schedule", return_value=True), \
              patch.object(af, "load_af_email_state", return_value={}), \
-             patch.object(af, "save_af_email_state"):
+             patch.object(af, "save_af_email_state"), \
+             patch.object(af, "load_af_telegram_state", return_value={}), \
+             patch.object(af, "save_af_telegram_state"):
             _run(af.recv_af_remove(update, ctx))
         self.assertIn("john\\_doe@example.com", update.callback_query.edit_message_text.call_args[0][0])
 
@@ -1544,9 +1620,26 @@ class TestRecvAfRemove(unittest.TestCase):
                            return_value={"id": "sched-1", "email": "abc@gmail.com"}), \
              patch.object(af, "remove_auto_fetch_schedule", return_value=True), \
              patch.object(af, "load_af_email_state", return_value={"sched-1": ["REF1"], "sched-2": ["REF2"]}), \
-             patch.object(af, "save_af_email_state") as mock_save_state:
+             patch.object(af, "save_af_email_state") as mock_save_state, \
+             patch.object(af, "load_af_telegram_state", return_value={}), \
+             patch.object(af, "save_af_telegram_state"):
             _run(af.recv_af_remove(update, ctx))
         mock_save_state.assert_called_once_with({"sched-2": ["REF2"]})
+
+    def test_removing_a_schedule_also_drops_its_telegram_dedup_state(self):
+        update = self._make_query("af_remove:sched-1")
+        ctx = MagicMock()
+        ctx.job_queue.get_jobs_by_name.return_value = []
+        with patch.object(af, "get_auto_fetch_schedule",
+                           return_value={"id": "sched-1", "email": "abc@gmail.com"}), \
+             patch.object(af, "remove_auto_fetch_schedule", return_value=True), \
+             patch.object(af, "load_af_email_state", return_value={}), \
+             patch.object(af, "save_af_email_state"), \
+             patch.object(af, "load_af_telegram_state",
+                           return_value={"sched-1": ["REF1"], "sched-2": ["REF2"]}), \
+             patch.object(af, "save_af_telegram_state") as mock_save_tg_state:
+            _run(af.recv_af_remove(update, ctx))
+        mock_save_tg_state.assert_called_once_with({"sched-2": ["REF2"]})
 
     def test_already_removed_shows_warning(self):
         update = self._make_query("af_remove:sched-1")
@@ -1555,7 +1648,9 @@ class TestRecvAfRemove(unittest.TestCase):
         with patch.object(af, "get_auto_fetch_schedule", return_value=None), \
              patch.object(af, "remove_auto_fetch_schedule", return_value=False), \
              patch.object(af, "load_af_email_state", return_value={}), \
-             patch.object(af, "save_af_email_state"):
+             patch.object(af, "save_af_email_state"), \
+             patch.object(af, "load_af_telegram_state", return_value={}), \
+             patch.object(af, "save_af_telegram_state"):
             _run(af.recv_af_remove(update, ctx))
         self.assertIn("already removed", update.callback_query.edit_message_text.call_args[0][0])
 
