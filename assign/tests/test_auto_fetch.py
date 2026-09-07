@@ -595,15 +595,31 @@ class TestAutoFetchJob(unittest.TestCase):
         self.assertNotIn("`123`", sent)
         self.assertIn("`456`", sent)
 
-    def test_telegram_dedup_independent_of_email_dedup(self):
-        """Reusing the email dedup state for Telegram would suppress a ref
-        on one channel just because the other channel already saw it — the
-        two channels must track separately."""
+    def test_schedule_with_email_configured_never_gets_telegram_task_list(self):
+        """A schedule with an email set already gets the full task list
+        there — posting the same list to Telegram too would be pure
+        duplication, so the Telegram task-list notification must not fire
+        at all for it, regardless of Telegram dedup state."""
         cfg = {"id": "sched-1", "days_back": 2, "email": "ops@example.com"}
         tasks = [_task(ref="123")]
-        self._run_email_cycle(cfg, tasks).assert_called_once()
-        mock_send_2 = self._run_telegram_cycle(cfg, tasks)
-        mock_send_2.assert_called()
+        with patch.object(af, "get_auto_fetch_schedule", return_value=cfg), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]), \
+             patch.object(af, "load_sectional_config", return_value=None), \
+             patch.object(af, "persist_af_result"), \
+             patch.object(af, "ALLOWED_IDS", {111}), \
+             patch.object(af, "_send_auto_fetch_email"):
+            _run(af._auto_fetch_job(self.context))
+        self.context.bot.send_message.assert_not_called()
+
+    def test_telegram_only_schedule_still_gets_notified(self):
+        """A schedule with no email configured has no other delivery
+        channel, so it must still get the Telegram task list."""
+        cfg = {"id": "sched-1", "days_back": 2}
+        tasks = [_task(ref="123")]
+        mock_send = self._run_telegram_cycle(cfg, tasks)
+        mock_send.assert_called()
 
     def test_email_failure_notifies_telegram_instead_of_failing_silently(self):
         """Regression test: an SMTP error used to be swallowed by a log line only,
