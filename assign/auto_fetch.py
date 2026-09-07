@@ -36,25 +36,27 @@ results for this reason.
 Call register(app) from bot.py's main() to wire this feature in (this
 also restores one repeating job per saved schedule on startup).
 
-Both delivery channels are deduplicated per schedule, each with its own
-independent state file so a failure on one channel never suppresses a
-retry on the other: saved_af_email_state.json (load_af_email_state/
-save_af_email_state) and saved_af_telegram_state.json
+The Telegram task-list notification only fires for schedules with no
+email configured ("Telegram only" schedules) — a schedule with an email
+already gets the full list there, so posting it to Telegram too would be
+pure duplication. Each delivery channel that does fire is deduplicated
+per schedule, with its own independent state file so a failure on one
+channel never suppresses a retry on the other: saved_af_email_state.json
+(load_af_email_state/save_af_email_state) and saved_af_telegram_state.json
 (load_af_telegram_state/save_af_telegram_state) each accumulate every ref
 ever actually sent down that channel for that schedule, keyed by schedule
-id. Each cycle, refs already in the respective set are dropped before
-building that channel's message — once a ref has been sent it's assumed
-seen and is never sent again down that same channel, even if it keeps
-reappearing in later fetches. If nothing new is left after that filter,
-that channel is skipped entirely for the cycle (the other channel still
-sends if it has anything new). A successful send adds its refs to the
-stored set; a failed send does not, so it's retried next cycle.
+id. Each cycle, refs already in that set are dropped before building the
+message — once a ref has been sent it's assumed seen and is never sent
+again down that same channel, even if it keeps reappearing in later
+fetches. If nothing new is left after that filter, the channel is skipped
+entirely for the cycle. A successful send adds its refs to the stored
+set; a failed send does not, so it's retried next cycle.
 
 Each schedule picks one report_format ("block" or "excel", asked
 unconditionally right after the email step — see recv_af_email/
 recv_af_report_format), which governs BOTH the periodic Telegram delivery
-and the email (if one is configured), rather than each channel having its
-own separate choice:
+(when it fires) and the email (if one is configured), rather than each
+channel having its own separate choice:
 - "block" (default) — the plain-text/Markdown _ft_format_task_block body,
   sent via context.bot.send_message (Telegram, chunked) or
   email_service._send_auto_fetch_email (email) — unchanged from before
@@ -1103,62 +1105,68 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     excl_label = _af_exclusion_label(excluded_keywords)
 
     report_format = _af_get_report_format(cfg)
+    email         = cfg.get("email", "")
 
-    # Telegram dedup — mirrors the email dedup below (own state file, own
-    # ref set): refs already posted to Telegram for this schedule (ever)
-    # are dropped before notifying, so a task that keeps reappearing in
-    # later fetches (still unassigned, still matching filters) doesn't get
-    # re-posted to the chat on every cycle.
-    telegram_state  = load_af_telegram_state()
-    tg_already_sent = set(telegram_state.get(schedule_id, []))
-    tg_new_tasks    = [t for t in tasks if t.get("reference_number", "") not in tg_already_sent]
+    # Telegram task-list notification — only for schedules with no email
+    # configured. A schedule with an email already gets the full list
+    # there; posting the same list to Telegram too is pure duplication.
+    # "Telegram only" schedules (no email) still need it as their sole
+    # delivery channel.
+    if not email:
+        # Telegram dedup — mirrors the email dedup below (own state file,
+        # own ref set): refs already posted to Telegram for this schedule
+        # (ever) are dropped before notifying, so a task that keeps
+        # reappearing in later fetches (still unassigned, still matching
+        # filters) doesn't get re-posted to the chat on every cycle.
+        telegram_state  = load_af_telegram_state()
+        tg_already_sent = set(telegram_state.get(schedule_id, []))
+        tg_new_tasks    = [t for t in tasks if t.get("reference_number", "") not in tg_already_sent]
 
-    if not tg_new_tasks:
-        logger.info(
-            "Auto Fetch Telegram skipped for schedule %s — all %d task(s) already notified previously.",
-            schedule_id, len(tasks),
-        )
-    elif not ALLOWED_IDS:
-        # No one to notify — don't mark these refs as sent, since nothing
-        # was actually shown to anyone (state must reflect what recipients
-        # have seen, not what was merely eligible to send).
-        pass
-    else:
-        header = (
-            f"⏰ *Auto Fetch — {len(tg_new_tasks)} task(s)*\n"
-            f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | "
-            f"{excl_label}\n\n"
-        )
-
-        if report_format == "excel":
-            xlsx_bytes = _af_build_excel(tg_new_tasks)
-            filename   = f"auto_fetch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            for chat_id in ALLOWED_IDS:
-                try:
-                    await context.bot.send_document(
-                        chat_id, document=io.BytesIO(xlsx_bytes), filename=filename,
-                        caption=header.strip(), parse_mode="Markdown",
-                    )
-                except Exception as e:
-                    logger.warning("Auto Fetch notify error for %s: %s", chat_id, e)
+        if not tg_new_tasks:
+            logger.info(
+                "Auto Fetch Telegram skipped for schedule %s — all %d task(s) already notified previously.",
+                schedule_id, len(tasks),
+            )
+        elif not ALLOWED_IDS:
+            # No one to notify — don't mark these refs as sent, since nothing
+            # was actually shown to anyone (state must reflect what recipients
+            # have seen, not what was merely eligible to send).
+            pass
         else:
-            lines = [_ft_format_task_block(i, t, markdown=True) for i, t in enumerate(tg_new_tasks, 1)]
-            for chat_id in ALLOWED_IDS:
-                async def _send(text, reply_markup, chat_id=chat_id):
+            header = (
+                f"⏰ *Auto Fetch — {len(tg_new_tasks)} task(s)*\n"
+                f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | "
+                f"{excl_label}\n\n"
+            )
+
+            if report_format == "excel":
+                xlsx_bytes = _af_build_excel(tg_new_tasks)
+                filename   = f"auto_fetch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                for chat_id in ALLOWED_IDS:
                     try:
-                        await context.bot.send_message(chat_id, text, parse_mode="Markdown")
+                        await context.bot.send_document(
+                            chat_id, document=io.BytesIO(xlsx_bytes), filename=filename,
+                            caption=header.strip(), parse_mode="Markdown",
+                        )
                     except Exception as e:
                         logger.warning("Auto Fetch notify error for %s: %s", chat_id, e)
-                await _send_chunked_report(_send, [header] + lines, join="\n\n")
+            else:
+                lines = [_ft_format_task_block(i, t, markdown=True) for i, t in enumerate(tg_new_tasks, 1)]
+                for chat_id in ALLOWED_IDS:
+                    async def _send(text, reply_markup, chat_id=chat_id):
+                        try:
+                            await context.bot.send_message(chat_id, text, parse_mode="Markdown")
+                        except Exception as e:
+                            logger.warning("Auto Fetch notify error for %s: %s", chat_id, e)
+                    await _send_chunked_report(_send, [header] + lines, join="\n\n")
 
-        tg_new_refs = {t.get("reference_number", "") for t in tg_new_tasks}
-        telegram_state[schedule_id] = sorted(tg_already_sent | tg_new_refs)
-        save_af_telegram_state(telegram_state)
+            tg_new_refs = {t.get("reference_number", "") for t in tg_new_tasks}
+            telegram_state[schedule_id] = sorted(tg_already_sent | tg_new_refs)
+            save_af_telegram_state(telegram_state)
 
     # Email notification — refs already emailed for this schedule (ever)
     # are dropped before sending; once a ref has been emailed it's assumed
     # seen and never resent, even if it keeps reappearing in later fetches.
-    email = cfg.get("email", "")
     if email:
         schedule_id  = cfg.get("id", "")
         email_state  = load_af_email_state()
