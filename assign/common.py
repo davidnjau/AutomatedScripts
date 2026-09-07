@@ -506,6 +506,7 @@ BTN_HOLD_TASKS    = "✋ Hold Tasks"
 BTN_INCREMENTAL   = "🔢 Incremental"
 BTN_DLV_REPORT_SCHEDULE = "📧 DLV Report Schedule"
 BTN_CUSTOM_EXCLUSIONS = "🚫 Exclusions"
+BTN_TASK_ANALYTICS = "📈 Task Analytics"
 
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
@@ -519,7 +520,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_DLV_TASKS)}|{re.escape(BTN_BRIEFING)}|{re.escape(BTN_SECTIONAL)}"
     f"|{re.escape(BTN_APARTMENTS)}"
     f"|{re.escape(BTN_HOLD_TASKS)}|{re.escape(BTN_INCREMENTAL)}|{re.escape(BTN_DLV_REPORT_SCHEDULE)}"
-    f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}"
+    f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}|{re.escape(BTN_TASK_ANALYTICS)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -539,6 +540,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
             # ── DLV & Export ────────────────────────────────
             [KeyboardButton(BTN_DLV_BATCH)],
             [KeyboardButton(BTN_BULK_EXPORT),    KeyboardButton(BTN_JOB_DIST)],
+            [KeyboardButton(BTN_TASK_ANALYTICS)],
             [KeyboardButton(BTN_EXPORT_STATUS),  KeyboardButton(BTN_ERROR_REPORT)],
             [KeyboardButton(BTN_DLV_TASKS),      KeyboardButton(BTN_HOLD_TASKS)],
             [KeyboardButton(BTN_BRIEFING),       KeyboardButton(BTN_CUSTOM_EXCLUSIONS)],
