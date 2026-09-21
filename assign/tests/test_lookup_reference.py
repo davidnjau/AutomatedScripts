@@ -140,6 +140,22 @@ class TestLuFormatResult(unittest.TestCase):
         self.assertIn("Jane\\_Doe \\*Esq\\*", result)
         self.assertIn("NAI\\_ROBI", result)
 
+    def test_markdown_false_skips_escaping_and_formatting(self):
+        """parcel_watch.py's emailed notification passes markdown=False —
+        no asterisks/backticks, and an underscore survives unescaped."""
+        item = {"application_status": "ongoing", "date_created": "2026-01-01",
+                 "registry": "NAI_ROBI", "county": "NAIROBI"}
+        detail = {
+            "node": "VALUATION_STAMP_DUTY_CREATED",
+            "actors": [{"role": "VALUATION OFFICER", "user_details": {"names": "Jane_Doe"}}],
+        }
+        result = lu._lu_format_result("R1", item, detail, markdown=False)
+        self.assertIn("Jane_Doe", result)
+        self.assertIn("NAI_ROBI", result)
+        self.assertNotIn("*", result)
+        self.assertNotIn("`", result)
+        self.assertNotIn("\\", result)
+
 
 class TestLuExtractContext(unittest.TestCase):
     """_lu_extract_context — the raw-value counterpart to _lu_format_result,

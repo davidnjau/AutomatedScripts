@@ -208,11 +208,31 @@ class TestRecvPwEmail(unittest.TestCase):
         ctx.job_queue.run_repeating.assert_called_once()
 
 
+class TestPwFetchEnriched(unittest.TestCase):
+    def test_pairs_each_match_with_its_detail_and_ref(self):
+        matches = [
+            {"reference_number": "R1", "id": "app-1"},
+            {"reference_number": "R2", "id": "app-2"},
+        ]
+        details = {"app-1": {"node": "N1"}, "app-2": None}
+        with patch.object(pw, "_lu_fetch_detail", side_effect=lambda tokens, app_id: details[app_id]):
+            result = pw._pw_fetch_enriched(TOKENS, matches)
+        self.assertEqual(result, [
+            ("R1", matches[0], {"node": "N1"}),
+            ("R2", matches[1], None),
+        ])
+
+
 class TestPwCheckJob(unittest.TestCase):
     def setUp(self):
         self.context = MagicMock()
         self.context.bot.send_message = AsyncMock()
         self.context.job.data = "watch-1"
+        # Every "match found" test enriches via a real Reference Lookup
+        # detail call — stub it out so tests never hit the live API.
+        self._patch_detail = patch.object(pw, "_lu_fetch_detail", return_value=None)
+        self._patch_detail.start()
+        self.addCleanup(self._patch_detail.stop)
 
     def test_watch_removed_since_last_run_cancels_the_job(self):
         with patch.object(pw, "get_parcel_watch", return_value=None), \
@@ -253,6 +273,26 @@ class TestPwCheckJob(unittest.TestCase):
         self.assertIn("R1", sent_text)
         mock_remove.assert_called_once_with("watch-1")
         self.context.job.schedule_removal.assert_called_once()
+
+    def test_match_found_notification_is_enriched_with_reference_lookup_detail(self):
+        """Regression: the notification must come from _lu_format_result
+        (valuer/consideration/node from the detail-view call), not the
+        bare list-item block parcel_lookup.py's own immediate report uses."""
+        watch = {"id": "watch-1", "chat_id": 555, "parcel": "NBI/BLOCK1/123", "email": ""}
+        detail = {
+            "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
+            "actors": [{"role": "VALUATION OFFICER", "user_details": {"names": "Jane Doe"}}],
+            "external_process_details": {"consideration_amount": "5000000", "currency_code": "KES"},
+        }
+        with patch.object(pw, "get_parcel_watch", return_value=watch), \
+             patch.object(pw, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pw, "_pl_search_parcel", return_value=list(SAMPLE_MATCHES)), \
+             patch.object(pw, "_lu_fetch_detail", return_value=detail), \
+             patch.object(pw, "remove_parcel_watch"):
+            _run(pw._pw_check_job(self.context))
+        sent_text = self.context.bot.send_message.call_args_list[-1].args[1]
+        self.assertIn("Jane Doe", sent_text)
+        self.assertIn("5,000,000.00", sent_text)
 
     def test_match_found_with_email_also_sends_email(self):
         watch = {"id": "watch-1", "chat_id": 555, "parcel": "NBI/BLOCK1/123", "email": "someone@example.com"}
