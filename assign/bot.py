@@ -71,6 +71,7 @@ import auto_fetch
 import bulk_export
 import dlv_batch
 import dlv_incremental
+import dlv_ref_check
 import dlv_report_schedule
 import dlv_tasks
 import hold_tasks
@@ -722,6 +723,7 @@ def main():
     lookup_reference.register(app)
     parcel_lookup.register(app)
     parcel_watch.register(app)
+    dlv_ref_check.register(app)
     valuer_tasks.register(app)
     job_distribution.register(app)
     bulk_export.register(app)
