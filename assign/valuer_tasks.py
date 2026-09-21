@@ -53,6 +53,7 @@ from common import (
     deny,
     fallback,
     get_valid_tokens,
+    load_saved_valuers,
     logger,
     md_escape,
     not_cancel,
@@ -63,6 +64,7 @@ from endpoints import (
     STAMP_DUTY_APPLICATION_LIST_URL,
 )
 from excel_report import autofit_columns, style_header_row
+from telegram_report import _chunk_lines
 from token_rotator import _AllTokensExhausted, _TokenRotator, fetch_with_rotation
 
 _VT_TOKEN_ROTATE_DELAY = 10   # seconds to wait before retrying with a new token
@@ -74,9 +76,10 @@ _VT_WORKERS            = 5
 # States — Valuer Tasks conversation
 # ──────────────────────────────────────────────────────────
 class VT(Enum):
+    PICK_VALUER_SOURCE = auto()   # choose saved valuer or search new
     PICK_CRED     = auto()   # select cached credential
-    STAFF_NAME    = auto()   # enter valuer name to search
-    SELECT_STAFF  = auto()   # pick from search results
+    STAFF_NAME    = auto()   # enter valuer name to search (search-new path only)
+    SELECT_STAFF  = auto()   # pick from search results (search-new path only)
     DAYS_BACK     = auto()   # enter / pick number of days back
 
 
@@ -103,6 +106,31 @@ def _vt_headers(tokens: AuthTokens) -> dict:
         "JWTAUTH":       f"Bearer {tokens.jwt}",
         "cparams":       CPARAMS_DLV,
     }
+
+
+def _vt_is_ongoing(t: dict) -> bool:
+    """True if a matched task's application_status is "Ongoing" (case-
+    insensitive) — the signal for the Ongoing-vs-Completed count/label
+    shown in the Telegram summary and reference list."""
+    return (t.get("application_status") or "").strip().lower() == "ongoing"
+
+
+def _vt_days_keyboard() -> InlineKeyboardMarkup:
+    """Preset day-range choices + Custom for the days-back step — shared
+    by both the search-new path (recv_vt_select) and the saved-valuer
+    path (recv_vt_cred), which reach this step from different states."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("7 days",  callback_data="vt_days:7"),
+            InlineKeyboardButton("14 days", callback_data="vt_days:14"),
+            InlineKeyboardButton("30 days", callback_data="vt_days:30"),
+        ],
+        [
+            InlineKeyboardButton("60 days",  callback_data="vt_days:60"),
+            InlineKeyboardButton("90 days",  callback_data="vt_days:90"),
+            InlineKeyboardButton("Custom…",  callback_data="vt_days:custom"),
+        ],
+    ])
 
 
 def _vt_fetch_task_detail(sess: requests.Session, rotator: "_TokenRotator", task_id: str) -> dict:
@@ -282,6 +310,7 @@ def _vt_run(
                             "consideration_amount": ext.get("consideration_amount", ""),
                             "node":                detail.get("node", ""),
                             "date_created":        detail.get("date_created", ""),
+                            "application_status":  detail.get("application_status", ""),
                         })
                 except _AllTokensExhausted:
                     exhausted = True
@@ -301,9 +330,23 @@ def _vt_run(
         # Sort by date descending
         matched.sort(key=lambda t: t.get("date_created", ""), reverse=True)
 
+        ongoing_count   = sum(1 for t in matched if _vt_is_ongoing(t))
+        completed_count = len(matched) - ongoing_count
         _tg(
-            f"✅ *{len(matched)}* task(s) found for *{md_escape(valuer_name)}*.\nBuilding report…"
+            f"✅ *{len(matched)}* task(s) found for *{md_escape(valuer_name)}* "
+            f"— last {days_back} day(s).\n"
+            f"🟢 Ongoing: *{ongoing_count}*  |  ✅ Completed: *{completed_count}*"
         )
+
+        ref_lines = [
+            f"{i}. `{md_escape(t.get('reference_number') or '—')}` — "
+            + ("🟢 Ongoing" if _vt_is_ongoing(t) else "✅ Completed")
+            for i, t in enumerate(matched, start=1)
+        ]
+        for chunk in _chunk_lines(ref_lines, join="\n"):
+            _tg(chunk)
+
+        _tg("Building Excel report…")
 
         xlsx_bytes = _vt_build_excel(valuer_name, days_back, matched)
         filename   = (
@@ -332,9 +375,32 @@ def _vt_run(
 # ── Valuer Tasks conversation handlers ────────────────────
 
 async def cmd_valuer_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Entry point — offers a saved-valuer picker (button -> list) as an
+    # alternative to always typing a name, mirroring new_assignment.py's
+    # "pick saved or search new" pattern. Falls straight through to the
+    # credential step (old behavior, unchanged) when there are no saved
+    # valuers yet.
     if not allowed(update): return await deny(update)
-    sess           = _get_vt_sess(ctx)
-    sess.cred_type = ""
+    sess             = _get_vt_sess(ctx)
+    sess.cred_type   = ""
+    sess.valuer_name = ""
+    sess.valuer_uid  = ""
+
+    saved = load_saved_valuers()
+    if saved:
+        rows = [
+            [InlineKeyboardButton(f"👤 {sv['name']}", callback_data=f"vt_src:{i}")]
+            for i, sv in enumerate(saved)
+        ]
+        rows.append([InlineKeyboardButton("🔍 Search new valuer", callback_data="vt_src:new")])
+        await update.message.reply_text(
+            "👤 *Valuer Tasks*\n\n"
+            "Look up all tasks assigned to a specific valuer within a date range.\n\n"
+            "Select a saved valuer or search for a new one:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return VT.PICK_VALUER_SOURCE
 
     kbd = _be_cred_keyboard()
     if not kbd:
@@ -355,13 +421,72 @@ async def cmd_valuer_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return VT.PICK_CRED
 
 
+async def recv_vt_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Saved valuer -> stash name/uid directly (no live search needed) and
+    # move to the credential step. "Search new" -> same credential step,
+    # but recv_vt_cred will route to STAFF_NAME since valuer_uid is still
+    # empty.
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    data = query.data.split(":")[1]
+    sess = _get_vt_sess(ctx)
+
+    kbd = _be_cred_keyboard()
+    if not kbd:
+        await query.edit_message_text(
+            "❌ No valid cached tokens. Use *🔑 Refresh Auth* first.",
+            parse_mode="Markdown",
+        )
+        await query.message.reply_text("Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    if data == "new":
+        await query.edit_message_text(
+            "🔍 Search new valuer.\n\nSelect the account to search with:",
+            parse_mode="Markdown",
+            reply_markup=kbd,
+        )
+        return VT.PICK_CRED
+
+    saved = load_saved_valuers()
+    idx   = int(data)
+    if idx >= len(saved):
+        await query.edit_message_text("⚠️ That saved valuer no longer exists. Please start over.")
+        await query.message.reply_text("Main menu.", reply_markup=_main_menu())
+        return ConversationHandler.END
+
+    sv               = saved[idx]
+    sess.valuer_name = sv["name"]
+    sess.valuer_uid  = sv["uid"]
+    await query.edit_message_text(
+        f"✅ Valuer: *{md_escape(sv['name'])}*\n\nSelect the account to search with:",
+        parse_mode="Markdown",
+        reply_markup=kbd,
+    )
+    return VT.PICK_CRED
+
+
 async def recv_vt_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Saved-valuer path (valuer_uid already set) -> skip straight to the
+    # days-back step, since there's no name left to search for. Search-new
+    # path -> ask for the name as before.
     if not allowed(update): return await deny(update)
     query = update.callback_query
     await query.answer()
 
     sess           = _get_vt_sess(ctx)
     sess.cred_type = query.data.split(":")[1]
+
+    if sess.valuer_uid:
+        await query.edit_message_text(
+            f"✅ Account: *{CRED_LABELS.get(sess.cred_type, sess.cred_type)}*\n"
+            f"Valuer: *{md_escape(sess.valuer_name)}*\n\n"
+            "How many days back do you want to check?",
+            parse_mode="Markdown",
+            reply_markup=_vt_days_keyboard(),
+        )
+        return VT.DAYS_BACK
 
     await query.edit_message_text(
         f"✅ Account: *{CRED_LABELS.get(sess.cred_type, sess.cred_type)}*\n\n"
@@ -451,18 +576,7 @@ async def recv_vt_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"✅ Valuer: *{md_escape(full_name)}*\n\nHow many days back do you want to check?",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("7 days",  callback_data="vt_days:7"),
-                InlineKeyboardButton("14 days", callback_data="vt_days:14"),
-                InlineKeyboardButton("30 days", callback_data="vt_days:30"),
-            ],
-            [
-                InlineKeyboardButton("60 days",  callback_data="vt_days:60"),
-                InlineKeyboardButton("90 days",  callback_data="vt_days:90"),
-                InlineKeyboardButton("Custom…",  callback_data="vt_days:custom"),
-            ],
-        ]),
+        reply_markup=_vt_days_keyboard(),
     )
     return VT.DAYS_BACK
 
@@ -507,7 +621,7 @@ async def _vt_start_run(
     sess   = _get_vt_sess(ctx)
     tokens = get_valid_tokens(sess.cred_type)
     if not tokens:
-        text = f"❌ Tokens expired. Use *🔑 Refresh Auth* first."
+        text = "❌ Tokens expired. Use *🔑 Refresh Auth* first."
         if edit_msg:
             await edit_msg.edit_text(text, parse_mode="Markdown")
         else:
@@ -547,6 +661,7 @@ def register(app: Application) -> None:
             MessageHandler(filters.Regex(f"^{re.escape(BTN_VALUER_TASKS)}$"), cmd_valuer_tasks),
         ],
         states={
+            VT.PICK_VALUER_SOURCE: [CallbackQueryHandler(recv_vt_source, pattern=r"^vt_src:")],
             VT.PICK_CRED:    [CallbackQueryHandler(recv_vt_cred,          pattern=r"^be_cred:")],
             VT.STAFF_NAME:   [MessageHandler(not_cancel, recv_vt_name)],
             VT.SELECT_STAFF: [CallbackQueryHandler(recv_vt_select,        pattern=r"^vt_staff:")],
