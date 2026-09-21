@@ -26,11 +26,20 @@ A ref with no record at all (never touched by any of the three) is
 reported separately from one that has a record but is "No" on all three
 checks (e.g. seen only via a live DLV search, never actually assigned).
 
+List mode: entering more than one reference number (one per line, or
+comma-separated — see common._parse_list_input) checks every ref against
+the one already-loaded consolidated store and compiles the results into
+one chunked report, rather than requiring a separate /dlvcheck run per
+ref. Since this is a local-file lookup (no per-ref API call), the
+common._LIST_INPUT_MAX_ITEMS cap here is about keeping the compiled
+report readable rather than limiting request volume.
+
 Call register(app) from bot.py's main() to wire this feature in.
 """
 
 import re
 from enum import Enum, auto
+from typing import List
 
 from telegram import Update
 from telegram.ext import (
@@ -45,7 +54,9 @@ from telegram.ext import (
 from common import (
     BTN_DLV_REF_CHECK,
     _CANCEL_FILTER,
+    _LIST_INPUT_MAX_ITEMS,
     _main_menu,
+    _parse_list_input,
     allowed,
     cmd_cancel,
     deny,
@@ -56,6 +67,7 @@ from common import (
 from dlv_core import _load_consolidated
 from new_assignment import _WORKFLOW_LABELS
 from task_block import assessor_field, consideration_field, format_labeled_block, parcel_field, tag_field
+from telegram_report import _send_chunked_report
 
 # Friendly label per record status — mirrors dlv_tasks.py's closed_reason
 # labels, extended to cover every status the consolidated store uses.
@@ -119,23 +131,57 @@ async def cmd_dlv_ref_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🕓 *DLV Ref Check*\n\n"
         "Check a reference number's history across New Assignment, the "
         "DLV Batch queue, and the Hold queue.\n\n"
-        "Enter the *reference number* to check:",
+        "Enter the *reference number* to check\n"
+        f"_or paste up to {_LIST_INPUT_MAX_ITEMS}, one per line or comma-separated, "
+        "for a compiled report._",
         parse_mode="Markdown",
     )
     return DC.REF_INPUT
 
 
+async def _dc_handle_ref_list(update: Update, refs: List[str]) -> int:
+    """List mode: check every ref in refs against the one already-loaded
+    consolidated store and compile the results into one chunked report."""
+    store = _load_consolidated()
+    lines = [f"🕓 *DLV Ref Check* — {len(refs)} reference(s)"]
+    for ref in refs:
+        record = store.get(ref)
+        if not record:
+            lines.append(f"❌ `{md_escape(ref)}` — no record at all.")
+            continue
+        lines.append(_dc_format_record(ref, record))
+
+    async def _send(text, reply_markup):
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+
+    await _send_chunked_report(_send, lines, join="\n\n", reply_markup=_main_menu())
+    return ConversationHandler.END
+
+
 async def recv_dc_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Look up the ref in the consolidated DLV store. No record at all ->
-    # report that plainly; any record -> show all three checks, whichever
-    # way they land.
+    # One ref -> look it up in the consolidated DLV store. No record at
+    # all -> report that plainly; any record -> show all three checks,
+    # whichever way they land. More than one ref (list mode) ->
+    # _dc_handle_ref_list instead.
     if not allowed(update): return await deny(update)
 
-    ref = (update.message.text or "").strip()
-    if not ref:
+    raw = (update.message.text or "").strip()
+    if not raw:
         await update.message.reply_text("Please enter a reference number.")
         return DC.REF_INPUT
 
+    refs = _parse_list_input(raw)
+    if len(refs) > _LIST_INPUT_MAX_ITEMS:
+        await update.message.reply_text(
+            f"❌ Too many references ({len(refs)}) — max {_LIST_INPUT_MAX_ITEMS} per list.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+    if len(refs) > 1:
+        return await _dc_handle_ref_list(update, refs)
+
+    ref = refs[0] if refs else raw
     record = _load_consolidated().get(ref)
 
     if not record:

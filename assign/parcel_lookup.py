@@ -34,6 +34,15 @@ auto HTML, same as Auto Fetch's body) rather than
 _send_bulk_export_email, since this report has no spreadsheet — just the
 same labeled-block text either channel would show.
 
+List mode: entering more than one parcel number (one per line, or comma-
+separated — see common._parse_list_input) searches each in turn and
+compiles all of them into the one delivery choice/report, rather than
+requiring a separate /parcelcheck run per parcel. PLSession.batch (a list
+of (parcel, matches) pairs) carries this instead of the single-parcel
+parcel/matches fields; recv_pl_delivery/recv_pl_email pick whichever is
+populated. Capped at common._LIST_INPUT_MAX_ITEMS since each parcel is
+its own sequential search across every filter/role combo.
+
 Call register(app) from bot.py's main() to wire this feature in.
 """
 
@@ -42,7 +51,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -60,8 +69,10 @@ from common import (
     BTN_PARCEL_LOOKUP,
     CRED_LABELS,
     _CANCEL_FILTER,
+    _LIST_INPUT_MAX_ITEMS,
     _main_menu,
     _NODE_LABELS,
+    _parse_list_input,
     allowed,
     cmd_cancel,
     deny,
@@ -89,14 +100,16 @@ class PL(Enum):
 
 @dataclass
 class PLSession:
-    parcel:  str        = ""              # the parcel number searched
-    matches: List[Dict] = field(default_factory=list)   # matching list-items
+    parcel:  str        = ""              # single-parcel mode: the parcel number searched
+    matches: List[Dict] = field(default_factory=list)   # single-parcel mode: its matching list-items
+    batch:   List[Tuple[str, List[Dict]]] = field(default_factory=list)   # list mode: [(parcel, matches), ...]
 
 
 def _get_pl_sess(ctx: ContextTypes.DEFAULT_TYPE) -> PLSession:
     """Fetch (creating if absent) this chat's Parcel Lookup session, holding
-    the parcel searched and its matches between the search step and the
-    delivery choice."""
+    either a single parcel/matches pair or a list-mode batch between the
+    search step and the delivery choice — recv_pl_delivery/recv_pl_email
+    check .batch first and fall back to .parcel/.matches."""
     if "pl_session" not in ctx.user_data:
         ctx.user_data["pl_session"] = PLSession()
     return ctx.user_data["pl_session"]
@@ -168,21 +181,46 @@ async def cmd_parcel_lookup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🏞 *Parcel Lookup*\n\n"
         "Find out whether a parcel number has landed in the Stamp Duty "
         "application list, and which reference(s) it's under.\n\n"
-        "Enter a *parcel number* to check:",
+        "Enter a *parcel number* to check\n"
+        f"_or paste up to {_LIST_INPUT_MAX_ITEMS}, one per line or comma-separated, "
+        "for a compiled report._",
         parse_mode="Markdown",
     )
     return PL.PARCEL_INPUT
 
 
+def _pl_delivery_keyboard() -> InlineKeyboardMarkup:
+    """Telegram-vs-email delivery choice — shared by both the single-
+    parcel and list-mode paths in recv_pl_parcel."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📩 Send to Email", callback_data="pl_delivery:email"),
+            InlineKeyboardButton("💬 View on Telegram", callback_data="pl_delivery:telegram"),
+        ],
+    ])
+
+
 async def recv_pl_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Search the parcel number; on a miss, report "not found" and end. On a
-    # hit, stash the matches on the session and ask how to deliver them.
+    # One parcel -> the original single-parcel flow (miss reports "not
+    # found" and ends; hit stashes parcel/matches). More than one parcel
+    # (list mode, one per line or comma-separated) -> search each in turn
+    # and stash the whole batch instead, then ask how to deliver the
+    # compiled result either way.
     if not allowed(update): return await deny(update)
 
-    parcel = (update.message.text or "").strip()
-    if not parcel:
+    raw = (update.message.text or "").strip()
+    if not raw:
         await update.message.reply_text("Please enter a parcel number.")
         return PL.PARCEL_INPUT
+
+    parcels = _parse_list_input(raw)
+    if len(parcels) > _LIST_INPUT_MAX_ITEMS:
+        await update.message.reply_text(
+            f"❌ Too many parcels ({len(parcels)}) — max {_LIST_INPUT_MAX_ITEMS} per list.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
 
     tokens = get_valid_tokens(_LU_CRED_DEFAULT)
     if not tokens:
@@ -194,6 +232,24 @@ async def recv_pl_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    sess = _get_pl_sess(ctx)
+
+    if len(parcels) > 1:
+        await update.message.reply_text(f"🔍 Searching {len(parcels)} parcel(s)…", parse_mode="Markdown")
+        batch = [(parcel, await asyncio.to_thread(_pl_search_parcel, tokens, parcel)) for parcel in parcels]
+        sess.parcel, sess.matches, sess.batch = "", [], batch
+
+        total = sum(len(matches) for _, matches in batch)
+        await update.message.reply_text(
+            f"✅ Found *{total}* application(s) across *{len(parcels)}* parcel(s). "
+            "How would you like to receive the result?",
+            parse_mode="Markdown",
+            reply_markup=_pl_delivery_keyboard(),
+        )
+        return PL.DELIVERY
+
+    parcel = parcels[0]
+    sess.batch = []
     await update.message.reply_text(f"🔍 Searching for `{_lu_md_escape(parcel)}`…", parse_mode="Markdown")
 
     matches = await asyncio.to_thread(_pl_search_parcel, tokens, parcel)
@@ -206,19 +262,13 @@ async def recv_pl_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    sess = _get_pl_sess(ctx)
     sess.parcel  = parcel
     sess.matches = matches
 
     await update.message.reply_text(
         f"✅ Found on *{len(matches)}* application(s). How would you like to receive the result?",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📩 Send to Email", callback_data="pl_delivery:email"),
-                InlineKeyboardButton("💬 View on Telegram", callback_data="pl_delivery:telegram"),
-            ],
-        ]),
+        reply_markup=_pl_delivery_keyboard(),
     )
     return PL.DELIVERY
 
@@ -235,9 +285,32 @@ def _pl_report_lines(parcel: str, matches: List[Dict], markdown: bool = True) ->
     return [header] + [_pl_format_match(i, item, markdown=markdown) for i, item in enumerate(matches, start=1)]
 
 
+def _pl_report_lines_batch(batch: List[Tuple[str, List[Dict]]], markdown: bool = True) -> List[str]:
+    """List-mode counterpart to _pl_report_lines: one compiled report
+    covering every parcel searched, in entry order — a per-parcel
+    sub-header (found-count, or a plain "not found" line) followed by
+    that parcel's matches."""
+    total = sum(len(matches) for _, matches in batch)
+    header = f"🏞 *Parcel Lookup* — {len(batch)} parcel(s), {total} application(s) total" if markdown \
+        else f"Parcel Lookup — {len(batch)} parcel(s), {total} application(s) total"
+    lines = [header]
+    for parcel, matches in batch:
+        parcel_disp = _lu_md_escape(parcel) if markdown else parcel
+        if not matches:
+            lines.append(f"❌ `{parcel_disp}` — not found" if markdown else f"{parcel_disp} — not found")
+            continue
+        lines.append(
+            f"📌 *{parcel_disp}* — {len(matches)} application(s)" if markdown
+            else f"{parcel_disp} — {len(matches)} application(s)"
+        )
+        lines += [_pl_format_match(i, item, markdown=markdown) for i, item in enumerate(matches, start=1)]
+    return lines
+
+
 async def recv_pl_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Telegram -> send the chunked report immediately and end. Email ->
-    # ask for the address next.
+    # ask for the address next. sess.batch (list mode) takes priority over
+    # sess.parcel/matches (single-parcel mode) when both could apply.
     if not allowed(update): return await deny(update)
     query = update.callback_query
     await query.answer()
@@ -245,7 +318,8 @@ async def recv_pl_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess = _get_pl_sess(ctx)
 
     if mode == "telegram":
-        lines = _pl_report_lines(sess.parcel, sess.matches, markdown=True)
+        lines = _pl_report_lines_batch(sess.batch, markdown=True) if sess.batch \
+            else _pl_report_lines(sess.parcel, sess.matches, markdown=True)
 
         async def _send(text, reply_markup):
             await ctx.bot.send_message(query.message.chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
@@ -273,9 +347,11 @@ async def recv_pl_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return PL.EMAIL_INPUT
 
     sess = _get_pl_sess(ctx)
-    lines   = _pl_report_lines(sess.parcel, sess.matches, markdown=False)
+    lines = _pl_report_lines_batch(sess.batch, markdown=False) if sess.batch \
+        else _pl_report_lines(sess.parcel, sess.matches, markdown=False)
     body    = "\n\n".join(lines)
-    subject = f"Ardhisasa Parcel Lookup — {sess.parcel} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    subject_target = f"{len(sess.batch)} parcels" if sess.batch else sess.parcel
+    subject = f"Ardhisasa Parcel Lookup — {subject_target} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
     try:
         await asyncio.to_thread(_send_auto_fetch_email, email, subject, body)

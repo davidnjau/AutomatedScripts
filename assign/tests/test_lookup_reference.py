@@ -648,6 +648,81 @@ class TestRecvLuRef(unittest.TestCase):
         mock_fmt.assert_called_once()
         mock_fmt_default.assert_not_called()
 
+    def test_multiple_refs_routes_to_list_mode(self):
+        update = _make_update_with_message("R1\nR2")
+        ctx = MagicMock()
+        with patch.object(lu, "allowed", return_value=True), \
+             patch.object(lu, "_lu_handle_ref_list", new_callable=AsyncMock) as mock_list:
+            mock_list.return_value = lu.ConversationHandler.END
+            result = _run(lu.recv_lu_ref(update, ctx))
+        mock_list.assert_called_once_with(update, ["R1", "R2"])
+        self.assertEqual(result, lu.ConversationHandler.END)
+
+    def test_too_many_refs_ends_conversation_without_list_handling(self):
+        raw = "\n".join(f"R{i}" for i in range(lu._LIST_INPUT_MAX_ITEMS + 1))
+        update = _make_update_with_message(raw)
+        ctx = MagicMock()
+        with patch.object(lu, "allowed", return_value=True), \
+             patch.object(lu, "_lu_handle_ref_list", new_callable=AsyncMock) as mock_list:
+            result = _run(lu.recv_lu_ref(update, ctx))
+        mock_list.assert_not_called()
+        self.assertEqual(result, lu.ConversationHandler.END)
+
+
+class TestLuLookupOne(unittest.TestCase):
+    """_lu_lookup_one — the per-ref routing list mode compiles into one
+    report; never raises, always returns a display string."""
+
+    def test_non_county_ref_no_tokens_returns_message_not_raise(self):
+        with patch.object(lu, "get_valid_tokens", return_value=None):
+            result = _run(lu._lu_lookup_one("R1"))
+        self.assertIn("no valid cached tokens", result)
+
+    def test_non_county_ref_not_found_returns_message(self):
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref", return_value=None):
+            result = _run(lu._lu_lookup_one("R1"))
+        self.assertIn("not found", result)
+
+    def test_non_county_ref_found_returns_formatted_result(self):
+        item = {"id": "app-1", "reference_number": "R1"}
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref", return_value=item), \
+             patch.object(lu, "_lu_fetch_detail", return_value=None), \
+             patch.object(lu, "_lu_format_result", return_value="formatted-R1"):
+            result = _run(lu._lu_lookup_one("R1"))
+        self.assertEqual(result, "formatted-R1")
+
+    def test_county_ref_no_tokens_returns_message_not_raise(self):
+        with patch.object(lu, "get_valid_tokens", return_value=None):
+            result = _run(lu._lu_lookup_one("CNTYINV/AB12CD34EF"))
+        self.assertIn("no valid cached tokens", result)
+
+    def test_county_ref_not_found_returns_message(self):
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_lookup_county", new_callable=AsyncMock, return_value=None):
+            result = _run(lu._lu_lookup_one("CNTYINV/AB12CD34EF"))
+        self.assertIn("not found", result)
+
+    def test_county_ref_found_returns_lu_lookup_county_result(self):
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_lookup_county", new_callable=AsyncMock, return_value="formatted-county"):
+            result = _run(lu._lu_lookup_one("CNTYINV/AB12CD34EF"))
+        self.assertEqual(result, "formatted-county")
+
+
+class TestLuHandleRefList(unittest.TestCase):
+    def test_compiles_one_report_from_each_lookup(self):
+        update = _make_update_with_message()
+        with patch.object(lu, "_lu_lookup_one", new_callable=AsyncMock, side_effect=["result-R1", "result-R2"]):
+            result = _run(lu._lu_handle_ref_list(update, ["R1", "R2"]))
+        self.assertEqual(result, lu.ConversationHandler.END)
+        sent_texts = [c.args[0] for c in update.message.reply_text.call_args_list]
+        combined = "\n\n".join(sent_texts)
+        self.assertIn("result-R1", combined)
+        self.assertIn("result-R2", combined)
+        self.assertIn("2 reference(s)", combined)
+
 
 if __name__ == "__main__":
     unittest.main()

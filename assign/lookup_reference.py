@@ -45,6 +45,17 @@ auto-routing, since New Assignment already knows which workflow a ref
 belongs to from its own explicit picker, unlike /lookup which would have
 to guess from ref format alone.
 
+List mode: entering more than one reference number (one per line, or
+comma-separated — see common._parse_list_input) looks each one up in
+turn via _lu_lookup_one (the same county-vs-default routing recv_lu_ref
+uses for a single ref) and compiles every result into one chunked
+report, rather than requiring a separate /lookup run per reference. The
+single-ref path is untouched — list mode is a new branch taken only when
+more than one item is parsed out of the entered text. Capped at
+common._LIST_INPUT_MAX_ITEMS since each ref can mean several sequential
+API calls (multiple filter/role combos, a county ref's two-stage
+fallback, a detail-view fetch).
+
 Call register(app) from bot.py's main() to wire this feature in.
 """
 
@@ -71,8 +82,10 @@ from common import (
     CRED_LABELS,
     _CANCEL_FILTER,
     _ft_headers,
+    _LIST_INPUT_MAX_ITEMS,
     _main_menu,
     _NODE_LABELS,
+    _parse_list_input,
     allowed,
     cmd_cancel,
     deny,
@@ -89,6 +102,7 @@ from endpoints import (
     STAMP_DUTY_APPLICATION_DETAIL_URL,
     STAMP_DUTY_APPLICATION_LIST_URL,
 )
+from telegram_report import _send_chunked_report
 
 # Credential each ref format is searched under — Lookup Reference is the
 # only place Support Reg is used for a County ref; every other ref always
@@ -553,7 +567,9 @@ async def cmd_lookup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔎 *Reference Lookup*\n\n"
         "Find out which valuer holds an application and its current node.\n\n"
         "Enter a *reference number* to look up\n"
-        "(e.g. `NBI/STAMP/2024/12345` or `CNTYINV/AB12CD34EF`):",
+        "(e.g. `NBI/STAMP/2024/12345` or `CNTYINV/AB12CD34EF`)\n"
+        f"_or paste up to {_LIST_INPUT_MAX_ITEMS}, one per line or comma-separated, "
+        "for a compiled report._",
         parse_mode="Markdown",
     )
     return LU.REF_INPUT
@@ -604,17 +620,80 @@ async def _lu_lookup_county(ref: str) -> Optional[str]:
     return None
 
 
+async def _lu_lookup_one(ref: str) -> str:
+    """Look up a single reference end to end — the same county-vs-default
+    routing recv_lu_ref uses for its single-ref path — and return its
+    formatted result, or a not-found/no-tokens message. Never raises;
+    used by list mode to compile one report line per ref regardless of
+    whether that particular ref succeeds."""
+    if _lu_is_county_ref(ref):
+        if not get_valid_tokens(_LU_CRED_COUNTY) and not get_valid_tokens(_LU_CRED_DEFAULT):
+            return (
+                f"❌ `{_lu_md_escape(ref)}` — no valid cached tokens for "
+                f"{CRED_LABELS.get(_LU_CRED_COUNTY, _LU_CRED_COUNTY)} or "
+                f"{CRED_LABELS.get(_LU_CRED_DEFAULT, _LU_CRED_DEFAULT)}."
+            )
+        result = await _lu_lookup_county(ref)
+        if not result:
+            return (
+                f"❌ `{_lu_md_escape(ref)}` — not found at either the assessor stage "
+                "or the DLV/valuation stage."
+            )
+        return result
+
+    tokens = get_valid_tokens(_LU_CRED_DEFAULT)
+    if not tokens:
+        return f"❌ `{_lu_md_escape(ref)}` — no valid cached tokens for {CRED_LABELS.get(_LU_CRED_DEFAULT, _LU_CRED_DEFAULT)}."
+    item = await asyncio.to_thread(_lu_search_ref, tokens, ref)
+    if not item:
+        return f"❌ `{_lu_md_escape(ref)}` — not found across all filters (Ongoing, Pending, Completed)."
+    detail = await asyncio.to_thread(_lu_fetch_detail, tokens, item["id"])
+    return _lu_format_result(ref, item, detail)
+
+
+async def _lu_handle_ref_list(update: Update, refs: List[str]) -> int:
+    """List mode: look up every ref in refs and compile the results into
+    one chunked Telegram report. Sequential, not concurrent — matches
+    _lu_lookup_one's own per-ref sequencing and keeps this simple, at the
+    cost of total wall-clock time scaling with list length."""
+    await update.message.reply_text(f"🔍 Searching {len(refs)} reference(s)…", parse_mode="Markdown")
+
+    lines = [f"🔎 *Reference Lookup* — {len(refs)} reference(s)"]
+    for ref in refs:
+        lines.append(await _lu_lookup_one(ref))
+
+    async def _send(text, reply_markup):
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+
+    await _send_chunked_report(_send, lines, join="\n\n", reply_markup=_main_menu())
+    return ConversationHandler.END
+
+
 async def recv_lu_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Route by ref format: County -> try assessor stage (Support Reg) then
     # DLV/valuation stage (Staff Valuer) via _lu_lookup_county; everything
     # else -> Staff Valuer + the existing DLV/VALUER application list/detail-view.
+    # More than one ref entered (list mode) -> _lu_handle_ref_list instead,
+    # which reuses the same routing per ref via _lu_lookup_one.
     if not allowed(update): return await deny(update)
 
-    ref = (update.message.text or "").strip()
-    if not ref:
+    raw = (update.message.text or "").strip()
+    if not raw:
         await update.message.reply_text("Please enter a reference number.")
         return LU.REF_INPUT
 
+    refs = _parse_list_input(raw)
+    if len(refs) > _LIST_INPUT_MAX_ITEMS:
+        await update.message.reply_text(
+            f"❌ Too many references ({len(refs)}) — max {_LIST_INPUT_MAX_ITEMS} per list.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+    if len(refs) > 1:
+        return await _lu_handle_ref_list(update, refs)
+
+    ref = refs[0] if refs else raw
     is_county = _lu_is_county_ref(ref)
 
     if not is_county:

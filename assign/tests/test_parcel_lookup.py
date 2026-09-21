@@ -189,6 +189,42 @@ class TestRecvPlParcel(unittest.TestCase):
             result = _run(pl.recv_pl_parcel(update, ctx))
         self.assertEqual(result, pl.ConversationHandler.END)
 
+    def test_too_many_parcels_ends_conversation_without_searching(self):
+        update = _make_update_with_message("\n".join(f"P{i}" for i in range(pl._LIST_INPUT_MAX_ITEMS + 1)))
+        ctx = MagicMock()
+        with patch.object(pl, "allowed", return_value=True), \
+             patch.object(pl, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pl, "_pl_search_parcel") as mock_search:
+            result = _run(pl.recv_pl_parcel(update, ctx))
+        self.assertEqual(result, pl.ConversationHandler.END)
+        mock_search.assert_not_called()
+
+    def test_multiple_parcels_searches_each_and_stashes_batch(self):
+        update = _make_update_with_message("P1\nP2")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        with patch.object(pl, "allowed", return_value=True), \
+             patch.object(pl, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pl, "_pl_search_parcel", side_effect=[list(SAMPLE_MATCHES), []]) as mock_search:
+            result = _run(pl.recv_pl_parcel(update, ctx))
+        self.assertEqual(result, pl.PL.DELIVERY)
+        self.assertEqual(mock_search.call_count, 2)
+        sess = pl._get_pl_sess(ctx)
+        self.assertEqual(sess.batch, [("P1", SAMPLE_MATCHES), ("P2", [])])
+        self.assertEqual(sess.parcel, "")
+        self.assertEqual(sess.matches, [])
+
+    def test_comma_separated_parcels_also_trigger_list_mode(self):
+        update = _make_update_with_message("P1, P2")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        with patch.object(pl, "allowed", return_value=True), \
+             patch.object(pl, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pl, "_pl_search_parcel", return_value=[]):
+            result = _run(pl.recv_pl_parcel(update, ctx))
+        self.assertEqual(result, pl.PL.DELIVERY)
+        self.assertEqual(pl._get_pl_sess(ctx).batch, [("P1", []), ("P2", [])])
+
     def test_no_matches_reports_not_found(self):
         update = _make_update_with_message("NBI/BLOCK1/123")
         ctx = MagicMock()
@@ -217,6 +253,20 @@ class TestRecvPlParcel(unittest.TestCase):
         self.assertIn("reply_markup", kwargs)
 
 
+class TestPlReportLinesBatch(unittest.TestCase):
+    def test_not_found_parcel_gets_its_own_line(self):
+        lines = pl._pl_report_lines_batch([("P1", []), ("P2", list(SAMPLE_MATCHES))])
+        joined = "\n\n".join(lines)
+        self.assertIn("P1", joined)
+        self.assertIn("not found", joined)
+        self.assertIn("R1", joined)
+
+    def test_header_totals_parcels_and_matches(self):
+        lines = pl._pl_report_lines_batch([("P1", list(SAMPLE_MATCHES)), ("P2", [])])
+        self.assertIn("2 parcel(s)", lines[0])
+        self.assertIn("1 application(s)", lines[0])
+
+
 class TestRecvPlDelivery(unittest.TestCase):
     def test_telegram_mode_sends_report_and_ends(self):
         update = _make_update_with_callback("pl_delivery:telegram")
@@ -235,6 +285,17 @@ class TestRecvPlDelivery(unittest.TestCase):
             result = _run(pl.recv_pl_delivery(update, ctx))
         self.assertEqual(result, pl.PL.EMAIL_INPUT)
         update.callback_query.edit_message_text.assert_awaited()
+
+    def test_batch_mode_sends_compiled_report(self):
+        update = _make_update_with_callback("pl_delivery:telegram")
+        ctx = _make_ctx_with_session(matches=[])
+        pl._get_pl_sess(ctx).batch = [("P1", []), ("P2", list(SAMPLE_MATCHES))]
+        with patch.object(pl, "allowed", return_value=True):
+            result = _run(pl.recv_pl_delivery(update, ctx))
+        self.assertEqual(result, pl.ConversationHandler.END)
+        sent_text = ctx.bot.send_message.call_args_list[-1].args[1]
+        self.assertIn("P1", sent_text)
+        self.assertIn("R1", sent_text)
 
 
 class TestRecvPlEmail(unittest.TestCase):
@@ -258,6 +319,19 @@ class TestRecvPlEmail(unittest.TestCase):
         self.assertIn("R1", args[2])   # plain-text body includes the ref
         sent_text = update.message.reply_text.call_args_list[-1].args[0]
         self.assertIn("sent", sent_text.lower())
+
+    def test_batch_mode_emails_compiled_report_with_parcel_count_subject(self):
+        update = _make_update_with_message("someone@example.com")
+        ctx = _make_ctx_with_session(matches=[])
+        pl._get_pl_sess(ctx).batch = [("P1", []), ("P2", list(SAMPLE_MATCHES))]
+        with patch.object(pl, "allowed", return_value=True), \
+             patch.object(pl, "_send_auto_fetch_email") as mock_send:
+            result = _run(pl.recv_pl_email(update, ctx))
+        self.assertEqual(result, pl.ConversationHandler.END)
+        args = mock_send.call_args.args
+        self.assertIn("2 parcels", args[1])   # subject
+        self.assertIn("P1", args[2])
+        self.assertIn("R1", args[2])
 
     def test_send_failure_reports_warning_but_still_ends(self):
         update = _make_update_with_message("someone@example.com")

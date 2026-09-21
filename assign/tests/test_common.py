@@ -293,5 +293,32 @@ class TestMainMenu(unittest.TestCase):
         self.assertEqual([b.text for b in row], [common.BTN_BRIEFING, common.BTN_CUSTOM_EXCLUSIONS])
 
 
+class TestParseListInput(unittest.TestCase):
+    """_parse_list_input — the shared multi-item paste parser used by
+    Lookup Reference, Parcel Lookup, Parcel Watch, and DLV Ref Check to
+    accept a list of refs/parcels in one conversation turn."""
+
+    def test_single_plain_value_returns_one_item_list(self):
+        self.assertEqual(common._parse_list_input("R1"), ["R1"])
+
+    def test_newline_separated(self):
+        self.assertEqual(common._parse_list_input("R1\nR2\nR3"), ["R1", "R2", "R3"])
+
+    def test_comma_separated(self):
+        self.assertEqual(common._parse_list_input("R1, R2, R3"), ["R1", "R2", "R3"])
+
+    def test_mixed_newline_and_comma(self):
+        self.assertEqual(common._parse_list_input("R1, R2\nR3"), ["R1", "R2", "R3"])
+
+    def test_blank_lines_and_extra_commas_are_dropped(self):
+        self.assertEqual(common._parse_list_input(" R1 ,, \n\n R2 "), ["R1", "R2"])
+
+    def test_empty_string_returns_empty_list(self):
+        self.assertEqual(common._parse_list_input(""), [])
+
+    def test_does_not_dedupe(self):
+        self.assertEqual(common._parse_list_input("R1\nR1"), ["R1", "R1"])
+
+
 if __name__ == "__main__":
     unittest.main()

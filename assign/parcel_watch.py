@@ -31,6 +31,16 @@ no "keep watching for new matches" mode, unlike Auto Fetch's continuous
 polling. /parcelwatches lists this chat's active watches with an inline
 cancel button for stopping one early.
 
+List mode: entering more than one parcel number (one per line, or comma-
+separated — see common._parse_list_input) queues one independent watch
+per parcel, all sharing the interval/delivery choice made in that setup
+run. Each watch still fires its own one-shot notification via
+_pw_check_job exactly like a single-parcel watch — this only changes how
+many watches one /parcelwatch conversation creates, not how a watch
+behaves once queued. PWSession.parcels (plural) carries the list;
+PWSession.parcel (singular) is unchanged for the single-parcel case.
+Capped at common._LIST_INPUT_MAX_ITEMS parcels per setup run.
+
 Call register(app) from bot.py's main() to wire this feature in.
 """
 
@@ -39,7 +49,7 @@ import json
 import os
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from typing import Dict, List, Optional
@@ -62,7 +72,9 @@ from common import (
     _atomic_json_write,
     _CANCEL_FILTER,
     _ensure_data_dir,
+    _LIST_INPUT_MAX_ITEMS,
     _main_menu,
+    _parse_list_input,
     allowed,
     cmd_cancel,
     deny,
@@ -101,7 +113,8 @@ class PW(Enum):
 
 @dataclass
 class PWSession:
-    parcel:           str = ""
+    parcel:           str = ""              # single-parcel mode: the parcel number
+    parcels:          List[str] = field(default_factory=list)   # list mode: every parcel entered
     interval_minutes: int = 60
 
 
@@ -210,21 +223,35 @@ async def cmd_parcel_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "⏳ *Parcel Watch*\n\n"
         "Queue a recurring check for a parcel number — you'll be notified "
         "the moment it lands in the Stamp Duty list, then the watch stops.\n\n"
-        "Enter the *parcel number* to watch:",
+        "Enter the *parcel number* to watch\n"
+        f"_or paste up to {_LIST_INPUT_MAX_ITEMS}, one per line or comma-separated, "
+        "to queue a watch for each._",
         parse_mode="Markdown",
     )
     return PW.PARCEL_INPUT
 
 
 async def recv_pw_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Store the parcel (after confirming a cached login exists for the
-    # background job to use), then ask how often to check it.
+    # One parcel -> stash it on sess.parcel (unchanged single-parcel
+    # behavior). More than one parcel (list mode, one per line or comma-
+    # separated) -> stash the whole list on sess.parcels instead; each
+    # still becomes its own independent watch in _pw_finalize. Either way,
+    # confirm a cached login exists before asking how often to check.
     if not allowed(update): return await deny(update)
 
-    parcel = (update.message.text or "").strip()
-    if not parcel:
+    raw = (update.message.text or "").strip()
+    if not raw:
         await update.message.reply_text("Please enter a parcel number.")
         return PW.PARCEL_INPUT
+
+    parcels = _parse_list_input(raw)
+    if len(parcels) > _LIST_INPUT_MAX_ITEMS:
+        await update.message.reply_text(
+            f"❌ Too many parcels ({len(parcels)}) — max {_LIST_INPUT_MAX_ITEMS} per list.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
 
     if not get_valid_tokens(_LU_CRED_DEFAULT):
         await update.message.reply_text(
@@ -236,7 +263,10 @@ async def recv_pw_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     sess = _get_pw_sess(ctx)
-    sess.parcel = parcel
+    if len(parcels) > 1:
+        sess.parcel, sess.parcels = "", parcels
+    else:
+        sess.parcel, sess.parcels = parcels[0], []
 
     await update.message.reply_text("⏱ How often should it check?", reply_markup=_pw_interval_keyboard())
     return PW.INTERVAL
@@ -276,39 +306,53 @@ async def recv_pw_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📧 Enter the email address to also notify:", parse_mode="Markdown")
         return PW.EMAIL_INPUT
 
-    _pw_finalize(query.message.chat_id, ctx, "")
-    await query.edit_message_text("✅ Watch queued.")
+    watch_ids = _pw_finalize(query.message.chat_id, ctx, "")
+    await query.edit_message_text(_pw_queued_text(watch_ids))
     await query.message.reply_text("Main menu.", reply_markup=_main_menu())
     return ConversationHandler.END
 
 
 async def recv_pw_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Validate the email, finalize the watch with it attached.
+    # Validate the email, finalize the watch(es) with it attached.
     if not allowed(update): return await deny(update)
     email = (update.message.text or "").strip()
     if "@" not in email or "." not in email.split("@")[-1]:
         await update.message.reply_text("❌ Invalid email. Enter a valid address.", parse_mode="Markdown")
         return PW.EMAIL_INPUT
 
-    _pw_finalize(update.effective_chat.id, ctx, email)
-    await update.message.reply_text("✅ Watch queued.", reply_markup=_main_menu())
+    watch_ids = _pw_finalize(update.effective_chat.id, ctx, email)
+    await update.message.reply_text(_pw_queued_text(watch_ids), reply_markup=_main_menu())
     return ConversationHandler.END
 
 
-def _pw_finalize(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, email: str) -> None:
-    """Persist the watch and schedule its repeating job — shared by both
-    the Telegram-only and Telegram+email delivery paths. first=interval
-    (not 0) so a brand-new watch doesn't fire an immediate check before
-    the user has even seen the confirmation message."""
+def _pw_finalize(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, email: str) -> List[str]:
+    """Persist the watch(es) and schedule their repeating job(s) — shared
+    by both the Telegram-only and Telegram+email delivery paths. List
+    mode (sess.parcels has entries) creates one independent watch per
+    parcel, all sharing this interval/email; single-parcel mode (the
+    default, sess.parcels empty) creates exactly one, matching prior
+    behavior exactly. first=interval (not 0) so a brand-new watch doesn't
+    fire an immediate check before the user has even seen the
+    confirmation message. Returns every watch id created."""
     sess = _get_pw_sess(ctx)
-    watch_id = add_parcel_watch(chat_id, sess.parcel, sess.interval_minutes, email)
-    ctx.job_queue.run_repeating(
-        _pw_check_job,
-        interval=sess.interval_minutes * 60,
-        first=sess.interval_minutes * 60,
-        name=f"pl_watch_job:{watch_id}",
-        data=watch_id,
-    )
+    parcels = sess.parcels or [sess.parcel]
+    watch_ids = []
+    for parcel in parcels:
+        watch_id = add_parcel_watch(chat_id, parcel, sess.interval_minutes, email)
+        ctx.job_queue.run_repeating(
+            _pw_check_job,
+            interval=sess.interval_minutes * 60,
+            first=sess.interval_minutes * 60,
+            name=f"pl_watch_job:{watch_id}",
+            data=watch_id,
+        )
+        watch_ids.append(watch_id)
+    return watch_ids
+
+
+def _pw_queued_text(watch_ids: List[str]) -> str:
+    """Confirmation text after finalizing — pluralized for list mode."""
+    return "✅ Watch queued." if len(watch_ids) == 1 else f"✅ {len(watch_ids)} watches queued."
 
 
 # ──────────────────────────────────────────────────────────
