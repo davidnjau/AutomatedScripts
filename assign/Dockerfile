@@ -40,6 +40,7 @@ COPY new_assignment.py .
 COPY bulk_export.py .
 COPY task_analytics.py .
 COPY access_control.py .
+COPY post_board.py .
 COPY ardhisasa_auth.py .
 COPY token_refresh_daemon.py .
 
