@@ -61,16 +61,19 @@ from common import (
     _jwt_exp,
     _load_tokens_raw,
     _main_menu,
+    _main_menu_for,
     _MENU_CATEGORY_FILTER,
     allowed,
     cmd_cancel,
     deny,
+    get_user_categories,
     load_saved_valuers,
     logger,
     md_escape,
     recv_menu_back,
     recv_menu_category,
 )
+import access_control
 import auto_fetch
 import bulk_export
 import dlv_batch
@@ -173,6 +176,16 @@ DAEMON_LOG_FILE = os.path.join(DATA_DIR, "daemon.log")
 # ──────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
+    user_id = update.effective_user.id
+    if not get_user_categories(user_id):
+        await update.message.reply_text(
+            "🏛 *Ardhisasa Valuation Bot*\n\n"
+            "⛔ You don't have access to any menu categories yet. Ask an admin "
+            "to grant you some via 🔐 Manage Access.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu_for(user_id),
+        )
+        return
     await update.message.reply_text(
         "🏛 *Ardhisasa Valuation Bot*\n\n"
         "Tap a category below to open its workflows — each one also shows a short "
@@ -185,7 +198,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "👥 Valuers — manage your saved valuer list\n"
         "⚙️ Bot Settings — logins, daemon, restart, help",
         parse_mode="Markdown",
-        reply_markup=_main_menu(),
+        reply_markup=_main_menu_for(user_id),
     )
 
 
@@ -755,6 +768,7 @@ def main():
     job_distribution.register(app)
     bulk_export.register(app)
     task_analytics.register(app)
+    access_control.register(app)
 
     # DLV Batch: 5-minute repeating job + DLV Queue handlers registered via
     # dlv_batch.register(app) above.

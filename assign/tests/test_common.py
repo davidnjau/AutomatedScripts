@@ -102,6 +102,90 @@ class TestCustomExclusionsPersistence(unittest.TestCase):
         self.assertEqual(common.load_custom_exclusions(), ["MAISONETTE", "TOWNHOUSE"])
 
 
+class TestCategoryAccessPersistence(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.data_file = os.path.join(self.tmpdir.name, "saved_category_access.json")
+        self._patch = patch.object(common, "SAVED_CATEGORY_ACCESS_FILE", self.data_file)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self.tmpdir.cleanup()
+
+    def test_load_missing_file_returns_empty_dict(self):
+        self.assertEqual(common.load_category_access(), {})
+
+    def test_save_then_load_roundtrip(self):
+        common.save_category_access({"111": [common.BTN_CAT_LOOKUPS]})
+        self.assertEqual(common.load_category_access(), {"111": [common.BTN_CAT_LOOKUPS]})
+
+
+class TestIsAdmin(unittest.TestCase):
+    def test_id_in_admin_ids_is_admin(self):
+        with patch.object(common, "ADMIN_IDS", {111}):
+            self.assertTrue(common.is_admin(111))
+
+    def test_id_not_in_admin_ids_is_not_admin(self):
+        with patch.object(common, "ADMIN_IDS", {111}):
+            self.assertFalse(common.is_admin(222))
+
+
+class TestGetUserCategories(unittest.TestCase):
+    """get_user_categories — admins always get every category; a
+    non-admin gets exactly what's been granted (empty by default); and
+    the no-admin-configured safety fallback opens everything to everyone
+    so a restriction can never be permanently un-liftable."""
+
+    def test_admin_gets_every_category_regardless_of_grants(self):
+        with patch.object(common, "ADMIN_IDS", {111}), \
+             patch.object(common, "load_category_access", return_value={"111": []}):
+            self.assertEqual(common.get_user_categories(111), list(common._MENU_CATEGORIES))
+
+    def test_non_admin_with_no_grant_gets_nothing(self):
+        with patch.object(common, "ADMIN_IDS", {999}), \
+             patch.object(common, "load_category_access", return_value={}):
+            self.assertEqual(common.get_user_categories(111), [])
+
+    def test_non_admin_gets_exactly_what_was_granted(self):
+        granted = [common.BTN_CAT_LOOKUPS, common.BTN_CAT_VALUERS]
+        with patch.object(common, "ADMIN_IDS", {999}), \
+             patch.object(common, "load_category_access", return_value={"111": granted}):
+            self.assertEqual(common.get_user_categories(111), granted)
+
+    def test_no_admin_configured_opens_everything_to_everyone(self):
+        """Safety fallback: if ADMIN_TELEGRAM_IDS is empty, nobody could
+        ever grant access to a restricted user, so the restriction must
+        not apply at all in that case."""
+        with patch.object(common, "ADMIN_IDS", set()), \
+             patch.object(common, "load_category_access", return_value={}):
+            self.assertEqual(common.get_user_categories(111), list(common._MENU_CATEGORIES))
+
+
+class TestCategoryAllowed(unittest.TestCase):
+    def test_true_when_category_in_users_list(self):
+        with patch.object(common, "get_user_categories", return_value=[common.BTN_CAT_LOOKUPS]):
+            self.assertTrue(common.category_allowed(111, common.BTN_CAT_LOOKUPS))
+
+    def test_false_when_category_not_in_users_list(self):
+        with patch.object(common, "get_user_categories", return_value=[common.BTN_CAT_LOOKUPS]):
+            self.assertFalse(common.category_allowed(111, common.BTN_CAT_VALUERS))
+
+
+class TestMainMenuFor(unittest.TestCase):
+    def test_shows_only_granted_categories_plus_cancel(self):
+        with patch.object(common, "get_user_categories", return_value=[common.BTN_CAT_LOOKUPS]):
+            kb = common._main_menu_for(111)
+        texts = [b.text for row in kb.keyboard for b in row]
+        self.assertEqual(set(texts), {common.BTN_CAT_LOOKUPS, common.BTN_CANCEL})
+
+    def test_zero_categories_still_returns_a_valid_keyboard_with_cancel(self):
+        with patch.object(common, "get_user_categories", return_value=[]):
+            kb = common._main_menu_for(111)
+        texts = [b.text for row in kb.keyboard for b in row]
+        self.assertEqual(texts, [common.BTN_CANCEL])
+
+
 class TestPersistAssignment(unittest.TestCase):
     """persist_assignment — ref -> valuer_name/valuer_uid/assigned_at, plus
     whatever extra context a caller passes (e.g. DLV Batch's queue item).
@@ -329,11 +413,17 @@ class TestCategoryMenu(unittest.TestCase):
 
 
 class TestRecvMenuCategory(unittest.TestCase):
-    def test_known_category_shows_description_and_submenu(self):
+    def _make_update(self, text, user_id=111):
         update = MagicMock()
-        update.message.text = common.BTN_CAT_LOOKUPS
+        update.message.text = text
         update.message.reply_text = AsyncMock()
-        with patch.object(common, "allowed", return_value=True):
+        update.effective_user.id = user_id
+        return update
+
+    def test_known_category_shows_description_and_submenu(self):
+        update = self._make_update(common.BTN_CAT_LOOKUPS)
+        with patch.object(common, "allowed", return_value=True), \
+             patch.object(common, "category_allowed", return_value=True):
             asyncio.run(common.recv_menu_category(update, MagicMock()))
         update.message.reply_text.assert_awaited_once()
         args, kwargs = update.message.reply_text.call_args
@@ -341,12 +431,38 @@ class TestRecvMenuCategory(unittest.TestCase):
         self.assertIn("reply_markup", kwargs)
 
     def test_unknown_text_does_nothing(self):
-        update = MagicMock()
-        update.message.text = "not a category"
-        update.message.reply_text = AsyncMock()
+        update = self._make_update("not a category")
         with patch.object(common, "allowed", return_value=True):
             asyncio.run(common.recv_menu_category(update, MagicMock()))
         update.message.reply_text.assert_not_awaited()
+
+    def test_disallowed_category_is_denied_not_opened(self):
+        update = self._make_update(common.BTN_CAT_LOOKUPS)
+        with patch.object(common, "allowed", return_value=True), \
+             patch.object(common, "category_allowed", return_value=False):
+            asyncio.run(common.recv_menu_category(update, MagicMock()))
+        sent_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("don't have access", sent_text)
+
+    def test_admin_gets_manage_access_appended_to_bot_settings(self):
+        update = self._make_update(common.BTN_CAT_SETTINGS)
+        with patch.object(common, "allowed", return_value=True), \
+             patch.object(common, "category_allowed", return_value=True), \
+             patch.object(common, "is_admin", return_value=True):
+            asyncio.run(common.recv_menu_category(update, MagicMock()))
+        _, kwargs = update.message.reply_text.call_args
+        texts = [b.text for row in kwargs["reply_markup"].keyboard for b in row]
+        self.assertIn(common.BTN_MANAGE_ACCESS, texts)
+
+    def test_non_admin_does_not_get_manage_access(self):
+        update = self._make_update(common.BTN_CAT_SETTINGS)
+        with patch.object(common, "allowed", return_value=True), \
+             patch.object(common, "category_allowed", return_value=True), \
+             patch.object(common, "is_admin", return_value=False):
+            asyncio.run(common.recv_menu_category(update, MagicMock()))
+        _, kwargs = update.message.reply_text.call_args
+        texts = [b.text for row in kwargs["reply_markup"].keyboard for b in row]
+        self.assertNotIn(common.BTN_MANAGE_ACCESS, texts)
 
 
 class TestRecvMenuBack(unittest.TestCase):
