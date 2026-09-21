@@ -32,6 +32,7 @@ COPY receive_tasks.py .
 COPY token_rotator.py .
 COPY lookup_reference.py .
 COPY parcel_lookup.py .
+COPY parcel_watch.py .
 COPY valuer_tasks.py .
 COPY job_distribution.py .
 COPY new_assignment.py .

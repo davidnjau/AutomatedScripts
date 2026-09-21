@@ -496,6 +496,7 @@ BTN_EXPORT_STATUS = "📊 Export Status"
 BTN_JOB_DIST      = "🏆 Job Distribution"
 BTN_LOOKUP        = "🔎 Lookup Reference"
 BTN_PARCEL_LOOKUP = "🏞 Parcel Lookup"
+BTN_PARCEL_WATCH  = "⏳ Parcel Watch"
 BTN_VALUER_TASKS  = "👤 Valuer Tasks"
 BTN_HELP          = "❓ Help"
 BTN_RESTART       = "🔁 Restart Bot"
@@ -517,7 +518,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
     f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_AF_RESULTS)}|{re.escape(BTN_BULK_EXPORT)}"
     f"|{re.escape(BTN_EXPORT_STATUS)}|{re.escape(BTN_JOB_DIST)}|{re.escape(BTN_LOOKUP)}"
-    f"|{re.escape(BTN_PARCEL_LOOKUP)}"
+    f"|{re.escape(BTN_PARCEL_LOOKUP)}|{re.escape(BTN_PARCEL_WATCH)}"
     f"|{re.escape(BTN_VALUER_TASKS)}"
     f"|{re.escape(BTN_DLV_TASKS)}|{re.escape(BTN_BRIEFING)}|{re.escape(BTN_SECTIONAL)}"
     f"|{re.escape(BTN_APARTMENTS)}"
@@ -549,6 +550,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(BTN_DLV_REPORT_SCHEDULE), KeyboardButton(BTN_INCREMENTAL)],
             # ── Lookup ──────────────────────────────────────
             [KeyboardButton(BTN_LOOKUP),         KeyboardButton(BTN_PARCEL_LOOKUP)],
+            [KeyboardButton(BTN_PARCEL_WATCH)],
             [KeyboardButton(BTN_AUTH),           KeyboardButton(BTN_TOKEN_STATUS)],
             [KeyboardButton(BTN_VALUERS),        KeyboardButton(BTN_DELETE)],
             # ── System ──────────────────────────────────────

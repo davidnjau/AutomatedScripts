@@ -223,14 +223,16 @@ async def recv_pl_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return PL.DELIVERY
 
 
-def _pl_report_lines(sess: PLSession, markdown: bool = True) -> List[str]:
+def _pl_report_lines(parcel: str, matches: List[Dict], markdown: bool = True) -> List[str]:
     """Build the header + one block per match — shared by the Telegram and
-    email delivery paths so both render identically apart from
-    markdown escaping."""
-    parcel_disp = _lu_md_escape(sess.parcel) if markdown else sess.parcel
-    header = f"🏞 *Parcel Lookup* — `{parcel_disp}` found on {len(sess.matches)} application(s)" if markdown \
-        else f"Parcel Lookup — {parcel_disp} found on {len(sess.matches)} application(s)"
-    return [header] + [_pl_format_match(i, item, markdown=markdown) for i, item in enumerate(sess.matches, start=1)]
+    email delivery paths (and by parcel_watch.py's background job, which
+    has no PLSession of its own) so all render identically apart from
+    Markdown escaping. Takes parcel/matches directly rather than a
+    PLSession so it's reusable outside this module's own conversation."""
+    parcel_disp = _lu_md_escape(parcel) if markdown else parcel
+    header = f"🏞 *Parcel Lookup* — `{parcel_disp}` found on {len(matches)} application(s)" if markdown \
+        else f"Parcel Lookup — {parcel_disp} found on {len(matches)} application(s)"
+    return [header] + [_pl_format_match(i, item, markdown=markdown) for i, item in enumerate(matches, start=1)]
 
 
 async def recv_pl_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -243,7 +245,7 @@ async def recv_pl_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess = _get_pl_sess(ctx)
 
     if mode == "telegram":
-        lines = _pl_report_lines(sess, markdown=True)
+        lines = _pl_report_lines(sess.parcel, sess.matches, markdown=True)
 
         async def _send(text, reply_markup):
             await ctx.bot.send_message(query.message.chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
@@ -271,7 +273,7 @@ async def recv_pl_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return PL.EMAIL_INPUT
 
     sess = _get_pl_sess(ctx)
-    lines   = _pl_report_lines(sess, markdown=False)
+    lines   = _pl_report_lines(sess.parcel, sess.matches, markdown=False)
     body    = "\n\n".join(lines)
     subject = f"Ardhisasa Parcel Lookup — {sess.parcel} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 

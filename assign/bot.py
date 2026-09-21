@@ -82,6 +82,7 @@ import job_distribution
 import lookup_reference
 import new_assignment
 import parcel_lookup
+import parcel_watch
 import receive_tasks
 import refresh_auth
 import sectional_properties
@@ -720,6 +721,7 @@ def main():
     receive_tasks.register(app)
     lookup_reference.register(app)
     parcel_lookup.register(app)
+    parcel_watch.register(app)
     valuer_tasks.register(app)
     job_distribution.register(app)
     bulk_export.register(app)
