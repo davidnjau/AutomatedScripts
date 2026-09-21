@@ -320,6 +320,8 @@ async def cmd_assign(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["session"] = Session()
     await update.message.reply_text(
         "📋 *New Assignment Flow*\n\n"
+        "Assign a valuer to one or more Stamp Duty / Land Rent Determination "
+        "reference numbers.\n\n"
         "Step 0 — Which workflow is this?",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove(),

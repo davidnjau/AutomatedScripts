@@ -185,7 +185,9 @@ async def cmd_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         status = "Status: 🛑 Disabled"
 
     await update.message.reply_text(
-        f"🌅 *Morning Briefing* — Open DLV Tasks\n{status}",
+        "🌅 *Morning Briefing* — Open DLV Tasks\n"
+        "Get a daily summary of open DLV tasks delivered automatically, on Telegram or email.\n"
+        f"{status}",
         parse_mode="Markdown",
         reply_markup=_mb_menu_keyboard(enabled),
     )

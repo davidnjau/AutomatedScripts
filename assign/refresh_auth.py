@@ -89,7 +89,10 @@ async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     ctx.user_data["auth_session"] = AuthSession()
     await update.message.reply_text(
-        "🔑 *Refresh Auth*\n\nSelect a credential profile to authenticate:",
+        "🔑 *Refresh Auth*\n\n"
+        "Log in for a credential profile so other features can reuse its cached "
+        "session instead of asking for OTP again.\n\n"
+        "Select a credential profile to authenticate:",
         parse_mode="Markdown",
         reply_markup=_auth_cred_keyboard(),
     )

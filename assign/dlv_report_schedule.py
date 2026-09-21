@@ -309,7 +309,10 @@ async def cmd_drs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["drs_session"] = DRSSession()
     schedules = load_dlv_report_schedules()
 
-    lines = ["📧 *DLV Report Schedule*\n"]
+    lines = [
+        "📧 *DLV Report Schedule*\n",
+        "Get DLV Tasks' By Valuer/By Tag report emailed automatically on a recurring schedule.\n",
+    ]
     if schedules:
         lines.append(f"{len(schedules)} active schedule(s):")
         lines += [f"• {_drs_format_schedule_summary(cfg)}" for cfg in schedules]

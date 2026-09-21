@@ -843,7 +843,10 @@ async def cmd_bulk_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess.email       = ""
     sess.cred_type   = ""
     await update.message.reply_text(
-        "📤 *Export Valuation Report*\n\nSelect the report type:",
+        "📤 *Export Valuation Report*\n\n"
+        "Export a full stamp-duty valuation report to Excel, optionally emailed "
+        "or run on a repeating schedule.\n\n"
+        "Select the report type:",
         parse_mode="Markdown",
         reply_markup=_be_report_type_keyboard(),
     )
@@ -858,7 +861,11 @@ async def cmd_export_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not be_st and not jd_st:
         await update.message.reply_text(
+            "📊 *Export Status*\n\n"
+            "Tracks progress of the last Export Valuation Report / Job "
+            "Distribution run in this session.\n\n"
             "ℹ️ No export or analysis has been run in this session.",
+            parse_mode="Markdown",
             reply_markup=_main_menu(),
         )
         return
@@ -882,7 +889,7 @@ async def cmd_export_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "paused — tokens exhausted": "⏸",
     }
 
-    all_lines = []
+    all_lines = ["📊 *Export Status*\n"]
 
     if be_st:
         phase        = be_st.get("phase", "unknown")
@@ -920,8 +927,8 @@ async def cmd_export_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         all_lines.extend(lines)
 
     if jd_st:
-        if all_lines:
-            all_lines.append("")   # blank separator
+        if be_st:
+            all_lines.append("")   # blank separator, only when both blocks render
         phase        = jd_st.get("phase", "unknown")
         started_at   = jd_st.get("started_at")
         completed_at = jd_st.get("completed_at")

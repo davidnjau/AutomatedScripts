@@ -382,7 +382,9 @@ async def cmd_fetch_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     ctx.user_data["ft_session"] = FTSession()
     await update.message.reply_text(
-        "📊 *Fetch Tasks* — Select the account to use:",
+        "📊 *Fetch Tasks*\n\n"
+        "Pull unassigned tasks matching your filters and assign them to a valuer.\n\n"
+        "Select the account to use:",
         parse_mode="Markdown",
         reply_markup=_cred_keyboard(),
     )

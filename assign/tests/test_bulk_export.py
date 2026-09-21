@@ -314,6 +314,26 @@ class TestCmdExportStatus(unittest.TestCase):
         sent_text = update.message.reply_text.call_args[0][0]
         self.assertIn("Export Valuation Report", sent_text)
 
+    def test_jd_status_only_has_no_extra_blank_separator(self):
+        """Regression: the header line always seeded into all_lines used to
+        make the be_st/jd_st blank-separator check ("if all_lines:") true
+        even when only jd_st is present, inserting an extra stray blank
+        line before the Job Distribution block on top of the header's own
+        trailing blank line."""
+        update = _make_update_with_message()
+        update.effective_chat.id = 999
+        ctx = MagicMock()
+        jd_status = {999: {"phase": "done", "started_at": None, "rows": 5}}
+        with patch.object(be, "allowed", return_value=True), \
+             patch.object(be, "_BE_STATUS", {}), \
+             patch.object(be, "_JD_STATUS", jd_status):
+            _run(be.cmd_export_status(update, ctx))
+        sent_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("Export Status", sent_text)
+        # Exactly one blank line between the header and the Job
+        # Distribution block, not two.
+        self.assertNotIn("\n\n\n", sent_text)
+
 
 if __name__ == "__main__":
     unittest.main()
