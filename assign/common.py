@@ -567,7 +567,6 @@ BTN_AF_RESULTS    = "🗂 AF Results"
 BTN_BULK_EXPORT   = "📤 Export Valuation Report"
 BTN_EXPORT_STATUS = "📊 Export Status"
 BTN_JOB_DIST      = "🏆 Job Distribution"
-BTN_POST_BOARD    = "📥 Post Board"
 BTN_LOOKUP        = "🔎 Lookup Reference"
 BTN_PARCEL_LOOKUP = "🏞 Parcel Lookup"
 BTN_PARCEL_WATCH  = "⏳ Parcel Watch"
@@ -595,12 +594,19 @@ BTN_CAT_ANALYTICS   = "📈 Analytics"
 BTN_CAT_LOOKUPS     = "🔎 Look Ups"
 BTN_CAT_VALUERS     = "👥 Valuers"
 BTN_CAT_SETTINGS    = "⚙️ Bot Settings"
+BTN_CAT_POST_BOARD  = "📥 Post Board"
 BTN_BACK            = "⬅ Back"
 
 # Admin-only action appended to ⚙️ Bot Settings' submenu (only for admins,
 # see recv_menu_category) — manages other users' category access
 # (access_control.py).
 BTN_MANAGE_ACCESS = "🔐 Manage Access"
+
+# 📥 Post Board's two member buttons (post_board.py) — its own category
+# rather than a member of another one, so it's independently grantable
+# via Manage Access.
+BTN_PB_POST = "➕ Post New Item(s)"
+BTN_PB_VIEW = "📋 View Queue"
 
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
@@ -618,7 +624,8 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}|{re.escape(BTN_TASK_ANALYTICS)}"
     f"|{re.escape(BTN_CAT_ASSIGNMENTS)}|{re.escape(BTN_CAT_AUTOMATION)}|{re.escape(BTN_CAT_ANALYTICS)}"
     f"|{re.escape(BTN_CAT_LOOKUPS)}|{re.escape(BTN_CAT_VALUERS)}|{re.escape(BTN_CAT_SETTINGS)}"
-    f"|{re.escape(BTN_BACK)}|{re.escape(BTN_MANAGE_ACCESS)}|{re.escape(BTN_POST_BOARD)}"
+    f"|{re.escape(BTN_CAT_POST_BOARD)}|{re.escape(BTN_PB_POST)}|{re.escape(BTN_PB_VIEW)}"
+    f"|{re.escape(BTN_BACK)}|{re.escape(BTN_MANAGE_ACCESS)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -636,7 +643,7 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
             "📋 *Assignments*\n\n"
             "Assign, queue, and distribute stamp-duty valuation tasks to valuers."
         ),
-        "buttons": [BTN_ASSIGN, BTN_DLV_BATCH, BTN_DLV_TASKS, BTN_HOLD_TASKS, BTN_JOB_DIST, BTN_POST_BOARD],
+        "buttons": [BTN_ASSIGN, BTN_DLV_BATCH, BTN_DLV_TASKS, BTN_HOLD_TASKS, BTN_JOB_DIST],
     },
     BTN_CAT_AUTOMATION: {
         "description": (
@@ -678,6 +685,15 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
         ),
         "buttons": [BTN_AUTH, BTN_TOKEN_STATUS, BTN_DAEMON, BTN_RESTART, BTN_HELP],
     },
+    BTN_CAT_POST_BOARD: {
+        "description": (
+            "📥 *Post Board*\n\n"
+            "A shared drop box for reference numbers and photos — post items here "
+            "and everyone else with access is notified immediately; check the "
+            "queue any time and clear (✅ Done) whatever's been dealt with."
+        ),
+        "buttons": [BTN_PB_POST, BTN_PB_VIEW],
+    },
 }
 
 
@@ -698,42 +714,41 @@ def _category_menu(buttons: List[str]) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 
+def _category_row_keyboard(categories: List[str]) -> ReplyKeyboardMarkup:
+    """Shared row-builder for both _main_menu (unfiltered, every category)
+    and _main_menu_for (filtered to one user's grants) — two categories
+    per row, an odd category out gets its own final row, plus Cancel.
+    Handles any category count, including an odd one out (e.g. 7 becomes
+    3 rows of 2 + 1 row of 1), without hardcoding a fixed grid shape."""
+    pairs = [categories[i:i + 2] for i in range(0, len(categories), 2)]
+    rows = [[KeyboardButton(b) for b in pair] for pair in pairs]
+    rows.append([KeyboardButton(BTN_CANCEL)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
 def _main_menu() -> ReplyKeyboardMarkup:
     # Top-level menu, unfiltered — every category shown regardless of the
     # requesting user's own category access. Used by every feature
     # module's own "flow finished" messages (they don't have per-user
     # filtering wired in yet — see _main_menu_for's docstring for where
     # filtering actually applies today).
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton(BTN_CAT_ASSIGNMENTS), KeyboardButton(BTN_CAT_AUTOMATION)],
-            [KeyboardButton(BTN_CAT_ANALYTICS),   KeyboardButton(BTN_CAT_LOOKUPS)],
-            [KeyboardButton(BTN_CAT_VALUERS),      KeyboardButton(BTN_CAT_SETTINGS)],
-            [KeyboardButton(BTN_CANCEL)],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
+    return _category_row_keyboard(list(_MENU_CATEGORIES))
 
 
 def _main_menu_for(user_id: int) -> ReplyKeyboardMarkup:
     """Top-level menu filtered to whichever categories user_id may open
-    (get_user_categories) — only that user's permitted category buttons,
-    two per row, plus Cancel. Used at the four "fresh arrival at the top-
-    level menu" points: /start (bot.py's cmd_start), ⬅ Back
-    (recv_menu_back), 🛑 Cancel (cmd_cancel), and the generic
-    "I didn't understand" fallback — NOT at the ~180 "a feature just
-    finished" call sites scattered across every feature module, which
-    still call the unfiltered _main_menu() (see its own docstring). A
-    restricted user can therefore still see the full category list again
-    right after finishing an allowed workflow, until they next hit
-    Cancel/Back or restart with /start — a known, accepted gap from
-    scoping this as menu-hiding rather than full per-module enforcement."""
-    allowed_cats = get_user_categories(user_id)
-    pairs = [allowed_cats[i:i + 2] for i in range(0, len(allowed_cats), 2)]
-    rows = [[KeyboardButton(b) for b in pair] for pair in pairs]
-    rows.append([KeyboardButton(BTN_CANCEL)])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+    (get_user_categories) — only that user's permitted category buttons.
+    Used at the four "fresh arrival at the top-level menu" points:
+    /start (bot.py's cmd_start), ⬅ Back (recv_menu_back), 🛑 Cancel
+    (cmd_cancel), and the generic "I didn't understand" fallback — NOT at
+    the ~180 "a feature just finished" call sites scattered across every
+    feature module, which still call the unfiltered _main_menu() (see its
+    own docstring). A restricted user can therefore still see the full
+    category list again right after finishing an allowed workflow, until
+    they next hit Cancel/Back or restart with /start — a known, accepted
+    gap from scoping this as menu-hiding rather than full per-module
+    enforcement."""
+    return _category_row_keyboard(get_user_categories(user_id))
 
 
 # ──────────────────────────────────────────────────────────

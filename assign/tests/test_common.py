@@ -435,8 +435,8 @@ class TestNodeLabels(unittest.TestCase):
 
 
 class TestMainMenu(unittest.TestCase):
-    """_main_menu — the top-level menu now shows only the six category
-    buttons (plus Cancel); workflow buttons live one level down in each
+    """_main_menu — the top-level menu shows only the category buttons
+    (plus Cancel); workflow buttons live one level down in each
     category's own submenu (see TestCategoryMenu/TestMenuCategories)."""
 
     def _rows(self):
@@ -445,13 +445,9 @@ class TestMainMenu(unittest.TestCase):
     def _all_texts(self):
         return [b.text for row in self._rows() for b in row]
 
-    def test_shows_exactly_the_six_categories_plus_cancel(self):
+    def test_shows_exactly_every_category_plus_cancel(self):
         texts = self._all_texts()
-        self.assertEqual(set(texts), {
-            common.BTN_CAT_ASSIGNMENTS, common.BTN_CAT_AUTOMATION, common.BTN_CAT_ANALYTICS,
-            common.BTN_CAT_LOOKUPS, common.BTN_CAT_VALUERS, common.BTN_CAT_SETTINGS,
-            common.BTN_CANCEL,
-        })
+        self.assertEqual(set(texts), set(common._MENU_CATEGORIES) | {common.BTN_CANCEL})
 
     def test_workflow_buttons_are_not_on_the_top_level_menu(self):
         texts = self._all_texts()
@@ -462,10 +458,10 @@ class TestMainMenu(unittest.TestCase):
 
 class TestMenuCategories(unittest.TestCase):
     """_MENU_CATEGORIES — every workflow button ends up in exactly one
-    category, and the categories partition all 26 previously-visible
-    buttons with nothing dropped or duplicated. Apartments/Sectional/AF
-    Results/Valuer Tasks/Assignments stay hidden from every category,
-    same as they were hidden from the old flat grid."""
+    category, and the categories partition every visible button with
+    nothing dropped or duplicated. Apartments/Sectional/AF Results/Valuer
+    Tasks/Assignments stay hidden from every category, same as they were
+    hidden from the old flat grid."""
 
     def _all_category_buttons(self):
         return [b for cat in common._MENU_CATEGORIES.values() for b in cat["buttons"]]
@@ -495,8 +491,29 @@ class TestMenuCategories(unittest.TestCase):
                     common.BTN_PARCEL_WATCH, common.BTN_DLV_REF_CHECK, common.BTN_AUTH,
                     common.BTN_TOKEN_STATUS, common.BTN_ERROR_REPORT, common.BTN_VALUERS,
                     common.BTN_DELETE, common.BTN_DAEMON, common.BTN_RESTART, common.BTN_HELP,
-                    common.BTN_TASK_ANALYTICS):
+                    common.BTN_TASK_ANALYTICS, common.BTN_PB_POST, common.BTN_PB_VIEW):
             self.assertEqual(buttons.count(btn), 1, f"{btn} should appear in exactly one category")
+
+
+class TestCategoryRowKeyboard(unittest.TestCase):
+    """_category_row_keyboard — shared by _main_menu and _main_menu_for;
+    two categories per row, an odd one out gets its own final row before
+    Cancel, regardless of how many categories are passed in."""
+
+    def test_even_count_pairs_cleanly(self):
+        kb = common._category_row_keyboard(["A", "B", "C", "D"])
+        rows = [[b.text for b in row] for row in kb.keyboard]
+        self.assertEqual(rows, [["A", "B"], ["C", "D"], [common.BTN_CANCEL]])
+
+    def test_odd_count_gets_a_final_single_row(self):
+        kb = common._category_row_keyboard(["A", "B", "C"])
+        rows = [[b.text for b in row] for row in kb.keyboard]
+        self.assertEqual(rows, [["A", "B"], ["C"], [common.BTN_CANCEL]])
+
+    def test_empty_list_still_returns_cancel_only(self):
+        kb = common._category_row_keyboard([])
+        rows = [[b.text for b in row] for row in kb.keyboard]
+        self.assertEqual(rows, [[common.BTN_CANCEL]])
 
 
 class TestCategoryMenu(unittest.TestCase):
