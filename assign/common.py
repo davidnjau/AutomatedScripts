@@ -567,6 +567,7 @@ BTN_AF_RESULTS    = "🗂 AF Results"
 BTN_BULK_EXPORT   = "📤 Export Valuation Report"
 BTN_EXPORT_STATUS = "📊 Export Status"
 BTN_JOB_DIST      = "🏆 Job Distribution"
+BTN_POST_BOARD    = "📥 Post Board"
 BTN_LOOKUP        = "🔎 Lookup Reference"
 BTN_PARCEL_LOOKUP = "🏞 Parcel Lookup"
 BTN_PARCEL_WATCH  = "⏳ Parcel Watch"
@@ -617,7 +618,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}|{re.escape(BTN_TASK_ANALYTICS)}"
     f"|{re.escape(BTN_CAT_ASSIGNMENTS)}|{re.escape(BTN_CAT_AUTOMATION)}|{re.escape(BTN_CAT_ANALYTICS)}"
     f"|{re.escape(BTN_CAT_LOOKUPS)}|{re.escape(BTN_CAT_VALUERS)}|{re.escape(BTN_CAT_SETTINGS)}"
-    f"|{re.escape(BTN_BACK)}|{re.escape(BTN_MANAGE_ACCESS)}"
+    f"|{re.escape(BTN_BACK)}|{re.escape(BTN_MANAGE_ACCESS)}|{re.escape(BTN_POST_BOARD)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -635,7 +636,7 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
             "📋 *Assignments*\n\n"
             "Assign, queue, and distribute stamp-duty valuation tasks to valuers."
         ),
-        "buttons": [BTN_ASSIGN, BTN_DLV_BATCH, BTN_DLV_TASKS, BTN_HOLD_TASKS, BTN_JOB_DIST],
+        "buttons": [BTN_ASSIGN, BTN_DLV_BATCH, BTN_DLV_TASKS, BTN_HOLD_TASKS, BTN_JOB_DIST, BTN_POST_BOARD],
     },
     BTN_CAT_AUTOMATION: {
         "description": (
