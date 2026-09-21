@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Unit tests for dlv_ref_check.py — _dc_format_record's field rendering and
+Unit tests for dlv_ref_check.py — _dc_format_record's three explicit
+checks (New Assignment via `workflow`, DLV Batch Queue via `queued_at`,
+Hold Queue via `hold`) plus the shared status/valuer/timeline fields, and
 the cmd_dlv_ref_check/recv_dc_ref conversation handlers, including the
-queued_at-is-the-signal distinction between "never had any record",
-"has a record but was never queued via DLV Batch" (e.g. assigned
-directly), and "was queued via DLV Batch".
+"no record at all" vs "has a record" distinction.
 
 Run with: python3 -m unittest discover -s assign/tests -v
 """
@@ -32,12 +32,43 @@ def _make_update_with_message(text=""):
 
 
 class TestDcFormatRecord(unittest.TestCase):
-    def test_queued_only_shows_queued_status_and_date(self):
-        record = {"status": "queued", "queued_at": "2026-01-01T10:00:00"}
+    def test_no_workflow_no_queued_no_hold_all_report_no(self):
+        record = {"status": "assigned"}
         block = dc._dc_format_record("R1", record)
         self.assertIn("R1", block)
-        self.assertIn("Queued", block)
-        self.assertIn("2026-01-01T10:00:00", block)
+        self.assertIn("New Assignment: ❌ No", block)
+        self.assertIn("DLV Batch Queue: ❌ No", block)
+        self.assertIn("Hold Queue: ❌ No", block)
+
+    def test_workflow_present_shows_new_assignment_label(self):
+        record = {"status": "assigned", "workflow": "stamp_duty"}
+        block = dc._dc_format_record("R1", record)
+        self.assertIn("New Assignment: 📋 Stamp Duty", block)
+
+    def test_land_rent_workflow_shows_its_own_label(self):
+        record = {"status": "assigned", "workflow": "land_rent"}
+        block = dc._dc_format_record("R1", record)
+        self.assertIn("New Assignment: 🏘 Land Rent", block)
+
+    def test_queued_at_present_shows_queue_date(self):
+        record = {"status": "queued", "queued_at": "2026-01-01T10:00:00"}
+        block = dc._dc_format_record("R1", record)
+        self.assertIn("DLV Batch Queue: ✅ Yes — 2026-01-01T10:00:00", block)
+
+    def test_hold_present_shows_held_for(self):
+        record = {"status": "assigned", "hold": {"held_valuer_name": "Byron"}}
+        block = dc._dc_format_record("R1", record)
+        self.assertIn("Hold Queue: ✅ Currently held for Byron", block)
+
+    def test_all_three_checks_can_be_true_together(self):
+        record = {
+            "status": "assigned", "workflow": "stamp_duty",
+            "queued_at": "2026-01-01T10:00:00", "hold": {"held_valuer_name": "Byron"},
+        }
+        block = dc._dc_format_record("R1", record)
+        self.assertIn("New Assignment: 📋 Stamp Duty", block)
+        self.assertIn("DLV Batch Queue: ✅ Yes", block)
+        self.assertIn("Hold Queue: ✅ Currently held for Byron", block)
 
     def test_assigned_shows_valuer_and_assigned_date(self):
         record = {
@@ -75,14 +106,6 @@ class TestDcFormatRecord(unittest.TestCase):
         block = dc._dc_format_record("R1", record)
         self.assertIn("Direct", block)
 
-    def test_hold_info_is_included_when_present(self):
-        record = {
-            "status": "assigned", "queued_at": "2026-01-01T10:00:00",
-            "hold": {"held_valuer_name": "Byron"},
-        }
-        block = dc._dc_format_record("R1", record)
-        self.assertIn("Byron", block)
-
 
 class TestCmdDlvRefCheck(unittest.TestCase):
     def test_asks_for_reference_number(self):
@@ -111,9 +134,10 @@ class TestRecvDcRef(unittest.TestCase):
         sent_text = update.message.reply_text.call_args_list[-1].args[0]
         self.assertIn("No record at all", sent_text)
 
-    def test_record_without_queued_at_reports_never_queued(self):
-        """A ref assigned directly (New Assignment/Receive Tasks, never
-        through DLV Batch) has a record but no queued_at."""
+    def test_record_with_no_matching_checks_still_shows_full_report(self):
+        """A record can exist (e.g. seen via a live DLV search) without
+        ever being a New Assignment, queued, or held — all three checks
+        should still render, each reporting No."""
         update = _make_update_with_message("R1")
         ctx = MagicMock()
         store = {"R1": {"status": "assigned", "assigned_at": "2026-01-02T09:00:00"}}
@@ -122,14 +146,17 @@ class TestRecvDcRef(unittest.TestCase):
             result = _run(dc.recv_dc_ref(update, ctx))
         self.assertEqual(result, dc.ConversationHandler.END)
         sent_text = update.message.reply_text.call_args_list[-1].args[0]
-        self.assertIn("never queued via DLV Batch", sent_text)
+        self.assertIn("New Assignment: ❌ No", sent_text)
+        self.assertIn("DLV Batch Queue: ❌ No", sent_text)
+        self.assertIn("Hold Queue: ❌ No", sent_text)
         self.assertIn("2026-01-02T09:00:00", sent_text)
 
-    def test_record_with_queued_at_reports_queued_with_full_history(self):
+    def test_record_with_all_history_shows_every_check_as_yes(self):
         update = _make_update_with_message("R1")
         ctx = MagicMock()
         store = {"R1": {
-            "status": "completed", "queued_at": "2026-01-01T10:00:00",
+            "status": "completed", "workflow": "stamp_duty",
+            "queued_at": "2026-01-01T10:00:00",
             "closed_at": "2026-01-05T12:00:00", "closed_reason": "completed",
             "valuer_name": "Jane Doe",
         }}
@@ -138,7 +165,8 @@ class TestRecvDcRef(unittest.TestCase):
             result = _run(dc.recv_dc_ref(update, ctx))
         self.assertEqual(result, dc.ConversationHandler.END)
         sent_text = update.message.reply_text.call_args_list[-1].args[0]
-        self.assertIn("was queued via DLV Batch", sent_text)
+        self.assertIn("New Assignment: 📋 Stamp Duty", sent_text)
+        self.assertIn("DLV Batch Queue: ✅ Yes", sent_text)
         self.assertIn("Jane Doe", sent_text)
 
 
