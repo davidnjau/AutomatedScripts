@@ -257,8 +257,11 @@ def _lu_extract_context(item: Dict, detail: Optional[Dict]) -> Dict:
     }
 
 
-def _lu_format_result(ref: str, item: Dict, detail: Optional[Dict]) -> str:
-    """Build the lookup result message from list-item + detail-view data."""
+def _lu_format_result(ref: str, item: Dict, detail: Optional[Dict], markdown: bool = True) -> str:
+    """Build the lookup result message from list-item + detail-view data.
+    markdown=False (parcel_watch.py's emailed notification) skips Markdown
+    escaping/backticks/header formatting, same convention as
+    task_block.format_labeled_block."""
     status = (item.get("application_status") or item.get("status") or "—").upper()
     node_raw = ""
     valuer_name = "—"
@@ -287,18 +290,32 @@ def _lu_format_result(ref: str, item: Dict, detail: Optional[Dict]) -> str:
                   ext.get("parcel_number") or "—"
     created     = item.get("date_created", "—")
 
-    lines = [
-        "🔎 *Reference Lookup*\n",
-        f"📌 *Ref:* `{_lu_md_escape(ref)}`",
-        f"📊 *Status:* {_lu_md_escape(status)}",
-        f"🔄 *Node:* {_lu_md_escape(node_label)}",
-        f"👤 *Valuer:* {_lu_md_escape(valuer_name)}",
-        f"🏢 *Registry:* {_lu_md_escape(registry)}",
-        f"📍 *County:* {_lu_md_escape(county)}",
-        f"💰 *Consideration:* {_lu_md_escape(consideration)}",
-        f"📋 *Parcel:* {_lu_md_escape(parcel)}",
-        f"📅 *Created:* {_lu_md_escape(created)}",
-    ]
+    if markdown:
+        lines = [
+            "🔎 *Reference Lookup*\n",
+            f"📌 *Ref:* `{_lu_md_escape(ref)}`",
+            f"📊 *Status:* {_lu_md_escape(status)}",
+            f"🔄 *Node:* {_lu_md_escape(node_label)}",
+            f"👤 *Valuer:* {_lu_md_escape(valuer_name)}",
+            f"🏢 *Registry:* {_lu_md_escape(registry)}",
+            f"📍 *County:* {_lu_md_escape(county)}",
+            f"💰 *Consideration:* {_lu_md_escape(consideration)}",
+            f"📋 *Parcel:* {_lu_md_escape(parcel)}",
+            f"📅 *Created:* {_lu_md_escape(created)}",
+        ]
+    else:
+        lines = [
+            "Reference Lookup",
+            f"Ref: {ref}",
+            f"Status: {status}",
+            f"Node: {node_label}",
+            f"Valuer: {valuer_name}",
+            f"Registry: {registry}",
+            f"County: {county}",
+            f"Consideration: {consideration}",
+            f"Parcel: {parcel}",
+            f"Created: {created}",
+        ]
     return "\n".join(lines)
 
 

@@ -5,8 +5,19 @@ parcel_watch.py
 Parcel Watch — schedule a recurring check for whether a parcel number has
 landed in the Stamp Duty list, the scheduled counterpart to
 parcel_lookup.py's on-demand /parcelcheck (the same relationship Auto
-Fetch has to Fetch Tasks). Reuses parcel_lookup.py's _pl_search_parcel
-and _pl_report_lines rather than duplicating the search/formatting logic.
+Fetch has to Fetch Tasks). Reuses parcel_lookup.py's _pl_search_parcel to
+find matching references.
+
+Once a match is found, each matching reference is enriched with a full
+Reference Lookup — lookup_reference.py's own _lu_fetch_detail +
+_lu_format_result, the same primitives /lookup uses — rather than the
+bare list-item block parcel_lookup.py's own immediate report uses. A
+one-shot background notification (unlike an on-demand /parcelcheck,
+which can return many matches and deliberately skips the extra detail
+call per match to stay fast) can afford the extra per-match API round
+trip, and the payoff — valuer name, node label, consideration amount —
+makes the notification materially more useful than "it landed, here's
+its status."
 
 /parcelwatch ("⏳ Parcel Watch") walks through: parcel number -> check
 interval (15 min / 30 min / 1 hour / 2 hours / 6 hours) -> delivery
@@ -62,8 +73,8 @@ from common import (
     not_cancel,
 )
 from email_service import _send_auto_fetch_email
-from lookup_reference import _LU_CRED_DEFAULT, _lu_md_escape
-from parcel_lookup import _pl_report_lines, _pl_search_parcel
+from lookup_reference import _LU_CRED_DEFAULT, _lu_fetch_detail, _lu_format_result, _lu_md_escape
+from parcel_lookup import _pl_search_parcel
 from telegram_report import _send_chunked_report
 
 SAVED_PARCEL_WATCHES_FILE = os.path.join(DATA_DIR, "saved_parcel_watches.json")
@@ -304,6 +315,19 @@ def _pw_finalize(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, email: str) -> No
 # Background job
 # ──────────────────────────────────────────────────────────
 
+def _pw_fetch_enriched(tokens, matches: List[Dict]):
+    """For each matching list-item from _pl_search_parcel, fetch its
+    detail-view via lookup_reference.py's own _lu_fetch_detail — the same
+    primitive /lookup uses — and pair it with the item and its reference
+    number. Synchronous (run via asyncio.to_thread from _pw_check_job, one
+    call covering the whole loop) since it's the same blocking-HTTP-in-a-
+    thread pattern _pl_search_parcel already uses. _lu_fetch_detail
+    catches its own exceptions and returns None on failure, so a single
+    failed detail call degrades that one match to item-only fields rather
+    than failing the whole notification."""
+    return [(item.get("reference_number", "—"), item, _lu_fetch_detail(tokens, item.get("id"))) for item in matches]
+
+
 async def _pw_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Background job for one watch: search the parcel, and if found,
     notify (Telegram always, email too if configured) then remove the
@@ -329,8 +353,10 @@ async def _pw_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not matches:
         return
 
-    lines = _pl_report_lines(watch["parcel"], matches, markdown=True)
-    lines[0] = "🔔 *Parcel Watch* — found!\n" + lines[0]
+    enriched = await asyncio.to_thread(_pw_fetch_enriched, tokens, matches)
+
+    header = f"🔔 *Parcel Watch* — `{_lu_md_escape(watch['parcel'])}` found on {len(enriched)} application(s)"
+    lines = [header] + [_lu_format_result(ref, item, detail, markdown=True) for ref, item, detail in enriched]
 
     async def _send(text, reply_markup):
         await context.bot.send_message(watch["chat_id"], text, parse_mode="Markdown", reply_markup=reply_markup)
@@ -339,7 +365,10 @@ async def _pw_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if watch.get("email"):
         try:
-            body = "\n\n".join(_pl_report_lines(watch["parcel"], matches, markdown=False))
+            plain_header = f"Parcel Watch — {watch['parcel']} found on {len(enriched)} application(s)"
+            body = "\n\n".join(
+                [plain_header] + [_lu_format_result(ref, item, detail, markdown=False) for ref, item, detail in enriched],
+            )
             subject = f"Ardhisasa Parcel Watch — {watch['parcel']} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             await asyncio.to_thread(_send_auto_fetch_email, watch["email"], subject, body)
         except Exception as exc:
