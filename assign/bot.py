@@ -44,6 +44,7 @@ from telegram.ext import (
 )
 
 from common import (
+    BTN_BACK,
     BTN_CANCEL,
     BTN_DAEMON,
     BTN_DELETE,
@@ -60,12 +61,15 @@ from common import (
     _jwt_exp,
     _load_tokens_raw,
     _main_menu,
+    _MENU_CATEGORY_FILTER,
     allowed,
     cmd_cancel,
     deny,
     load_saved_valuers,
     logger,
     md_escape,
+    recv_menu_back,
+    recv_menu_category,
 )
 import auto_fetch
 import bulk_export
@@ -171,7 +175,15 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     await update.message.reply_text(
         "🏛 *Ardhisasa Valuation Bot*\n\n"
-        "Use the buttons below to get started:",
+        "Tap a category below to open its workflows — each one also shows a short "
+        "description of what it does when you tap it. Use ⬅ Back to return here, "
+        "or 🛑 Cancel at any time to abort whatever you're doing.\n\n"
+        "📋 Assignments — assign/queue/distribute tasks\n"
+        "🤖 Automation — scheduled fetches, briefings, reports\n"
+        "📈 Analytics — exports and job-progress monitoring\n"
+        "🔎 Look Ups — check a reference/parcel's status\n"
+        "👥 Valuers — manage your saved valuer list\n"
+        "⚙️ Bot Settings — logins, daemon, restart, help",
         parse_mode="Markdown",
         reply_markup=_main_menu(),
     )
@@ -203,7 +215,10 @@ async def cmd_valuers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for i, v in enumerate(valuers)
     ]
     await update.message.reply_text(
-        "📋 *Saved Valuers:*\n\n" + "\n".join(lines),
+        "📋 *Saved Valuers*\n\n"
+        "The valuer list reused across New Assignment, Receive Tasks, and Job "
+        "Distribution pickers — saved automatically after a successful assignment.\n\n"
+        + "\n".join(lines),
         parse_mode="Markdown",
         reply_markup=_main_menu(),
     )
@@ -224,7 +239,10 @@ async def cmd_delete_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ]
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="del:cancel")])
     await update.message.reply_text(
+        "🗑 *Delete Valuer*\n\n"
+        "Remove a valuer from your saved list — this doesn't undo any past assignment.\n\n"
         "Select a valuer to delete:",
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(rows),
     )
 
@@ -429,7 +447,11 @@ async def cmd_token_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             time_str = f"{hrs}h {mins}m" if hrs else f"{mins}m"
             lines.append(f"{label}\n  🟢 Valid — expires in {time_str} ({exp_str})")
 
-    text = "🔒 *Token Status*\n\n" + "\n\n".join(lines)
+    text = (
+        "🔒 *Token Status*\n\n"
+        "Shows whether each credential profile has a valid cached login.\n\n"
+        + "\n\n".join(lines)
+    )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu())
 
 
@@ -464,7 +486,11 @@ async def cmd_error_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     records = _read_log_records()
     if not records:
         await update.message.reply_text(
+            "📉 *Error Report*\n\n"
+            "Charts warnings/errors logged by the bot over time, so you can spot "
+            "spikes or recurring failures.\n\n"
             "✅ No warnings or errors logged yet (`data/bot.log`).",
+            parse_mode="Markdown",
             reply_markup=_main_menu(),
         )
         return
@@ -520,6 +546,7 @@ async def cmd_error_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     total = sum(warnings) + sum(errors)
     caption = (
         f"📉 *Error Report* — {total:,} entries across {len(days)} day(s)\n"
+        "Charts warnings/errors logged by the bot over time.\n"
         f"Range: `{days[0]}` → `{days[-1]}`"
     )
     await update.message.reply_photo(
@@ -761,6 +788,8 @@ def main():
     # BTN_ASSIGNMENTS handler registered via new_assignment.register(app) above.
     # AF Results handlers registered via auto_fetch.register(app) above.
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_CANCEL)}$"),      cmd_cancel))
+    app.add_handler(MessageHandler(_MENU_CATEGORY_FILTER,                           recv_menu_category))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_BACK)}$"),        recv_menu_back))
 
     logger.info("Bot started. Polling for updates…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -639,7 +639,10 @@ async def cmd_incremental(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     cfg = load_incremental_counter()
     await update.message.reply_text(
-        f"🔢 *Incremental Report*\n\nCurrent position: *Batch {cfg.get('batch_number', 1)}, "
+        "🔢 *Incremental Report*\n\n"
+        "Auto-sequences DLV Batch tags into fixed-size batches (\"B{n}-T{n}\") and "
+        "tracks which batches are fully cleared.\n\n"
+        f"Current position: *Batch {cfg.get('batch_number', 1)}, "
         f"Task {cfg.get('task_number', 1)}* (batch size: {cfg.get('batch_size', _DEFAULT_BATCH_SIZE)})",
         parse_mode="Markdown",
         reply_markup=_ic_menu_keyboard(),

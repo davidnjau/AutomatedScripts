@@ -86,6 +86,7 @@ async def cmd_exclusions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         custom_listing = "\n".join(f"• {kw}" for kw in custom)
         status = (
             f"🚫 *Manage Exclusions*\n\n"
+            f"Keywords Auto Fetch's Exclude checklist can filter parcel numbers on.\n\n"
             f"Built-in (always available): {md_escape(builtin_listing)}\n\n"
             f"Your custom keywords:\n{md_escape(custom_listing)}\n\n"
             f"Choose an action:"

@@ -8,11 +8,12 @@ save_sectional_config (shared by Sectional Properties and Auto Fetch).
 Run with: python3 -m unittest discover -s assign/tests -v
 """
 
+import asyncio
 import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -240,10 +241,9 @@ class TestNodeLabels(unittest.TestCase):
 
 
 class TestMainMenu(unittest.TestCase):
-    """_main_menu — Apartments/Sectional/AF Results/Valuer Tasks/
-    Assignments are hidden from the grid (each still has its own working
-    /command or MessageHandler elsewhere — this only covers the keyboard
-    layout), and several buttons are paired on shared rows."""
+    """_main_menu — the top-level menu now shows only the six category
+    buttons (plus Cancel); workflow buttons live one level down in each
+    category's own submenu (see TestCategoryMenu/TestMenuCategories)."""
 
     def _rows(self):
         return common._main_menu().keyboard
@@ -251,46 +251,113 @@ class TestMainMenu(unittest.TestCase):
     def _all_texts(self):
         return [b.text for row in self._rows() for b in row]
 
-    def test_hidden_buttons_are_absent(self):
+    def test_shows_exactly_the_six_categories_plus_cancel(self):
         texts = self._all_texts()
-        for btn in (common.BTN_APARTMENTS, common.BTN_SECTIONAL, common.BTN_AF_RESULTS,
-                    common.BTN_VALUER_TASKS, common.BTN_ASSIGNMENTS):
+        self.assertEqual(set(texts), {
+            common.BTN_CAT_ASSIGNMENTS, common.BTN_CAT_AUTOMATION, common.BTN_CAT_ANALYTICS,
+            common.BTN_CAT_LOOKUPS, common.BTN_CAT_VALUERS, common.BTN_CAT_SETTINGS,
+            common.BTN_CANCEL,
+        })
+
+    def test_workflow_buttons_are_not_on_the_top_level_menu(self):
+        texts = self._all_texts()
+        for btn in (common.BTN_ASSIGN, common.BTN_FETCH_TASKS, common.BTN_LOOKUP,
+                    common.BTN_VALUERS, common.BTN_AUTH, common.BTN_TASK_ANALYTICS):
             self.assertNotIn(btn, texts)
 
-    def test_every_other_button_still_present(self):
-        texts = self._all_texts()
+
+class TestMenuCategories(unittest.TestCase):
+    """_MENU_CATEGORIES — every workflow button ends up in exactly one
+    category, and the categories partition all 26 previously-visible
+    buttons with nothing dropped or duplicated. Apartments/Sectional/AF
+    Results/Valuer Tasks/Assignments stay hidden from every category,
+    same as they were hidden from the old flat grid."""
+
+    def _all_category_buttons(self):
+        return [b for cat in common._MENU_CATEGORIES.values() for b in cat["buttons"]]
+
+    def test_every_category_has_a_description_and_at_least_one_button(self):
+        for label, cat in common._MENU_CATEGORIES.items():
+            self.assertTrue(cat["description"])
+            self.assertTrue(cat["buttons"])
+
+    def test_no_button_appears_in_more_than_one_category(self):
+        buttons = self._all_category_buttons()
+        self.assertEqual(len(buttons), len(set(buttons)))
+
+    def test_hidden_buttons_are_in_no_category(self):
+        buttons = self._all_category_buttons()
+        for btn in (common.BTN_APARTMENTS, common.BTN_SECTIONAL, common.BTN_AF_RESULTS,
+                    common.BTN_VALUER_TASKS, common.BTN_ASSIGNMENTS, common.BTN_DLV_QUEUE):
+            self.assertNotIn(btn, buttons)
+
+    def test_every_other_button_is_in_exactly_one_category(self):
+        buttons = self._all_category_buttons()
         for btn in (common.BTN_ASSIGN, common.BTN_FETCH_TASKS, common.BTN_AUTO_FETCH,
                     common.BTN_DLV_BATCH, common.BTN_BULK_EXPORT, common.BTN_EXPORT_STATUS,
                     common.BTN_JOB_DIST, common.BTN_DLV_TASKS, common.BTN_BRIEFING,
                     common.BTN_HOLD_TASKS, common.BTN_INCREMENTAL, common.BTN_DLV_REPORT_SCHEDULE,
-                    common.BTN_CUSTOM_EXCLUSIONS, common.BTN_LOOKUP, common.BTN_AUTH,
+                    common.BTN_CUSTOM_EXCLUSIONS, common.BTN_LOOKUP, common.BTN_PARCEL_LOOKUP,
+                    common.BTN_PARCEL_WATCH, common.BTN_DLV_REF_CHECK, common.BTN_AUTH,
                     common.BTN_TOKEN_STATUS, common.BTN_ERROR_REPORT, common.BTN_VALUERS,
                     common.BTN_DELETE, common.BTN_DAEMON, common.BTN_RESTART, common.BTN_HELP,
-                    common.BTN_CANCEL):
+                    common.BTN_TASK_ANALYTICS):
+            self.assertEqual(buttons.count(btn), 1, f"{btn} should appear in exactly one category")
+
+
+class TestCategoryMenu(unittest.TestCase):
+    """_category_menu — lays out a category's buttons two per row, then a
+    final row of Back + Cancel."""
+
+    def test_back_and_cancel_are_the_last_row(self):
+        kb = common._category_menu([common.BTN_ASSIGN, common.BTN_DLV_BATCH])
+        last_row = kb.keyboard[-1]
+        self.assertEqual([b.text for b in last_row], [common.BTN_BACK, common.BTN_CANCEL])
+
+    def test_buttons_paired_two_per_row(self):
+        kb = common._category_menu([common.BTN_ASSIGN, common.BTN_DLV_BATCH, common.BTN_DLV_TASKS])
+        rows = kb.keyboard[:-1]   # exclude the Back/Cancel row
+        self.assertEqual([b.text for b in rows[0]], [common.BTN_ASSIGN, common.BTN_DLV_BATCH])
+        self.assertEqual([b.text for b in rows[1]], [common.BTN_DLV_TASKS])
+
+    def test_all_buttons_present(self):
+        buttons = [common.BTN_LOOKUP, common.BTN_PARCEL_LOOKUP, common.BTN_PARCEL_WATCH, common.BTN_DLV_REF_CHECK]
+        kb = common._category_menu(buttons)
+        texts = [b.text for row in kb.keyboard for b in row]
+        for btn in buttons:
             self.assertIn(btn, texts)
 
-    def _row_for(self, btn_text):
-        return next(row for row in self._rows() if any(b.text == btn_text for b in row))
 
-    def test_bulk_export_and_job_dist_share_a_row(self):
-        row = self._row_for(common.BTN_BULK_EXPORT)
-        self.assertEqual([b.text for b in row], [common.BTN_BULK_EXPORT, common.BTN_JOB_DIST])
+class TestRecvMenuCategory(unittest.TestCase):
+    def test_known_category_shows_description_and_submenu(self):
+        update = MagicMock()
+        update.message.text = common.BTN_CAT_LOOKUPS
+        update.message.reply_text = AsyncMock()
+        with patch.object(common, "allowed", return_value=True):
+            asyncio.run(common.recv_menu_category(update, MagicMock()))
+        update.message.reply_text.assert_awaited_once()
+        args, kwargs = update.message.reply_text.call_args
+        self.assertIn("Look Ups", args[0])
+        self.assertIn("reply_markup", kwargs)
 
-    def test_export_status_and_error_report_share_a_row(self):
-        row = self._row_for(common.BTN_EXPORT_STATUS)
-        self.assertEqual([b.text for b in row], [common.BTN_EXPORT_STATUS, common.BTN_ERROR_REPORT])
+    def test_unknown_text_does_nothing(self):
+        update = MagicMock()
+        update.message.text = "not a category"
+        update.message.reply_text = AsyncMock()
+        with patch.object(common, "allowed", return_value=True):
+            asyncio.run(common.recv_menu_category(update, MagicMock()))
+        update.message.reply_text.assert_not_awaited()
 
-    def test_dlv_tasks_and_hold_tasks_share_a_row(self):
-        row = self._row_for(common.BTN_DLV_TASKS)
-        self.assertEqual([b.text for b in row], [common.BTN_DLV_TASKS, common.BTN_HOLD_TASKS])
 
-    def test_dlv_report_schedule_and_incremental_share_a_row(self):
-        row = self._row_for(common.BTN_DLV_REPORT_SCHEDULE)
-        self.assertEqual([b.text for b in row], [common.BTN_DLV_REPORT_SCHEDULE, common.BTN_INCREMENTAL])
-
-    def test_briefing_and_custom_exclusions_share_a_row(self):
-        row = self._row_for(common.BTN_BRIEFING)
-        self.assertEqual([b.text for b in row], [common.BTN_BRIEFING, common.BTN_CUSTOM_EXCLUSIONS])
+class TestRecvMenuBack(unittest.TestCase):
+    def test_returns_to_main_menu(self):
+        update = MagicMock()
+        update.message.reply_text = AsyncMock()
+        with patch.object(common, "allowed", return_value=True):
+            asyncio.run(common.recv_menu_back(update, MagicMock()))
+        update.message.reply_text.assert_awaited_once()
+        _, kwargs = update.message.reply_text.call_args
+        self.assertIn("reply_markup", kwargs)
 
 
 class TestParseListInput(unittest.TestCase):

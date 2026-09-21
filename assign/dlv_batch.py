@@ -700,6 +700,8 @@ async def cmd_dlv_batch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["db_session"] = DBSession()
     await update.message.reply_text(
         "📥 *DLV Batch Assignment*\n\n"
+        "Queue reference numbers into the DLV pipeline, assigned to a valuer "
+        "of your choice, tracked until completed or returned.\n\n"
         "Send your batch — one group per line:\n"
         "`REF1, REF2, REF3 : Valuer Name`\n\n"
         "*Example:*\n"

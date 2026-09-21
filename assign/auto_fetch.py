@@ -469,7 +469,10 @@ async def cmd_auto_fetch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     schedules = load_auto_fetch_schedules()
     if schedules:
-        lines = [f"⏰ *Auto Fetch* — {len(schedules)} active schedule(s)\n"]
+        lines = [
+            f"⏰ *Auto Fetch* — {len(schedules)} active schedule(s)",
+            "Periodically fetches tasks and sends results here.\n",
+        ]
         lines += [f"{i}. {_af_format_schedule_summary(cfg)}" for i, cfg in enumerate(schedules, 1)]
         status = "\n".join(lines)
     else:

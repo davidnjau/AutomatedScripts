@@ -528,6 +528,18 @@ BTN_DLV_REPORT_SCHEDULE = "📧 DLV Report Schedule"
 BTN_CUSTOM_EXCLUSIONS = "🚫 Exclusions"
 BTN_TASK_ANALYTICS = "📈 Task Analytics"
 
+# Category buttons — the main menu shows only these six (plus Cancel);
+# tapping one opens that category's own submenu of workflow buttons (see
+# _MENU_CATEGORIES/_category_menu/_main_menu below). BTN_BACK returns from
+# a submenu to the main category menu.
+BTN_CAT_ASSIGNMENTS = "📋 Assignments"
+BTN_CAT_AUTOMATION  = "🤖 Automation"
+BTN_CAT_ANALYTICS   = "📈 Analytics"
+BTN_CAT_LOOKUPS     = "🔎 Look Ups"
+BTN_CAT_VALUERS     = "👥 Valuers"
+BTN_CAT_SETTINGS    = "⚙️ Bot Settings"
+BTN_BACK            = "⬅ Back"
+
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
     f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_DLV_BATCH)}|{re.escape(BTN_DLV_QUEUE)}"
@@ -542,38 +554,97 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_APARTMENTS)}"
     f"|{re.escape(BTN_HOLD_TASKS)}|{re.escape(BTN_INCREMENTAL)}|{re.escape(BTN_DLV_REPORT_SCHEDULE)}"
     f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}|{re.escape(BTN_TASK_ANALYTICS)}"
+    f"|{re.escape(BTN_CAT_ASSIGNMENTS)}|{re.escape(BTN_CAT_AUTOMATION)}|{re.escape(BTN_CAT_ANALYTICS)}"
+    f"|{re.escape(BTN_CAT_LOOKUPS)}|{re.escape(BTN_CAT_VALUERS)}|{re.escape(BTN_CAT_SETTINGS)}"
+    f"|{re.escape(BTN_BACK)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
 not_cancel = filters.TEXT & ~filters.COMMAND & ~_CANCEL_FILTER
 
+# Each category: a short description shown when the category button is
+# tapped, plus the list of workflow buttons its submenu shows (in
+# display order). Apartments, Sectional, AF Results, Valuer Tasks, and
+# Assignments are intentionally left out of every category — hidden from
+# the menu exactly as before this reorganization, but each still has its
+# own working /command entry point and MessageHandler.
+_MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
+    BTN_CAT_ASSIGNMENTS: {
+        "description": (
+            "📋 *Assignments*\n\n"
+            "Assign, queue, and distribute stamp-duty valuation tasks to valuers."
+        ),
+        "buttons": [BTN_ASSIGN, BTN_DLV_BATCH, BTN_DLV_TASKS, BTN_HOLD_TASKS, BTN_JOB_DIST],
+    },
+    BTN_CAT_AUTOMATION: {
+        "description": (
+            "🤖 *Automation*\n\n"
+            "Schedule recurring fetches, briefings, and reports so tasks and "
+            "DLV updates come to you automatically."
+        ),
+        "buttons": [
+            BTN_FETCH_TASKS, BTN_AUTO_FETCH, BTN_BRIEFING,
+            BTN_DLV_REPORT_SCHEDULE, BTN_INCREMENTAL, BTN_CUSTOM_EXCLUSIONS,
+        ],
+    },
+    BTN_CAT_ANALYTICS: {
+        "description": (
+            "📈 *Analytics*\n\n"
+            "Export valuation reports and monitor background job progress."
+        ),
+        "buttons": [BTN_TASK_ANALYTICS, BTN_BULK_EXPORT, BTN_EXPORT_STATUS, BTN_ERROR_REPORT],
+    },
+    BTN_CAT_LOOKUPS: {
+        "description": (
+            "🔎 *Look Ups*\n\n"
+            "Check a reference or parcel number's status, on demand or via a standing watch."
+        ),
+        "buttons": [BTN_LOOKUP, BTN_PARCEL_LOOKUP, BTN_PARCEL_WATCH, BTN_DLV_REF_CHECK],
+    },
+    BTN_CAT_VALUERS: {
+        "description": (
+            "👥 *Valuers*\n\n"
+            "Manage the saved valuer list used across New Assignment, Receive "
+            "Tasks, and Job Distribution."
+        ),
+        "buttons": [BTN_VALUERS, BTN_DELETE],
+    },
+    BTN_CAT_SETTINGS: {
+        "description": (
+            "⚙️ *Bot Settings*\n\n"
+            "Manage login sessions, the token refresh daemon, and the bot process itself."
+        ),
+        "buttons": [BTN_AUTH, BTN_TOKEN_STATUS, BTN_DAEMON, BTN_RESTART, BTN_HELP],
+    },
+}
+
+
+def _category_menu(buttons: List[str]) -> ReplyKeyboardMarkup:
+    """Build a category's submenu keyboard — its workflow buttons two per
+    row, then a final row of ⬅ Back and 🛑 Cancel (both always available
+    from inside any category)."""
+    rows = []
+    row: List[KeyboardButton] = []
+    for label in buttons:
+        row.append(KeyboardButton(label))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([KeyboardButton(BTN_BACK), KeyboardButton(BTN_CANCEL)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
 
 def _main_menu() -> ReplyKeyboardMarkup:
-    # Apartments, Sectional, AF Results, Valuer Tasks, and Assignments are
-    # intentionally left off this grid — hidden from the menu, but each
-    # still has its own working /command entry point and MessageHandler,
-    # so nothing about their functionality changed.
+    # Top-level menu is just the six categories (plus Cancel) — tapping a
+    # category shows its description and opens its own submenu (see
+    # recv_menu_category/_category_menu below).
     return ReplyKeyboardMarkup(
         [
-            # ── Assignment ──────────────────────────────────
-            [KeyboardButton(BTN_ASSIGN)],
-            [KeyboardButton(BTN_FETCH_TASKS),    KeyboardButton(BTN_AUTO_FETCH)],
-            # ── DLV & Export ────────────────────────────────
-            [KeyboardButton(BTN_DLV_BATCH)],
-            [KeyboardButton(BTN_BULK_EXPORT),    KeyboardButton(BTN_JOB_DIST)],
-            [KeyboardButton(BTN_TASK_ANALYTICS)],
-            [KeyboardButton(BTN_EXPORT_STATUS),  KeyboardButton(BTN_ERROR_REPORT)],
-            [KeyboardButton(BTN_DLV_TASKS),      KeyboardButton(BTN_HOLD_TASKS)],
-            [KeyboardButton(BTN_BRIEFING),       KeyboardButton(BTN_CUSTOM_EXCLUSIONS)],
-            [KeyboardButton(BTN_DLV_REPORT_SCHEDULE), KeyboardButton(BTN_INCREMENTAL)],
-            # ── Lookup ──────────────────────────────────────
-            [KeyboardButton(BTN_LOOKUP),         KeyboardButton(BTN_PARCEL_LOOKUP)],
-            [KeyboardButton(BTN_PARCEL_WATCH),   KeyboardButton(BTN_DLV_REF_CHECK)],
-            [KeyboardButton(BTN_AUTH),           KeyboardButton(BTN_TOKEN_STATUS)],
-            [KeyboardButton(BTN_VALUERS),        KeyboardButton(BTN_DELETE)],
-            # ── System ──────────────────────────────────────
-            [KeyboardButton(BTN_DAEMON)],
-            [KeyboardButton(BTN_RESTART),        KeyboardButton(BTN_HELP)],
+            [KeyboardButton(BTN_CAT_ASSIGNMENTS), KeyboardButton(BTN_CAT_AUTOMATION)],
+            [KeyboardButton(BTN_CAT_ANALYTICS),   KeyboardButton(BTN_CAT_LOOKUPS)],
+            [KeyboardButton(BTN_CAT_VALUERS),      KeyboardButton(BTN_CAT_SETTINGS)],
             [KeyboardButton(BTN_CANCEL)],
         ],
         resize_keyboard=True,
@@ -611,6 +682,37 @@ async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🤔 I didn't understand that. Follow the steps above, or tap 🛑 Cancel to abort.",
         reply_markup=_main_menu(),
     )
+
+
+# ──────────────────────────────────────────────────────────
+# Category menu navigation (tapping a category / ⬅ Back)
+# ──────────────────────────────────────────────────────────
+
+# Matches any of the six category button texts — the entry filter for
+# recv_menu_category, registered once in bot.py's main() rather than one
+# handler per category.
+_MENU_CATEGORY_FILTER = filters.Regex(
+    f"^({'|'.join(re.escape(b) for b in _MENU_CATEGORIES)})$"
+)
+
+
+async def recv_menu_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Show the tapped category's description and open its submenu.
+    if not allowed(update): return await deny(update)
+    category = _MENU_CATEGORIES.get(update.message.text)
+    if not category:
+        return
+    await update.message.reply_text(
+        category["description"],
+        parse_mode="Markdown",
+        reply_markup=_category_menu(category["buttons"]),
+    )
+
+
+async def recv_menu_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Return from a category submenu to the top-level category menu.
+    if not allowed(update): return await deny(update)
+    await update.message.reply_text("Main menu:", reply_markup=_main_menu())
 
 
 # (_send_bulk_export_email / _send_auto_fetch_email live in email_service.py)
