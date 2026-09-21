@@ -81,6 +81,7 @@ import fetch_tasks
 import job_distribution
 import lookup_reference
 import new_assignment
+import parcel_lookup
 import receive_tasks
 import refresh_auth
 import sectional_properties
@@ -718,6 +719,7 @@ def main():
     auto_fetch.register(app)
     receive_tasks.register(app)
     lookup_reference.register(app)
+    parcel_lookup.register(app)
     valuer_tasks.register(app)
     job_distribution.register(app)
     bulk_export.register(app)
