@@ -69,6 +69,18 @@ ALLOWED_IDS = set(
     if x.strip()
 )
 
+# Admins can manage every other allowed user's per-category menu access
+# (see load_category_access/category_allowed below and access_control.py's
+# Manage Access flow) and always have every category themselves,
+# regardless of what's been granted to them explicitly. A separate,
+# smaller list from ALLOWED_IDS on purpose — being allowed to use the bot
+# and being allowed to manage other users' access are different things.
+ADMIN_IDS = set(
+    int(x.strip())
+    for x in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",")
+    if x.strip()
+)
+
 # SMTP config for email notifications (all optional)
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587").strip())
@@ -84,6 +96,7 @@ SAVED_ASSIGNMENTS_FILE      = os.path.join(DATA_DIR, "saved_assignments.json")
 SAVED_SECTIONAL_CONFIG_FILE = os.path.join(DATA_DIR, "saved_sectional_config.json")
 SAVED_APARTMENTS_CONFIG_FILE = os.path.join(DATA_DIR, "saved_apartments_config.json")
 SAVED_CUSTOM_EXCLUSIONS_FILE = os.path.join(DATA_DIR, "saved_custom_exclusions.json")
+SAVED_CATEGORY_ACCESS_FILE  = os.path.join(DATA_DIR, "saved_category_access.json")
 
 # base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
 CPARAMS_DLV          = base64.b64encode(b'{"active_role":"DLV"}').decode()
@@ -268,6 +281,48 @@ def load_custom_exclusions() -> List[str]:
 
 def save_custom_exclusions(keywords: List[str]) -> None:
     _atomic_json_write(SAVED_CUSTOM_EXCLUSIONS_FILE, keywords, indent=2)
+
+
+# ── Per-user category access (Manage Access, access_control.py) ───────
+
+def load_category_access() -> Dict[str, List[str]]:
+    """{str(user_id): [category_label, ...]} — every non-admin user's
+    explicitly granted menu categories. A user with no entry here has
+    zero categories — locked out by default until an admin grants some
+    (see get_user_categories's admin bypass and its no-admin-configured
+    safety fallback below)."""
+    try:
+        with open(SAVED_CATEGORY_ACCESS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_category_access(data: Dict[str, List[str]]) -> None:
+    _atomic_json_write(SAVED_CATEGORY_ACCESS_FILE, data, indent=2)
+
+
+def is_admin(user_id: int) -> bool:
+    """True if user_id is configured as an admin (ADMIN_TELEGRAM_IDS)."""
+    return user_id in ADMIN_IDS
+
+
+def get_user_categories(user_id: int) -> List[str]:
+    """Every menu category label user_id may open. Admins always get
+    every category, regardless of what's explicitly granted to them.
+    Safety fallback: if no admin is configured at all (ADMIN_IDS empty),
+    there would be nobody able to grant access to anyone, ever — so in
+    that case every user gets every category too, exactly like the
+    pre-Manage-Access behavior. The empty-by-default restriction only
+    actually applies once at least one admin exists to lift it."""
+    if not ADMIN_IDS or user_id in ADMIN_IDS:
+        return list(_MENU_CATEGORIES.keys())
+    return load_category_access().get(str(user_id), [])
+
+
+def category_allowed(user_id: int, category: str) -> bool:
+    """True if user_id may open the given category label."""
+    return category in get_user_categories(user_id)
 
 
 # ── Tokens ────────────────────────────────────────────────
@@ -540,6 +595,11 @@ BTN_CAT_VALUERS     = "👥 Valuers"
 BTN_CAT_SETTINGS    = "⚙️ Bot Settings"
 BTN_BACK            = "⬅ Back"
 
+# Admin-only action appended to ⚙️ Bot Settings' submenu (only for admins,
+# see recv_menu_category) — manages other users' category access
+# (access_control.py).
+BTN_MANAGE_ACCESS = "🔐 Manage Access"
+
 # Filter that matches any of the persistent menu button texts
 _MENU_BUTTON_FILTER = filters.Regex(
     f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_DLV_BATCH)}|{re.escape(BTN_DLV_QUEUE)}"
@@ -556,7 +616,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}|{re.escape(BTN_TASK_ANALYTICS)}"
     f"|{re.escape(BTN_CAT_ASSIGNMENTS)}|{re.escape(BTN_CAT_AUTOMATION)}|{re.escape(BTN_CAT_ANALYTICS)}"
     f"|{re.escape(BTN_CAT_LOOKUPS)}|{re.escape(BTN_CAT_VALUERS)}|{re.escape(BTN_CAT_SETTINGS)}"
-    f"|{re.escape(BTN_BACK)}"
+    f"|{re.escape(BTN_BACK)}|{re.escape(BTN_MANAGE_ACCESS)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
 )
 _CANCEL_FILTER = filters.Regex(f"^{re.escape(BTN_CANCEL)}$")
@@ -637,9 +697,11 @@ def _category_menu(buttons: List[str]) -> ReplyKeyboardMarkup:
 
 
 def _main_menu() -> ReplyKeyboardMarkup:
-    # Top-level menu is just the six categories (plus Cancel) — tapping a
-    # category shows its description and opens its own submenu (see
-    # recv_menu_category/_category_menu below).
+    # Top-level menu, unfiltered — every category shown regardless of the
+    # requesting user's own category access. Used by every feature
+    # module's own "flow finished" messages (they don't have per-user
+    # filtering wired in yet — see _main_menu_for's docstring for where
+    # filtering actually applies today).
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton(BTN_CAT_ASSIGNMENTS), KeyboardButton(BTN_CAT_AUTOMATION)],
@@ -650,6 +712,26 @@ def _main_menu() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         is_persistent=True,
     )
+
+
+def _main_menu_for(user_id: int) -> ReplyKeyboardMarkup:
+    """Top-level menu filtered to whichever categories user_id may open
+    (get_user_categories) — only that user's permitted category buttons,
+    two per row, plus Cancel. Used at the four "fresh arrival at the top-
+    level menu" points: /start (bot.py's cmd_start), ⬅ Back
+    (recv_menu_back), 🛑 Cancel (cmd_cancel), and the generic
+    "I didn't understand" fallback — NOT at the ~180 "a feature just
+    finished" call sites scattered across every feature module, which
+    still call the unfiltered _main_menu() (see its own docstring). A
+    restricted user can therefore still see the full category list again
+    right after finishing an allowed workflow, until they next hit
+    Cancel/Back or restart with /start — a known, accepted gap from
+    scoping this as menu-hiding rather than full per-module enforcement."""
+    allowed_cats = get_user_categories(user_id)
+    pairs = [allowed_cats[i:i + 2] for i in range(0, len(allowed_cats), 2)]
+    rows = [[KeyboardButton(b) for b in pair] for pair in pairs]
+    rows.append([KeyboardButton(BTN_CANCEL)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 
 # ──────────────────────────────────────────────────────────
@@ -672,7 +754,7 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("session", None)
     await update.message.reply_text(
         "🛑 Flow cancelled.",
-        reply_markup=_main_menu(),
+        reply_markup=_main_menu_for(update.effective_user.id),
     )
     return ConversationHandler.END
 
@@ -680,7 +762,7 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤔 I didn't understand that. Follow the steps above, or tap 🛑 Cancel to abort.",
-        reply_markup=_main_menu(),
+        reply_markup=_main_menu_for(update.effective_user.id),
     )
 
 
@@ -697,22 +779,39 @@ _MENU_CATEGORY_FILTER = filters.Regex(
 
 
 async def recv_menu_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Show the tapped category's description and open its submenu.
+    # Show the tapped category's description and open its submenu — but
+    # only if this user is actually permitted to open it (category_allowed);
+    # this is the one enforcement point a restricted user can't bypass by
+    # tapping a category button directly, even if it were somehow shown to
+    # them. ⚙️ Bot Settings' submenu additionally gets 🔐 Manage Access
+    # appended, but only for admins.
     if not allowed(update): return await deny(update)
-    category = _MENU_CATEGORIES.get(update.message.text)
+    text = update.message.text
+    category = _MENU_CATEGORIES.get(text)
     if not category:
         return
+    user_id = update.effective_user.id
+    if not category_allowed(user_id, text):
+        await update.message.reply_text(
+            "⛔ You don't have access to this category. Ask an admin to grant it "
+            "via 🔐 Manage Access.",
+            reply_markup=_main_menu_for(user_id),
+        )
+        return
+    buttons = list(category["buttons"])
+    if text == BTN_CAT_SETTINGS and is_admin(user_id):
+        buttons.append(BTN_MANAGE_ACCESS)
     await update.message.reply_text(
         category["description"],
         parse_mode="Markdown",
-        reply_markup=_category_menu(category["buttons"]),
+        reply_markup=_category_menu(buttons),
     )
 
 
 async def recv_menu_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Return from a category submenu to the top-level category menu.
     if not allowed(update): return await deny(update)
-    await update.message.reply_text("Main menu:", reply_markup=_main_menu())
+    await update.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
 
 
 # (_send_bulk_export_email / _send_auto_fetch_email live in email_service.py)
