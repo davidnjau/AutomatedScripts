@@ -56,6 +56,24 @@ class TestMaCandidateUsers(unittest.TestCase):
             self.assertEqual(ac._ma_candidate_users(), [])
 
 
+class TestMaDisplayLabel(unittest.TestCase):
+    def test_known_name_shown_with_id(self):
+        self.assertEqual(ac._ma_display_label(2, {"2": "Jane Doe"}), "Jane Doe (2)")
+
+    def test_unknown_id_falls_back_to_bare_id(self):
+        self.assertEqual(ac._ma_display_label(2, {}), "2")
+
+
+class TestMaUserKeyboard(unittest.TestCase):
+    def test_buttons_show_cached_names(self):
+        with patch.object(ac, "_ma_candidate_users", return_value=[2, 3]), \
+             patch.object(ac, "load_user_names", return_value={"2": "Jane Doe"}):
+            kb = ac._ma_user_keyboard()
+        texts = [row[0].text for row in kb.inline_keyboard if row[0].text != "❌ Cancel"]
+        self.assertIn("Jane Doe (2)", texts)
+        self.assertIn("3", texts)
+
+
 class TestMaCategoryKeyboard(unittest.TestCase):
     def test_selected_categories_are_checked(self):
         kb = ac._ma_category_keyboard({common.BTN_CAT_LOOKUPS})
@@ -128,12 +146,24 @@ class TestRecvMaUser(unittest.TestCase):
         ctx.user_data = {}
         existing = {"2": [common.BTN_CAT_LOOKUPS]}
         with patch.object(ac, "is_admin", return_value=True), \
-             patch.object(ac, "load_category_access", return_value=existing):
+             patch.object(ac, "load_category_access", return_value=existing), \
+             patch.object(ac, "load_user_names", return_value={}):
             result = _run(ac.recv_ma_user(update, ctx))
         self.assertEqual(result, ac.MA.PICK_CATEGORIES)
         sess = ac._get_ma_sess(ctx)
         self.assertEqual(sess.target_user_id, 2)
         self.assertEqual(sess.selected, {common.BTN_CAT_LOOKUPS})
+
+    def test_confirmation_shows_cached_name(self):
+        update = _make_update_with_callback("ma_user:2", user_id=1)
+        ctx = MagicMock()
+        ctx.user_data = {}
+        with patch.object(ac, "is_admin", return_value=True), \
+             patch.object(ac, "load_category_access", return_value={}), \
+             patch.object(ac, "load_user_names", return_value={"2": "Jane Doe"}):
+            _run(ac.recv_ma_user(update, ctx))
+        sent_text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Jane Doe", sent_text)
 
 
 class TestRecvMaCategory(unittest.TestCase):
@@ -167,6 +197,7 @@ class TestRecvMaCategory(unittest.TestCase):
         ctx.user_data = {"ma_session": ac.MASession(target_user_id=2, selected={common.BTN_CAT_LOOKUPS})}
         with patch.object(ac, "is_admin", return_value=True), \
              patch.object(ac, "load_category_access", return_value={}), \
+             patch.object(ac, "load_user_names", return_value={}), \
              patch.object(ac, "save_category_access") as mock_save:
             result = _run(ac.recv_ma_category(update, ctx))
         self.assertEqual(result, ac.ConversationHandler.END)
@@ -178,9 +209,22 @@ class TestRecvMaCategory(unittest.TestCase):
         ctx.user_data = {"ma_session": ac.MASession(target_user_id=2, selected=set())}
         with patch.object(ac, "is_admin", return_value=True), \
              patch.object(ac, "load_category_access", return_value={"2": [common.BTN_CAT_LOOKUPS]}), \
+             patch.object(ac, "load_user_names", return_value={}), \
              patch.object(ac, "save_category_access") as mock_save:
             _run(ac.recv_ma_category(update, ctx))
         mock_save.assert_called_once_with({"2": []})
+
+    def test_done_confirmation_shows_cached_name(self):
+        update = _make_update_with_callback("ma_cat:done", user_id=1)
+        ctx = MagicMock()
+        ctx.user_data = {"ma_session": ac.MASession(target_user_id=2, selected={common.BTN_CAT_LOOKUPS})}
+        with patch.object(ac, "is_admin", return_value=True), \
+             patch.object(ac, "load_category_access", return_value={}), \
+             patch.object(ac, "load_user_names", return_value={"2": "Jane Doe"}), \
+             patch.object(ac, "save_category_access"):
+            _run(ac.recv_ma_category(update, ctx))
+        sent_text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("Jane Doe", sent_text)
 
 
 if __name__ == "__main__":

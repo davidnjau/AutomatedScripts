@@ -121,6 +121,116 @@ class TestCategoryAccessPersistence(unittest.TestCase):
         self.assertEqual(common.load_category_access(), {"111": [common.BTN_CAT_LOOKUPS]})
 
 
+class TestUserNamesPersistence(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.data_file = os.path.join(self.tmpdir.name, "saved_user_names.json")
+        self._patch = patch.object(common, "SAVED_USER_NAMES_FILE", self.data_file)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self.tmpdir.cleanup()
+
+    def test_load_missing_file_returns_empty_dict(self):
+        self.assertEqual(common.load_user_names(), {})
+
+    def test_save_then_load_roundtrip(self):
+        common.save_user_names({"111": "Jane Doe"})
+        self.assertEqual(common.load_user_names(), {"111": "Jane Doe"})
+
+
+class TestRecordUserName(unittest.TestCase):
+    """_record_user_name — first+last name, falling back to @username,
+    caching only on change so the common case (name already up to date)
+    is a cheap dict lookup with no disk write."""
+
+    def _make_user(self, first="", last="", username=""):
+        user = MagicMock()
+        user.id = 111
+        user.first_name = first
+        user.last_name = last
+        user.username = username
+        update = MagicMock()
+        update.effective_user = user
+        return update
+
+    def test_no_effective_user_is_a_noop(self):
+        update = MagicMock()
+        update.effective_user = None
+        with patch.object(common, "load_user_names") as mock_load:
+            common._record_user_name(update)
+        mock_load.assert_not_called()
+
+    def test_first_and_last_name_combined(self):
+        update = self._make_user(first="Jane", last="Doe")
+        with patch.object(common, "load_user_names", return_value={}), \
+             patch.object(common, "save_user_names") as mock_save:
+            common._record_user_name(update)
+        mock_save.assert_called_once_with({"111": "Jane Doe"})
+
+    def test_falls_back_to_username_when_no_name_set(self):
+        update = self._make_user(username="janedoe")
+        with patch.object(common, "load_user_names", return_value={}), \
+             patch.object(common, "save_user_names") as mock_save:
+            common._record_user_name(update)
+        mock_save.assert_called_once_with({"111": "@janedoe"})
+
+    def test_no_name_and_no_username_is_a_noop(self):
+        update = self._make_user()
+        with patch.object(common, "load_user_names") as mock_load, \
+             patch.object(common, "save_user_names") as mock_save:
+            common._record_user_name(update)
+        mock_load.assert_not_called()
+        mock_save.assert_not_called()
+
+    def test_unchanged_name_does_not_write(self):
+        update = self._make_user(first="Jane", last="Doe")
+        with patch.object(common, "load_user_names", return_value={"111": "Jane Doe"}), \
+             patch.object(common, "save_user_names") as mock_save:
+            common._record_user_name(update)
+        mock_save.assert_not_called()
+
+    def test_changed_name_overwrites(self):
+        update = self._make_user(first="Jane", last="Smith")
+        with patch.object(common, "load_user_names", return_value={"111": "Jane Doe"}), \
+             patch.object(common, "save_user_names") as mock_save:
+            common._record_user_name(update)
+        mock_save.assert_called_once_with({"111": "Jane Smith"})
+
+
+class TestAllowedRecordsName(unittest.TestCase):
+    """allowed() calls _record_user_name for every user it actually lets
+    through — but not for a user it's about to deny."""
+
+    def test_open_bot_records_name(self):
+        update = MagicMock()
+        update.effective_user.id = 111
+        with patch.object(common, "ALLOWED_IDS", set()), \
+             patch.object(common, "_record_user_name") as mock_record:
+            result = common.allowed(update)
+        self.assertTrue(result)
+        mock_record.assert_called_once_with(update)
+
+    def test_allowed_user_records_name(self):
+        update = MagicMock()
+        update.effective_user.id = 111
+        with patch.object(common, "ALLOWED_IDS", {111}), \
+             patch.object(common, "_record_user_name") as mock_record:
+            result = common.allowed(update)
+        self.assertTrue(result)
+        mock_record.assert_called_once_with(update)
+
+    def test_disallowed_user_does_not_record_name(self):
+        update = MagicMock()
+        update.effective_user.id = 999
+        with patch.object(common, "ALLOWED_IDS", {111}), \
+             patch.object(common, "_record_user_name") as mock_record:
+            result = common.allowed(update)
+        self.assertFalse(result)
+        mock_record.assert_not_called()
+
+
 class TestIsAdmin(unittest.TestCase):
     def test_id_in_admin_ids_is_admin(self):
         with patch.object(common, "ADMIN_IDS", {111}):
