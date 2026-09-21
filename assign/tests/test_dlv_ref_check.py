@@ -169,6 +169,41 @@ class TestRecvDcRef(unittest.TestCase):
         self.assertIn("DLV Batch Queue: ✅ Yes", sent_text)
         self.assertIn("Jane Doe", sent_text)
 
+    def test_too_many_refs_ends_conversation_without_list_handling(self):
+        raw = "\n".join(f"R{i}" for i in range(dc._LIST_INPUT_MAX_ITEMS + 1))
+        update = _make_update_with_message(raw)
+        ctx = MagicMock()
+        with patch.object(dc, "allowed", return_value=True), \
+             patch.object(dc, "_dc_handle_ref_list", new_callable=AsyncMock) as mock_list:
+            result = _run(dc.recv_dc_ref(update, ctx))
+        mock_list.assert_not_called()
+        self.assertEqual(result, dc.ConversationHandler.END)
+
+    def test_multiple_refs_routes_to_list_mode(self):
+        update = _make_update_with_message("R1\nR2")
+        ctx = MagicMock()
+        with patch.object(dc, "allowed", return_value=True), \
+             patch.object(dc, "_dc_handle_ref_list", new_callable=AsyncMock) as mock_list:
+            mock_list.return_value = dc.ConversationHandler.END
+            result = _run(dc.recv_dc_ref(update, ctx))
+        mock_list.assert_called_once_with(update, ["R1", "R2"])
+        self.assertEqual(result, dc.ConversationHandler.END)
+
+
+class TestDcHandleRefList(unittest.TestCase):
+    def test_no_record_and_has_record_both_reported(self):
+        update = _make_update_with_message()
+        store = {"R1": {"status": "queued", "queued_at": "2026-01-01T10:00:00"}}
+        with patch.object(dc, "_load_consolidated", return_value=store):
+            result = _run(dc._dc_handle_ref_list(update, ["R1", "R2"]))
+        self.assertEqual(result, dc.ConversationHandler.END)
+        sent_texts = [c.args[0] for c in update.message.reply_text.call_args_list]
+        combined = "\n\n".join(sent_texts)
+        self.assertIn("R1", combined)
+        self.assertIn("DLV Batch Queue: ✅ Yes", combined)
+        self.assertIn("R2", combined)
+        self.assertIn("no record at all", combined)
+
 
 if __name__ == "__main__":
     unittest.main()

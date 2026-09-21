@@ -136,7 +136,31 @@ class TestRecvPwParcel(unittest.TestCase):
              patch.object(pw, "get_valid_tokens", return_value=TOKENS):
             result = _run(pw.recv_pw_parcel(update, ctx))
         self.assertEqual(result, pw.PW.INTERVAL)
-        self.assertEqual(pw._get_pw_sess(ctx).parcel, "NBI/BLOCK1/123")
+        sess = pw._get_pw_sess(ctx)
+        self.assertEqual(sess.parcel, "NBI/BLOCK1/123")
+        self.assertEqual(sess.parcels, [])
+
+    def test_too_many_parcels_ends_conversation_without_token_check(self):
+        raw = "\n".join(f"P{i}" for i in range(pw._LIST_INPUT_MAX_ITEMS + 1))
+        update = _make_update_with_message(raw)
+        ctx = MagicMock()
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "get_valid_tokens") as mock_tokens:
+            result = _run(pw.recv_pw_parcel(update, ctx))
+        self.assertEqual(result, pw.ConversationHandler.END)
+        mock_tokens.assert_not_called()
+
+    def test_multiple_parcels_stashed_as_list(self):
+        update = _make_update_with_message("P1\nP2")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "get_valid_tokens", return_value=TOKENS):
+            result = _run(pw.recv_pw_parcel(update, ctx))
+        self.assertEqual(result, pw.PW.INTERVAL)
+        sess = pw._get_pw_sess(ctx)
+        self.assertEqual(sess.parcel, "")
+        self.assertEqual(sess.parcels, ["P1", "P2"])
 
 
 class TestRecvPwInterval(unittest.TestCase):
@@ -184,6 +208,24 @@ class TestRecvPwDelivery(unittest.TestCase):
         self.assertEqual(result, pw.PW.EMAIL_INPUT)
         ctx.job_queue.run_repeating.assert_not_called()
 
+    def test_list_mode_creates_one_watch_per_parcel(self):
+        update = _make_update_with_callback("pw_delivery:telegram")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = pw._get_pw_sess(ctx)
+        sess.parcels = ["P1", "P2"]
+        sess.interval_minutes = 30
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "add_parcel_watch", side_effect=["watch-1", "watch-2"]) as mock_add:
+            result = _run(pw.recv_pw_delivery(update, ctx))
+        self.assertEqual(result, pw.ConversationHandler.END)
+        self.assertEqual(mock_add.call_count, 2)
+        mock_add.assert_any_call(555, "P1", 30, "")
+        mock_add.assert_any_call(555, "P2", 30, "")
+        self.assertEqual(ctx.job_queue.run_repeating.call_count, 2)
+        sent_text = update.callback_query.edit_message_text.call_args_list[-1].args[0]
+        self.assertIn("2 watches queued", sent_text)
+
 
 class TestRecvPwEmail(unittest.TestCase):
     def test_invalid_email_reprompts(self):
@@ -206,6 +248,14 @@ class TestRecvPwEmail(unittest.TestCase):
         self.assertEqual(result, pw.ConversationHandler.END)
         mock_add.assert_called_once_with(555, "NBI/BLOCK1/123", 15, "someone@example.com")
         ctx.job_queue.run_repeating.assert_called_once()
+
+
+class TestPwQueuedText(unittest.TestCase):
+    def test_singular_for_one_watch(self):
+        self.assertEqual(pw._pw_queued_text(["watch-1"]), "✅ Watch queued.")
+
+    def test_plural_for_multiple_watches(self):
+        self.assertIn("2 watches queued", pw._pw_queued_text(["watch-1", "watch-2"]))
 
 
 class TestPwFetchEnriched(unittest.TestCase):

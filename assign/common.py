@@ -347,6 +347,23 @@ def _within_days(date_created: str, cutoff: str) -> bool:
     return date_created[:10] >= cutoff
 
 
+# Cap for multi-item paste inputs (Lookup Reference, Parcel Lookup, Parcel
+# Watch, DLV Ref Check) — each item can mean one or more sequential API
+# calls, so this keeps a single pasted list from turning into an
+# unbounded chain of requests in one conversation turn.
+_LIST_INPUT_MAX_ITEMS = 25
+
+
+def _parse_list_input(raw: str) -> List[str]:
+    """Split a free-text entry into a list of trimmed, non-empty items —
+    one per line, comma-separated on a single line, or a mix of both. A
+    single plain entry with no separators still returns a one-item list,
+    so every caller can treat "one value" and "a pasted list" the same
+    way. Does not dedupe — a caller compiling one result per item decides
+    whether repeats matter (e.g. the same ref pasted twice)."""
+    return [r.strip() for r in re.split(r"[\n,]+", raw) if r.strip()]
+
+
 # ──────────────────────────────────────────────────────────
 # Credential profiles (used by any feature with its own login step)
 # ──────────────────────────────────────────────────────────
