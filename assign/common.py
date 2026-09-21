@@ -97,6 +97,7 @@ SAVED_SECTIONAL_CONFIG_FILE = os.path.join(DATA_DIR, "saved_sectional_config.jso
 SAVED_APARTMENTS_CONFIG_FILE = os.path.join(DATA_DIR, "saved_apartments_config.json")
 SAVED_CUSTOM_EXCLUSIONS_FILE = os.path.join(DATA_DIR, "saved_custom_exclusions.json")
 SAVED_CATEGORY_ACCESS_FILE  = os.path.join(DATA_DIR, "saved_category_access.json")
+SAVED_USER_NAMES_FILE       = os.path.join(DATA_DIR, "saved_user_names.json")
 
 # base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
 CPARAMS_DLV          = base64.b64encode(b'{"active_role":"DLV"}').decode()
@@ -737,10 +738,52 @@ def _main_menu_for(user_id: int) -> ReplyKeyboardMarkup:
 # ──────────────────────────────────────────────────────────
 # Auth guard
 # ──────────────────────────────────────────────────────────
+
+def load_user_names() -> Dict[str, str]:
+    """{str(user_id): display_name} — every user's cached Telegram display
+    name (see _record_user_name), used by access_control.py's Manage
+    Access picker to show a human name instead of a bare numeric ID."""
+    try:
+        with open(SAVED_USER_NAMES_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_user_names(names: Dict[str, str]) -> None:
+    _atomic_json_write(SAVED_USER_NAMES_FILE, names, indent=2)
+
+
+def _record_user_name(update: Update) -> None:
+    """Cache this user's display name (first + last name, falling back to
+    @username if no name is set on their Telegram account) the first time
+    we see them, or whenever it's changed since — called from allowed()
+    so every allowed user gets captured automatically with no per-feature
+    wiring needed. A cheap no-op (one dict lookup, no disk write) once the
+    cached value already matches, so this doesn't add real I/O cost to
+    the common case."""
+    user = update.effective_user
+    if not user:
+        return
+    display = " ".join(filter(None, [user.first_name, user.last_name])) or \
+        (f"@{user.username}" if user.username else "")
+    if not display:
+        return
+    names = load_user_names()
+    if names.get(str(user.id)) == display:
+        return
+    names[str(user.id)] = display
+    save_user_names(names)
+
+
 def allowed(update: Update) -> bool:
     if not ALLOWED_IDS:
+        _record_user_name(update)
         return True
-    return update.effective_user.id in ALLOWED_IDS
+    is_allowed = update.effective_user.id in ALLOWED_IDS
+    if is_allowed:
+        _record_user_name(update)
+    return is_allowed
 
 
 async def deny(update: Update):

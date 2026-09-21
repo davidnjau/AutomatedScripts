@@ -26,9 +26,13 @@ to use Refresh Auth) never sees it there. cmd_manage_access still
 re-checks admin status itself regardless, since /manageaccess and the
 exact button text both work independently of which menu got them there.
 
-Note: users are only ever shown by their raw Telegram numeric ID — this
-module does not track display names, so cross-referencing which ID
-belongs to which person is left to whoever configured ALLOWED_TELEGRAM_IDS.
+Users are shown by their cached Telegram display name (common.py's
+load_user_names/_record_user_name — first + last name, or @username,
+captured automatically the moment any allowed user's message passes
+through common.allowed()) alongside their numeric ID, e.g. "Jane Doe
+(5794776293)". A user who's in ALLOWED_TELEGRAM_IDS but has never
+actually messaged the bot yet has no cached name — falls back to
+showing just the raw ID until they do.
 
 Call register(app) from bot.py's main() to wire this feature in.
 """
@@ -36,7 +40,7 @@ Call register(app) from bot.py's main() to wire this feature in.
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Set
+from typing import Dict, List, Set
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -62,6 +66,8 @@ from common import (
     fallback,
     is_admin,
     load_category_access,
+    load_user_names,
+    md_escape,
     save_category_access,
 )
 
@@ -97,11 +103,20 @@ def _ma_candidate_users() -> List[int]:
     return sorted(uid for uid in ALLOWED_IDS if uid not in ADMIN_IDS)
 
 
+def _ma_display_label(uid: int, names: Dict[str, str]) -> str:
+    """"Jane Doe (5794776293)" if a cached display name exists for uid,
+    else just "5794776293" — the fallback for a user who's in
+    ALLOWED_TELEGRAM_IDS but hasn't messaged the bot yet."""
+    name = names.get(str(uid))
+    return f"{name} ({uid})" if name else str(uid)
+
+
 def _ma_user_keyboard() -> InlineKeyboardMarkup:
-    """One button per candidate user (shown by raw Telegram id — no
-    display-name tracking), plus Cancel."""
+    """One button per candidate user (their cached display name + ID, or
+    just the ID if no name is cached yet), plus Cancel."""
+    names = load_user_names()
     rows = [
-        [InlineKeyboardButton(str(uid), callback_data=f"ma_user:{uid}")]
+        [InlineKeyboardButton(_ma_display_label(uid, names), callback_data=f"ma_user:{uid}")]
         for uid in _ma_candidate_users()
     ]
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="ma_user:cancel")])
@@ -145,7 +160,8 @@ async def cmd_manage_access(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔐 *Manage Access*\n\n"
         "Grant or revoke which menu categories a user can see and open.\n\n"
-        "Select a user (shown by their Telegram ID):",
+        "Select a user (shown by name if they've messaged the bot before, "
+        "otherwise their Telegram ID):",
         parse_mode="Markdown",
         reply_markup=_ma_user_keyboard(),
     )
@@ -171,8 +187,9 @@ async def recv_ma_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess.target_user_id = target_id
     sess.selected = set(load_category_access().get(str(target_id), []))
 
+    label = _ma_display_label(target_id, load_user_names())
     await query.edit_message_text(
-        f"✅ Managing user `{target_id}`.\n\nToggle their categories, then tap ✅ Done:",
+        f"✅ Managing *{md_escape(label)}*.\n\nToggle their categories, then tap ✅ Done:",
         parse_mode="Markdown",
         reply_markup=_ma_category_keyboard(sess.selected),
     )
@@ -193,8 +210,9 @@ async def recv_ma_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         access[str(sess.target_user_id)] = sorted(sess.selected)
         save_category_access(access)
         summary = ", ".join(sorted(sess.selected)) if sess.selected else "_none_"
+        label = _ma_display_label(sess.target_user_id, load_user_names())
         await query.edit_message_text(
-            f"✅ Saved — user `{sess.target_user_id}` can now access: {summary}",
+            f"✅ Saved — *{md_escape(label)}* can now access: {summary}",
             parse_mode="Markdown",
         )
         await query.message.reply_text("Main menu.", reply_markup=_main_menu_for(query.from_user.id))
