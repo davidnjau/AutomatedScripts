@@ -90,7 +90,7 @@ from common import (
     _atomic_json_write,
     _CANCEL_FILTER,
     _ensure_data_dir,
-    _main_menu,
+    _main_menu_for,
     _parse_list_input,
     allowed,
     category_allowed,
@@ -362,7 +362,7 @@ async def recv_pb_done_posting(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Posting finished — {sess.posted_count} item(s) added.",
         reply_markup=ReplyKeyboardRemove(),
     )
-    await update.message.reply_text("Main menu.", reply_markup=_main_menu())
+    await update.message.reply_text("Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -377,13 +377,13 @@ async def cmd_pb_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     items = load_post_board()
     if not items:
-        await update.message.reply_text("✅ No pending items.", reply_markup=_main_menu())
+        await update.message.reply_text("✅ No pending items.", reply_markup=_main_menu_for(update.effective_user.id))
         return
 
     chat_id = update.effective_chat.id
     for item in items:
         await _pb_deliver_item(item, chat_id, ctx)
-    await update.message.reply_text(f"— {len(items)} item(s) total —", reply_markup=_main_menu())
+    await update.message.reply_text(f"— {len(items)} item(s) total —", reply_markup=_main_menu_for(update.effective_user.id))
 
 
 # ──────────────────────────────────────────────────────────

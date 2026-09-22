@@ -83,7 +83,7 @@ from common import (
     _CANCEL_FILTER,
     _ft_headers,
     _LIST_INPUT_MAX_ITEMS,
-    _main_menu,
+    _main_menu_for,
     _NODE_LABELS,
     _parse_list_input,
     allowed,
@@ -665,7 +665,7 @@ async def _lu_handle_ref_list(update: Update, refs: List[str]) -> int:
     async def _send(text, reply_markup):
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
 
-    await _send_chunked_report(_send, lines, join="\n\n", reply_markup=_main_menu())
+    await _send_chunked_report(_send, lines, join="\n\n", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -687,7 +687,7 @@ async def recv_lu_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ Too many references ({len(refs)}) — max {_LIST_INPUT_MAX_ITEMS} per list.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
     if len(refs) > 1:
@@ -703,7 +703,7 @@ async def recv_lu_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"❌ No valid cached tokens for *{CRED_LABELS.get(_LU_CRED_DEFAULT, _LU_CRED_DEFAULT)}*. "
                 "Use *🔑 Refresh Auth* first.",
                 parse_mode="Markdown",
-                reply_markup=_main_menu(),
+                reply_markup=_main_menu_for(update.effective_user.id),
             )
             return ConversationHandler.END
     elif not get_valid_tokens(_LU_CRED_COUNTY) and not get_valid_tokens(_LU_CRED_DEFAULT):
@@ -711,7 +711,7 @@ async def recv_lu_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"❌ No valid cached tokens for *{CRED_LABELS.get(_LU_CRED_COUNTY, _LU_CRED_COUNTY)}* "
             f"or *{CRED_LABELS.get(_LU_CRED_DEFAULT, _LU_CRED_DEFAULT)}*. Use *🔑 Refresh Auth* first.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
 
@@ -725,10 +725,10 @@ async def recv_lu_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "(TO_VALUATION, Ongoing) or the DLV/valuation stage (Ongoing, "
                 "Completed, Returned).\n\nCheck the reference number and try again.",
                 parse_mode="Markdown",
-                reply_markup=_main_menu(),
+                reply_markup=_main_menu_for(update.effective_user.id),
             )
             return ConversationHandler.END
-        await update.message.reply_text(result, parse_mode="Markdown", reply_markup=_main_menu())
+        await update.message.reply_text(result, parse_mode="Markdown", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     item = await asyncio.to_thread(_lu_search_ref, tokens, ref)
@@ -737,14 +737,14 @@ async def recv_lu_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"❌ Reference `{_lu_md_escape(ref)}` not found across all filters (Ongoing, Pending, Completed).\n\n"
             "Check the reference number and try again.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
 
     detail = await asyncio.to_thread(_lu_fetch_detail, tokens, item["id"])
     result = _lu_format_result(ref, item, detail)
 
-    await update.message.reply_text(result, parse_mode="Markdown", reply_markup=_main_menu())
+    await update.message.reply_text(result, parse_mode="Markdown", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 

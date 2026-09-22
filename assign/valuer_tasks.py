@@ -45,7 +45,7 @@ from common import (
     _be_cred_keyboard,
     _CANCEL_FILTER,
     _date_cutoff_str,
-    _main_menu,
+    _main_menu_for,
     _NODE_LABELS,
     _within_days,
     allowed,
@@ -407,7 +407,7 @@ async def cmd_valuer_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ No valid cached tokens. Use *🔑 Refresh Auth* first.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
 
@@ -438,7 +438,7 @@ async def recv_vt_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "❌ No valid cached tokens. Use *🔑 Refresh Auth* first.",
             parse_mode="Markdown",
         )
-        await query.message.reply_text("Main menu.", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu.", reply_markup=_main_menu_for(query.from_user.id))
         return ConversationHandler.END
 
     if data == "new":
@@ -453,7 +453,7 @@ async def recv_vt_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     idx   = int(data)
     if idx >= len(saved):
         await query.edit_message_text("⚠️ That saved valuer no longer exists. Please start over.")
-        await query.message.reply_text("Main menu.", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu.", reply_markup=_main_menu_for(query.from_user.id))
         return ConversationHandler.END
 
     sv               = saved[idx]
@@ -509,7 +509,7 @@ async def recv_vt_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not tokens:
         await update.message.reply_text(
             "❌ Tokens expired. Use *🔑 Refresh Auth* first.",
-            parse_mode="Markdown", reply_markup=_main_menu(),
+            parse_mode="Markdown", reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
 
@@ -526,7 +526,7 @@ async def recv_vt_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         results = resp.json().get("results", [])
     except Exception as e:
         await update.message.reply_text(
-            f"❌ Search failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu(),
+            f"❌ Search failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
 
@@ -561,7 +561,7 @@ async def recv_vt_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     results = ctx.user_data.get("vt_search_results", [])
     if idx >= len(results):
         await query.edit_message_text("❌ Invalid selection.")
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.from_user.id))
         return ConversationHandler.END
 
     v   = results[idx]
@@ -626,7 +626,7 @@ async def _vt_start_run(
             await edit_msg.edit_text(text, parse_mode="Markdown")
         else:
             await reply_msg.reply_text(text, parse_mode="Markdown")
-        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu_for(chat_id))
         return ConversationHandler.END
 
     confirm_text = (
@@ -637,7 +637,7 @@ async def _vt_start_run(
         await edit_msg.edit_text(confirm_text, parse_mode="Markdown")
     else:
         await reply_msg.reply_text(confirm_text, parse_mode="Markdown")
-    await ctx.bot.send_message(chat_id, "Returning to menu.", reply_markup=_main_menu())
+    await ctx.bot.send_message(chat_id, "Returning to menu.", reply_markup=_main_menu_for(chat_id))
 
     loop = asyncio.get_event_loop()
     asyncio.ensure_future(

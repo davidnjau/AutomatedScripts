@@ -50,7 +50,7 @@ from common import (
     CRED_MAP,
     _be_cred_keyboard,
     _CANCEL_FILTER,
-    _main_menu,
+    _main_menu_for,
     allowed,
     cmd_cancel,
     deny,
@@ -653,7 +653,7 @@ def _jd_run(tokens: AuthTokens, chat_id: int, bot, loop, counties: Optional[List
                 document=io.BytesIO(xlsx_bytes),
                 filename=filename,
                 caption=(
-                    f"🏆 Job Distribution Report\n"
+                    "🏆 Job Distribution Report\n"
                     + (f"Counties: {', '.join(counties)}\n" if counties else "")
                     + f"Teams: {len(teams)} | Members: {total_members} | "
                     f"Assigned: {assigned_count} | Pending: {unassigned_count}"
@@ -682,7 +682,7 @@ async def cmd_job_distribution(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ No valid cached tokens. Use *🔑 Refresh Auth* first.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
 
@@ -724,7 +724,7 @@ async def recv_jd_county(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "cancel":
         await query.answer()
         await query.edit_message_text("❌ Analysis cancelled.")
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     if data == "done":
@@ -739,7 +739,7 @@ async def recv_jd_county(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"❌ Tokens for *{cred_label}* have expired. Use *🔑 Refresh Auth* first.",
                 parse_mode="Markdown",
             )
-            await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+            await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
             return ConversationHandler.END
 
         county_labels = ", ".join(
@@ -749,7 +749,7 @@ async def recv_jd_county(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"⏳ Analysis running for: *{county_labels}*\n\nYou will be notified when done.",
             parse_mode="Markdown",
         )
-        await ctx.bot.send_message(query.message.chat_id, "Returning to menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Returning to menu.", reply_markup=_main_menu_for(update.effective_user.id))
 
         loop = asyncio.get_event_loop()
         asyncio.ensure_future(
@@ -779,7 +779,7 @@ async def recv_jd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("❌ Cancelled.")
-    await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+    await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 

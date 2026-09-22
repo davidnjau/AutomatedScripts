@@ -75,7 +75,7 @@ from common import (
     CRED_MAP,
     _CANCEL_FILTER,
     _cred_keyboard,
-    _main_menu,
+    _main_menu_for,
     _safe_err,
     allowed,
     cmd_cancel,
@@ -284,7 +284,7 @@ async def cmd_assignments(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not assignments:
         await update.message.reply_text(
             "📭 No assignments recorded yet.",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return
 
@@ -309,7 +309,7 @@ async def cmd_assignments(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async def _send(text, reply_markup):
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
 
-    await _send_chunked_report(_send, lines, reply_markup=_main_menu())
+    await _send_chunked_report(_send, lines, reply_markup=_main_menu_for(update.effective_user.id))
 
 
 # ──────────────────────────────────────────────────────────
@@ -463,7 +463,7 @@ async def recv_confirm_refs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if choice == "cancel":
         await query.edit_message_text("❌ Assignment cancelled.")
-        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     if choice == "edit":
@@ -572,7 +572,7 @@ async def recv_reassign_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if choice == "cancel":
         await query.edit_message_text("❌ Assignment cancelled.")
-        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     if choice == "skip":
@@ -581,7 +581,7 @@ async def recv_reassign_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 "ℹ️ All references are already assigned. Nothing to do."
             )
-            await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu())
+            await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu_for(update.effective_user.id))
             return ConversationHandler.END
         sess.refs = new_refs
         await query.edit_message_text(
@@ -621,7 +621,7 @@ async def recv_valuer_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if idx >= len(saved):
             await query.edit_message_text(
                 "⚠️ That saved valuer no longer exists. Please start over.",
-                reply_markup=_main_menu(),
+                reply_markup=_main_menu_for(update.effective_user.id),
             )
             return ConversationHandler.END
         sv = saved[idx]
@@ -694,14 +694,14 @@ async def recv_cred_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             results = await _do_valuer_search(query.message, sess)
             if results is None:
                 await query.message.reply_text(
-                    "Use the menu to start again.", reply_markup=_main_menu()
+                    "Use the menu to start again.", reply_markup=_main_menu_for(update.effective_user.id)
                 )
                 return ConversationHandler.END
             if not results:
                 await query.message.reply_text(
                     f"⚠️ No valuers found matching *{md_escape(sess.valuer_name)}*.",
                     parse_mode="Markdown",
-                    reply_markup=_main_menu(),
+                    reply_markup=_main_menu_for(update.effective_user.id),
                 )
                 return ConversationHandler.END
             return await _show_valuer_keyboard(query.message, sess, results)
@@ -733,7 +733,7 @@ async def recv_cred_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"❌ Login failed: `{e}`\n\nUse the menu to retry.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
 
@@ -808,14 +808,14 @@ async def recv_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     results = await _do_valuer_search(update.message, sess)
     if results is None:
         await update.message.reply_text(
-            "Use the menu to start again.", reply_markup=_main_menu()
+            "Use the menu to start again.", reply_markup=_main_menu_for(update.effective_user.id)
         )
         return ConversationHandler.END
     if not results:
         await update.message.reply_text(
             f"⚠️ No valuers found matching *{md_escape(sess.valuer_name)}*.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
     return await _show_valuer_keyboard(update.message, sess, results)
@@ -922,7 +922,7 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "confirm:no":
         await query.edit_message_text("❌ Assignment cancelled.")
-        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     sess = get_sess(ctx)
@@ -1004,7 +1004,7 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("🔍 Fetching post-assignment status…", parse_mode="Markdown")
         pages, extras = await asyncio.to_thread(_post_assignment_report, sess.tokens, ok_refs, sess.workflow)
         for i, page in enumerate(pages):
-            markup = _main_menu() if i == len(pages) - 1 else None
+            markup = _main_menu_for(update.effective_user.id) if i == len(pages) - 1 else None
             await query.message.reply_text(page, parse_mode="Markdown", reply_markup=markup)
 
         # Enrich each already-persisted assignment with whatever the

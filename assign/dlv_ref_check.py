@@ -55,7 +55,7 @@ from common import (
     BTN_DLV_REF_CHECK,
     _CANCEL_FILTER,
     _LIST_INPUT_MAX_ITEMS,
-    _main_menu,
+    _main_menu_for,
     _parse_list_input,
     allowed,
     cmd_cancel,
@@ -154,7 +154,7 @@ async def _dc_handle_ref_list(update: Update, refs: List[str]) -> int:
     async def _send(text, reply_markup):
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
 
-    await _send_chunked_report(_send, lines, join="\n\n", reply_markup=_main_menu())
+    await _send_chunked_report(_send, lines, join="\n\n", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -175,7 +175,7 @@ async def recv_dc_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ Too many references ({len(refs)}) — max {_LIST_INPUT_MAX_ITEMS} per list.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
     if len(refs) > 1:
@@ -189,11 +189,11 @@ async def recv_dc_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"❌ No record at all for *{md_escape(ref)}* — never a New Assignment, "
             "never queued via DLV Batch, never placed on hold."
         )
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu())
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     text = f"🕓 *DLV Ref Check* — `{md_escape(ref)}`\n\n" + _dc_format_record(ref, record)
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu())
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 

@@ -81,7 +81,7 @@ from common import (
     _date_cutoff_str,
     _ft_county_keyboard,
     _ft_headers,
-    _main_menu,
+    _main_menu_for,
     allowed,
     cmd_cancel,
     deny,
@@ -928,7 +928,7 @@ def _ta_run(registrar_tokens: AuthTokens, valuation_tokens: AuthTokens, chat_id:
 
     def _to_menu():
         asyncio.run_coroutine_threadsafe(
-            bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu()), loop,
+            bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu_for(chat_id)), loop,
         ).result(timeout=15)
 
     http_sess = build_session()
@@ -1030,7 +1030,7 @@ async def cmd_task_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Task Analytics needs both the Support Reg and Staff Valuer credentials — "
             "use *🔑 Refresh Auth* first.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
     ctx.user_data["ta_session"] = TASession()
@@ -1068,7 +1068,7 @@ async def recv_ta_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "ta_period_cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.from_user.id))
         return ConversationHandler.END
 
     days = int(query.data.split(":")[1])
@@ -1097,7 +1097,7 @@ async def recv_ta_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "ta_confirm:no":
         await query.edit_message_text("❌ Cancelled.")
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.from_user.id))
         return ConversationHandler.END
 
     registrar_tokens = get_valid_tokens(_TA_CRED_REGISTRAR)
@@ -1112,7 +1112,7 @@ async def recv_ta_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"❌ Tokens for *{', '.join(missing)}* expired mid-flow. Use *🔑 Refresh Auth* first.",
             parse_mode="Markdown",
         )
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.from_user.id))
         return ConversationHandler.END
 
     sess = _get_ta_sess(ctx)

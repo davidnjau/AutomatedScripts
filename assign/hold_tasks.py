@@ -56,7 +56,7 @@ from common import (
     _any_valid_tokens,
     _be_cred_keyboard,
     _CANCEL_FILTER,
-    _main_menu,
+    _main_menu_for,
     allowed,
     cmd_cancel,
     deny,
@@ -529,7 +529,7 @@ async def recv_ht_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     if action == "view":
@@ -551,7 +551,7 @@ async def recv_ht_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if source == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     held_refs = {i.get("ref") for i in load_hold_tasks()}
@@ -566,7 +566,7 @@ async def recv_ht_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "❌ No valid cached tokens. Use *🔑 Refresh Auth* first.",
             parse_mode="Markdown",
         )
-        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     await query.edit_message_text("Select the account to search with:", reply_markup=kbd)
@@ -583,7 +583,7 @@ async def recv_ht_live_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tokens = get_valid_tokens(sess.cred_type)
     if not tokens:
         await query.edit_message_text("❌ Tokens expired. Use *🔑 Refresh Auth* first.", parse_mode="Markdown")
-        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     await query.edit_message_text("⏳ Searching the live DLV queue, please wait…")
@@ -596,7 +596,7 @@ async def _ht_show_candidates(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_T
     # Shared by both candidate sources: show the multi-select keyboard, or end if empty.
     if not sess.candidates:
         await edit_fn("ℹ️ No candidate tasks found (or everything found is already held).")
-        await ctx.bot.send_message(chat_id, "Use the menu to continue.", reply_markup=_main_menu())
+        await ctx.bot.send_message(chat_id, "Use the menu to continue.", reply_markup=_main_menu_for(chat_id))
         return ConversationHandler.END
 
     sess.selected = set()
@@ -632,7 +632,7 @@ async def recv_ht_confirm_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "ht_cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     if not sess.selected:
@@ -658,7 +658,7 @@ async def recv_ht_confirm_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     refs = ", ".join(f"`{r}`" for r in sorted(sess.selected))
     await query.edit_message_text(f"✋ Now holding *{len(sess.selected)}* task(s):\n{refs}", parse_mode="Markdown")
-    await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
+    await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
     return ConversationHandler.END
 
 
@@ -667,7 +667,7 @@ async def _ht_show_queue(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) 
     items = load_hold_tasks()
     if not items:
         await edit_fn("✅ No tasks are currently held.")
-        await ctx.bot.send_message(chat_id, "Use the menu to continue.", reply_markup=_main_menu())
+        await ctx.bot.send_message(chat_id, "Use the menu to continue.", reply_markup=_main_menu_for(chat_id))
         return ConversationHandler.END
 
     lines = [f"✋ *Held Tasks* — {len(items)} task(s)\n"]
@@ -715,7 +715,7 @@ async def recv_ht_queue_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if len(msg) > 4000:
             msg = msg[:4000] + "\n…_(truncated)_"
         await query.edit_message_text(msg, parse_mode="Markdown")
-        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     if data == "htq:release":
@@ -780,7 +780,7 @@ async def recv_ht_release_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 
     if data == "ht_relcancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     if not sess.release_selected:
@@ -801,7 +801,7 @@ async def recv_ht_release_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         f"{len(remaining)} task(s) still held.",
         parse_mode="Markdown",
     )
-    await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
+    await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
     return ConversationHandler.END
 
 

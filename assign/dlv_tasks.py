@@ -54,7 +54,7 @@ from common import (
     _any_valid_tokens,
     _CANCEL_FILTER,
     _date_cutoff_str,
-    _main_menu,
+    _main_menu_for,
     _NODE_LABELS,
     _within_days,
     allowed,
@@ -310,7 +310,7 @@ async def _dt_run_delete_select(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT
     items = load_dlv_batch()
     if not items:
         await edit_fn("ℹ️ The DLV queue is empty — nothing to delete.")
-        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu_for(chat_id))
         return ConversationHandler.END
 
     sess = _get_dt_sess(ctx)
@@ -395,7 +395,7 @@ async def _dt_run_open_tasks(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TY
     tokens = _any_valid_tokens()
     if not tokens:
         await edit_fn("❌ No valid cached tokens. Use *🔑 Refresh Auth* first.", parse_mode="Markdown")
-        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu_for(chat_id))
         return ConversationHandler.END
 
     await edit_fn("⏳ Checking DLV Batch queue status, please wait…")
@@ -405,12 +405,12 @@ async def _dt_run_open_tasks(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TY
     except Exception as exc:
         logger.error("DLV Tasks fetch failed: %s", exc, exc_info=True)
         await edit_fn(f"❌ Failed to fetch tasks: `{exc}`", parse_mode="Markdown")
-        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu_for(chat_id))
         return ConversationHandler.END
 
     if not rows:
         await edit_fn("ℹ️ No open DLV tasks — queue is empty or every item has since closed.")
-        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu_for(chat_id))
         return ConversationHandler.END
 
     # Collect unique valuers (preserve insertion order, dedupe by uid)
@@ -568,7 +568,7 @@ async def _dt_run_valuer_select(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT
     valuers = _dt_collect_valuers()
     if not valuers:
         await edit_fn("ℹ️ No queued or historical DLV tasks yet — nothing to report on.")
-        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu_for(chat_id))
         return ConversationHandler.END
 
     sess = _get_dt_sess(ctx)
@@ -844,7 +844,7 @@ async def recv_dt_pick_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "dt_pickvaluer_cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     sess = _get_dt_sess(ctx)
@@ -870,7 +870,7 @@ async def recv_dt_pick_tag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "dt_picktag_cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     sess = _get_dt_sess(ctx)
@@ -902,7 +902,7 @@ async def recv_dt_pick_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "dt_pickview_cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     sess = _get_dt_sess(ctx)
@@ -965,7 +965,7 @@ async def recv_dt_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "dt_period_cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     days = int(query.data.split(":")[1])
@@ -985,7 +985,7 @@ async def recv_dt_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"⏳ Building report for *{md_escape(valuer['name'])}*…", parse_mode="Markdown")
         await _dt_send_valuer_report(query.message.chat_id, valuer["name"], queued, desk, closed, period_label, ctx.bot)
 
-    await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+    await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.message.chat_id))
     return ConversationHandler.END
 
 
@@ -1005,10 +1005,10 @@ async def recv_dt_scope(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         rows = load_dlv_closed()
         if not rows:
             await query.edit_message_text("ℹ️ No closed tasks yet.")
-            await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+            await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.message.chat_id))
             return ConversationHandler.END
         await _dt_send_closed_report(query.message.chat_id, rows, ctx.bot)
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     if scope == "delete":
@@ -1040,7 +1040,7 @@ async def recv_dt_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "dt_cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     sess = _get_dt_sess(ctx)
@@ -1074,7 +1074,7 @@ async def recv_dt_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if mode == "telegram":
         await _dt_send_telegram(query.message.chat_id, sess.tasks, ctx.bot)
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     # email mode — ask for address
@@ -1117,7 +1117,7 @@ async def recv_dt_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as exc:
             await update.message.reply_text(f"⚠️ Email failed: `{exc}`", parse_mode="Markdown")
 
-    await update.message.reply_text("Main menu.", reply_markup=_main_menu())
+    await update.message.reply_text("Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -1149,7 +1149,7 @@ async def recv_dt_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 
     if query.data == "dt_delcancel":
         await query.edit_message_text("❌ Deletion cancelled.")
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.message.chat_id))
         return ConversationHandler.END
 
     sess = _get_dt_sess(ctx)
@@ -1175,7 +1175,7 @@ async def recv_dt_delete_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         f"{len(remaining)} task(s) remain queued.",
         parse_mode="Markdown",
     )
-    await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+    await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.message.chat_id))
     return ConversationHandler.END
 
 

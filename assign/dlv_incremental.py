@@ -103,7 +103,7 @@ from common import (
     DATA_DIR,
     _atomic_json_write,
     _CANCEL_FILTER,
-    _main_menu,
+    _main_menu_for,
     allowed,
     cmd_cancel,
     deny,
@@ -659,7 +659,7 @@ async def recv_ic_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     if action == "setcounter":
@@ -694,7 +694,7 @@ async def recv_ic_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _ic_auto_close(grouped, batch_size)
         if not grouped:
             await query.edit_message_text("ℹ️ No incremental-tagged tasks yet.")
-            await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+            await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
             return ConversationHandler.END
         await query.edit_message_text(
             "📦 *Available Batches* — pick one to see its tasks, or Show All for the full report:",
@@ -709,7 +709,7 @@ async def recv_ic_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         async def _send(text, reply_markup):
             await query.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-        await _send_chunked_report(_send, lines, reply_markup=_main_menu())
+        await _send_chunked_report(_send, lines, reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     # action == "closebatch"
@@ -717,7 +717,7 @@ async def recv_ic_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     eligible = set(_ic_eligible_batches(grouped, batch_size)) - set(load_closed_batches())
     if not eligible:
         await query.edit_message_text("ℹ️ No batch is fully cleared and still open.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
     await query.edit_message_text("🔓 Pick a batch to close:", reply_markup=_ic_close_pick_keyboard(sorted(eligible)))
     return IC.CLOSE_PICK
@@ -737,7 +737,7 @@ async def recv_ic_view_batch_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 
     if data == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     batch_size     = get_batch_size()
@@ -760,7 +760,7 @@ async def recv_ic_view_batch_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 
     async def _send(text, reply_markup):
         await query.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-    await _send_chunked_report(_send, lines, reply_markup=_main_menu())
+    await _send_chunked_report(_send, lines, reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -773,13 +773,13 @@ async def recv_ic_close_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     batch_number = int(data)
     close_batch(batch_number)
     await query.edit_message_text(f"✅ Batch {batch_number} closed.")
-    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -830,7 +830,7 @@ async def recv_ic_set_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Counter set to *Batch {batch_number}, Task {task_number}* (batch size: {size}). "
         f"The next 🔢 Incremental tag will be `B{batch_number}-T{task_number}`.",
         parse_mode="Markdown",
-        reply_markup=_main_menu(),
+        reply_markup=_main_menu_for(update.effective_user.id),
     )
     return ConversationHandler.END
 
@@ -844,14 +844,14 @@ async def recv_ic_notify_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     if action == "run_now":
         await query.edit_message_text("⏳ Checking for newly-filled batches / newly-cleared tasks…")
         sent = await _ic_run_notify_cycle(ctx)
         result = "✅ Report sent." if sent else "ℹ️ Nothing new to report."
-        await query.message.reply_text(result, reply_markup=_main_menu())
+        await query.message.reply_text(result, reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     if action == "disable":
@@ -861,7 +861,7 @@ async def recv_ic_notify_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for job in ctx.job_queue.get_jobs_by_name(_IC_NOTIFY_JOB_NAME):
             job.schedule_removal()
         await query.edit_message_text("🚫 Notify on Fill disabled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     # action == "configure"
@@ -881,7 +881,7 @@ async def recv_ic_notify_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 
     if data == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     ctx.user_data["ic_notify_interval"] = int(data)
@@ -907,7 +907,7 @@ async def recv_ic_notify_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ Notify on Fill enabled — checking every {interval_minutes} min, delivery: {delivery}.",
         parse_mode="Markdown",
-        reply_markup=_main_menu(),
+        reply_markup=_main_menu_for(update.effective_user.id),
     )
     return ConversationHandler.END
 

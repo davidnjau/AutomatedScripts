@@ -46,7 +46,7 @@ from common import (
     _ft_county_keyboard,
     _ft_headers,
     _ft_registry_keyboard,
-    _main_menu,
+    _main_menu_for,
     _sectional_keyboard,
     allowed,
     cmd_cancel,
@@ -428,7 +428,7 @@ async def recv_ft_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             raise RuntimeError(data.get("error") or data.get("message"))
     except Exception as e:
         await query.message.reply_text(
-            f"❌ Login failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu()
+            f"❌ Login failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu_for(query.from_user.id)
         )
         return ConversationHandler.END
 
@@ -634,7 +634,7 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
         tasks, stats = _load_fetch_tasks(sess.tokens, sess.days_back)
     except Exception as e:
         await message.reply_text(
-            f"❌ Fetch failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu()
+            f"❌ Fetch failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu_for(message.chat_id)
         )
         return ConversationHandler.END
 
@@ -695,7 +695,7 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
             f"{filter_line}"
             f"(HQ: {hq_raw} seen → {hq_kept} matched | "
             f"County: {c_raw} seen → {c_kept} matched)",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(message.chat_id),
         )
         return ConversationHandler.END
 
@@ -718,7 +718,7 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
     if not tasks:
         await message.reply_text(
             f"ℹ️ All {tasks_before} task(s) are already in the DLV queue.",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(message.chat_id),
         )
         return ConversationHandler.END
 
@@ -732,7 +732,7 @@ async def _ft_do_fetch(message, ctx: ContextTypes.DEFAULT_TYPE, sess: FTSession)
     except Exception as e:
         logger.error("_ft_show_results error: %s", e)
         await message.reply_text(
-            "❌ Failed to display results — please try again.", reply_markup=_main_menu()
+            "❌ Failed to display results — please try again.", reply_markup=_main_menu_for(message.chat_id)
         )
     return ConversationHandler.END
 
@@ -783,7 +783,7 @@ def _ft_format_task_block(i: int, t: dict, markdown: bool = False) -> str:
 async def _ft_show_results(message, tasks: List[Dict]):
     """Send tasks as formatted text, splitting at Telegram's 4096-char limit."""
     if not tasks:
-        await message.reply_text("No tasks to display.", reply_markup=_main_menu())
+        await message.reply_text("No tasks to display.", reply_markup=_main_menu_for(message.chat_id))
         return
 
     lines = [_ft_format_task_block(i, t, markdown=True) for i, t in enumerate(tasks, 1)]
@@ -798,7 +798,7 @@ async def _ft_show_results(message, tasks: List[Dict]):
     await _send_chunked_report(
         _send, lines,
         footer=f"\n\nTotal: {len(tasks)} task(s)",
-        reply_markup=_main_menu(),
+        reply_markup=_main_menu_for(message.chat_id),
     )
 
 

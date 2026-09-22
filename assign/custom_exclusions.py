@@ -32,7 +32,7 @@ from auto_fetch import _AF_EXCLUSION_KEYWORDS
 from common import (
     BTN_CUSTOM_EXCLUSIONS,
     _CANCEL_FILTER,
-    _main_menu,
+    _main_menu_for,
     allowed,
     cmd_cancel,
     deny,
@@ -119,7 +119,7 @@ async def recv_ce_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         custom = load_custom_exclusions()
         if not custom:
             await query.edit_message_text("ℹ️ No custom keywords to remove.")
-            await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+            await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
             return ConversationHandler.END
         await query.edit_message_text(
             "🗑 *Remove which keyword?*",
@@ -164,7 +164,7 @@ async def recv_ce_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     custom.append(text)
     save_custom_exclusions(custom)
     await update.message.reply_text(f"✅ Added *{md_escape(text)}*.", parse_mode="Markdown")
-    await update.message.reply_text("Main menu:", reply_markup=_main_menu())
+    await update.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -176,7 +176,7 @@ async def recv_ce_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if keyword == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     custom = load_custom_exclusions()
@@ -187,7 +187,7 @@ async def recv_ce_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         msg = "⚠️ That keyword was already removed."
     await query.edit_message_text(msg, parse_mode="Markdown")
-    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 

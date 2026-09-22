@@ -46,7 +46,7 @@ from common import (
     _cred_keyboard,
     _ensure_data_dir,
     _ft_amount_keyboard,
-    _main_menu,
+    _main_menu_for,
     allowed,
     cmd_cancel,
     deny,
@@ -551,7 +551,7 @@ async def _rt_resolve_saved_valuer(message, rt: RTSession) -> int:
     except Exception as e:
         await message.reply_text(
             f"❌ Could not fetch profile for *{md_escape(sv['name'])}*: `{e}`",
-            parse_mode="Markdown", reply_markup=_main_menu(),
+            parse_mode="Markdown", reply_markup=_main_menu_for(message.chat_id),
         )
         return ConversationHandler.END
 
@@ -565,7 +565,7 @@ async def _rt_resolve_saved_valuer(message, rt: RTSession) -> int:
         await message.reply_text(
             f"⚠️ Could not uniquely identify *{md_escape(sv['name'])}* from search results.\n"
             "Use 🔍 Search new valuer to select manually.",
-            parse_mode="Markdown", reply_markup=_main_menu(),
+            parse_mode="Markdown", reply_markup=_main_menu_for(message.chat_id),
         )
         return ConversationHandler.END
 
@@ -578,7 +578,7 @@ async def _rt_resolve_saved_valuer(message, rt: RTSession) -> int:
     if not ok:
         await message.reply_text(
             f"❌ *Validation failed for {name}:*\n{err_msg}",
-            parse_mode="Markdown", reply_markup=_main_menu(),
+            parse_mode="Markdown", reply_markup=_main_menu_for(message.chat_id),
         )
         return ConversationHandler.END
 
@@ -637,14 +637,14 @@ async def _rt_do_staff_search(message, rt: RTSession) -> int:
         results = resp.json().get("results", [])
     except Exception as e:
         await message.reply_text(
-            f"❌ Staff search failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu()
+            f"❌ Staff search failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu_for(message.chat_id)
         )
         return ConversationHandler.END
 
     if not results:
         await message.reply_text(
             f"⚠️ No staff found matching *{md_escape(rt.staff_name)}*.",
-            parse_mode="Markdown", reply_markup=_main_menu(),
+            parse_mode="Markdown", reply_markup=_main_menu_for(message.chat_id),
         )
         return ConversationHandler.END
 
@@ -699,12 +699,12 @@ async def _rt_fetch_and_show(message, rt: RTSession) -> int:
     try:
         candidates = _fetch_tasks(rt, rt.task_count)
     except Exception as e:
-        await message.reply_text(f"❌ Task fetch failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu())
+        await message.reply_text(f"❌ Task fetch failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu_for(message.chat_id))
         return ConversationHandler.END
 
     if not candidates:
         await message.reply_text(
-            "ℹ️ No eligible tasks found matching your filters.", reply_markup=_main_menu()
+            "ℹ️ No eligible tasks found matching your filters.", reply_markup=_main_menu_for(message.chat_id)
         )
         return ConversationHandler.END
 
@@ -713,7 +713,7 @@ async def _rt_fetch_and_show(message, rt: RTSession) -> int:
     matched = _verify_and_filter_tasks(rt, candidates)
     if not matched:
         await message.reply_text(
-            "ℹ️ No tasks passed the detail-view verification checks.", reply_markup=_main_menu()
+            "ℹ️ No tasks passed the detail-view verification checks.", reply_markup=_main_menu_for(message.chat_id)
         )
         return ConversationHandler.END
 
@@ -800,7 +800,7 @@ async def recv_rt_pick_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if idx >= len(saved):
         await query.edit_message_text(
             "⚠️ That saved valuer no longer exists. Please start over.",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(query.from_user.id),
         )
         return ConversationHandler.END
     sv = saved[idx]
@@ -874,7 +874,7 @@ async def recv_rt_cred_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             raise RuntimeError(data.get("error") or data.get("message"))
     except Exception as e:
         await query.message.reply_text(
-            f"❌ Login failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu()
+            f"❌ Login failed: `{e}`", parse_mode="Markdown", reply_markup=_main_menu_for(query.from_user.id)
         )
         return ConversationHandler.END
 
@@ -929,7 +929,7 @@ async def recv_rt_select_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if idx >= len(rt.staff_results):
         await query.edit_message_text(
             "⚠️ Selection no longer available. Please search again.",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(query.from_user.id),
         )
         return ConversationHandler.END
     list_entry = rt.staff_results[idx]
@@ -947,7 +947,7 @@ async def recv_rt_select_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"❌ *Validation failed for {name}:*\n{err_msg}",
             parse_mode="Markdown",
         )
-        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu_for(query.from_user.id))
         return ConversationHandler.END
 
     rt.staff_data     = user_data
@@ -1142,7 +1142,7 @@ async def recv_rt_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "rt_confirm:no":
         await query.edit_message_text("❌ Receive tasks cancelled.")
-        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu_for(query.from_user.id))
         return ConversationHandler.END
 
     rt   = _get_rt(ctx)
@@ -1190,10 +1190,10 @@ async def recv_rt_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"⏰ *Schedule saved:* runs every *{rt.schedule_interval_minutes} minute(s)*.\n"
             f"Use */schedules* to view active schedules.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(query.from_user.id),
         )
     else:
-        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to start again.", reply_markup=_main_menu_for(query.from_user.id))
 
     return ConversationHandler.END
 
@@ -1206,7 +1206,7 @@ async def cmd_schedules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     schedules = [s for s in load_schedules() if s.get("active", True)]
     if not schedules:
-        await update.message.reply_text("📭 No active schedules.", reply_markup=_main_menu())
+        await update.message.reply_text("📭 No active schedules.", reply_markup=_main_menu_for(update.effective_user.id))
         return
     lines = []
     for s in schedules:
@@ -1222,7 +1222,7 @@ async def cmd_schedules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⏰ *Active Schedules:*\n\n" + "\n\n".join(lines),
         parse_mode="Markdown",
-        reply_markup=_main_menu(),
+        reply_markup=_main_menu_for(update.effective_user.id),
     )
 
 
@@ -1234,7 +1234,7 @@ async def cmd_task_batches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     batches = load_task_batches()
     if not batches:
-        await update.message.reply_text("📭 No saved task batches yet.", reply_markup=_main_menu())
+        await update.message.reply_text("📭 No saved task batches yet.", reply_markup=_main_menu_for(update.effective_user.id))
         return
     lines = []
     for b in batches[-10:]:   # most recent 10
@@ -1245,7 +1245,7 @@ async def cmd_task_batches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📦 *Recent Task Batches (last 10):*\n\n" + "\n\n".join(lines),
         parse_mode="Markdown",
-        reply_markup=_main_menu(),
+        reply_markup=_main_menu_for(update.effective_user.id),
     )
 
 
