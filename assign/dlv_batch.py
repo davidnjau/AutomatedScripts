@@ -71,7 +71,7 @@ from common import (
     BTN_DLV_QUEUE,
     _any_valid_tokens,
     _CANCEL_FILTER,
-    _main_menu,
+    _main_menu_for,
     allowed,
     cmd_cancel,
     deny,
@@ -575,7 +575,7 @@ async def cmd_dlv_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not items:
         await update.message.reply_text(
             "✅ DLV Queue is empty — no pending assignments.",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return
 
@@ -687,7 +687,7 @@ async def recv_dlv_queue_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"✅ DLV check interval set to *{label}*.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
 
 
@@ -865,7 +865,7 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "db:cancel":
         await query.edit_message_text("❌ DLV Batch cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     sess = _get_db_sess(ctx)
@@ -874,7 +874,7 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sess.tag_refs = [ref for g in sess.groups if g["status"] == "resolved" for ref in g["refs"]]
         if not sess.tag_refs:
             await query.edit_message_text("⚠️ No resolved refs to tag.")
-            await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+            await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
             return ConversationHandler.END
         await query.edit_message_text(
             "🏷 *Tag Tasks* — tap a ref to set its tag, then Done.",
@@ -887,7 +887,7 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not to_save:
         await query.edit_message_text("⚠️ No resolved valuers — nothing to process.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     # Flatten groups to individual ref+valuer items for per-ref retry tracking
@@ -942,7 +942,7 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Batch saved; will retry on the next 5-minute cycle.",
             parse_mode="Markdown",
         )
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     await query.edit_message_text(
@@ -950,7 +950,7 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "⏳ Processing in the background — I'll message you with the report when it's done.",
         parse_mode="Markdown",
     )
-    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
     asyncio.create_task(_run_dlv_batch_bg(ctx, query.message.chat_id, tokens))
     return ConversationHandler.END
 
@@ -965,7 +965,7 @@ async def recv_db_tag_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "cancel":
         await query.edit_message_text("❌ DLV Batch cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     if data == "done":

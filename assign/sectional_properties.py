@@ -32,7 +32,7 @@ from common import (
     CRED_LABELS,
     _any_valid_tokens,
     _CANCEL_FILTER,
-    _main_menu,
+    _main_menu_for,
     _safe_err,
     allowed,
     cmd_cancel,
@@ -109,13 +109,13 @@ async def recv_sc_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_sectional_config(cfg)
         state = "enabled" if cfg["auto_route"] else "disabled"
         await query.edit_message_text(f"✅ Auto-routing {state}.", reply_markup=None)
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     if query.data == "sc:clear":
         save_sectional_config({})
         await query.edit_message_text("🗑 Sectional config cleared.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     # sc:change — ask for new name
@@ -214,7 +214,7 @@ async def recv_sc_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Use /sectional to toggle auto-routing.",
         parse_mode="Markdown",
     )
-    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 

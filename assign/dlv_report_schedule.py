@@ -53,7 +53,7 @@ from common import (
     DATA_DIR,
     _atomic_json_write,
     _CANCEL_FILTER,
-    _main_menu,
+    _main_menu_for,
     allowed,
     cmd_cancel,
     deny,
@@ -337,7 +337,7 @@ async def recv_drs_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     if action == "remove":
@@ -358,7 +358,7 @@ async def recv_drs_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if schedule_id == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     for job in ctx.job_queue.get_jobs_by_name(f"drs_job:{schedule_id}"):
@@ -366,7 +366,7 @@ async def recv_drs_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     removed = remove_dlv_report_schedule(schedule_id)
 
     await query.edit_message_text("🗑 Schedule removed." if removed else "⚠️ That schedule was already removed.")
-    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -379,7 +379,7 @@ async def recv_drs_scope(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if scope == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     sess = _get_drs_sess(ctx)
@@ -392,7 +392,7 @@ async def recv_drs_scope(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     valuers = _dt_collect_valuers()
     if not valuers:
         await query.edit_message_text("ℹ️ No queued, at-desk, or closed DLV tasks yet — nothing to schedule.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
     sess.valuer_choices = valuers
     await query.edit_message_text("👤 Pick a valuer:", reply_markup=_drs_valuer_keyboard(valuers))
@@ -407,7 +407,7 @@ async def recv_drs_pick_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "drs_pickvaluer:cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     sess = _get_drs_sess(ctx)
@@ -435,7 +435,7 @@ async def recv_drs_pick_tag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if tag == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     sess = _get_drs_sess(ctx)
@@ -458,7 +458,7 @@ async def recv_drs_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "drs_period:cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     days = int(query.data.split(":")[1])
@@ -482,7 +482,7 @@ async def recv_drs_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "drs_interval:cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     sess = _get_drs_sess(ctx)
@@ -528,7 +528,7 @@ async def recv_drs_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ *Schedule created*\n\n{_drs_format_schedule_summary({**cfg, 'id': schedule_id})}",
         parse_mode="Markdown",
-        reply_markup=_main_menu(),
+        reply_markup=_main_menu_for(update.effective_user.id),
     )
     return ConversationHandler.END
 

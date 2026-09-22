@@ -70,7 +70,7 @@ from common import (
     CRED_LABELS,
     _CANCEL_FILTER,
     _LIST_INPUT_MAX_ITEMS,
-    _main_menu,
+    _main_menu_for,
     _NODE_LABELS,
     _parse_list_input,
     allowed,
@@ -218,7 +218,7 @@ async def recv_pl_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ Too many parcels ({len(parcels)}) — max {_LIST_INPUT_MAX_ITEMS} per list.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
 
@@ -228,7 +228,7 @@ async def recv_pl_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"❌ No valid cached tokens for *{CRED_LABELS.get(_LU_CRED_DEFAULT, _LU_CRED_DEFAULT)}*. "
             "Use *🔑 Refresh Auth* first.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
 
@@ -258,7 +258,7 @@ async def recv_pl_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"❌ Parcel `{_lu_md_escape(parcel)}` not found across all filters (Ongoing, Pending, Completed).\n\n"
             "It hasn't landed in the Stamp Duty list yet — check the parcel number and try again.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
 
@@ -324,7 +324,7 @@ async def recv_pl_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async def _send(text, reply_markup):
             await ctx.bot.send_message(query.message.chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
 
-        await _send_chunked_report(_send, lines, join="\n\n", reply_markup=_main_menu())
+        await _send_chunked_report(_send, lines, join="\n\n", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     await query.edit_message_text(
@@ -358,10 +358,10 @@ async def recv_pl_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📧 Result sent to *{md_escape(email)}*.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
     except Exception as exc:
-        await update.message.reply_text(f"⚠️ Email failed: `{exc}`", parse_mode="Markdown", reply_markup=_main_menu())
+        await update.message.reply_text(f"⚠️ Email failed: `{exc}`", parse_mode="Markdown", reply_markup=_main_menu_for(update.effective_user.id))
 
     return ConversationHandler.END
 

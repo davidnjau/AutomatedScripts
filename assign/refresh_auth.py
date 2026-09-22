@@ -38,7 +38,7 @@ from common import (
     _CANCEL_FILTER,
     _jwt_exp,
     _load_tokens_raw,
-    _main_menu,
+    _main_menu_for,
     allowed,
     cmd_cancel,
     deny,
@@ -106,7 +106,7 @@ async def recv_auth_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if cred_type == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.from_user.id))
         return ConversationHandler.END
 
     auth_sess           = _get_auth_sess(ctx)
@@ -146,7 +146,7 @@ async def recv_auth_force(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✅ Keeping existing tokens for *{CRED_LABELS[auth_sess.cred_type]}*.",
             parse_mode="Markdown",
         )
-        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu())
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.from_user.id))
         return ConversationHandler.END
 
     return await _auth_trigger_login(query, auth_sess)
@@ -176,7 +176,7 @@ async def _auth_trigger_login(query, auth_sess: AuthSession) -> int:
         await query.message.reply_text(
             f"❌ Login failed: `{e}`\n\nUse the menu to retry.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(query.from_user.id),
         )
         return ConversationHandler.END
 
@@ -227,7 +227,7 @@ async def recv_auth_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"*Profile:* {CRED_LABELS[auth_sess.cred_type]}\n"
         f"*Token expires:* {exp_str}",
         parse_mode="Markdown",
-        reply_markup=_main_menu(),
+        reply_markup=_main_menu_for(update.effective_user.id),
     )
     return ConversationHandler.END
 

@@ -60,7 +60,6 @@ from common import (
     _ensure_data_dir,
     _jwt_exp,
     _load_tokens_raw,
-    _main_menu,
     _main_menu_for,
     _MENU_CATEGORY_FILTER,
     allowed,
@@ -221,7 +220,7 @@ async def cmd_valuers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "📭 No saved valuers yet.\n"
             "They are saved automatically after a successful assignment.",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return
     lines = [
@@ -234,7 +233,7 @@ async def cmd_valuers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Distribution pickers — saved automatically after a successful assignment.\n\n"
         + "\n".join(lines),
         parse_mode="Markdown",
-        reply_markup=_main_menu(),
+        reply_markup=_main_menu_for(update.effective_user.id),
     )
 
 
@@ -244,7 +243,7 @@ async def cmd_delete_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not valuers:
         await update.message.reply_text(
             "📭 No saved valuers to delete.",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return
     rows = [
@@ -466,7 +465,7 @@ async def cmd_token_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Shows whether each credential profile has a valid cached login.\n\n"
         + "\n\n".join(lines)
     )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu())
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu_for(update.effective_user.id))
 
 
 _LOG_LINE_RE = re.compile(
@@ -505,7 +504,7 @@ async def cmd_error_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "spikes or recurring failures.\n\n"
             "✅ No warnings or errors logged yet (`data/bot.log`).",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return
 
@@ -525,7 +524,7 @@ async def cmd_error_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except ImportError:
         await update.message.reply_text(
             "❌ `matplotlib` is not installed — cannot render the chart.",
-            parse_mode="Markdown", reply_markup=_main_menu(),
+            parse_mode="Markdown", reply_markup=_main_menu_for(update.effective_user.id),
         )
         return
 
@@ -564,7 +563,7 @@ async def cmd_error_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Range: `{days[0]}` → `{days[-1]}`"
     )
     await update.message.reply_photo(
-        photo=buf, caption=caption, parse_mode="Markdown", reply_markup=_main_menu()
+        photo=buf, caption=caption, parse_mode="Markdown", reply_markup=_main_menu_for(update.effective_user.id)
     )
 
 

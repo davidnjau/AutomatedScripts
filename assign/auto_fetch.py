@@ -108,7 +108,7 @@ from common import (
     _ft_amount_keyboard,
     _ft_county_keyboard,
     _ft_registry_keyboard,
-    _main_menu,
+    _main_menu_for,
     _af_exclusion_multiselect_keyboard,
     allowed,
     cmd_cancel,
@@ -503,7 +503,7 @@ async def recv_af_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         schedules = load_auto_fetch_schedules()
         if not schedules:
             await query.edit_message_text("ℹ️ No schedules to remove.")
-            await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+            await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
             return ConversationHandler.END
         await query.edit_message_text(
             "🗑 *Remove which schedule?*",
@@ -528,7 +528,7 @@ async def recv_af_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if schedule_id == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     cfg = get_auto_fetch_schedule(schedule_id)
@@ -547,7 +547,7 @@ async def recv_af_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     label = (cfg or {}).get("email") or "Telegram only"
     msg = f"🗑 Removed the schedule for *{md_escape(label)}*." if removed else "⚠️ That schedule was already removed."
     await query.edit_message_text(msg, parse_mode="Markdown")
-    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -557,7 +557,7 @@ async def recv_af_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "af:cancel":
         await query.edit_message_text("❌ Cancelled — no schedule created.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     try:
@@ -867,7 +867,7 @@ async def recv_af_report_format(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     _, cfg = _af_create_schedule(ctx, email, report_format)
     await query.edit_message_text(_af_schedule_created_text(cfg), parse_mode="Markdown")
-    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -1232,7 +1232,7 @@ async def cmd_af_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not results:
         await update.message.reply_text(
             "📭 No Auto Fetch runs recorded yet. The history is saved once the Auto Fetch schedule runs.",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return
 

@@ -38,7 +38,7 @@ from common import (
     _any_valid_tokens,
     _atomic_json_write,
     _CANCEL_FILTER,
-    _main_menu,
+    _main_menu_for,
     allowed,
     cmd_cancel,
     deny,
@@ -204,7 +204,7 @@ async def recv_mb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cfg = load_briefing_config() or {}
         await query.edit_message_text("⏳ Running Morning Briefing now…")
         await _run_morning_briefing(ctx, cfg.get("delivery", "telegram"), cfg.get("email", ""))
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     if action == "disable":
@@ -212,7 +212,7 @@ async def recv_mb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for job in ctx.job_queue.get_jobs_by_name("morning_briefing_job"):
             job.schedule_removal()
         await query.edit_message_text("🛑 Morning Briefing disabled.")
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     # action == "enable"
@@ -244,7 +244,7 @@ async def recv_mb_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Use /briefing again to disable.",
         parse_mode="Markdown",
     )
-    await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+    await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -261,7 +261,7 @@ async def recv_mb_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🌅 *Morning Briefing enabled* — Open Tasks emailed to *{md_escape(email)}*, daily at 7 AM EAT.\n"
         "Use /briefing again to disable.",
         parse_mode="Markdown",
-        reply_markup=_main_menu(),
+        reply_markup=_main_menu_for(update.effective_user.id),
     )
     return ConversationHandler.END
 

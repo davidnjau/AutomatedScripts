@@ -435,12 +435,15 @@ class TestNodeLabels(unittest.TestCase):
 
 
 class TestMainMenu(unittest.TestCase):
-    """_main_menu — the top-level menu shows only the category buttons
-    (plus Cancel); workflow buttons live one level down in each
-    category's own submenu (see TestCategoryMenu/TestMenuCategories)."""
+    """_main_menu_for — the top-level menu shows only the category buttons
+    (plus Cancel), filtered to whichever categories the user is granted;
+    workflow buttons live one level down in each category's own submenu
+    (see TestCategoryMenu/TestMenuCategories). An admin (every category
+    granted) exercises the "everything visible" case."""
 
     def _rows(self):
-        return common._main_menu().keyboard
+        with patch.object(common, "get_user_categories", return_value=list(common._MENU_CATEGORIES)):
+            return common._main_menu_for(111).keyboard
 
     def _all_texts(self):
         return [b.text for row in self._rows() for b in row]
@@ -496,8 +499,8 @@ class TestMenuCategories(unittest.TestCase):
 
 
 class TestCategoryRowKeyboard(unittest.TestCase):
-    """_category_row_keyboard — shared by _main_menu and _main_menu_for;
-    two categories per row, an odd one out gets its own final row before
+    """_category_row_keyboard — the row-builder behind _main_menu_for; two
+    categories per row, an odd one out gets its own final row before
     Cancel, regardless of how many categories are passed in."""
 
     def test_even_count_pairs_cleanly(self):

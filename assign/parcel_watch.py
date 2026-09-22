@@ -73,7 +73,7 @@ from common import (
     _CANCEL_FILTER,
     _ensure_data_dir,
     _LIST_INPUT_MAX_ITEMS,
-    _main_menu,
+    _main_menu_for,
     _parse_list_input,
     allowed,
     cmd_cancel,
@@ -249,7 +249,7 @@ async def recv_pw_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ Too many parcels ({len(parcels)}) — max {_LIST_INPUT_MAX_ITEMS} per list.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
 
@@ -258,7 +258,7 @@ async def recv_pw_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"❌ No valid cached tokens for *{CRED_LABELS.get(_LU_CRED_DEFAULT, _LU_CRED_DEFAULT)}*. "
             "Use *🔑 Refresh Auth* first — the background job needs a cached login to check.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
 
@@ -281,7 +281,7 @@ async def recv_pw_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if choice == "cancel":
         await query.edit_message_text("❌ Cancelled.")
-        await query.message.reply_text("Main menu.", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     sess = _get_pw_sess(ctx)
@@ -308,7 +308,7 @@ async def recv_pw_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     watch_ids = _pw_finalize(query.message.chat_id, ctx, "")
     await query.edit_message_text(_pw_queued_text(watch_ids))
-    await query.message.reply_text("Main menu.", reply_markup=_main_menu())
+    await query.message.reply_text("Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -321,7 +321,7 @@ async def recv_pw_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return PW.EMAIL_INPUT
 
     watch_ids = _pw_finalize(update.effective_chat.id, ctx, email)
-    await update.message.reply_text(_pw_queued_text(watch_ids), reply_markup=_main_menu())
+    await update.message.reply_text(_pw_queued_text(watch_ids), reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -431,7 +431,7 @@ async def cmd_parcel_watches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
     watches = [w for w in load_parcel_watches() if w.get("chat_id") == update.effective_chat.id]
     if not watches:
-        await update.message.reply_text("ℹ️ No active parcel watches.", reply_markup=_main_menu())
+        await update.message.reply_text("ℹ️ No active parcel watches.", reply_markup=_main_menu_for(update.effective_user.id))
         return
 
     lines = [f"⏳ *Parcel Watches* — {len(watches)} active\n"]

@@ -106,7 +106,7 @@ class TestFtShowResults(unittest.TestCase):
     def test_no_tasks_shows_empty_message(self):
         message = MagicMock()
         message.reply_text = AsyncMock()
-        with patch.object(ft, "_main_menu", return_value="menu"):
+        with patch.object(ft, "_main_menu_for", return_value="menu"):
             _run(ft._ft_show_results(message, []))
         message.reply_text.assert_called_once_with("No tasks to display.", reply_markup="menu")
 
@@ -114,7 +114,7 @@ class TestFtShowResults(unittest.TestCase):
         message = MagicMock()
         message.reply_text = AsyncMock()
         tasks = [_task(assessor="John Otieno")]
-        with patch.object(ft, "_main_menu", return_value="menu"):
+        with patch.object(ft, "_main_menu_for", return_value="menu"):
             _run(ft._ft_show_results(message, tasks))
         text = message.reply_text.call_args[0][0]
         self.assertIn("📌 *Ref:* `REG/TSFR/ABC123`", text)

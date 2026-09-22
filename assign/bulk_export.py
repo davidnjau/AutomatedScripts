@@ -60,7 +60,7 @@ from common import (
     _any_valid_tokens,
     _atomic_json_write,
     _CANCEL_FILTER,
-    _main_menu,
+    _main_menu_for,
     allowed,
     cmd_cancel,
     deny,
@@ -866,7 +866,7 @@ async def cmd_export_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Distribution run in this session.\n\n"
             "ℹ️ No export or analysis has been run in this session.",
             parse_mode="Markdown",
-            reply_markup=_main_menu(),
+            reply_markup=_main_menu_for(update.effective_user.id),
         )
         return
 
@@ -964,7 +964,7 @@ async def cmd_export_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "\n".join(all_lines),
         parse_mode="Markdown",
-        reply_markup=_main_menu(),
+        reply_markup=_main_menu_for(update.effective_user.id),
     )
 
 
@@ -1043,7 +1043,7 @@ async def recv_be_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "❌ No valid cached tokens for *🏢 Staff Valuer*. Use *🔑 Refresh Auth* first.",
             parse_mode="Markdown",
         )
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     cred_label   = CRED_LABELS.get(sess.cred_type, sess.cred_type)
@@ -1081,7 +1081,7 @@ async def recv_be_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "be:no":
         await query.edit_message_text("❌ Export cancelled.")
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     sess   = _get_be_sess(ctx)
@@ -1092,7 +1092,7 @@ async def recv_be_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"❌ Tokens for *{cred_label}* have expired. Use *🔑 Refresh Auth* first.",
             parse_mode="Markdown",
         )
-        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu())
+        await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     chat_id = query.message.chat_id
@@ -1134,7 +1134,7 @@ async def recv_be_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                               sess.registries, sess.county, sess.report_type)
         )
 
-    await ctx.bot.send_message(chat_id, "Returning to menu.", reply_markup=_main_menu())
+    await ctx.bot.send_message(chat_id, "Returning to menu.", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 

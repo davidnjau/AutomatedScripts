@@ -38,7 +38,7 @@ from common import (
     CRED_LABELS,
     _any_valid_tokens,
     _CANCEL_FILTER,
-    _main_menu,
+    _main_menu_for,
     _safe_err,
     allowed,
     cmd_cancel,
@@ -118,13 +118,13 @@ async def recv_ap_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_apartments_config(cfg)
         state = "enabled" if cfg["auto_route"] else "disabled"
         await query.edit_message_text(f"✅ Auto-routing {state}.", reply_markup=None)
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     if query.data == "ap:clear":
         save_apartments_config({})
         await query.edit_message_text("🗑 Apartments config cleared.")
-        await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
     # ap:change — ask for new name
@@ -226,7 +226,7 @@ async def recv_ap_cred(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Use /apartments to toggle auto-routing.",
         parse_mode="Markdown",
     )
-    await query.message.reply_text("Main menu:", reply_markup=_main_menu())
+    await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
