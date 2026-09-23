@@ -66,6 +66,7 @@ from common import (
     cmd_cancel,
     deny,
     get_user_categories,
+    install_message_tracking,
     load_saved_valuers,
     logger,
     md_escape,
@@ -75,6 +76,7 @@ from common import (
 import access_control
 import auto_fetch
 import bulk_export
+import clear_chat
 import dlv_batch
 import dlv_incremental
 import dlv_ref_check
@@ -735,6 +737,7 @@ def main():
         .build()
     )
     app.add_error_handler(_on_error)
+    install_message_tracking(app)
 
     # not_cancel / _CANCEL_FILTER (text filter excluding the cancel button,
     # so it reaches fallbacks) live in common.py — imported above
@@ -770,6 +773,7 @@ def main():
     task_analytics.register(app)
     access_control.register(app)
     post_board.register(app)
+    clear_chat.register(app)
 
     # DLV Batch: 5-minute repeating job + DLV Queue handlers registered via
     # dlv_batch.register(app) above.

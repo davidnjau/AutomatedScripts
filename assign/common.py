@@ -31,7 +31,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
-from telegram.ext import ContextTypes, ConversationHandler, filters
+from telegram.ext import Application, ContextTypes, ConversationHandler, ExtBot, filters
 
 from ardhisasa_auth import (
     PUBLIC_CREDENTIALS,
@@ -98,6 +98,7 @@ SAVED_APARTMENTS_CONFIG_FILE = os.path.join(DATA_DIR, "saved_apartments_config.j
 SAVED_CUSTOM_EXCLUSIONS_FILE = os.path.join(DATA_DIR, "saved_custom_exclusions.json")
 SAVED_CATEGORY_ACCESS_FILE  = os.path.join(DATA_DIR, "saved_category_access.json")
 SAVED_USER_NAMES_FILE       = os.path.join(DATA_DIR, "saved_user_names.json")
+SAVED_CHAT_MESSAGES_FILE    = os.path.join(DATA_DIR, "saved_chat_messages.json")
 
 # base64('{"active_role":"DLV"}') — required cparams header for DLV task endpoints
 CPARAMS_DLV          = base64.b64encode(b'{"active_role":"DLV"}').decode()
@@ -583,6 +584,7 @@ BTN_INCREMENTAL   = "🔢 Incremental"
 BTN_DLV_REPORT_SCHEDULE = "📧 DLV Report Schedule"
 BTN_CUSTOM_EXCLUSIONS = "🚫 Exclusions"
 BTN_TASK_ANALYTICS = "📈 Task Analytics"
+BTN_CLEAR_CHAT    = "🧹 Clear Chat"
 
 # Category buttons — the main menu shows only these six (plus Cancel);
 # tapping one opens that category's own submenu of workflow buttons (see
@@ -621,7 +623,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_DLV_TASKS)}|{re.escape(BTN_BRIEFING)}|{re.escape(BTN_SECTIONAL)}"
     f"|{re.escape(BTN_APARTMENTS)}"
     f"|{re.escape(BTN_HOLD_TASKS)}|{re.escape(BTN_INCREMENTAL)}|{re.escape(BTN_DLV_REPORT_SCHEDULE)}"
-    f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}|{re.escape(BTN_TASK_ANALYTICS)}"
+    f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}|{re.escape(BTN_TASK_ANALYTICS)}|{re.escape(BTN_CLEAR_CHAT)}"
     f"|{re.escape(BTN_CAT_ASSIGNMENTS)}|{re.escape(BTN_CAT_AUTOMATION)}|{re.escape(BTN_CAT_ANALYTICS)}"
     f"|{re.escape(BTN_CAT_LOOKUPS)}|{re.escape(BTN_CAT_VALUERS)}|{re.escape(BTN_CAT_SETTINGS)}"
     f"|{re.escape(BTN_CAT_POST_BOARD)}|{re.escape(BTN_PB_POST)}|{re.escape(BTN_PB_VIEW)}"
@@ -683,7 +685,7 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
             "⚙️ *Bot Settings*\n\n"
             "Manage login sessions, the token refresh daemon, and the bot process itself."
         ),
-        "buttons": [BTN_AUTH, BTN_TOKEN_STATUS, BTN_DAEMON, BTN_RESTART, BTN_HELP],
+        "buttons": [BTN_AUTH, BTN_TOKEN_STATUS, BTN_DAEMON, BTN_RESTART, BTN_HELP, BTN_CLEAR_CHAT],
     },
     BTN_CAT_POST_BOARD: {
         "description": (
@@ -791,6 +793,109 @@ def allowed(update: Update) -> bool:
 
 async def deny(update: Update):
     await update.message.reply_text("⛔ You are not authorised to use this bot.")
+
+
+# ──────────────────────────────────────────────────────────
+# Clear Chat message tracking
+# ──────────────────────────────────────────────────────────
+# Telegram bots can only delete messages they sent themselves, and only
+# within 48h — clear_chat.py's 🧹 Clear Chat button and daily auto-clear
+# job need to know which message_ids this bot has sent to which chat.
+# install_message_tracking() wraps ExtBot's three send methods once at
+# startup so every outgoing message across every feature module (all
+# ~20 of them go through these same three underlying calls via
+# reply_text/reply_photo/send_message/etc.) is recorded here
+# automatically, with zero per-call-site wiring — same reasoning as
+# _record_user_name piggybacking on allowed() above.
+_CHAT_MSG_MAX_AGE_HOURS = 48
+_CHAT_MSG_MAX_PER_CHAT  = 1000
+
+
+def load_chat_messages() -> Dict[str, List[Dict]]:
+    """{str(chat_id): [{"message_id": int, "sent_at": iso}, ...]} — every
+    bot-sent message still within Telegram's 48h delete window."""
+    try:
+        with open(SAVED_CHAT_MESSAGES_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_chat_messages(data: Dict[str, List[Dict]]) -> None:
+    _atomic_json_write(SAVED_CHAT_MESSAGES_FILE, data, indent=2)
+
+
+def _prune_chat_messages(items: List[Dict]) -> List[Dict]:
+    """Drop entries older than Telegram's 48h delete window (they can
+    never be deleted anyway) and cap the remainder to the most recent
+    _CHAT_MSG_MAX_PER_CHAT, so the store can't grow unbounded on a busy day."""
+    cutoff = datetime.now() - timedelta(hours=_CHAT_MSG_MAX_AGE_HOURS)
+    kept = []
+    for m in items:
+        try:
+            if datetime.fromisoformat(m["sent_at"]) > cutoff:
+                kept.append(m)
+        except (KeyError, ValueError):
+            continue
+    return kept[-_CHAT_MSG_MAX_PER_CHAT:]
+
+
+def _record_sent_message(chat_id, message_id: int) -> None:
+    """Append one outgoing message to its chat's tracked list, pruning
+    stale/overflow entries on the same write. Called from every wrapped
+    send method installed by install_message_tracking()."""
+    data = load_chat_messages()
+    key = str(chat_id)
+    items = data.get(key, [])
+    items.append({"message_id": message_id, "sent_at": datetime.now().isoformat(timespec="seconds")})
+    data[key] = _prune_chat_messages(items)
+    save_chat_messages(data)
+
+
+class _MessageTrackingExtBot(ExtBot):
+    """ExtBot with send_message/send_photo/send_document overridden to
+    record every outgoing message for clear_chat.py. install_message_
+    tracking() swaps an already-built ExtBot instance's __class__ to this
+    (safe here since ExtBot instances carry a real __dict__, unlike a
+    plain setattr on the instance — PTB's TelegramObject.__setattr__
+    deliberately rejects that for any name that isn't an existing
+    attribute, to catch typos) rather than constructing a new bot, so the
+    existing instance's connection pool/token/request config from
+    bot.py's builder chain is left untouched."""
+
+    async def send_message(self, *args, **kwargs):
+        msg = await super().send_message(*args, **kwargs)
+        _try_record_sent_message(msg)
+        return msg
+
+    async def send_photo(self, *args, **kwargs):
+        msg = await super().send_photo(*args, **kwargs)
+        _try_record_sent_message(msg)
+        return msg
+
+    async def send_document(self, *args, **kwargs):
+        msg = await super().send_document(*args, **kwargs)
+        _try_record_sent_message(msg)
+        return msg
+
+
+def _try_record_sent_message(msg) -> None:
+    """_record_sent_message, but never lets a tracking failure break the
+    actual send it's piggybacking on."""
+    try:
+        _record_sent_message(msg.chat_id, msg.message_id)
+    except Exception as e:
+        logger.warning("Clear Chat: failed to record sent message: %s", e)
+
+
+def install_message_tracking(app: Application) -> None:
+    """Retarget this app's already-built bot instance onto
+    _MessageTrackingExtBot so every outgoing message this bot ever sends
+    (all ~20 feature modules go through these same three underlying Bot
+    calls via reply_text/reply_photo/send_message/etc.) is recorded for
+    clear_chat.py, without touching any individual feature module. Call
+    once from bot.py's main(), right after the Application is built."""
+    app.bot.__class__ = _MessageTrackingExtBot
 
 
 # ──────────────────────────────────────────────────────────
