@@ -340,12 +340,48 @@ def _db_format_outcome_block(i: int, outcome: Dict) -> str:
     return format_labeled_block(i, outcome["ref"], fields)
 
 
+def _db_days_ago(queued_at: str) -> str:
+    """Render an item's queued_at ISO timestamp as a short relative age
+    ('today' / '1 day ago' / 'N days ago'), or '—' if missing/unparseable —
+    used in the Still Pending report so a stale queue entry is obvious at
+    a glance instead of requiring a date lookup."""
+    if not queued_at:
+        return "—"
+    try:
+        queued_date = datetime.fromisoformat(queued_at).date()
+    except ValueError:
+        return "—"
+    days = (datetime.now().date() - queued_date).days
+    if days <= 0:
+        return "today"
+    if days == 1:
+        return "1 day ago"
+    return f"{days} days ago"
+
+
+def _db_format_pending_group(valuer_name: str, items: List[Dict]) -> str:
+    """One valuer's block of still-pending refs for the Still Pending
+    report — ref, how long it's been queued, and the live-search error
+    that's keeping it in the queue for retry (set on the item by
+    _process_dlv_batch_item every cycle it's re-checked)."""
+    lines = [f"👤 *{md_escape(valuer_name or 'Unknown')}* — {len(items)} pending"]
+    for item in sorted(items, key=lambda i: i.get("queued_at") or ""):
+        ref = item.get("ref", "?")
+        age = _db_days_ago(item.get("queued_at", ""))
+        err = item.get("last_error") or "Not found in DLV endpoint"
+        lines.append(f"  • `{md_escape(ref)}` — {age} — _{md_escape(err)}_")
+    return "\n".join(lines)
+
+
 def _process_dlv_batch_items(tokens: AuthTokens) -> Tuple[List[str], List[Dict]]:
     """
     Process the flat batch queue (list of {ref, valuer_name, valuer_uid, valuer_acct})
     across worker threads — each ref's search/detail-view/assign calls are
     independent I/O, same as the parallel fetch used elsewhere (e.g. Fetch Tasks).
-    Refs not found in DLV are kept in the queue for the next 5-minute retry cycle.
+    Refs not found in DLV are kept in the queue for the next 5-minute retry
+    cycle and reported grouped by their queued valuer (see
+    _db_format_pending_group) — ref, days queued, and the live-search error
+    each cycle sets on the item — rather than a bare flat list of refs.
     Refs already flagged awaiting_decision (found held by someone else on a
     prior cycle, still waiting on a Reassign/Remove answer — see
     recv_db_taken_decision) are held out of processing entirely, so they're
@@ -401,8 +437,12 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> Tuple[List[str], List[Dict]]
 
     still_pending = [i for i in remaining if not i.get("awaiting_decision")]
     if still_pending:
-        pending_refs = ", ".join(f"`{i['ref']}`" for i in still_pending)
-        completed_lines.append(f"⏳ Still pending (retry in 5 min): {pending_refs}")
+        by_valuer: Dict[str, List[Dict]] = {}
+        for item in still_pending:
+            by_valuer.setdefault(item.get("valuer_name") or "Unknown", []).append(item)
+        completed_lines.append(f"⏳ *Still pending* (retry in 5 min) — {len(still_pending)} ref(s):")
+        for valuer_name in sorted(by_valuer, key=lambda v: -len(by_valuer[v])):
+            completed_lines.append(_db_format_pending_group(valuer_name, by_valuer[valuer_name]))
 
     return completed_lines, newly_awaiting
 

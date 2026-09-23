@@ -11,6 +11,7 @@ import asyncio
 import os
 import sys
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -321,6 +322,63 @@ class TestDbFormatOutcomeBlock(unittest.TestCase):
         self.assertNotIn("🔒 Currently held by", block)
 
 
+class TestDbDaysAgo(unittest.TestCase):
+    """_db_days_ago — relative-age rendering for a queued_at ISO timestamp."""
+
+    def test_missing_returns_dash(self):
+        self.assertEqual(dlv_batch._db_days_ago(""), "—")
+
+    def test_unparseable_returns_dash(self):
+        self.assertEqual(dlv_batch._db_days_ago("not-a-date"), "—")
+
+    def test_today_returns_today(self):
+        now = datetime.now().isoformat()
+        self.assertEqual(dlv_batch._db_days_ago(now), "today")
+
+    def test_one_day_ago_singular(self):
+        ts = (datetime.now() - timedelta(days=1)).isoformat()
+        self.assertEqual(dlv_batch._db_days_ago(ts), "1 day ago")
+
+    def test_multiple_days_ago_plural(self):
+        ts = (datetime.now() - timedelta(days=5)).isoformat()
+        self.assertEqual(dlv_batch._db_days_ago(ts), "5 days ago")
+
+
+class TestDbFormatPendingGroup(unittest.TestCase):
+    """_db_format_pending_group — one valuer's block of still-pending refs
+    in the Still Pending report."""
+
+    def test_header_shows_valuer_and_count(self):
+        items = [{"ref": "REF1", "queued_at": "", "last_error": ""}]
+        block = dlv_batch._db_format_pending_group("Jane Doe", items)
+        self.assertIn("Jane Doe", block.splitlines()[0])
+        self.assertIn("1 pending", block.splitlines()[0])
+
+    def test_unknown_valuer_name_falls_back(self):
+        block = dlv_batch._db_format_pending_group("", [{"ref": "REF1", "queued_at": "", "last_error": ""}])
+        self.assertIn("Unknown", block)
+
+    def test_each_ref_shows_age_and_error(self):
+        items = [{"ref": "REF1", "queued_at": "", "last_error": "Not found in DLV endpoint"}]
+        block = dlv_batch._db_format_pending_group("Jane Doe", items)
+        self.assertIn("REF1", block)
+        self.assertIn("—", block)  # missing queued_at renders as a dash
+        self.assertIn("Not found in DLV endpoint", block)
+
+    def test_missing_last_error_defaults_to_not_found_message(self):
+        items = [{"ref": "REF1", "queued_at": ""}]
+        block = dlv_batch._db_format_pending_group("Jane Doe", items)
+        self.assertIn("Not found in DLV endpoint", block)
+
+    def test_refs_sorted_by_queued_at_oldest_first(self):
+        items = [
+            {"ref": "NEWER", "queued_at": "2026-09-20T00:00:00", "last_error": ""},
+            {"ref": "OLDER", "queued_at": "2026-08-01T00:00:00", "last_error": ""},
+        ]
+        block = dlv_batch._db_format_pending_group("Jane Doe", items)
+        self.assertLess(block.index("OLDER"), block.index("NEWER"))
+
+
 class TestProcessDlvBatchItems(unittest.TestCase):
     """_process_dlv_batch_items — aggregates per-ref outcomes into a list of
     numbered blocks (for _send_chunked_report, no manual truncation), and
@@ -357,17 +415,37 @@ class TestProcessDlvBatchItems(unittest.TestCase):
             self.assertIn("📊 Status: ✅ Assigned", line)
             self.assertIn("👤 Valuer: Jane Doe", line)
 
-    def test_still_pending_refs_appended_as_final_line(self):
-        items = [self._item("REF1")]
+    def test_still_pending_refs_grouped_by_valuer(self):
+        items = [self._item("REF1", valuer_name="Jane Doe"), self._item("REF2", valuer_name="John Roe")]
         with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
              patch.object(dlv_batch, "save_dlv_batch"), \
              patch.object(dlv_batch, "build_session", return_value=MagicMock()), \
              patch.object(dlv_batch, "_search_ref_dlv", return_value=None):
             lines, newly_awaiting = dlv_batch._process_dlv_batch_items(TOKENS)
-        self.assertEqual(len(lines), 1)
+        # 1 header line + 1 group block per distinct valuer
+        self.assertEqual(len(lines), 3)
         self.assertIn("Still pending", lines[0])
-        self.assertIn("REF1", lines[0])
+        self.assertIn("2 ref(s)", lines[0])
+        group_text = "\n".join(lines[1:])
+        self.assertIn("Jane Doe", group_text)
+        self.assertIn("REF1", group_text)
+        self.assertIn("John Roe", group_text)
+        self.assertIn("REF2", group_text)
         self.assertEqual(newly_awaiting, [])
+
+    def test_still_pending_same_valuer_grouped_into_one_block(self):
+        items = [self._item("REF1", valuer_name="Jane Doe"), self._item("REF2", valuer_name="Jane Doe")]
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
+             patch.object(dlv_batch, "save_dlv_batch"), \
+             patch.object(dlv_batch, "build_session", return_value=MagicMock()), \
+             patch.object(dlv_batch, "_search_ref_dlv", return_value=None):
+            lines, newly_awaiting = dlv_batch._process_dlv_batch_items(TOKENS)
+        # 1 header line + 1 group block (both refs share the same valuer)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("Jane Doe", lines[1])
+        self.assertIn("2 pending", lines[1])
+        self.assertIn("REF1", lines[1])
+        self.assertIn("REF2", lines[1])
 
     def test_taken_by_another_valuer_returned_as_newly_awaiting_not_still_pending(self):
         items = [self._item("REF1")]
