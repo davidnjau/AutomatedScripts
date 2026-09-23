@@ -140,6 +140,149 @@ class TestUserNamesPersistence(unittest.TestCase):
         self.assertEqual(common.load_user_names(), {"111": "Jane Doe"})
 
 
+class TestChatMessagesPersistence(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.data_file = os.path.join(self.tmpdir.name, "saved_chat_messages.json")
+        self._patch = patch.object(common, "SAVED_CHAT_MESSAGES_FILE", self.data_file)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self.tmpdir.cleanup()
+
+    def test_load_missing_file_returns_empty_dict(self):
+        self.assertEqual(common.load_chat_messages(), {})
+
+    def test_save_then_load_roundtrip(self):
+        common.save_chat_messages({"111": [{"message_id": 1, "sent_at": "2026-09-23T00:00:00"}]})
+        self.assertEqual(
+            common.load_chat_messages(),
+            {"111": [{"message_id": 1, "sent_at": "2026-09-23T00:00:00"}]},
+        )
+
+
+class TestPruneChatMessages(unittest.TestCase):
+    """_prune_chat_messages — drops entries past Telegram's 48h delete
+    window (they can never be deleted anyway) and caps the remainder."""
+
+    def test_recent_entry_kept(self):
+        recent = (common.datetime.now() - common.timedelta(hours=1)).isoformat()
+        items = [{"message_id": 1, "sent_at": recent}]
+        self.assertEqual(common._prune_chat_messages(items), items)
+
+    def test_stale_entry_over_48h_dropped(self):
+        stale = (common.datetime.now() - common.timedelta(hours=49)).isoformat()
+        items = [{"message_id": 1, "sent_at": stale}]
+        self.assertEqual(common._prune_chat_messages(items), [])
+
+    def test_malformed_entry_dropped_not_raised(self):
+        items = [{"message_id": 1, "sent_at": "not-a-date"}, {"message_id": 2}]
+        self.assertEqual(common._prune_chat_messages(items), [])
+
+    def test_capped_to_max_per_chat_keeping_most_recent(self):
+        now = common.datetime.now()
+        items = [
+            {"message_id": i, "sent_at": (now - common.timedelta(minutes=i)).isoformat()}
+            for i in range(common._CHAT_MSG_MAX_PER_CHAT + 5)
+        ]
+        pruned = common._prune_chat_messages(items)
+        self.assertEqual(len(pruned), common._CHAT_MSG_MAX_PER_CHAT)
+        # the oldest-appended (highest minute offset) entries were dropped first
+        self.assertEqual(pruned[-1]["message_id"], common._CHAT_MSG_MAX_PER_CHAT + 4)
+
+
+class TestRecordSentMessage(unittest.TestCase):
+    """_record_sent_message — appends to the chat's tracked list and
+    persists via save_chat_messages, pruning on the same write."""
+
+    def test_appends_new_entry_and_saves(self):
+        with patch.object(common, "load_chat_messages", return_value={}), \
+             patch.object(common, "save_chat_messages") as mock_save:
+            common._record_sent_message(111, 42)
+        saved = mock_save.call_args[0][0]
+        self.assertEqual(len(saved["111"]), 1)
+        self.assertEqual(saved["111"][0]["message_id"], 42)
+
+    def test_appends_to_existing_chat_entry(self):
+        existing = {"111": [{"message_id": 1, "sent_at": common.datetime.now().isoformat()}]}
+        with patch.object(common, "load_chat_messages", return_value=existing), \
+             patch.object(common, "save_chat_messages") as mock_save:
+            common._record_sent_message(111, 2)
+        saved = mock_save.call_args[0][0]
+        ids = [m["message_id"] for m in saved["111"]]
+        self.assertEqual(ids, [1, 2])
+
+
+class TestTryRecordSentMessage(unittest.TestCase):
+    """_try_record_sent_message — records chat_id/message_id from a sent
+    Message, and never lets a recording failure raise (it piggybacks on
+    a real send that already succeeded)."""
+
+    def test_records_chat_id_and_message_id(self):
+        msg = MagicMock(chat_id=111, message_id=42)
+        with patch.object(common, "_record_sent_message") as mock_record:
+            common._try_record_sent_message(msg)
+        mock_record.assert_called_once_with(111, 42)
+
+    def test_recording_failure_does_not_raise(self):
+        msg = MagicMock(chat_id=111, message_id=42)
+        with patch.object(common, "_record_sent_message", side_effect=RuntimeError("boom")):
+            common._try_record_sent_message(msg)  # must not raise
+
+
+class TestInstallMessageTracking(unittest.TestCase):
+    """install_message_tracking — retargets the app's already-built
+    ExtBot instance onto _MessageTrackingExtBot so send_message/
+    send_photo/send_document all record every outgoing message, with
+    zero per-call-site wiring. Regression coverage for a real bug: a
+    naive setattr(bot, "send_message", wrapper) raises AttributeError,
+    since PTB's TelegramObject.__setattr__ rejects new instance
+    attributes — these tests exercise the actual __class__ swap against
+    a real ExtBot instance instead of a bare MagicMock, so they'd have
+    caught that."""
+
+    def _make_app(self):
+        bot = common.ExtBot(token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11")
+        app = MagicMock(bot=bot)
+        return app
+
+    def test_swaps_bot_class_to_tracking_subclass(self):
+        app = self._make_app()
+        common.install_message_tracking(app)
+        self.assertIsInstance(app.bot, common._MessageTrackingExtBot)
+
+    def test_send_message_records_and_returns_original_result(self):
+        app = self._make_app()
+        common.install_message_tracking(app)
+        fake_msg = MagicMock(chat_id=111, message_id=42)
+        with patch.object(common.ExtBot, "send_message", new=AsyncMock(return_value=fake_msg)), \
+             patch.object(common, "_record_sent_message") as mock_record:
+            result = asyncio.run(app.bot.send_message(chat_id=111, text="hi"))
+        mock_record.assert_called_once_with(111, 42)
+        self.assertIs(result, fake_msg)
+
+    def test_send_photo_and_send_document_also_wrapped(self):
+        app = self._make_app()
+        common.install_message_tracking(app)
+        fake_msg = MagicMock(chat_id=111, message_id=42)
+        with patch.object(common.ExtBot, "send_photo", new=AsyncMock(return_value=fake_msg)), \
+             patch.object(common.ExtBot, "send_document", new=AsyncMock(return_value=fake_msg)), \
+             patch.object(common, "_record_sent_message") as mock_record:
+            asyncio.run(app.bot.send_photo(chat_id=111, photo="x"))
+            asyncio.run(app.bot.send_document(chat_id=111, document="x"))
+        self.assertEqual(mock_record.call_count, 2)
+
+    def test_recording_failure_does_not_propagate(self):
+        app = self._make_app()
+        common.install_message_tracking(app)
+        fake_msg = MagicMock(chat_id=111, message_id=42)
+        with patch.object(common.ExtBot, "send_message", new=AsyncMock(return_value=fake_msg)), \
+             patch.object(common, "_record_sent_message", side_effect=RuntimeError("boom")):
+            result = asyncio.run(app.bot.send_message(chat_id=111, text="hi"))
+        self.assertIs(result, fake_msg)
+
+
 class TestRecordUserName(unittest.TestCase):
     """_record_user_name — first+last name, falling back to @username,
     caching only on change so the common case (name already up to date)
