@@ -142,6 +142,37 @@ class TestClassifyDlvDetail(unittest.TestCase):
         self.assertEqual(info["assessor_name"], "")
 
 
+class TestCurrentValuationOfficer(unittest.TestCase):
+    """_current_valuation_officer — role-filtered extraction of the
+    current VALUATION OFFICER actor from a detail-view actors list, used
+    by dlv_tasks.py to detect drift between a ref's queued valuer and who
+    actually holds it live."""
+
+    def test_extracts_id_and_names_for_valuation_officer(self):
+        actors = [{"role": "VALUATION OFFICER", "user_details": {"id": "uid-2", "names": "OTHER VALUER"}}]
+        result = dlv_core._current_valuation_officer(actors)
+        self.assertEqual(result, {"id": "uid-2", "names": "OTHER VALUER"})
+
+    def test_ignores_non_valuation_officer_actors(self):
+        actors = [{"role": "ASSESSOR_OF_STAMP_DUTY", "user_details": {"id": "uid-1", "names": "AN ASSESSOR"}}]
+        self.assertIsNone(dlv_core._current_valuation_officer(actors))
+
+    def test_empty_actors_list_returns_none(self):
+        self.assertIsNone(dlv_core._current_valuation_officer([]))
+
+    def test_missing_user_details_defaults_empty_strings(self):
+        actors = [{"role": "VALUATION OFFICER"}]
+        self.assertEqual(dlv_core._current_valuation_officer(actors), {"id": "", "names": ""})
+
+    def test_picks_valuation_officer_among_multiple_actors(self):
+        actors = [
+            {"role": "ASSESSOR_OF_STAMP_DUTY", "user_details": {"id": "uid-1", "names": "AN ASSESSOR"}},
+            {"role": "VALUATION OFFICER", "user_details": {"id": "uid-2", "names": "OTHER VALUER"}},
+        ]
+        result = dlv_core._current_valuation_officer(actors)
+        self.assertEqual(result["names"], "OTHER VALUER")
+
+
 class TestSearchRefDlv(unittest.TestCase):
     def test_finds_ref_on_first_filter_non_county(self):
         ref = "REG/TSFR/ABC123"

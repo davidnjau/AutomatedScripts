@@ -193,6 +193,88 @@ class TestDtFetchTasksPriorityOrder(unittest.TestCase):
         mock_search.assert_not_called()
 
 
+class TestDtFetchTasksTakenByOther(unittest.TestCase):
+    """_dt_fetch_tasks flags a ref found in DLV whose live current valuer
+    (the VALUATION OFFICER actor) differs from who it's actually queued
+    to — the drift a queued ref taken over outside this bot used to hide
+    behind the stale queued name."""
+
+    def setUp(self):
+        self._patch_load = patch.object(dlv_tasks, "load_dlv_batch")
+        self.mock_load = self._patch_load.start()
+        self._patch_save = patch.object(dlv_tasks, "save_dlv_batch")
+        self.mock_save = self._patch_save.start()
+
+    def tearDown(self):
+        self._patch_load.stop()
+        self._patch_save.stop()
+
+    def _run(self, item, detail, classify_info):
+        self.mock_load.return_value = [item]
+        dlv_task = {"id": "1", "parcel_number": "", "registry": "", "county": "", "date_created": "",
+                    "_request_type": "STAMP_DUTY"}
+        with patch.object(dlv_tasks, "_search_ref_stampduty", return_value=None), \
+             patch.object(dlv_tasks, "_search_ref_dlv", return_value=dlv_task), \
+             patch.object(dlv_tasks, "_fetch_ref_detail_dlv", return_value=detail), \
+             patch.object(dlv_tasks, "_classify_dlv_detail", return_value=classify_info):
+            rows = dlv_tasks._dt_fetch_tasks(TOKENS)
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def _open_info(self):
+        return {
+            "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+            "node": "VALUATION_STAMP_DUTY_VALUER_REPORT", "assessor_name": "",
+            "consideration_amount": "", "currency_code": "", "actor_name": "",
+        }
+
+    def test_different_valuation_officer_flags_taken_by_other(self):
+        detail = {"actors": [{"role": "VALUATION OFFICER",
+                               "user_details": {"id": "uid-2", "names": "OTHER VALUER"}}]}
+        row = self._run(_batch_item(valuer_uid="uid-1"), detail, self._open_info())
+        self.assertTrue(row["taken_by_other"])
+        self.assertEqual(row["live_valuer"], "OTHER VALUER")
+
+    def test_same_valuation_officer_does_not_flag(self):
+        detail = {"actors": [{"role": "VALUATION OFFICER",
+                               "user_details": {"id": "uid-1", "names": "Jane Doe"}}]}
+        row = self._run(_batch_item(valuer_uid="uid-1"), detail, self._open_info())
+        self.assertFalse(row["taken_by_other"])
+        self.assertEqual(row["live_valuer"], "")
+
+    def test_no_actor_yet_does_not_flag(self):
+        detail = {"actors": []}
+        row = self._run(_batch_item(valuer_uid="uid-1"), detail, self._open_info())
+        self.assertFalse(row["taken_by_other"])
+
+    def test_missing_queued_uid_does_not_flag(self):
+        """A ref queued before valuer_uid was tracked on the item — nothing
+        to compare against, so no false-positive flag."""
+        detail = {"actors": [{"role": "VALUATION OFFICER",
+                               "user_details": {"id": "uid-2", "names": "OTHER VALUER"}}]}
+        row = self._run(_batch_item(valuer_uid=""), detail, self._open_info())
+        self.assertFalse(row["taken_by_other"])
+
+    def test_closed_items_are_not_flagged_or_checked(self):
+        closed_info = {
+            "bucket": "closed", "closed_reason": "completed", "application_status": "COMPLETED",
+            "node": "VALUATION_STAMP_DUTY_COMPLETED", "assessor_name": "", "consideration_amount": "",
+            "currency_code": "", "actor_name": "OTHER VALUER",
+        }
+        detail = {"actors": [{"role": "VALUATION OFFICER",
+                               "user_details": {"id": "uid-2", "names": "OTHER VALUER"}}]}
+        self.mock_load.return_value = [_batch_item(valuer_uid="uid-1")]
+        dlv_task = {"id": "1", "parcel_number": "", "registry": "", "county": "", "date_created": "",
+                    "_request_type": "STAMP_DUTY"}
+        with patch.object(dlv_tasks, "_search_ref_stampduty", return_value=None), \
+             patch.object(dlv_tasks, "_search_ref_dlv", return_value=dlv_task), \
+             patch.object(dlv_tasks, "_fetch_ref_detail_dlv", return_value=detail), \
+             patch.object(dlv_tasks, "_classify_dlv_detail", return_value=closed_info), \
+             patch.object(dlv_tasks, "_append_dlv_closed"):
+            rows = dlv_tasks._dt_fetch_tasks(TOKENS)
+        self.assertEqual(rows, [])  # closed items are excluded from rows entirely
+
+
 class TestDtRowConsiderationValue(unittest.TestCase):
     """_dt_row_consideration_value — parses the already-formatted
     "KES 1,234.00" string back to a number for Excel-export sorting."""
@@ -232,6 +314,24 @@ class TestDtBuildExcelSortOrder(unittest.TestCase):
         ]
         xlsx_bytes = dlv_tasks._dt_build_excel(rows)
         self.assertEqual(self._refs_in_sheet_order(xlsx_bytes), ["HAS_AMOUNT", "NO_AMOUNT"])
+
+    def _column(self, xlsx_bytes, header):
+        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
+        ws = wb.active
+        headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        idx = headers.index(header)
+        return [row[idx] for row in ws.iter_rows(min_row=2, values_only=True)]
+
+    def test_taken_by_other_row_shows_live_valuer_in_flag_column(self):
+        rows = [{"ref": "R1", "taken_by_other": True, "live_valuer": "OTHER VALUER"}]
+        xlsx_bytes = dlv_tasks._dt_build_excel(rows)
+        self.assertEqual(self._column(xlsx_bytes, "Taken By Another Valuer"), ["OTHER VALUER"])
+
+    def test_non_flagged_row_leaves_flag_column_blank(self):
+        rows = [{"ref": "R1", "taken_by_other": False, "live_valuer": ""}]
+        xlsx_bytes = dlv_tasks._dt_build_excel(rows)
+        # openpyxl reads an empty-string cell back as None
+        self.assertEqual(self._column(xlsx_bytes, "Taken By Another Valuer"), [None])
 
 
 class TestDtFormatTaskBlock(unittest.TestCase):
@@ -283,6 +383,25 @@ class TestDtFormatTaskBlock(unittest.TestCase):
     def test_still_with_assessor_appends_note(self):
         block = dlv_tasks._dt_format_task_block(1, self._task(location="assessor"))
         self.assertIn("⏳ _still with Assessor, not yet in DLV_", block)
+
+    def test_taken_by_other_appends_warning_with_both_names(self):
+        block = dlv_tasks._dt_format_task_block(1, self._task(
+            taken_by_other=True, live_valuer="OTHER VALUER",
+        ))
+        self.assertIn("⚠️ *TAKEN BY ANOTHER VALUER*", block)
+        self.assertIn("queued to BYRON MARCEL ONDITI", block)
+        self.assertIn("currently held by *OTHER VALUER*", block)
+
+    def test_not_taken_by_other_omits_warning(self):
+        block = dlv_tasks._dt_format_task_block(1, self._task())
+        self.assertNotIn("TAKEN BY ANOTHER VALUER", block)
+
+    def test_taken_by_other_valuer_names_are_markdown_escaped(self):
+        block = dlv_tasks._dt_format_task_block(1, self._task(
+            valuer_name="Jane_Doe", taken_by_other=True, live_valuer="John_Roe",
+        ))
+        self.assertIn("Jane\\_Doe", block)
+        self.assertIn("John\\_Roe", block)
 
 
 class TestDtConsiderationValue(unittest.TestCase):
@@ -667,6 +786,25 @@ class TestDtSendTelegram(unittest.TestCase):
         _run(dlv_tasks._dt_send_telegram(123, rows, bot))
         text = bot.send_message.call_args[0][1]
         self.assertIn("👤 *Jane\\_Doe*", text)
+
+    def test_taken_by_other_tasks_counted_in_header(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        rows = [
+            {"ref": "REF1", "valuer_name": "Jane Doe", "taken_by_other": True, "live_valuer": "Other"},
+            {"ref": "REF2", "valuer_name": "Jane Doe", "taken_by_other": False},
+        ]
+        _run(dlv_tasks._dt_send_telegram(123, rows, bot))
+        text = bot.send_message.call_args[0][1]
+        self.assertIn("⚠️ *1 taken by another valuer*", text)
+
+    def test_no_taken_by_other_tasks_omits_warning_header(self):
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        rows = [{"ref": "REF1", "valuer_name": "Jane Doe"}]
+        _run(dlv_tasks._dt_send_telegram(123, rows, bot))
+        text = bot.send_message.call_args[0][1]
+        self.assertNotIn("taken by another valuer", text)
 
 
 class TestDtSendClosedReport(unittest.TestCase):
