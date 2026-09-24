@@ -71,6 +71,7 @@ from dlv_core import (
     INCREMENTAL_TAG_SENTINEL,
     _append_dlv_closed,
     _classify_dlv_detail,
+    _current_valuation_officer,
     _fetch_ref_detail_dlv,
     _fetch_stampduty_detail,
     _resolve_assessor,
@@ -145,7 +146,13 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
     non-County alike). Only still-open (available for reallocation) rows are
     returned; refs found to have since Completed or been Returned are moved
     into the closed store so the active queue and the Closed Tasks view stay
-    in sync between timer runs.
+    in sync between timer runs. A ref found in DLV also has its live current
+    valuer compared against who it's actually queued to — a mismatch sets
+    live_valuer/taken_by_other on the row (see _dt_format_task_block), so a
+    ref taken over by someone else outside this bot shows up as a flag
+    instead of silently displaying the stale queued name. Both DLV Tasks'
+    Open Tasks report and Morning Briefing are built on this one function,
+    so the flag surfaces in both without either needing its own check.
     """
     batch = load_dlv_batch()
     if not batch:
@@ -168,6 +175,8 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
             "found":         False,   # found anywhere (DLV or still with the assessor)
             "location":      "",      # "dlv" | "assessor"
             "tag":           item.get("tag", ""),   # optional, set via DLV Batch's Tag Tasks step
+            "live_valuer":     "",     # set only when this differs from valuer_name (see below)
+            "taken_by_other":  False,  # ref is queued to valuer_name but a different valuer holds it live
             "_closed":       None,
         }
         try:
@@ -226,6 +235,18 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
                         row["consideration"] = format_consideration(
                             info["consideration_amount"], info["currency_code"]
                         )
+
+                        # Drift check: this ref is queued to item["valuer_uid"],
+                        # but the live detail-view may show a different valuer
+                        # already holding it (taken over outside this bot, e.g.
+                        # a manual assignment) — flag it rather than silently
+                        # keep showing the stale queued name as current.
+                        queued_uid = str(item.get("valuer_uid", ""))
+                        current = _current_valuation_officer(detail.get("actors") or [])
+                        if queued_uid and current and current.get("names") and \
+                                str(current.get("id", "")) != queued_uid:
+                            row["live_valuer"]    = current["names"]
+                            row["taken_by_other"] = True
         except Exception as e:
             logger.warning("DLV Tasks enrich failed for %s: %s", ref, e)
 
@@ -348,7 +369,7 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
     ws = wb.active
     ws.title = "DLV Tasks"
     cols = ["Reference Number", "Parcel Number", "Registry", "County",
-            "Date Added", "Valuer", "Assessor", "Status"]
+            "Date Added", "Valuer", "Assessor", "Status", "Taken By Another Valuer"]
     style_header_row(ws, cols)
     _status_labels = {"dlv": "In DLV", "assessor": "With Assessor (not yet in DLV)"}
     for r in rows:
@@ -361,6 +382,7 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
             r.get("valuer_name", ""),
             r.get("assessor", ""),
             _status_labels.get(r.get("location", ""), "Not found"),
+            r.get("live_valuer", "") if r.get("taken_by_other") else "",
         ])
     autofit_columns(ws, min_width=15, max_width=60)
     buf = io.BytesIO()
@@ -1211,6 +1233,13 @@ def _dt_format_task_block(i: int, t: dict) -> str:
     block = format_labeled_block(i, t.get("ref"), fields)
     if note:
         block += f"\n     {note}"
+    if t.get("taken_by_other"):
+        queued_name = md_escape(t.get("valuer_name") or "—")
+        live_name   = md_escape(t.get("live_valuer") or "someone else")
+        block += (
+            f"\n     ⚠️ *TAKEN BY ANOTHER VALUER* — queued to {queued_name}, "
+            f"currently held by *{live_name}*"
+        )
     return block
 
 
@@ -1227,7 +1256,11 @@ async def _dt_send_telegram(chat_id: int, rows: List[dict], bot) -> None:
         key = r.get("valuer_name") or "Unassigned"
         groups[key].append(r)
 
-    lines = [f"📋 *DLV Tasks Report* — {len(rows)} task(s)\n"]
+    taken_count = sum(1 for r in rows if r.get("taken_by_other"))
+    header = f"📋 *DLV Tasks Report* — {len(rows)} task(s)"
+    if taken_count:
+        header += f"\n⚠️ *{taken_count} taken by another valuer* — see flagged task(s) below"
+    lines = [header + "\n"]
     for valuer, tasks in sorted(groups.items()):
         lines.append(f"\n👤 *{md_escape(valuer)}* ({len(tasks)} task(s))")
         for i, t in enumerate(tasks, start=1):

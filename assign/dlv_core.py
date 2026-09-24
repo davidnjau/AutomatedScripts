@@ -437,6 +437,22 @@ def _classify_dlv_detail(detail: Dict) -> Dict:
     }
 
 
+def _current_valuation_officer(actors: List[Dict]) -> Optional[Dict]:
+    """Pick the VALUATION OFFICER out of a detail-view actors list —
+    {"id", "names"}, or None if no such actor is present. Pure. Used by
+    dlv_tasks.py's _dt_fetch_tasks to detect drift between a ref's queued
+    valuer and who's actually holding it live (surfaced in DLV Tasks'
+    Open Tasks report and, since Morning Briefing is built on the same
+    function, the morning brief too) — the same role-filtered extraction
+    dlv_batch.py's own taken-by-another-valuer check and hold_tasks.py's
+    _ht_current_valuer already do independently for their own paths."""
+    vo = next((a for a in actors if a.get("role") == "VALUATION OFFICER"), None)
+    if not vo:
+        return None
+    user_details = vo.get("user_details") or {}
+    return {"id": user_details.get("id", ""), "names": user_details.get("names", "")}
+
+
 def _search_ref_stampduty(tokens: AuthTokens, ref: str) -> Optional[Dict]:
     """
     Fallback search for a ref not yet visible in DLV — checks the assessor/HQ
