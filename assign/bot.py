@@ -713,13 +713,27 @@ async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     Telegram API timeouts). Without this registered, PTB just dumps the raw
     traceback and silently drops the update — the user's tap/message never
     gets any response and a ConversationHandler can be left stuck mid-flow.
+
+    Always reattaches the main menu keyboard. This used to be the one place
+    in the whole bot that sent a message with no reply_markup at all — every
+    other exit point reattaches _main_menu_for(). Several flows (New
+    Assignment, DLV Batch, Receive Tasks, Post Board's posting entry) hide
+    the keyboard via ReplyKeyboardRemove() while they collect free-text
+    input, only restoring it at their own completion step — an exception
+    firing after that but before completion (a network hiccup, an API
+    timeout — inherently unpredictable) left the keyboard hidden with no
+    way back except /start. Restoring it here also puts 🛑 Cancel back
+    within reach, which already properly ends whatever conversation state
+    the user might still be stuck in.
     """
     logger.error("Unhandled exception while processing update: %s", update, exc_info=context.error)
     if isinstance(update, Update) and update.effective_chat:
         try:
+            user_id = update.effective_user.id if update.effective_user else update.effective_chat.id
             await context.bot.send_message(
                 update.effective_chat.id,
                 "⚠️ Something went wrong processing that (likely a network hiccup) — please try again.",
+                reply_markup=_main_menu_for(user_id),
             )
         except Exception:
             pass   # best-effort notification only; don't let this raise too
