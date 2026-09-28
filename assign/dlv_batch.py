@@ -89,11 +89,12 @@ from dlv_core import (
     _classify_dlv_detail,
     _fetch_ref_detail_dlv,
     _search_ref_dlv,
+    is_incremental_tag,
     load_dlv_batch,
     mark_removed,
     save_dlv_batch,
 )
-from dlv_incremental import next_incremental_tag
+from dlv_incremental import next_incremental_assign_tag, next_incremental_tag
 from endpoints import ACCOUNTS_LIST_URL, STAMP_DUTY_FIX_APPLICATION_URL
 from fetch_tasks_cache import _fetch_tasks_log_lookup, _fetch_tasks_log_remove
 from task_block import format_labeled_block
@@ -169,6 +170,20 @@ def _search_valuer_api(name: str, tokens: AuthTokens) -> List[Dict]:
 
 
 _DLV_BATCH_WORKERS = 8
+
+
+def _incremental_assign_tag_for(item: Dict) -> str:
+    """Allocate the next "A{batch}-T{task}" assignment tag for a ref
+    queued with an incremental (B-tag) queue tag — "" for anything else,
+    so persist_assignment's extra dict can carry the field unconditionally
+    rather than needing a per-call-site conditional key. Called exactly
+    once per successful-assignment outcome (Assigned/Reassigned/Already
+    correctly assigned), right before persisting, so the assignment-order
+    sequence advances exactly once per ref regardless of which of those
+    three outcomes it takes."""
+    if not is_incremental_tag(item.get("tag", "")):
+        return ""
+    return next_incremental_assign_tag()
 
 
 def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth_hdrs: dict, item: Dict) -> Dict:
@@ -250,6 +265,7 @@ def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth
                     "consideration": item.get("consideration", ""),
                     "currency_code": item.get("currency_code", ""),
                     "queued_at":     item.get("queued_at", ""),
+                    "assigned_tag":  _incremental_assign_tag_for(item),
                 })
             except Exception as _pe:
                 logger.error("persist_assignment failed for %s: %s", ref, _pe)
@@ -287,6 +303,7 @@ def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth
                         "consideration": item.get("consideration", ""),
                         "currency_code": item.get("currency_code", ""),
                         "queued_at":     item.get("queued_at", ""),
+                        "assigned_tag":  _incremental_assign_tag_for(item),
                     })
                 except Exception as _pe:
                     logger.error("persist_assignment failed for %s: %s", ref, _pe)
@@ -297,6 +314,29 @@ def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth
                 # Distinguish "correctly assigned already" from "taken by someone
                 # else" — both used to render identically as "already with X",
                 # which read as a failure even when the intended valuer already had it.
+                # Previously this branch never called persist_assignment at all
+                # (a ref landing here on its very first check — already at the
+                # valuer-report stage, correctly held, without this bot ever
+                # having made the assign call itself — was never recorded in
+                # saved_assignments.json). Now recorded, but only for
+                # incremental-tagged refs, so the assignment tag has somewhere
+                # to persist to; non-incremental refs keep their prior
+                # (unrecorded) behavior here rather than this feature silently
+                # changing it bot-wide.
+                if is_incremental_tag(item.get("tag", "")):
+                    try:
+                        persist_assignment(ref, valuer_name, valuer_uid, extra={
+                            "valuer_acct":   item.get("valuer_acct", ""),
+                            "tag":           item.get("tag", ""),
+                            "assessor":      item.get("assessor", ""),
+                            "parcel":        item.get("parcel", ""),
+                            "consideration": item.get("consideration", ""),
+                            "currency_code": item.get("currency_code", ""),
+                            "queued_at":     item.get("queued_at", ""),
+                            "assigned_tag":  _incremental_assign_tag_for(item),
+                        })
+                    except Exception as _pe:
+                        logger.error("persist_assignment failed for %s: %s", ref, _pe)
                 outcome = {"ref": ref, "status": "✅ Already correctly assigned",
                            "valuer_name": valuer_name, "held_by": ""}
             elif actor_name:

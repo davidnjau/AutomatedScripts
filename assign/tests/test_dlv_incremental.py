@@ -51,47 +51,85 @@ class TestCounterPersistence(unittest.TestCase):
         self._patch.stop()
         self.tmpdir.cleanup()
 
+    def _cfg(self, **overrides):
+        base = {"batch_number": 1, "task_number": 1, "batch_size": 6,
+                "assign_batch_number": 1, "assign_task_number": 1}
+        base.update(overrides)
+        return base
+
     def test_missing_file_defaults_to_batch_1_task_1_size_6(self):
-        self.assertEqual(ic.load_incremental_counter(), {"batch_number": 1, "task_number": 1, "batch_size": 6})
+        self.assertEqual(ic.load_incremental_counter(), self._cfg())
 
     def test_set_incremental_counter_seeds_state_keeping_batch_size(self):
         ic.set_incremental_counter(2, 2)
-        self.assertEqual(ic.load_incremental_counter(),
-                          {"batch_number": 2, "task_number": 2, "batch_size": 6})
+        self.assertEqual(ic.load_incremental_counter(), self._cfg(batch_number=2, task_number=2))
 
     def test_set_incremental_counter_can_also_change_batch_size(self):
         ic.set_incremental_counter(2, 2, batch_size=4)
-        self.assertEqual(ic.load_incremental_counter(),
-                          {"batch_number": 2, "task_number": 2, "batch_size": 4})
+        self.assertEqual(ic.load_incremental_counter(), self._cfg(batch_number=2, task_number=2, batch_size=4))
         self.assertEqual(ic.get_batch_size(), 4)
+
+    def test_set_incremental_counter_preserves_assign_position(self):
+        """Regression: set_incremental_counter used to replace the whole
+        config wholesale, silently resetting the separate assignment-tag
+        counter back to 1/1 every time the queue counter was reseeded."""
+        ic.next_incremental_assign_tag()   # advances assign position to 1/2
+        ic.set_incremental_counter(5, 1)
+        self.assertEqual(ic.load_incremental_counter(),
+                          self._cfg(batch_number=5, task_number=1, assign_task_number=2))
 
     def test_next_tag_advances_task_number(self):
         ic.set_incremental_counter(2, 2)
         tag = ic.next_incremental_tag()
         self.assertEqual(tag, "B2-T2")
-        self.assertEqual(ic.load_incremental_counter(),
-                          {"batch_number": 2, "task_number": 3, "batch_size": 6})
+        self.assertEqual(ic.load_incremental_counter(), self._cfg(batch_number=2, task_number=3))
 
     def test_next_tag_wraps_batch_after_last_task_of_configured_size(self):
         ic.set_incremental_counter(2, 6)
         tag = ic.next_incremental_tag()
         self.assertEqual(tag, "B2-T6")
-        self.assertEqual(ic.load_incremental_counter(),
-                          {"batch_number": 3, "task_number": 1, "batch_size": 6})
+        self.assertEqual(ic.load_incremental_counter(), self._cfg(batch_number=3, task_number=1))
 
     def test_smaller_batch_size_wraps_sooner(self):
         ic.set_incremental_counter(2, 4, batch_size=4)
         tag = ic.next_incremental_tag()
         self.assertEqual(tag, "B2-T4")
-        self.assertEqual(ic.load_incremental_counter(),
-                          {"batch_number": 3, "task_number": 1, "batch_size": 4})
+        self.assertEqual(ic.load_incremental_counter(), self._cfg(batch_number=3, task_number=1, batch_size=4))
 
     def test_sequential_calls_walk_through_a_full_batch(self):
         ic.set_incremental_counter(2, 2)
         tags = [ic.next_incremental_tag() for _ in range(5)]
         self.assertEqual(tags, ["B2-T2", "B2-T3", "B2-T4", "B2-T5", "B2-T6"])
+        self.assertEqual(ic.load_incremental_counter(), self._cfg(batch_number=3, task_number=1))
+
+    def test_next_tag_does_not_touch_assign_position(self):
+        ic.next_incremental_assign_tag()   # advances assign position to 1/2
+        ic.next_incremental_tag()
         self.assertEqual(ic.load_incremental_counter(),
-                          {"batch_number": 3, "task_number": 1, "batch_size": 6})
+                          self._cfg(task_number=2, assign_task_number=2))
+
+    def test_next_assign_tag_advances_assign_task_number(self):
+        tag = ic.next_incremental_assign_tag()
+        self.assertEqual(tag, "A1-T1")
+        self.assertEqual(ic.load_incremental_counter(), self._cfg(assign_task_number=2))
+
+    def test_next_assign_tag_wraps_batch_after_last_task_of_configured_size(self):
+        ic.save_incremental_counter(self._cfg(assign_batch_number=2, assign_task_number=6))
+        tag = ic.next_incremental_assign_tag()
+        self.assertEqual(tag, "A2-T6")
+        self.assertEqual(ic.load_incremental_counter(),
+                          self._cfg(assign_batch_number=3, assign_task_number=1))
+
+    def test_next_assign_tag_does_not_touch_queue_position(self):
+        ic.next_incremental_tag()   # advances queue position to 1/2
+        ic.next_incremental_assign_tag()
+        self.assertEqual(ic.load_incremental_counter(),
+                          self._cfg(task_number=2, assign_task_number=2))
+
+    def test_sequential_assign_calls_walk_through_a_full_batch(self):
+        tags = [ic.next_incremental_assign_tag() for _ in range(7)]
+        self.assertEqual(tags, ["A1-T1", "A1-T2", "A1-T3", "A1-T4", "A1-T5", "A1-T6", "A2-T1"])
+        self.assertEqual(ic.load_incremental_counter(), self._cfg(assign_batch_number=2, assign_task_number=2))
 
 
 class TestParseIncrementalTag(unittest.TestCase):
@@ -104,6 +142,22 @@ class TestParseIncrementalTag(unittest.TestCase):
     def test_empty_or_none_returns_none(self):
         self.assertIsNone(ic.parse_incremental_tag(""))
         self.assertIsNone(ic.parse_incremental_tag(None))
+
+
+class TestParseIncrementalAssignTag(unittest.TestCase):
+    def test_valid_tag_parses(self):
+        self.assertEqual(ic._parse_incremental_assign_tag("A2-T3"), (2, 3))
+
+    def test_queue_tag_prefix_returns_none(self):
+        """An "A" tag and a "B" tag must not cross-match each other's parser."""
+        self.assertIsNone(ic._parse_incremental_assign_tag("B2-T3"))
+
+    def test_fixed_tag_returns_none(self):
+        self.assertIsNone(ic._parse_incremental_assign_tag("Queue"))
+
+    def test_empty_or_none_returns_none(self):
+        self.assertIsNone(ic._parse_incremental_assign_tag(""))
+        self.assertIsNone(ic._parse_incremental_assign_tag(None))
 
 
 class TestClosedBatchPersistence(unittest.TestCase):
@@ -159,6 +213,19 @@ class TestGatherAndGroup(unittest.TestCase):
         self.assertEqual(items[0]["status"], "cleared")
         self.assertEqual(items[0]["batch_number"], 2)
         self.assertEqual(items[0]["task_number"], 3)
+        # no assigned_tag on this record — legacy/pre-tagging item
+        self.assertIsNone(items[0]["assign_batch_number"])
+        self.assertIsNone(items[0]["assign_task_number"])
+
+    def test_cleared_item_with_assigned_tag_gets_assign_batch_and_task(self):
+        with patch.object(ic, "load_dlv_batch", return_value=[]), \
+             patch.object(ic, "load_saved_assignments", return_value={
+                "REF1": {"valuer_name": "Jane Doe", "tag": "B2-T3", "assigned_tag": "A1-T4",
+                         "assigned_at": "2026-07-17 09:00:00"},
+             }):
+            items = ic._ic_gather_items()
+        self.assertEqual(items[0]["assign_batch_number"], 1)
+        self.assertEqual(items[0]["assign_task_number"], 4)
 
     def test_cleared_wins_when_ref_in_both_sources(self):
         """Shouldn't normally happen, but if it does, the more-progressed
@@ -180,6 +247,27 @@ class TestGatherAndGroup(unittest.TestCase):
         grouped = ic._ic_group_by_batch(items)
         self.assertEqual([i["ref"] for i in grouped[2]], ["B", "A"])
         self.assertEqual([i["ref"] for i in grouped[3]], ["C"])
+
+
+class TestGroupByAssignBatch(unittest.TestCase):
+    def test_sorts_by_assign_task_number(self):
+        items = [
+            {"ref": "A", "assign_batch_number": 2, "assign_task_number": 4},
+            {"ref": "B", "assign_batch_number": 2, "assign_task_number": 2},
+            {"ref": "C", "assign_batch_number": 3, "assign_task_number": 1},
+        ]
+        grouped = ic._ic_group_by_assign_batch(items)
+        self.assertEqual([i["ref"] for i in grouped[2]], ["B", "A"])
+        self.assertEqual([i["ref"] for i in grouped[3]], ["C"])
+
+    def test_items_without_an_assign_batch_are_excluded(self):
+        items = [
+            {"ref": "A", "assign_batch_number": 1, "assign_task_number": 1},
+            {"ref": "B", "assign_batch_number": None, "assign_task_number": None},
+        ]
+        grouped = ic._ic_group_by_assign_batch(items)
+        all_refs = [i["ref"] for group in grouped.values() for i in group]
+        self.assertEqual(all_refs, ["A"])
 
 
 class TestEligibleAndAutoClose(unittest.TestCase):
@@ -242,6 +330,36 @@ class TestFormatReports(unittest.TestCase):
         self.assertIn("📊 Status: ✅ Cleared", lines)
         self.assertIn("👤 Valuer: John Otieno", lines)
 
+    def test_by_batch_report_shows_assign_tag_alongside_queue_tag(self):
+        grouped = {
+            2: [{"ref": "REF1", "task_number": 3, "status": "cleared", "valuer_name": "Jane Doe",
+                 "assign_batch_number": 5, "assign_task_number": 1}],
+        }
+        lines = "\n".join(ic._ic_format_by_batch_report(grouped, [], batch_size=6))
+        self.assertIn("🔢 Batch/Task: B2-T3", lines)
+        self.assertIn("🏁 Assigned As: A5-T1 (different batch number)", lines)
+
+    def test_by_batch_report_notes_matching_batch_numbers(self):
+        grouped = {
+            2: [{"ref": "REF1", "task_number": 3, "status": "cleared", "valuer_name": "Jane Doe",
+                 "assign_batch_number": 2, "assign_task_number": 1}],
+        }
+        lines = "\n".join(ic._ic_format_by_batch_report(grouped, [], batch_size=6))
+        self.assertIn("🏁 Assigned As: A2-T1 (same batch number)", lines)
+
+    def test_by_batch_report_omits_assign_tag_for_still_queued_item(self):
+        grouped = {2: [{"ref": "REF1", "task_number": 3, "status": "queued", "valuer_name": "Jane Doe"}]}
+        lines = "\n".join(ic._ic_format_by_batch_report(grouped, [], batch_size=6))
+        self.assertNotIn("Assigned As", lines)
+
+    def test_by_batch_report_omits_assign_tag_for_legacy_cleared_item(self):
+        grouped = {
+            2: [{"ref": "REF1", "task_number": 3, "status": "cleared", "valuer_name": "Jane Doe",
+                 "assign_batch_number": None, "assign_task_number": None}],
+        }
+        lines = "\n".join(ic._ic_format_by_batch_report(grouped, [], batch_size=6))
+        self.assertNotIn("Assigned As", lines)
+
     def test_by_batch_report_uses_shared_labeled_block_format(self):
         """Regression: each task used to be a packed one-liner
         ("T2: `REF1` ⏳ Jane Doe") — it must now use the same
@@ -272,29 +390,18 @@ class TestFormatReports(unittest.TestCase):
         lines = "\n".join(ic._ic_format_by_batch_report(grouped, [], batch_size=6))
         self.assertIn("Jane\\_Doe", lines)
 
+    def _cleared_item(self, ref, batch_number, task_number, assign_batch_number, assign_task_number, **overrides):
+        item = {
+            "ref": ref, "batch_number": batch_number, "task_number": task_number, "status": "cleared",
+            "assign_batch_number": assign_batch_number, "assign_task_number": assign_task_number,
+            "valuer_name": "Jane Doe", "assigned_at": "2026-07-10 09:00:00",
+        }
+        item.update(overrides)
+        return item
+
     def test_cleared_report_empty(self):
         lines = ic._ic_format_cleared_report([], batch_size=6)
         self.assertIn("No cleared incremental-tagged tasks yet", "\n".join(lines))
-
-    def test_cleared_report_groups_by_six_in_clearance_order(self):
-        items = [
-            {"ref": f"R{i}", "batch_number": 4, "task_number": i, "status": "cleared",
-             "assigned_at": f"2026-07-{10 + i:02d} 09:00:00", "valuer_name": "Jane Doe"}
-            for i in range(1, 8)   # 7 cleared items -> First Cleared (6) + Second Cleared (1)
-        ]
-        lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=6))
-        self.assertIn("*First Cleared* (6/6)", lines)
-        self.assertIn("*Second Cleared* (1/6)", lines)
-
-    def test_cleared_report_groups_by_configured_batch_size(self):
-        items = [
-            {"ref": f"R{i}", "batch_number": 4, "task_number": i, "status": "cleared",
-             "assigned_at": f"2026-07-{10 + i:02d} 09:00:00", "valuer_name": "Jane Doe"}
-            for i in range(1, 5)   # 4 cleared items, batch_size=4 -> exactly one full group
-        ]
-        lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=4))
-        self.assertIn("*First Cleared* (4/4)", lines)
-        self.assertNotIn("Second Cleared", lines)
 
     def test_cleared_report_ignores_queued_items(self):
         items = [
@@ -303,35 +410,90 @@ class TestFormatReports(unittest.TestCase):
         lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=6))
         self.assertIn("No cleared incremental-tagged tasks yet", lines)
 
-    def test_cleared_report_mixes_original_batches_within_one_group(self):
+    def test_cleared_report_groups_by_assign_batch_not_queue_batch(self):
+        """Two refs queued in different batches (4 and 6) but assigned
+        into the same assign-batch (1) must land in the same section."""
         items = [
-            {"ref": "A", "batch_number": 4, "task_number": 6, "status": "cleared",
-             "assigned_at": "2026-07-10 09:00:00", "valuer_name": "Jane Doe"},
-            {"ref": "B", "batch_number": 6, "task_number": 1, "status": "cleared",
-             "assigned_at": "2026-07-11 09:00:00", "valuer_name": "Jane Doe"},
+            self._cleared_item("A", batch_number=4, task_number=6, assign_batch_number=1, assign_task_number=1),
+            self._cleared_item("B", batch_number=6, task_number=1, assign_batch_number=1, assign_task_number=2),
         ]
         lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=6))
+        self.assertIn("*Assign Batch 1*", lines)
         self.assertIn("B4-T6", lines)
+        self.assertIn("A1-T1", lines)
         self.assertIn("B6-T1", lines)
-        self.assertIn("*First Cleared*", lines)
+        self.assertIn("A1-T2", lines)
+
+    def test_cleared_report_flags_complete_assign_batch(self):
+        items = [
+            self._cleared_item(f"R{i}", batch_number=4, task_number=i, assign_batch_number=1, assign_task_number=i)
+            for i in range(1, 7)
+        ]
+        lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=6))
+        self.assertIn("*Assign Batch 1* ✅ COMPLETE — 6/6 tagged", lines)
+
+    def test_cleared_report_no_complete_flag_when_partial(self):
+        items = [self._cleared_item("A", batch_number=4, task_number=1, assign_batch_number=1, assign_task_number=1)]
+        lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=6))
+        self.assertIn("*Assign Batch 1* — 1/6 tagged", lines)
+        self.assertNotIn("COMPLETE", lines)
 
     def test_cleared_report_uses_shared_labeled_block_format(self):
         """Regression: each cleared item used to be a packed one-liner
         ("B4-T6: `A` — Jane Doe") — it must now use the same
         task_block.format_labeled_block visual every other report uses."""
         items = [
-            {"ref": "A", "batch_number": 4, "task_number": 6, "status": "cleared",
-             "assigned_at": "2026-07-10 09:00:00", "valuer_name": "Jane Doe",
-             "assessor": "Jane Assessor", "consideration": "2000000", "currency_code": "KES", "parcel": "P2"},
+            self._cleared_item("A", batch_number=4, task_number=6, assign_batch_number=1, assign_task_number=1,
+                                assessor="Jane Assessor", consideration="2000000", currency_code="KES", parcel="P2"),
         ]
         lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=6))
         self.assertIn("1. 📌 *Ref:* `A`", lines)
-        self.assertIn("🔢 Batch/Task: B4-T6", lines)
+        self.assertIn("🔢 Queued As: B4-T6", lines)
+        self.assertIn("🏁 Assigned As: A1-T1", lines)
         self.assertIn("👤 Valuer: Jane Doe", lines)
         self.assertIn("Assessor: Jane Assessor", lines)
         self.assertIn("💰 Consideration: KES 2,000,000.00", lines)
         self.assertIn("📋 Parcel: P2", lines)
         self.assertNotIn("B4-T6: `A` —", lines)
+
+    def test_cleared_report_legacy_section_for_items_without_assign_tag(self):
+        """Refs cleared before assignment tagging existed have no assign
+        tag to group by — they must still appear, in a trailing Legacy
+        section, not be silently dropped."""
+        items = [
+            {"ref": "OLD1", "batch_number": 2, "task_number": 1, "status": "cleared",
+             "assign_batch_number": None, "assign_task_number": None,
+             "assigned_at": "2026-06-01 09:00:00", "valuer_name": "Jane Doe"},
+        ]
+        lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=6))
+        self.assertIn("*Legacy*", lines)
+        self.assertIn("OLD1", lines)
+        self.assertIn("B2-T1", lines)
+
+    def test_cleared_report_legacy_items_sorted_by_assigned_at(self):
+        items = [
+            {"ref": "NEWER", "batch_number": 1, "task_number": 1, "status": "cleared",
+             "assign_batch_number": None, "assign_task_number": None,
+             "assigned_at": "2026-06-02 09:00:00", "valuer_name": "Jane Doe"},
+            {"ref": "OLDER", "batch_number": 1, "task_number": 2, "status": "cleared",
+             "assign_batch_number": None, "assign_task_number": None,
+             "assigned_at": "2026-06-01 09:00:00", "valuer_name": "Jane Doe"},
+        ]
+        lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=6))
+        self.assertLess(lines.index("OLDER"), lines.index("NEWER"))
+
+    def test_cleared_report_tagged_and_legacy_items_both_shown(self):
+        items = [
+            self._cleared_item("TAGGED", batch_number=4, task_number=1, assign_batch_number=1, assign_task_number=1),
+            {"ref": "LEGACY", "batch_number": 2, "task_number": 1, "status": "cleared",
+             "assign_batch_number": None, "assign_task_number": None,
+             "assigned_at": "2026-06-01 09:00:00", "valuer_name": "Jane Doe"},
+        ]
+        lines = "\n".join(ic._ic_format_cleared_report(items, batch_size=6))
+        self.assertIn("*Assign Batch 1*", lines)
+        self.assertIn("TAGGED", lines)
+        self.assertIn("*Legacy*", lines)
+        self.assertIn("LEGACY", lines)
 
 
 class TestCmdIncremental(unittest.TestCase):
