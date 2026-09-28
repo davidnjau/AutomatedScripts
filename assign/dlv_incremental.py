@@ -21,6 +21,33 @@ sess.tag_by_ref via next_incremental_tag() right before saving), not at
 tag-selection time — so cancelling a batch submission never burns a
 counter slot for a tag that was never actually persisted.
 
+Two independent tags ride on an incremental ref, both consumed from the
+same counter file (sharing batch_size, since there's still only one
+"tasks per batch" setting) but advancing separately, since refs clear in
+a different order than they were queued:
+- The queue tag ("B{batch}-T{task}", above) — allocated once, at DLV
+  Batch confirm time, and never changes.
+- The assignment tag ("A{batch}-T{task}", next_incremental_assign_tag())
+  — allocated separately, in dlv_batch.py's _process_dlv_batch_item, the
+  moment a ref reaches ANY successful-assignment outcome (Assigned,
+  Reassigned, or Already-correctly-assigned) — stored as the record's
+  assigned_tag field, independent of and never overwriting the original
+  tag field. Only incremental-tagged refs (is_incremental_tag(item["tag"]))
+  get one; everything else's assigned_tag is left empty. This is also
+  the one case where persist_assignment is now called from the
+  Already-correctly-assigned branch (previously that branch recorded
+  nothing at all) — deliberately scoped to incremental-tagged refs only,
+  so non-incremental refs hitting that branch keep their prior (unrecorded)
+  behavior rather than this feature silently changing it bot-wide.
+
+📦 By Batch (below) still groups by the queue tag — unchanged. ✅ Cleared
+now groups by the assignment tag instead of recomputing clearance-order
+chunks each time, so its grouping is a real, stable, persisted label
+rather than something that only exists at render time. Cleared items
+predating this feature have no assignment tag to group by — they're
+rendered in a trailing Legacy section using the old sort-by-assigned_at
+chunking, so no historical data is dropped.
+
 Reports here are deliberately separate from DLV Tasks' own By
 Valuer/By Tag reports (which assume a small fixed tag vocabulary for
 their picker) since incremental tags are unique per ref. Both always use
@@ -42,10 +69,14 @@ the shared visual every report in the bot uses — not a packed one-liner:
   found cleared; ✋ Close Batch offers the same action manually for
   anyone impatient to see it reflected without waiting for the next
   report view.
-- ✅ Cleared — every cleared (assigned) incremental-tagged ref, sorted by
-  assigned_at and chunked into groups of batch_size in clearance order
-  (First Cleared, Second Cleared, ...) — independent of original batch
-  number, since tasks from different batches can clear in any order.
+- ✅ Cleared — every cleared (assigned) incremental-tagged ref, grouped by
+  its persisted assignment tag (assign_batch_number, batch_size per
+  group) — independent of original queue batch number, since tasks from
+  different batches can clear in any order. Refs cleared before
+  assignment tagging existed have no assign tag to group by; they're
+  rendered afterward in a Legacy section, sorted by assigned_at and
+  chunked into groups of batch_size the way this whole report used to
+  work.
 
 🔔 Notify on Fill is a single scheduled job (saved_incremental_notify_
 config.json: enabled/interval_minutes/emails — not a multi-schedule
@@ -84,7 +115,7 @@ import json
 import os
 import re
 from enum import Enum, auto
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -132,22 +163,27 @@ SAVED_INCREMENTAL_NOTIFY_STATE_FILE  = os.path.join(DATA_DIR, "saved_incremental
 
 _DEFAULT_BATCH_SIZE = 6
 
-_ORDINALS = ["First", "Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh", "Eighth", "Ninth", "Tenth"]
-
 
 # ──────────────────────────────────────────────────────────
 # Counter persistence
 # ──────────────────────────────────────────────────────────
 def load_incremental_counter() -> Dict:
-    """Current (batch_number, task_number, batch_size) position — defaults
-    to batch 1, task 1, batch_size 6. batch_size defaults in for files
-    saved before it existed, rather than requiring a migration step."""
+    """Current (batch_number, task_number, batch_size) position for the
+    queue tag, plus (assign_batch_number, assign_task_number) for the
+    separate assignment-tag sequence — defaults to 1/1/6 and 1/1
+    respectively. Missing fields default in for files saved before they
+    existed, rather than requiring a migration step."""
     try:
         with open(SAVED_INCREMENTAL_COUNTER_FILE) as f:
             cfg = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"batch_number": 1, "task_number": 1, "batch_size": _DEFAULT_BATCH_SIZE}
+        return {
+            "batch_number": 1, "task_number": 1, "batch_size": _DEFAULT_BATCH_SIZE,
+            "assign_batch_number": 1, "assign_task_number": 1,
+        }
     cfg.setdefault("batch_size", _DEFAULT_BATCH_SIZE)
+    cfg.setdefault("assign_batch_number", 1)
+    cfg.setdefault("assign_task_number", 1)
     return cfg
 
 
@@ -156,16 +192,21 @@ def save_incremental_counter(cfg: Dict) -> None:
 
 
 def get_batch_size() -> int:
-    """Current tasks-per-batch setting."""
+    """Current tasks-per-batch setting (shared by both the queue and
+    assignment tag sequences)."""
     return load_incremental_counter().get("batch_size", _DEFAULT_BATCH_SIZE)
 
 
 def set_incremental_counter(batch_number: int, task_number: int, batch_size: Optional[int] = None) -> None:
-    """Manually seed the counter's position to match real-world state (e.g.
-    a batch already partway used before this feature existed), and
-    optionally the tasks-per-batch size — left unchanged if not given."""
+    """Manually seed the queue tag counter's position to match real-world
+    state (e.g. a batch already partway used before this feature existed),
+    and optionally the tasks-per-batch size — left unchanged if not given.
+    Merges onto the existing config rather than replacing it wholesale, so
+    the separate assign_batch_number/assign_task_number position (this
+    function never touches those) survives untouched."""
     current = load_incremental_counter()
     save_incremental_counter({
+        **current,
         "batch_number": batch_number,
         "task_number":  task_number,
         "batch_size":   batch_size if batch_size is not None else current.get("batch_size", _DEFAULT_BATCH_SIZE),
@@ -173,19 +214,57 @@ def set_incremental_counter(batch_number: int, task_number: int, batch_size: Opt
 
 
 def next_incremental_tag() -> str:
-    """Consume and return the next "B{batch}-T{task}" tag, advancing the
-    persisted counter — task_number wraps to 1 and batch_number advances
-    once the configured batch_size is reached."""
+    """Consume and return the next "B{batch}-T{task}" queue tag, advancing
+    the persisted counter — task_number wraps to 1 and batch_number
+    advances once the configured batch_size is reached. Merges onto the
+    existing config so the separate assignment-tag position is untouched."""
     cfg   = load_incremental_counter()
     batch = cfg.get("batch_number", 1)
     task  = cfg.get("task_number", 1)
     size  = cfg.get("batch_size", _DEFAULT_BATCH_SIZE)
     tag   = f"B{batch}-T{task}"
     if task >= size:
-        save_incremental_counter({"batch_number": batch + 1, "task_number": 1, "batch_size": size})
+        save_incremental_counter({**cfg, "batch_number": batch + 1, "task_number": 1, "batch_size": size})
     else:
-        save_incremental_counter({"batch_number": batch, "task_number": task + 1, "batch_size": size})
+        save_incremental_counter({**cfg, "batch_number": batch, "task_number": task + 1, "batch_size": size})
     return tag
+
+
+def next_incremental_assign_tag() -> str:
+    """Consume and return the next "A{batch}-T{task}" assignment tag,
+    advancing its own position within the same counter file — a separate
+    sequence from the queue tag's batch/task position (next_incremental_
+    tag), since refs get assigned in a different order than they were
+    queued. Shares batch_size with the queue sequence rather than
+    tracking its own, per this feature's "one counter/one set of
+    batches" design. Called from dlv_batch.py's _process_dlv_batch_item
+    the moment an incremental-tagged ref reaches a successful-assignment
+    outcome."""
+    cfg   = load_incremental_counter()
+    batch = cfg.get("assign_batch_number", 1)
+    task  = cfg.get("assign_task_number", 1)
+    size  = cfg.get("batch_size", _DEFAULT_BATCH_SIZE)
+    tag   = f"A{batch}-T{task}"
+    if task >= size:
+        save_incremental_counter({**cfg, "assign_batch_number": batch + 1, "assign_task_number": 1})
+    else:
+        save_incremental_counter({**cfg, "assign_batch_number": batch, "assign_task_number": task + 1})
+    return tag
+
+
+_INCREMENTAL_ASSIGN_TAG_RE = re.compile(r"^A(\d+)-T(\d+)$")
+
+
+def _parse_incremental_assign_tag(tag: Optional[str]) -> Optional[Tuple[int, int]]:
+    """(assign_batch_number, assign_task_number) parsed from an
+    "A{n}-T{n}" assignment tag, or None if tag is empty/doesn't match.
+    Local to this module — unlike the queue tag's parse_incremental_tag
+    (dlv_core.py, shared with dlv_batch.py/dlv_tasks.py), nothing outside
+    Incremental's own ✅ Cleared report needs to parse an assigned_tag."""
+    m = _INCREMENTAL_ASSIGN_TAG_RE.match(tag or "")
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
 
 
 # ──────────────────────────────────────────────────────────
@@ -293,7 +372,10 @@ def _ic_gather_items() -> List[Dict]:
     and saved_assignments.json ("cleared"), each annotated with its parsed
     batch_number/task_number/status. If a ref somehow appears in both
     (shouldn't happen in the normal flow), the assignments.json ("cleared")
-    version wins, since it reflects the more-progressed state."""
+    version wins, since it reflects the more-progressed state. Cleared
+    items also get assign_batch_number/assign_task_number parsed from
+    their persisted assigned_tag (None/None if it has none — e.g. cleared
+    before assignment tagging existed, or a non-incremental ref)."""
     by_ref: Dict[str, Dict] = {}
     for item in load_dlv_batch():
         parsed = parse_incremental_tag(item.get("tag", ""))
@@ -306,7 +388,12 @@ def _ic_gather_items() -> List[Dict]:
         if not parsed:
             continue
         batch_number, task_number = parsed
-        by_ref[ref] = {**info, "ref": ref, "batch_number": batch_number, "task_number": task_number, "status": "cleared"}
+        assign_parsed = _parse_incremental_assign_tag(info.get("assigned_tag", ""))
+        assign_batch_number, assign_task_number = assign_parsed if assign_parsed else (None, None)
+        by_ref[ref] = {
+            **info, "ref": ref, "batch_number": batch_number, "task_number": task_number, "status": "cleared",
+            "assign_batch_number": assign_batch_number, "assign_task_number": assign_task_number,
+        }
     return list(by_ref.values())
 
 
@@ -317,6 +404,22 @@ def _ic_group_by_batch(items: List[Dict]) -> Dict[int, List[Dict]]:
         groups.setdefault(item["batch_number"], []).append(item)
     for batch_number in groups:
         groups[batch_number].sort(key=lambda i: i["task_number"])
+    return groups
+
+
+def _ic_group_by_assign_batch(cleared: List[Dict]) -> Dict[int, List[Dict]]:
+    """Group cleared items that have a parsed assignment tag by
+    assign_batch_number, each group's items sorted by assign_task_number.
+    Items with no assignment tag (assign_batch_number is None — cleared
+    before this tagging existed) are excluded; callers render those
+    separately (see _ic_format_cleared_report's Legacy section)."""
+    groups: Dict[int, List[Dict]] = {}
+    for item in cleared:
+        if item.get("assign_batch_number") is None:
+            continue
+        groups.setdefault(item["assign_batch_number"], []).append(item)
+    for batch_number in groups:
+        groups[batch_number].sort(key=lambda i: i["assign_task_number"])
     return groups
 
 
@@ -385,21 +488,41 @@ def _ic_format_by_batch_report(grouped: Dict[int, List[Dict]], closed_batches: L
 
 
 def _ic_format_cleared_report(items: List[Dict], batch_size: int) -> List[str]:
-    """✅ Cleared — cleared items only, sorted by clearance (assigned_at)
-    order and chunked into groups of batch_size regardless of original
-    batch, each rendered as its own labeled block."""
+    """✅ Cleared — cleared items grouped by their persisted assignment tag
+    (assign_batch_number, "A{n}-T{m}") rather than recomputed clearance-
+    order chunking, so the grouping is a stable, independently-checkable
+    label instead of something only computed at render time. Items
+    cleared before assignment tagging existed (no assign tag to group by)
+    are rendered afterward in a Legacy section, sorted by clearance
+    (assigned_at) order and chunked into groups of batch_size — the way
+    this whole report used to work, so no historical data is dropped."""
     cleared = [i for i in items if i["status"] == "cleared"]
-    cleared.sort(key=lambda i: i.get("assigned_at", ""))
     lines = ["✅ *Incremental Report — Cleared*\n"]
     if not cleared:
         lines.append("_No cleared incremental-tagged tasks yet._")
         return lines
-    for group_idx in range(0, len(cleared), batch_size):
-        group = cleared[group_idx:group_idx + batch_size]
-        ordinal_idx = group_idx // batch_size
-        ordinal = f"{_ORDINALS[ordinal_idx]} Cleared" if ordinal_idx < len(_ORDINALS) else f"Cleared Group {ordinal_idx + 1}"
-        lines.append(f"*{ordinal}* ({len(group)}/{batch_size})")
-        for i, item in enumerate(group, start=1):
+
+    tagged   = [i for i in cleared if i.get("assign_batch_number") is not None]
+    untagged = [i for i in cleared if i.get("assign_batch_number") is None]
+
+    for batch_number, group in sorted(_ic_group_by_assign_batch(tagged).items()):
+        status_note = " ✅ COMPLETE" if len(group) >= batch_size else ""
+        lines.append(f"*Assign Batch {batch_number}*{status_note} — {len(group)}/{batch_size} tagged")
+        for item in group:
+            fields = [
+                ("🔢 Queued As",   f"B{item['batch_number']}-T{item['task_number']}"),
+                ("🏁 Assigned As", f"A{item['assign_batch_number']}-T{item['assign_task_number']}"),
+                ("👤 Valuer", item.get("valuer_name") or "—"),
+                assessor_field(item),
+                consideration_field(item),
+                parcel_field(item),
+            ]
+            lines.append(format_labeled_block(item["assign_task_number"], item["ref"], fields))
+
+    if untagged:
+        untagged.sort(key=lambda i: i.get("assigned_at", ""))
+        lines.append(f"\n*Legacy* (cleared before assignment tagging) — {len(untagged)} task(s)")
+        for i, item in enumerate(untagged, start=1):
             fields = [
                 ("🔢 Batch/Task", f"B{item['batch_number']}-T{item['task_number']}"),
                 ("👤 Valuer", item.get("valuer_name") or "—"),

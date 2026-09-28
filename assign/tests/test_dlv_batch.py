@@ -97,6 +97,29 @@ class TestResolveValuerFromSaved(unittest.TestCase):
             self.assertIsNone(dlv_batch._resolve_valuer_from_saved("anyone"))
 
 
+class TestIncrementalAssignTagFor(unittest.TestCase):
+    """_incremental_assign_tag_for — allocates an "A{n}-T{n}" assignment
+    tag only for refs queued with an incremental (B-tag) queue tag."""
+
+    def test_incremental_tag_allocates_a_new_assign_tag(self):
+        with patch.object(dlv_batch, "next_incremental_assign_tag", return_value="A1-T1") as mock_next:
+            result = dlv_batch._incremental_assign_tag_for({"tag": "B1-T1"})
+        self.assertEqual(result, "A1-T1")
+        mock_next.assert_called_once()
+
+    def test_fixed_tag_returns_empty_without_consuming_a_slot(self):
+        with patch.object(dlv_batch, "next_incremental_assign_tag") as mock_next:
+            result = dlv_batch._incremental_assign_tag_for({"tag": "Queue"})
+        self.assertEqual(result, "")
+        mock_next.assert_not_called()
+
+    def test_missing_tag_returns_empty(self):
+        with patch.object(dlv_batch, "next_incremental_assign_tag") as mock_next:
+            result = dlv_batch._incremental_assign_tag_for({})
+        self.assertEqual(result, "")
+        mock_next.assert_not_called()
+
+
 class TestProcessDlvBatchItem(unittest.TestCase):
     def setUp(self):
         self.item = {"ref": "REG/TSFR/ABC123", "valuer_name": "Jane Doe", "valuer_uid": "uid-1"}
@@ -164,8 +187,25 @@ class TestProcessDlvBatchItem(unittest.TestCase):
         self.assertEqual(result["item"]["assessor"], "Jane Assessor")
         mock_persist.assert_called_once_with("REG/TSFR/ABC123", "Jane Doe", "uid-1", extra={
             "valuer_acct": "", "tag": "", "assessor": "Jane Assessor", "parcel": "",
-            "consideration": "", "currency_code": "", "queued_at": "",
+            "consideration": "", "currency_code": "", "queued_at": "", "assigned_tag": "",
         })
+
+    def test_open_created_node_with_incremental_tag_persists_assigned_tag(self):
+        """A ref queued with an incremental (B-tag) tag gets a real
+        assigned_tag allocated the moment it's assigned."""
+        self.item["tag"] = "B1-T1"
+        with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={"node": "VALUATION_STAMP_DUTY_CREATED"}), \
+             patch.object(dlv_batch, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+                 "node": "VALUATION_STAMP_DUTY_CREATED", "assessor_name": "",
+                 "consideration_amount": "", "currency_code": "", "actor_name": "",
+             }), \
+             patch.object(dlv_batch, "persist_assignment") as mock_persist, \
+             patch.object(dlv_batch, "next_incremental_assign_tag", return_value="A1-T1"):
+            self.http_sess.post.return_value = MagicMock(raise_for_status=lambda: None)
+            self._run()
+        self.assertEqual(mock_persist.call_args.kwargs["extra"]["assigned_tag"], "A1-T1")
 
     def test_assign_persists_the_queue_items_own_context(self):
         """Once assigned, the ref drops out of saved_dlv_batch.json for good —
@@ -189,6 +229,7 @@ class TestProcessDlvBatchItem(unittest.TestCase):
         mock_persist.assert_called_once_with("CNTYINV/X4LNTSVRPT", "Jane Doe", "uid-1", extra={
             "valuer_acct": "SE0C17N708", "tag": "Queue", "assessor": "", "parcel": "I.R 81948",
             "consideration": "40000000.000", "currency_code": "KES", "queued_at": "2026-07-16T11:34:41",
+            "assigned_tag": "",
         })
         self.http_sess.post.assert_called_once()
 
@@ -238,6 +279,48 @@ class TestProcessDlvBatchItem(unittest.TestCase):
         self.assertEqual(result["outcome"]["valuer_name"], "Jane Doe")
         self.http_sess.post.assert_not_called()
 
+    def test_already_assigned_without_incremental_tag_does_not_persist(self):
+        """Scoped deliberately: this branch previously never called
+        persist_assignment at all for any ref. It now does, but only for
+        incremental-tagged refs (so the assignment tag has somewhere to
+        persist to) — a non-incremental ref landing here keeps its prior
+        (unrecorded) behavior rather than this feature silently changing
+        it bot-wide."""
+        with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                 "actors": [{"role": "VALUATION OFFICER", "user_details": {"id": "uid-1", "names": "Jane Doe"}}],
+             }), \
+             patch.object(dlv_batch, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT", "assessor_name": "",
+                 "consideration_amount": "", "currency_code": "", "actor_name": "",
+             }), \
+             patch.object(dlv_batch, "persist_assignment") as mock_persist:
+            self._run()
+        mock_persist.assert_not_called()
+
+    def test_already_assigned_with_incremental_tag_persists_assigned_tag(self):
+        self.item["tag"] = "B1-T1"
+        with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                 "actors": [{"role": "VALUATION OFFICER", "user_details": {"id": "uid-1", "names": "Jane Doe"}}],
+             }), \
+             patch.object(dlv_batch, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT", "assessor_name": "",
+                 "consideration_amount": "", "currency_code": "", "actor_name": "",
+             }), \
+             patch.object(dlv_batch, "persist_assignment") as mock_persist, \
+             patch.object(dlv_batch, "next_incremental_assign_tag", return_value="A1-T1"):
+            result = self._run()
+        self.assertFalse(result["keep"])
+        mock_persist.assert_called_once_with("REG/TSFR/ABC123", "Jane Doe", "uid-1", extra={
+            "valuer_acct": "", "tag": "B1-T1", "assessor": "", "parcel": "",
+            "consideration": "", "currency_code": "", "queued_at": "", "assigned_tag": "A1-T1",
+        })
+
     def test_force_reassign_calls_assign_api_regardless_of_current_actor(self):
         """Reassign to New Valuer (recv_db_taken_decision) sets force_reassign
         on the requeued item — the next cycle must call the assign API against
@@ -267,8 +350,27 @@ class TestProcessDlvBatchItem(unittest.TestCase):
         )
         mock_persist.assert_called_once_with("REG/TSFR/ABC123", "Jane Doe", "uid-1", extra={
             "valuer_acct": "", "tag": "", "assessor": "", "parcel": "",
-            "consideration": "", "currency_code": "", "queued_at": "",
+            "consideration": "", "currency_code": "", "queued_at": "", "assigned_tag": "",
         })
+
+    def test_force_reassign_with_incremental_tag_persists_assigned_tag(self):
+        self.item["tag"] = "B1-T1"
+        self.item["force_reassign"] = True
+        with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                 "actors": [{"role": "VALUATION OFFICER", "user_details": {"id": "uid-2", "names": "EXISTING VALUER"}}],
+             }), \
+             patch.object(dlv_batch, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT", "assessor_name": "",
+                 "consideration_amount": "", "currency_code": "", "actor_name": "",
+             }), \
+             patch.object(dlv_batch, "persist_assignment") as mock_persist, \
+             patch.object(dlv_batch, "next_incremental_assign_tag", return_value="A1-T1"):
+            self.http_sess.post.return_value = MagicMock(raise_for_status=lambda: None)
+            self._run()
+        self.assertEqual(mock_persist.call_args.kwargs["extra"]["assigned_tag"], "A1-T1")
 
     def test_no_valuation_officer_actor_reports_no_actor_listed(self):
         with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
