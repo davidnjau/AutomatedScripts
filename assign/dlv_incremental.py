@@ -68,7 +68,10 @@ the shared visual every report in the bot uses — not a packed one-liner:
   status flag, not a data move) the moment all of its task slots are
   found cleared; ✋ Close Batch offers the same action manually for
   anyone impatient to see it reflected without waiting for the next
-  report view.
+  report view. A cleared item within a batch also shows its assignment
+  tag alongside the queue tag, noting whether the two batch numbers
+  match — coincidental, not guaranteed, since the two sequences advance
+  independently (see _ic_format_batch_section).
 - ✅ Cleared — every cleared (assigned) incremental-tagged ref, grouped by
   its persisted assignment tag (assign_batch_number, batch_size per
   group) — independent of original queue batch number, since tasks from
@@ -455,7 +458,12 @@ def _ic_format_batch_section(grouped: Dict[int, List[Dict]], closed_batches: Lis
     used by both the interactive 📦 By Batch report and Notify on Fill's
     Available Batches section — one block per batch number, each task
     slot as its own labeled block (task_block.format_labeled_block — the
-    shared visual every report in the bot uses, numbered by task_number)."""
+    shared visual every report in the bot uses, numbered by task_number).
+    A cleared item that's picked up an assignment tag (assign_batch_number
+    is not None) also shows it alongside the queue tag, noting whether
+    the two batch numbers happen to match — they're independent counters,
+    so a match is coincidental, not guaranteed. A still-queued item never
+    has one yet, so the field is simply omitted for it."""
     lines = []
     closed_set = set(closed_batches)
     for batch_number in sorted(grouped):
@@ -467,6 +475,15 @@ def _ic_format_batch_section(grouped: Dict[int, List[Dict]], closed_batches: Lis
             fields = [
                 ("🔢 Batch/Task", f"B{batch_number}-T{item['task_number']}"),
                 ("📊 Status", status_label),
+            ]
+            assign_batch_number = item.get("assign_batch_number")
+            if assign_batch_number is not None:
+                match_note = "same batch number" if assign_batch_number == batch_number else "different batch number"
+                fields.append((
+                    "🏁 Assigned As",
+                    f"A{assign_batch_number}-T{item['assign_task_number']} ({match_note})",
+                ))
+            fields += [
                 ("👤 Valuer", item.get("valuer_name") or "—"),
                 assessor_field(item),
                 consideration_field(item),

@@ -330,6 +330,36 @@ class TestFormatReports(unittest.TestCase):
         self.assertIn("📊 Status: ✅ Cleared", lines)
         self.assertIn("👤 Valuer: John Otieno", lines)
 
+    def test_by_batch_report_shows_assign_tag_alongside_queue_tag(self):
+        grouped = {
+            2: [{"ref": "REF1", "task_number": 3, "status": "cleared", "valuer_name": "Jane Doe",
+                 "assign_batch_number": 5, "assign_task_number": 1}],
+        }
+        lines = "\n".join(ic._ic_format_by_batch_report(grouped, [], batch_size=6))
+        self.assertIn("🔢 Batch/Task: B2-T3", lines)
+        self.assertIn("🏁 Assigned As: A5-T1 (different batch number)", lines)
+
+    def test_by_batch_report_notes_matching_batch_numbers(self):
+        grouped = {
+            2: [{"ref": "REF1", "task_number": 3, "status": "cleared", "valuer_name": "Jane Doe",
+                 "assign_batch_number": 2, "assign_task_number": 1}],
+        }
+        lines = "\n".join(ic._ic_format_by_batch_report(grouped, [], batch_size=6))
+        self.assertIn("🏁 Assigned As: A2-T1 (same batch number)", lines)
+
+    def test_by_batch_report_omits_assign_tag_for_still_queued_item(self):
+        grouped = {2: [{"ref": "REF1", "task_number": 3, "status": "queued", "valuer_name": "Jane Doe"}]}
+        lines = "\n".join(ic._ic_format_by_batch_report(grouped, [], batch_size=6))
+        self.assertNotIn("Assigned As", lines)
+
+    def test_by_batch_report_omits_assign_tag_for_legacy_cleared_item(self):
+        grouped = {
+            2: [{"ref": "REF1", "task_number": 3, "status": "cleared", "valuer_name": "Jane Doe",
+                 "assign_batch_number": None, "assign_task_number": None}],
+        }
+        lines = "\n".join(ic._ic_format_by_batch_report(grouped, [], batch_size=6))
+        self.assertNotIn("Assigned As", lines)
+
     def test_by_batch_report_uses_shared_labeled_block_format(self):
         """Regression: each task used to be a packed one-liner
         ("T2: `REF1` ⏳ Jane Doe") — it must now use the same
