@@ -31,6 +31,10 @@ jobs:
       # test_auto_fetch's _auto_fetch_job tests) assert a Telegram send
       # happened, which only fires per-chat_id in ALLOWED_IDS.
       ALLOWED_TELEGRAM_IDS: "123456789"
+      # bot.py reads this via os.environ["TELEGRAM_BOT_TOKEN"] at import
+      # time (raises KeyError otherwise) — needed since tests/test_bot.py
+      # imports bot directly. Never hits the real Telegram API in tests.
+      TELEGRAM_BOT_TOKEN: "123456:ci-test-dummy-token"
 
     steps:
       - name: Checkout code
