@@ -115,17 +115,34 @@ def _get_pl_sess(ctx: ContextTypes.DEFAULT_TYPE) -> PLSession:
     return ctx.user_data["pl_session"]
 
 
+_PL_NON_ALNUM_RE = re.compile(r"[^A-Z0-9]")
+
+
+def _pl_normalize_parcel(value: str) -> str:
+    """Uppercase and strip every non-alphanumeric character, so formatting
+    differences (slashes vs spaces vs dashes, extra whitespace) between a
+    search term and a stored parcel_number never prevent a match — e.g.
+    "Block 209/309", "BLOCK209-309", and "block209 309" all normalize to
+    the same "BLOCK209309"."""
+    return _PL_NON_ALNUM_RE.sub("", (value or "").upper())
+
+
 def _pl_search_parcel(tokens: AuthTokens, parcel: str) -> List[Dict]:
-    """Search every _LU_SEARCH_COMBOS filter/role combo for parcel (case-
-    insensitive, whitespace-trimmed exact match against each result's
-    parcel_number). Returns every distinct matching list-item dict,
-    deduped by reference_number, in first-seen order."""
+    """Search every _LU_SEARCH_COMBOS filter/role combo for parcel — a
+    normalized substring match (see _pl_normalize_parcel) against each
+    result's parcel_number, not an exact one, so a fragment like
+    "BLOCK209" or "209/309" matches "NAIROBI/BLOCK209/309" and formatting
+    differences (separators, spacing, case) never prevent a match that
+    would otherwise be correct. Returns every distinct matching list-item
+    dict, deduped by reference_number, in first-seen order. Shared by
+    Parcel Lookup's on-demand /parcelcheck and Parcel Watch's scheduled
+    checks, so both search the same way."""
     http_sess = build_session()
     hdrs = {
         "Authorization": f"Bearer {tokens.access_token}",
         "JWTAUTH":       f"Bearer {tokens.jwt}",
     }
-    target = parcel.strip().upper()
+    target = _pl_normalize_parcel(parcel)
     seen: Dict[str, Dict] = {}
     for filt, role, cparams in _LU_SEARCH_COMBOS:
         try:
@@ -143,7 +160,7 @@ def _pl_search_parcel(tokens: AuthTokens, parcel: str) -> List[Dict]:
             )
             resp.raise_for_status()
             for item in resp.json().get("results", []):
-                if (item.get("parcel_number") or "").strip().upper() != target:
+                if not target or target not in _pl_normalize_parcel(item.get("parcel_number") or ""):
                     continue
                 ref = item.get("reference_number")
                 if ref and ref not in seen:

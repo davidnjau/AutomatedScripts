@@ -133,6 +133,73 @@ class TestPlSearchParcel(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertEqual(fake_session.get.call_count, len(pl._LU_SEARCH_COMBOS))
 
+    def test_fragment_of_parcel_number_matches(self):
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(
+            raise_for_status=lambda: None,
+            json=lambda: {"results": [
+                {"reference_number": "R1", "parcel_number": "NAIROBI/BLOCK209/309"},
+            ]},
+        )
+        with patch.object(pl, "build_session", return_value=fake_session):
+            result = pl._pl_search_parcel(TOKENS, "BLOCK209")
+        self.assertEqual([r["reference_number"] for r in result], ["R1"])
+
+    def test_different_separators_still_match(self):
+        """A search entered with dashes/spaces must still match a parcel
+        number stored with slashes — formatting shouldn't matter."""
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(
+            raise_for_status=lambda: None,
+            json=lambda: {"results": [
+                {"reference_number": "R1", "parcel_number": "NBI/BLOCK1/123"},
+            ]},
+        )
+        with patch.object(pl, "build_session", return_value=fake_session):
+            result = pl._pl_search_parcel(TOKENS, "NBI-BLOCK1-123")
+        self.assertEqual([r["reference_number"] for r in result], ["R1"])
+
+    def test_unrelated_fragment_does_not_match(self):
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(
+            raise_for_status=lambda: None,
+            json=lambda: {"results": [
+                {"reference_number": "R1", "parcel_number": "NBI/BLOCK1/123"},
+            ]},
+        )
+        with patch.object(pl, "build_session", return_value=fake_session):
+            result = pl._pl_search_parcel(TOKENS, "BLOCK9")
+        self.assertEqual(result, [])
+
+    def test_empty_normalized_search_term_matches_nothing(self):
+        """A search term that normalizes to nothing (e.g. only punctuation)
+        must not fall through to matching every result."""
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(
+            raise_for_status=lambda: None,
+            json=lambda: {"results": [
+                {"reference_number": "R1", "parcel_number": "NBI/BLOCK1/123"},
+            ]},
+        )
+        with patch.object(pl, "build_session", return_value=fake_session):
+            result = pl._pl_search_parcel(TOKENS, "///")
+        self.assertEqual(result, [])
+
+
+class TestPlNormalizeParcel(unittest.TestCase):
+    def test_strips_separators_and_uppercases(self):
+        self.assertEqual(pl._pl_normalize_parcel("Nbi/Block1/123"), "NBIBLOCK1123")
+
+    def test_different_separators_normalize_the_same(self):
+        self.assertEqual(pl._pl_normalize_parcel("NBI-BLOCK1-123"), pl._pl_normalize_parcel("NBI/BLOCK1/123"))
+        self.assertEqual(pl._pl_normalize_parcel("NBI BLOCK1 123"), pl._pl_normalize_parcel("NBI/BLOCK1/123"))
+
+    def test_none_returns_empty_string(self):
+        self.assertEqual(pl._pl_normalize_parcel(None), "")
+
+    def test_empty_string_returns_empty_string(self):
+        self.assertEqual(pl._pl_normalize_parcel(""), "")
+
 
 class TestPlFormatMatch(unittest.TestCase):
     def test_renders_known_node_label(self):
