@@ -115,34 +115,60 @@ def _get_pl_sess(ctx: ContextTypes.DEFAULT_TYPE) -> PLSession:
     return ctx.user_data["pl_session"]
 
 
-_PL_NON_ALNUM_RE = re.compile(r"[^A-Z0-9]")
+_PL_TOKEN_RE = re.compile(r"[A-Z]+|\d+")
 
 
-def _pl_normalize_parcel(value: str) -> str:
-    """Uppercase and strip every non-alphanumeric character, so formatting
-    differences (slashes vs spaces vs dashes, extra whitespace) between a
-    search term and a stored parcel_number never prevent a match — e.g.
-    "Block 209/309", "BLOCK209-309", and "block209 309" all normalize to
-    the same "BLOCK209309"."""
-    return _PL_NON_ALNUM_RE.sub("", (value or "").upper())
+def _pl_tokenize_parcel(value: str) -> List[str]:
+    """Split into uppercase word/number tokens — letters and digits are
+    separate token types, and everything else (spaces, slashes, dashes,
+    punctuation) is an implicit separator. "block123" and "Block 123"
+    both tokenize to ["BLOCK", "123"], keeping word and number tokens
+    distinguishable after separators are gone (needed by _pl_tokens_match
+    to apply a different matching rule to each kind)."""
+    return _PL_TOKEN_RE.findall((value or "").upper())
+
+
+def _pl_tokens_match(search_tokens: List[str], candidate_tokens: List[str]) -> bool:
+    """True if every search token matches some candidate token, walking
+    through candidate_tokens in order — so an omitted or abbreviated
+    candidate word (e.g. a search that drops "Municipality" entirely, or
+    shortens it to "Muni") doesn't break the match, while tokens still
+    can't be matched out of order or reused. A word token matches as a
+    prefix ("MUNI" matches "MUNICIPALITY"); a number token must match
+    exactly — block/plot numbers are precise identifiers, and a prefix
+    match on "12" would also hit "123", "1256", etc., which gets noisy
+    fast."""
+    idx = 0
+    for st in search_tokens:
+        matched = False
+        while idx < len(candidate_tokens):
+            candidate = candidate_tokens[idx]
+            idx += 1
+            if (candidate == st) if st.isdigit() else candidate.startswith(st):
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
 
 
 def _pl_search_parcel(tokens: AuthTokens, parcel: str) -> List[Dict]:
     """Search every _LU_SEARCH_COMBOS filter/role combo for parcel — a
-    normalized substring match (see _pl_normalize_parcel) against each
-    result's parcel_number, not an exact one, so a fragment like
-    "BLOCK209" or "209/309" matches "NAIROBI/BLOCK209/309" and formatting
-    differences (separators, spacing, case) never prevent a match that
-    would otherwise be correct. Returns every distinct matching list-item
-    dict, deduped by reference_number, in first-seen order. Shared by
-    Parcel Lookup's on-demand /parcelcheck and Parcel Watch's scheduled
-    checks, so both search the same way."""
+    tokenized, order-preserving match against each result's parcel_number
+    (see _pl_tokens_match), not an exact or plain-substring one, so a
+    fragment like "BLOCK209" or "209/309" matches "NAIROBI/BLOCK209/309",
+    an abbreviated word like "Mavoko Muni" matches "Mavoko/Municipality",
+    and formatting differences (separators, spacing, case) never prevent
+    a match that would otherwise be correct. Returns every distinct
+    matching list-item dict, deduped by reference_number, in first-seen
+    order. Shared by Parcel Lookup's on-demand /parcelcheck and Parcel
+    Watch's scheduled checks, so both search the same way."""
     http_sess = build_session()
     hdrs = {
         "Authorization": f"Bearer {tokens.access_token}",
         "JWTAUTH":       f"Bearer {tokens.jwt}",
     }
-    target = _pl_normalize_parcel(parcel)
+    target_tokens = _pl_tokenize_parcel(parcel)
     seen: Dict[str, Dict] = {}
     for filt, role, cparams in _LU_SEARCH_COMBOS:
         try:
@@ -160,7 +186,8 @@ def _pl_search_parcel(tokens: AuthTokens, parcel: str) -> List[Dict]:
             )
             resp.raise_for_status()
             for item in resp.json().get("results", []):
-                if not target or target not in _pl_normalize_parcel(item.get("parcel_number") or ""):
+                candidate_tokens = _pl_tokenize_parcel(item.get("parcel_number") or "")
+                if not target_tokens or not _pl_tokens_match(target_tokens, candidate_tokens):
                     continue
                 ref = item.get("reference_number")
                 if ref and ref not in seen:

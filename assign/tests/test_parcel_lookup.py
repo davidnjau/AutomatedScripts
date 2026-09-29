@@ -185,20 +185,90 @@ class TestPlSearchParcel(unittest.TestCase):
             result = pl._pl_search_parcel(TOKENS, "///")
         self.assertEqual(result, [])
 
+    def test_abbreviated_word_matches_full_word_end_to_end(self):
+        """The reported case: "Mavoko Muni block 123/145/" must match
+        "Mavoko/Municipality/block123/145/5" even though a plain
+        (non-tokenized) substring check would fail — "Muni" jumps
+        straight to "block" while the real text has "cipality" between."""
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(
+            raise_for_status=lambda: None,
+            json=lambda: {"results": [
+                {"reference_number": "R1", "parcel_number": "Mavoko/Municipality/block123/145/5"},
+            ]},
+        )
+        with patch.object(pl, "build_session", return_value=fake_session):
+            result = pl._pl_search_parcel(TOKENS, "Mavoko Muni block 123/145/")
+        self.assertEqual([r["reference_number"] for r in result], ["R1"])
 
-class TestPlNormalizeParcel(unittest.TestCase):
-    def test_strips_separators_and_uppercases(self):
-        self.assertEqual(pl._pl_normalize_parcel("Nbi/Block1/123"), "NBIBLOCK1123")
+    def test_short_number_fragment_does_not_match_end_to_end(self):
+        """Regression: number tokens must match exactly, even end-to-end
+        through _pl_search_parcel — "12" must not match a parcel
+        containing "123"."""
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(
+            raise_for_status=lambda: None,
+            json=lambda: {"results": [
+                {"reference_number": "R1", "parcel_number": "NBI/BLOCK1/123"},
+            ]},
+        )
+        with patch.object(pl, "build_session", return_value=fake_session):
+            result = pl._pl_search_parcel(TOKENS, "12")
+        self.assertEqual(result, [])
 
-    def test_different_separators_normalize_the_same(self):
-        self.assertEqual(pl._pl_normalize_parcel("NBI-BLOCK1-123"), pl._pl_normalize_parcel("NBI/BLOCK1/123"))
-        self.assertEqual(pl._pl_normalize_parcel("NBI BLOCK1 123"), pl._pl_normalize_parcel("NBI/BLOCK1/123"))
 
-    def test_none_returns_empty_string(self):
-        self.assertEqual(pl._pl_normalize_parcel(None), "")
+class TestPlTokenizeParcel(unittest.TestCase):
+    def test_splits_words_and_numbers_uppercased(self):
+        self.assertEqual(pl._pl_tokenize_parcel("Nbi/Block1/123"), ["NBI", "BLOCK", "1", "123"])
 
-    def test_empty_string_returns_empty_string(self):
-        self.assertEqual(pl._pl_normalize_parcel(""), "")
+    def test_space_separated_and_glued_forms_tokenize_the_same(self):
+        self.assertEqual(pl._pl_tokenize_parcel("Block 123"), pl._pl_tokenize_parcel("block123"))
+
+    def test_different_separators_tokenize_the_same(self):
+        self.assertEqual(pl._pl_tokenize_parcel("NBI-BLOCK1-123"), pl._pl_tokenize_parcel("NBI/BLOCK1/123"))
+
+    def test_none_returns_empty_list(self):
+        self.assertEqual(pl._pl_tokenize_parcel(None), [])
+
+    def test_empty_string_returns_empty_list(self):
+        self.assertEqual(pl._pl_tokenize_parcel(""), [])
+
+
+class TestPlTokensMatch(unittest.TestCase):
+    """_pl_tokens_match — word tokens match as a prefix (abbreviations),
+    number tokens must match exactly, and candidate tokens can be
+    skipped (omitted words) but not reordered or reused."""
+
+    def test_exact_tokens_match(self):
+        self.assertTrue(pl._pl_tokens_match(["NBI", "BLOCK", "123"], ["NBI", "BLOCK", "123"]))
+
+    def test_word_prefix_matches_abbreviation(self):
+        # "Mavoko Muni block 123/145" vs "Mavoko/Municipality/block123/145/5"
+        search = pl._pl_tokenize_parcel("Mavoko Muni block 123/145/")
+        candidate = pl._pl_tokenize_parcel("Mavoko/Municipality/block123/145/5")
+        self.assertTrue(pl._pl_tokens_match(search, candidate))
+
+    def test_omitted_candidate_word_does_not_break_match(self):
+        search = pl._pl_tokenize_parcel("Mavoko block 123")
+        candidate = pl._pl_tokenize_parcel("Mavoko/Municipality/block123")
+        self.assertTrue(pl._pl_tokens_match(search, candidate))
+
+    def test_number_prefix_does_not_match(self):
+        """Regression: a number token must match exactly — "12" must not
+        loosely match "123", unlike word tokens."""
+        self.assertFalse(pl._pl_tokens_match(["12"], ["123"]))
+
+    def test_number_exact_match_succeeds(self):
+        self.assertTrue(pl._pl_tokens_match(["123"], ["123"]))
+
+    def test_out_of_order_tokens_do_not_match(self):
+        self.assertFalse(pl._pl_tokens_match(["BLOCK", "MAVOKO"], ["MAVOKO", "BLOCK"]))
+
+    def test_extra_search_token_not_in_candidate_fails(self):
+        self.assertFalse(pl._pl_tokens_match(["MAVOKO", "KIAMBU"], ["MAVOKO", "BLOCK"]))
+
+    def test_empty_search_tokens_trivially_matches(self):
+        self.assertTrue(pl._pl_tokens_match([], ["MAVOKO", "BLOCK"]))
 
 
 class TestPlFormatMatch(unittest.TestCase):
