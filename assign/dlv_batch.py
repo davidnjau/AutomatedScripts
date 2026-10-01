@@ -40,6 +40,8 @@ Call register(app) from bot.py's main() to wire this feature in.
 """
 
 import asyncio
+import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_completed
 from dataclasses import dataclass, field
@@ -69,7 +71,10 @@ from common import (
     ALLOWED_IDS,
     BTN_DLV_BATCH,
     BTN_DLV_QUEUE,
+    BTN_QUEUE_INTERVAL,
+    DATA_DIR,
     _any_valid_tokens,
+    _atomic_json_write,
     _CANCEL_FILTER,
     _main_menu_for,
     allowed,
@@ -620,11 +625,57 @@ async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ──────────────────────────────────────────────────────────
-# DLV Queue viewer
+# DLV Queue viewer / check-interval persistence
 # ──────────────────────────────────────────────────────────
 
-# Current DLV batch job interval in seconds (default 1 min); updated by user choice
-_dlv_batch_interval: int = 60
+SAVED_DLV_BATCH_INTERVAL_FILE = os.path.join(DATA_DIR, "saved_dlv_batch_interval.json")
+
+# Shared label set for the four preset check intervals — used by the
+# 🔍 DLV Queue viewer, ⏱ Queue Check Interval (Bot Settings), and the
+# confirmation message after picking one, so the three stay in sync.
+_DLV_INTERVAL_LABELS = {60: "1 min", 120: "2 min", 180: "3 min", 300: "5 min"}
+
+
+def load_dlv_batch_interval() -> int:
+    """Persisted DLV Batch job check interval, in seconds — defaults to
+    60 (1 min) if never set. Before this existed, the interval was a
+    bare in-memory global: picking 5 min via the 🔍 DLV Queue viewer
+    silently reverted to the hardcoded 1-min default on every bot
+    restart, with no record anywhere of what had actually been chosen."""
+    try:
+        with open(SAVED_DLV_BATCH_INTERVAL_FILE) as f:
+            return json.load(f).get("interval_seconds", 60)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return 60
+
+
+def save_dlv_batch_interval(interval_seconds: int) -> None:
+    _atomic_json_write(SAVED_DLV_BATCH_INTERVAL_FILE, {"interval_seconds": interval_seconds}, indent=2)
+
+
+# Current DLV batch job interval in seconds — seeded from disk at import
+# time so a restart resumes at whatever was last chosen (see register()),
+# not the hardcoded 1-min default. Updated via _set_dlv_batch_interval().
+_dlv_batch_interval: int = load_dlv_batch_interval()
+
+
+def _set_dlv_batch_interval(new_interval: int, job_queue) -> None:
+    """Update the in-memory interval, persist it, and reschedule the
+    repeating job to the new cadence — the one path both the 🔍 DLV Queue
+    picker and ⏱ Queue Check Interval (Bot Settings) write through, so
+    neither can drift out of sync with the other or with what's on disk."""
+    global _dlv_batch_interval
+    _dlv_batch_interval = new_interval
+    save_dlv_batch_interval(new_interval)
+    if job_queue:
+        for job in job_queue.get_jobs_by_name("dlv_batch_job"):
+            job.schedule_removal()
+        job_queue.run_repeating(
+            _dlv_batch_job,
+            interval=new_interval,
+            first=new_interval,
+            name="dlv_batch_job",
+        )
 
 
 def _dlv_queue_keyboard(current_interval: int) -> InlineKeyboardMarkup:
@@ -646,6 +697,24 @@ def _dlv_queue_keyboard(current_interval: int) -> InlineKeyboardMarkup:
         interval_row,
         [InlineKeyboardButton("❌ Cancel",   callback_data="dlvq:cancel")],
     ])
+
+
+async def cmd_queue_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # ⏱ Queue Check Interval (⚙️ Bot Settings) — set how often the DLV
+    # Batch job retries queued refs, independent of whether anything is
+    # currently queued (unlike 🔍 DLV Queue, which only shows the picker
+    # when the queue is non-empty). Shares the exact same keyboard/
+    # callback handling as 🔍 DLV Queue, so both always agree.
+    if not allowed(update): return await deny(update)
+    interval_label = _DLV_INTERVAL_LABELS.get(_dlv_batch_interval, f"{_dlv_batch_interval}s")
+    await update.message.reply_text(
+        "⏱ *Queue Check Interval*\n\n"
+        "Controls how often the DLV Batch background job retries references "
+        "still waiting to be assigned.\n\n"
+        f"Current interval: *{interval_label}*",
+        parse_mode="Markdown",
+        reply_markup=_dlv_queue_keyboard(_dlv_batch_interval),
+    )
 
 
 async def cmd_dlv_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -674,9 +743,7 @@ async def cmd_dlv_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             line += f"\n  ⚠️ _{last_error}_"
         lines.append(line)
 
-    interval_label = {60: "1 min", 120: "2 min", 180: "3 min", 300: "5 min"}.get(
-        _dlv_batch_interval, f"{_dlv_batch_interval}s"
-    )
+    interval_label = _DLV_INTERVAL_LABELS.get(_dlv_batch_interval, f"{_dlv_batch_interval}s")
     lines.append(f"\n_Current check interval: {interval_label}_")
 
     msg = "\n".join(lines)
@@ -691,7 +758,6 @@ async def cmd_dlv_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def recv_dlv_queue_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global _dlv_batch_interval
     query = update.callback_query
     await query.answer()
     data = query.data  # "dlvq:now" | "dlvq:interval:N" | "dlvq:cancel"
@@ -743,24 +809,9 @@ async def recv_dlv_queue_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             new_interval = int(data.split(":")[-1])
         except ValueError:
             return
-        _dlv_batch_interval = new_interval
+        _set_dlv_batch_interval(new_interval, ctx.job_queue)
 
-        # Reschedule the repeating job with the new interval
-        job_queue = ctx.job_queue
-        if job_queue:
-            existing = job_queue.get_jobs_by_name("dlv_batch_job")
-            for job in existing:
-                job.schedule_removal()
-            job_queue.run_repeating(
-                _dlv_batch_job,
-                interval=new_interval,
-                first=new_interval,
-                name="dlv_batch_job",
-            )
-
-        label = {60: "1 min", 120: "2 min", 180: "3 min", 300: "5 min"}.get(
-            new_interval, f"{new_interval}s"
-        )
+        label = _DLV_INTERVAL_LABELS.get(new_interval, f"{new_interval}s")
         await query.edit_message_reply_markup(
             reply_markup=_dlv_queue_keyboard(_dlv_batch_interval),
         )
@@ -1142,7 +1193,12 @@ def register(app: Application) -> None:
         per_message=False,
     )
     app.add_handler(db_conv)
-    app.job_queue.run_repeating(_dlv_batch_job, interval=60, first=60, name="dlv_batch_job")
+    # Resume at the persisted interval (see load_dlv_batch_interval), not a
+    # hardcoded 60s — a restart must not silently discard a chosen interval.
+    app.job_queue.run_repeating(
+        _dlv_batch_job, interval=_dlv_batch_interval, first=_dlv_batch_interval, name="dlv_batch_job",
+    )
     app.add_handler(CallbackQueryHandler(recv_dlv_queue_action, pattern=r"^dlvq:"))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DLV_QUEUE)}$"), cmd_dlv_queue))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_QUEUE_INTERVAL)}$"), cmd_queue_interval))
     app.add_handler(CallbackQueryHandler(recv_db_taken_decision, pattern=r"^dbtaken:"))

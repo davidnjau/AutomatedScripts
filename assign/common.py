@@ -585,6 +585,7 @@ BTN_DLV_REPORT_SCHEDULE = "📧 DLV Report Schedule"
 BTN_CUSTOM_EXCLUSIONS = "🚫 Exclusions"
 BTN_TASK_ANALYTICS = "📈 Task Analytics"
 BTN_CLEAR_CHAT    = "🧹 Clear Chat"
+BTN_QUEUE_INTERVAL = "⏱ Queue Check Interval"
 
 # Category buttons — the main menu shows only these six (plus Cancel);
 # tapping one opens that category's own submenu of workflow buttons (see
@@ -624,6 +625,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_APARTMENTS)}"
     f"|{re.escape(BTN_HOLD_TASKS)}|{re.escape(BTN_INCREMENTAL)}|{re.escape(BTN_DLV_REPORT_SCHEDULE)}"
     f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}|{re.escape(BTN_TASK_ANALYTICS)}|{re.escape(BTN_CLEAR_CHAT)}"
+    f"|{re.escape(BTN_QUEUE_INTERVAL)}"
     f"|{re.escape(BTN_CAT_ASSIGNMENTS)}|{re.escape(BTN_CAT_AUTOMATION)}|{re.escape(BTN_CAT_ANALYTICS)}"
     f"|{re.escape(BTN_CAT_LOOKUPS)}|{re.escape(BTN_CAT_VALUERS)}|{re.escape(BTN_CAT_SETTINGS)}"
     f"|{re.escape(BTN_CAT_POST_BOARD)}|{re.escape(BTN_PB_POST)}|{re.escape(BTN_PB_VIEW)}"
@@ -685,7 +687,7 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
             "⚙️ *Bot Settings*\n\n"
             "Manage login sessions, the token refresh daemon, and the bot process itself."
         ),
-        "buttons": [BTN_AUTH, BTN_TOKEN_STATUS, BTN_DAEMON, BTN_RESTART, BTN_HELP, BTN_CLEAR_CHAT],
+        "buttons": [BTN_AUTH, BTN_TOKEN_STATUS, BTN_DAEMON, BTN_RESTART, BTN_HELP, BTN_CLEAR_CHAT, BTN_QUEUE_INTERVAL],
     },
     BTN_CAT_POST_BOARD: {
         "description": (
