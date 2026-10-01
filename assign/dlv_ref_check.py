@@ -4,10 +4,20 @@ dlv_ref_check.py
 ==================
 DLV Ref Check — check a reference number's full history across every
 tracked source: New Assignment, the DLV Batch queue, and the Hold queue
-(/dlvcheck or "🕓 DLV Ref Check"). Unlike lookup_reference.py's /lookup
-(a live Ardhisasa API search for a ref's *current* state), this is a pure
-local lookup against dlv_core.py's consolidated ref-keyed store
-(saved_dlv_records.json) — no API call, no credential/token needed.
+(/dlvcheck or "🕓 DLV Ref Check"). The local part is a pure lookup
+against dlv_core.py's consolidated ref-keyed store (saved_dlv_records.json)
+— no API call, no credential/token needed — but a ref with a record also
+gets a live cross-check (lookup_reference.py's _lu_current_valuer, the
+same county-vs-default + assessor-vs-DLV-stage routing /lookup uses)
+against the actual current valuer, to catch drift between what this bot
+last recorded and who genuinely holds the ref now (e.g. a takeover made
+outside this bot entirely). When found live, it also surfaces the live
+DLV_FORWARDING_REMARKS audit-trail entry (who on the DLV side forwarded
+the ref into valuation, and when) — read alongside this record's own
+📅 Queued/📅 Assigned dates, this shows the actual gap between when the
+bot queued/assigned it and when DLV itself handed it off. The live check
+is skipped — not treated as an error — when there's no cached token for
+the relevant credential; the local report is still shown either way.
 
 Three explicit yes/no checks, each backed by a field that persists once
 set (dlv_core's store only ever merges new fields onto a record, never
@@ -16,7 +26,9 @@ replaces it wholesale — see the module's own consolidation notes):
   flow (missing/None from every other assignment source), so its
   presence means this ref was assigned that way at some point.
 - DLV Batch Queue — `queued_at` is set once, when dlv_batch.py first adds
-  the ref to the queue, and persists through every later stage.
+  the ref to the queue, and persists through every later stage. Shown
+  both as a plain Yes/No check and, when present, its own 📅 Queued date
+  row alongside the other timeline dates (📅 Assigned/📅 Closed/📅 Removed).
 - Hold Queue — `hold` reflects *current* hold status only: unlike the
   other two, hold_tasks.py's release path (clear_hold_and_remove) clears
   `hold` back to None, so this check answers "currently on hold", not
@@ -24,15 +36,19 @@ replaces it wholesale — see the module's own consolidation notes):
 
 A ref with no record at all (never touched by any of the three) is
 reported separately from one that has a record but is "No" on all three
-checks (e.g. seen only via a live DLV search, never actually assigned).
+checks (e.g. seen only via a live DLV search, never actually assigned) —
+and skips the live cross-check entirely, since there's no locally-recorded
+valuer to compare against.
 
 List mode: entering more than one reference number (one per line, or
 comma-separated — see common._parse_list_input) checks every ref against
-the one already-loaded consolidated store and compiles the results into
-one chunked report, rather than requiring a separate /dlvcheck run per
-ref. Since this is a local-file lookup (no per-ref API call), the
-common._LIST_INPUT_MAX_ITEMS cap here is about keeping the compiled
-report readable rather than limiting request volume.
+the one already-loaded consolidated store, sequentially live-checking
+each one with a record in turn (matching lookup_reference.py's own
+_lu_handle_ref_list convention — simple, not concurrent), and compiles
+everything into one chunked report rather than requiring a separate
+/dlvcheck run per ref. common._LIST_INPUT_MAX_ITEMS caps this mode —
+originally just for report readability, now also bounding how many live
+API round trips one list run can trigger.
 
 Call register(app) from bot.py's main() to wire this feature in.
 """
@@ -65,6 +81,7 @@ from common import (
     not_cancel,
 )
 from dlv_core import _load_consolidated
+from lookup_reference import _lu_current_valuer
 from new_assignment import _WORKFLOW_LABELS
 from task_block import assessor_field, consideration_field, format_labeled_block, parcel_field, tag_field
 from telegram_report import _send_chunked_report
@@ -91,12 +108,13 @@ def _dc_format_record(ref: str, record: dict) -> str:
     """Build the labeled block for any ref with a record — the three
     explicit New Assignment / DLV Batch Queue / Hold Queue checks first,
     then status, valuer, the shared Assessor/Consideration/Parcel fields,
-    every timeline date the record actually has, and tag."""
+    every timeline date the record actually has (queued, assigned,
+    closed, removed, in that chronological order), and tag."""
     fields = [("📊 Status", _DC_STATUS_LABELS.get(record.get("status"), record.get("status") or "—"))]
 
     workflow = record.get("workflow")
     fields.append(("📋 New Assignment", _WORKFLOW_LABELS.get(workflow, workflow) if workflow else "❌ No"))
-    fields.append(("📥 DLV Batch Queue", f"✅ Yes — {record['queued_at']}" if record.get("queued_at") else "❌ No"))
+    fields.append(("📥 DLV Batch Queue", "✅ Yes" if record.get("queued_at") else "❌ No"))
     if record.get("hold"):
         held_for = record["hold"].get("held_valuer_name", "?")
         fields.append(("✋ Hold Queue", f"✅ Currently held for {held_for}"))
@@ -108,6 +126,8 @@ def _dc_format_record(ref: str, record: dict) -> str:
     fields.append(assessor_field(record))
     fields.append(consideration_field(record))
     fields.append(parcel_field(record))
+    if record.get("queued_at"):
+        fields.append(("📅 Queued", record["queued_at"]))
     if record.get("assigned_at"):
         fields.append(("📅 Assigned", record["assigned_at"]))
     if record.get("closed_at"):
@@ -123,14 +143,58 @@ def _dc_format_record(ref: str, record: dict) -> str:
     return format_labeled_block(1, ref, fields)
 
 
+def _dc_format_live_status(record: dict, live: dict) -> str:
+    """Live cross-check summary (_lu_current_valuer's return shape)
+    against the local record's own valuer_name — appended after
+    _dc_format_record's block. Distinguishes "no tokens to check with"
+    (not an error) from "checked, but not found live" from an actual
+    match/mismatch against the locally-recorded valuer. When ref was
+    found live and a DLV_FORWARDING_REMARKS audit-trail entry exists
+    (dlv_forwarded_by/_at — see _lu_forwarding_fields), a second line
+    reports who (on the DLV side) forwarded it into valuation and when —
+    so it can be read against this record's own 📅 Queued/📅 Assigned
+    dates to see the actual gap between queuing and DLV's own handoff."""
+    if not live.get("tokens_available"):
+        return "⚠️ _Live check skipped — no cached tokens._"
+    if not live.get("found"):
+        return "❓ *Live Status:* Not found live (assessor/DLV search)."
+
+    lines = []
+    live_valuer = live.get("valuer_name")
+    local_valuer = record.get("valuer_name")
+
+    if not live_valuer:
+        lines.append("📋 *Live Status:* No valuer officer listed yet.")
+    elif not local_valuer:
+        lines.append(f"📋 *Live Status:* Currently held by *{md_escape(live_valuer)}*.")
+    elif local_valuer.strip().upper() == live_valuer.strip().upper():
+        lines.append(f"✅ *Live Status:* Confirmed — still held by *{md_escape(live_valuer)}*.")
+    else:
+        lines.append(
+            f"⚠️ *Live Status: TAKEN BY ANOTHER VALUER* — currently held by "
+            f"*{md_escape(live_valuer)}* (local record says {md_escape(local_valuer)})."
+        )
+
+    forwarded_by = live.get("dlv_forwarded_by")
+    forwarded_at = live.get("dlv_forwarded_at")
+    if forwarded_by or forwarded_at:
+        who = md_escape(forwarded_by) if forwarded_by else "—"
+        lines.append(f"📨 *DLV Forwarded:* {who} — {forwarded_at or '—'}")
+
+    return "\n     ".join(lines)
+
+
 async def cmd_dlv_ref_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Entry point — prompts for the reference number. No credential step
-    # at all: this is a local-file lookup, not a live API search.
+    # Entry point — prompts for the reference number. No credential step:
+    # the local lookup needs none, and the live cross-check (when a
+    # record is found) reuses whichever cached tokens are already there.
     if not allowed(update): return await deny(update)
     await update.message.reply_text(
         "🕓 *DLV Ref Check*\n\n"
         "Check a reference number's history across New Assignment, the "
-        "DLV Batch queue, and the Hold queue.\n\n"
+        "DLV Batch queue, and the Hold queue — plus a live cross-check "
+        "against who actually holds it now, to catch any takeover this "
+        "bot didn't make itself.\n\n"
         "Enter the *reference number* to check\n"
         f"_or paste up to {_LIST_INPUT_MAX_ITEMS}, one per line or comma-separated, "
         "for a compiled report._",
@@ -141,7 +205,10 @@ async def cmd_dlv_ref_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _dc_handle_ref_list(update: Update, refs: List[str]) -> int:
     """List mode: check every ref in refs against the one already-loaded
-    consolidated store and compile the results into one chunked report."""
+    consolidated store, live-checking each one with a record in turn
+    (sequential, not concurrent — matches lookup_reference.py's own
+    _lu_handle_ref_list convention), and compile the results into one
+    chunked report."""
     store = _load_consolidated()
     lines = [f"🕓 *DLV Ref Check* — {len(refs)} reference(s)"]
     for ref in refs:
@@ -149,7 +216,9 @@ async def _dc_handle_ref_list(update: Update, refs: List[str]) -> int:
         if not record:
             lines.append(f"❌ `{md_escape(ref)}` — no record at all.")
             continue
-        lines.append(_dc_format_record(ref, record))
+        live = await _lu_current_valuer(ref)
+        block = _dc_format_record(ref, record) + "\n     " + _dc_format_live_status(record, live)
+        lines.append(block)
 
     async def _send(text, reply_markup):
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
@@ -192,7 +261,10 @@ async def recv_dc_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu_for(update.effective_user.id))
         return ConversationHandler.END
 
-    text = f"🕓 *DLV Ref Check* — `{md_escape(ref)}`\n\n" + _dc_format_record(ref, record)
+    await update.message.reply_text(f"⏳ Checking live status for `{md_escape(ref)}`…", parse_mode="Markdown")
+    live = await _lu_current_valuer(ref)
+    block = _dc_format_record(ref, record) + "\n     " + _dc_format_live_status(record, live)
+    text = f"🕓 *DLV Ref Check* — `{md_escape(ref)}`\n\n" + block
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
