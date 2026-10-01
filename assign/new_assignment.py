@@ -855,7 +855,23 @@ async def recv_valuer_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def _lookup_one_ref(tokens: AuthTokens, ref: str, workflow: str) -> Tuple[str, Dict]:
     """Search + detail-fetch for a single ref, via the Stamp Duty or LRD
     primitives per workflow. Returns (formatted result string for display,
-    raw context dict for persist_assignment enrichment)."""
+    raw context dict for persist_assignment enrichment).
+
+    Only ever called (via _post_assignment_report) for a ref the direct
+    assign POST just returned success for — so a Stamp Duty "not found"
+    result here is a specific, meaningful signal, not a generic miss: the
+    assign call has no "is this ref actually at the assignable node yet"
+    check of its own (unlike dlv_batch.py's queue, which only ever calls
+    the same endpoint once a ref is confirmed to be there), so a 200
+    response doesn't guarantee the assignment actually took effect. If
+    _lu_search_ref can't find the ref in DLV's own list moments later, the
+    most likely explanation is it hasn't been forwarded there from the
+    assessor stage yet — meaning this assignment has nothing to attach to,
+    and whoever the assessor's stage eventually forwards it to (a human
+    DLV officer, same as it would be for any ref) may pick a different
+    valuer entirely before this bot gets another chance. The warning
+    below calls this out explicitly and points at 📥 DLV Batch, which
+    exists specifically to retry until a ref actually reaches that node."""
     if workflow == "land_rent":
         item = _lu_search_ref_lrd(tokens, ref)
         if not item:
@@ -865,7 +881,13 @@ def _lookup_one_ref(tokens: AuthTokens, ref: str, workflow: str) -> Tuple[str, D
 
     item = _lu_search_ref(tokens, ref)
     if not item:
-        return f"⚠️ `{ref}` — not found in post-assignment lookup", {}
+        return (
+            f"⚠️ `{ref}` — not found in DLV yet (likely still at the assessor stage). "
+            "This assignment may not take effect until it's forwarded — consider "
+            "queuing via 📥 DLV Batch instead, so it's assigned automatically the "
+            "moment it arrives, before it can be forwarded to a different valuer.",
+            {},
+        )
     detail = _lu_fetch_detail(tokens, item["id"])
     return _lu_format_result(ref, item, detail), _lu_extract_context(item, detail)
 
