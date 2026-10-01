@@ -10,6 +10,7 @@ Run with: python3 -m unittest discover -s assign/tests -v
 import asyncio
 import os
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -866,6 +867,94 @@ class TestDbFormatBatchSummary(unittest.TestCase):
         self.assertNotIn(dlv_batch.INCREMENTAL_TAG_SENTINEL, summary)
 
 
+class TestDlvBatchIntervalPersistence(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.interval_file = os.path.join(self.tmpdir.name, "saved_dlv_batch_interval.json")
+        self._patch = patch.object(dlv_batch, "SAVED_DLV_BATCH_INTERVAL_FILE", self.interval_file)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self.tmpdir.cleanup()
+
+    def test_missing_file_defaults_to_60(self):
+        self.assertEqual(dlv_batch.load_dlv_batch_interval(), 60)
+
+    def test_save_then_load_roundtrip(self):
+        dlv_batch.save_dlv_batch_interval(300)
+        self.assertEqual(dlv_batch.load_dlv_batch_interval(), 300)
+
+    def test_corrupt_file_defaults_to_60(self):
+        with open(self.interval_file, "w") as f:
+            f.write("not json")
+        self.assertEqual(dlv_batch.load_dlv_batch_interval(), 60)
+
+
+class TestSetDlvBatchInterval(unittest.TestCase):
+    """_set_dlv_batch_interval — the one path both the DLV Queue picker
+    and Queue Check Interval (Bot Settings) write through: updates the
+    in-memory global, persists it, and reschedules the job."""
+
+    def tearDown(self):
+        dlv_batch._dlv_batch_interval = 60   # restore default for other tests
+
+    def test_updates_in_memory_global(self):
+        with patch.object(dlv_batch, "save_dlv_batch_interval"):
+            dlv_batch._set_dlv_batch_interval(300, MagicMock())
+        self.assertEqual(dlv_batch._dlv_batch_interval, 300)
+
+    def test_persists_to_disk(self):
+        job_queue = MagicMock()
+        with patch.object(dlv_batch, "save_dlv_batch_interval") as mock_save:
+            dlv_batch._set_dlv_batch_interval(180, job_queue)
+        mock_save.assert_called_once_with(180)
+
+    def test_removes_existing_job_before_rescheduling(self):
+        old_job = MagicMock()
+        job_queue = MagicMock()
+        job_queue.get_jobs_by_name.return_value = [old_job]
+        with patch.object(dlv_batch, "save_dlv_batch_interval"):
+            dlv_batch._set_dlv_batch_interval(120, job_queue)
+        old_job.schedule_removal.assert_called_once()
+        job_queue.run_repeating.assert_called_once_with(
+            dlv_batch._dlv_batch_job, interval=120, first=120, name="dlv_batch_job",
+        )
+
+    def test_none_job_queue_still_persists_without_raising(self):
+        with patch.object(dlv_batch, "save_dlv_batch_interval") as mock_save:
+            dlv_batch._set_dlv_batch_interval(120, None)   # must not raise
+        mock_save.assert_called_once_with(120)
+
+
+class TestCmdQueueInterval(unittest.TestCase):
+    """cmd_queue_interval — ⏱ Queue Check Interval (⚙️ Bot Settings);
+    always shows the picker, regardless of whether anything is queued."""
+
+    def tearDown(self):
+        dlv_batch._dlv_batch_interval = 60
+
+    def test_shows_current_interval_and_keyboard(self):
+        update = MagicMock()
+        update.message.reply_text = AsyncMock()
+        dlv_batch._dlv_batch_interval = 180
+        with patch.object(dlv_batch, "allowed", return_value=True):
+            _run(dlv_batch.cmd_queue_interval(update, MagicMock()))
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("Queue Check Interval", text)
+        self.assertIn("3 min", text)
+        kwargs = update.message.reply_text.call_args.kwargs
+        self.assertIsNotNone(kwargs["reply_markup"])
+
+    def test_denies_unauthorized_user(self):
+        update = MagicMock()
+        update.message.reply_text = AsyncMock()
+        with patch.object(dlv_batch, "allowed", return_value=False), \
+             patch.object(dlv_batch, "deny", new=AsyncMock()) as mock_deny:
+            _run(dlv_batch.cmd_queue_interval(update, MagicMock()))
+        mock_deny.assert_awaited_once_with(update)
+
+
 class TestCmdDlvQueue(unittest.TestCase):
     """cmd_dlv_queue — the 🔍 DLV Queue viewer; awaiting-decision refs are
     annotated distinctly from a plain last_error."""
@@ -895,6 +984,45 @@ class TestCmdDlvQueue(unittest.TestCase):
         text = update.message.reply_text.call_args[0][0]
         self.assertIn("Not found in DLV endpoint", text)
         self.assertNotIn("awaiting your decision", text)
+
+
+class TestRecvDlvQueueAction(unittest.TestCase):
+    """recv_dlv_queue_action's interval branch — shared by both the
+    🔍 DLV Queue picker and ⏱ Queue Check Interval, since both send the
+    same "dlvq:interval:N" callback_data."""
+
+    def tearDown(self):
+        dlv_batch._dlv_batch_interval = 60
+
+    def _update(self, data):
+        update = _make_query_update(data)
+        update.callback_query.edit_message_reply_markup = AsyncMock()
+        return update
+
+    def test_sets_interval_via_shared_helper(self):
+        update = self._update("dlvq:interval:300")
+        ctx = MagicMock()
+        with patch.object(dlv_batch, "_set_dlv_batch_interval") as mock_set:
+            _run(dlv_batch.recv_dlv_queue_action(update, ctx))
+        mock_set.assert_called_once_with(300, ctx.job_queue)
+
+    def test_confirmation_message_shows_label(self):
+        update = self._update("dlvq:interval:300")
+        with patch.object(dlv_batch, "save_dlv_batch_interval"):
+            _run(dlv_batch.recv_dlv_queue_action(update, MagicMock()))
+        text = update.callback_query.message.reply_text.call_args[0][0]
+        self.assertIn("5 min", text)
+
+    def test_invalid_interval_value_is_ignored(self):
+        update = self._update("dlvq:interval:not-a-number")
+        with patch.object(dlv_batch, "_set_dlv_batch_interval") as mock_set:
+            _run(dlv_batch.recv_dlv_queue_action(update, MagicMock()))
+        mock_set.assert_not_called()
+
+    def test_cancel_removes_markup(self):
+        update = self._update("dlvq:cancel")
+        _run(dlv_batch.recv_dlv_queue_action(update, MagicMock()))
+        update.callback_query.edit_message_reply_markup.assert_called_once_with(reply_markup=None)
 
 
 class TestDbTagKeyboards(unittest.TestCase):
@@ -1172,6 +1300,36 @@ class TestRecvDbInputResetsTags(unittest.TestCase):
             _run(dlv_batch.recv_db_input(update, ctx))
 
         self.assertEqual(sess.tag_by_ref, {})
+
+
+class TestRegister(unittest.TestCase):
+    """register() must resume the repeating job at the persisted interval
+    — not a hardcoded 60s — and wire the new ⏱ Queue Check Interval button."""
+
+    def tearDown(self):
+        dlv_batch._dlv_batch_interval = 60
+
+    async def _register(self, app):
+        # ConversationHandler's construction needs a running event loop
+        # (asyncio.Lock() binds to it), so register() must run inside one.
+        dlv_batch.register(app)
+
+    def test_job_resumes_at_persisted_interval(self):
+        dlv_batch._dlv_batch_interval = 300
+        app = MagicMock()
+        _run(self._register(app))
+        calls = [c for c in app.job_queue.run_repeating.call_args_list if c.kwargs.get("name") == "dlv_batch_job"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].kwargs["interval"], 300)
+        self.assertEqual(calls[0].kwargs["first"], 300)
+
+    def test_queue_interval_button_handler_registered(self):
+        app = MagicMock()
+        _run(self._register(app))
+        callbacks = [
+            getattr(c.args[0], "callback", None) for c in app.add_handler.call_args_list if c.args
+        ]
+        self.assertIn(dlv_batch.cmd_queue_interval, callbacks)
 
 
 if __name__ == "__main__":
