@@ -171,6 +171,41 @@ class TestDcFormatLiveStatus(unittest.TestCase):
         self.assertIn("Jane\\_Doe", text)
         self.assertIn("John\\_Roe", text)
 
+    def test_dlv_forwarding_appended_as_second_line(self):
+        live = {
+            "tokens_available": True, "found": True, "valuer_name": "Jane Doe",
+            "dlv_forwarded_by": "George Ruhara Maina", "dlv_forwarded_at": "2026-10-01T13:12:38.013344",
+        }
+        text = dc._dc_format_live_status({"valuer_name": "Jane Doe"}, live)
+        self.assertIn("Confirmed", text)
+        self.assertIn("📨 *DLV Forwarded:* George Ruhara Maina — 2026-10-01T13:12:38.013344", text)
+
+    def test_no_forwarding_data_omits_the_line(self):
+        live = {"tokens_available": True, "found": True, "valuer_name": "Jane Doe"}
+        text = dc._dc_format_live_status({"valuer_name": "Jane Doe"}, live)
+        self.assertNotIn("DLV Forwarded", text)
+
+    def test_forwarding_shown_even_on_mismatch(self):
+        live = {
+            "tokens_available": True, "found": True, "valuer_name": "LYNN NDUTA KABURU",
+            "dlv_forwarded_by": "George Ruhara Maina", "dlv_forwarded_at": "2026-10-01T13:12:38.013344",
+        }
+        text = dc._dc_format_live_status({"valuer_name": "NEWTON MUCHEMI WAMBUGU"}, live)
+        self.assertIn("TAKEN BY ANOTHER VALUER", text)
+        self.assertIn("DLV Forwarded", text)
+
+    def test_forwarding_names_are_markdown_escaped(self):
+        live = {"tokens_available": True, "found": True, "valuer_name": "Jane Doe",
+                "dlv_forwarded_by": "George_Maina"}
+        text = dc._dc_format_live_status({"valuer_name": "Jane Doe"}, live)
+        self.assertIn("George\\_Maina", text)
+
+    def test_forwarding_date_shown_without_actor_name(self):
+        live = {"tokens_available": True, "found": True, "valuer_name": "Jane Doe",
+                "dlv_forwarded_at": "2026-10-01T13:12:38.013344"}
+        text = dc._dc_format_live_status({"valuer_name": "Jane Doe"}, live)
+        self.assertIn("📨 *DLV Forwarded:* — — 2026-10-01T13:12:38.013344", text)
+
 
 class TestCmdDlvRefCheck(unittest.TestCase):
     def test_asks_for_reference_number(self):

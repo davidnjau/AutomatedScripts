@@ -711,10 +711,81 @@ class TestLuLookupOne(unittest.TestCase):
         self.assertEqual(result, "formatted-county")
 
 
+class TestLuExtractDlvForwarding(unittest.TestCase):
+    """_lu_extract_dlv_forwarding — pure extraction of the earliest
+    DLV_FORWARDING_REMARKS entry from a valuationservice detail's
+    remarks[]."""
+
+    def test_none_detail_returns_none(self):
+        self.assertIsNone(lu._lu_extract_dlv_forwarding(None))
+
+    def test_no_remarks_key_returns_none(self):
+        self.assertIsNone(lu._lu_extract_dlv_forwarding({}))
+
+    def test_empty_remarks_returns_none(self):
+        self.assertIsNone(lu._lu_extract_dlv_forwarding({"remarks": []}))
+
+    def test_no_matching_status_returns_none(self):
+        detail = {"remarks": [{"status": "ASSESSOR APPROVAL REMARKS", "actor_names": "X",
+                                "date_created": "2026-10-01T11:00:00", "remarks": ["FORWARD TO VALUATION"]}]}
+        self.assertIsNone(lu._lu_extract_dlv_forwarding(detail))
+
+    def test_matching_entry_extracted(self):
+        detail = {"remarks": [{"status": "DLV_FORWARDING_REMARKS", "actor_names": "George Ruhara Maina",
+                                "date_created": "2026-10-01T13:12:38.013344", "remarks": ["DEAL"]}]}
+        result = lu._lu_extract_dlv_forwarding(detail)
+        self.assertEqual(result, {
+            "actor_names": "George Ruhara Maina",
+            "date_created": "2026-10-01T13:12:38.013344",
+            "remark_text": "DEAL",
+        })
+
+    def test_multiple_remark_strings_joined(self):
+        detail = {"remarks": [{"status": "DLV_FORWARDING_REMARKS", "actor_names": "X",
+                                "date_created": "2026-10-01T13:00:00", "remarks": ["DEAL", "URGENT"]}]}
+        result = lu._lu_extract_dlv_forwarding(detail)
+        self.assertEqual(result["remark_text"], "DEAL, URGENT")
+
+    def test_empty_remarks_list_in_entry_gives_none_text(self):
+        detail = {"remarks": [{"status": "DLV_FORWARDING_REMARKS", "actor_names": "X",
+                                "date_created": "2026-10-01T13:00:00", "remarks": []}]}
+        result = lu._lu_extract_dlv_forwarding(detail)
+        self.assertIsNone(result["remark_text"])
+
+    def test_multiple_matches_picks_earliest_by_date(self):
+        detail = {"remarks": [
+            {"status": "DLV_FORWARDING_REMARKS", "actor_names": "Later Actor",
+             "date_created": "2026-10-02T09:00:00", "remarks": ["LATER"]},
+            {"status": "DLV_FORWARDING_REMARKS", "actor_names": "Earlier Actor",
+             "date_created": "2026-10-01T09:00:00", "remarks": ["EARLIER"]},
+        ]}
+        result = lu._lu_extract_dlv_forwarding(detail)
+        self.assertEqual(result["actor_names"], "Earlier Actor")
+
+    def test_ignores_other_statuses_mixed_in(self):
+        detail = {"remarks": [
+            {"status": "ASSESSOR APPROVAL REMARKS", "actor_names": "An Assessor",
+             "date_created": "2026-10-01T11:01:46.785779", "remarks": ["FORWARD TO VALUATION"]},
+            {"status": "DLV_FORWARDING_REMARKS", "actor_names": "George Ruhara Maina",
+             "date_created": "2026-10-01T13:12:38.013344", "remarks": ["DEAL"]},
+        ]}
+        result = lu._lu_extract_dlv_forwarding(detail)
+        self.assertEqual(result["actor_names"], "George Ruhara Maina")
+
+
+def _expect(tokens_available, found, valuer_name, forwarded_by=None, forwarded_at=None, forward_remark=None):
+    return {
+        "tokens_available": tokens_available, "found": found, "valuer_name": valuer_name,
+        "dlv_forwarded_by": forwarded_by, "dlv_forwarded_at": forwarded_at, "dlv_forward_remark": forward_remark,
+    }
+
+
 class TestLuCurrentValuer(unittest.TestCase):
     """_lu_current_valuer — structured {"tokens_available", "found",
-    "valuer_name"} live current-valuer check, used by dlv_ref_check.py
-    to flag drift against a ref's locally-recorded valuer. Mirrors
+    "valuer_name", "dlv_forwarded_by", "dlv_forwarded_at",
+    "dlv_forward_remark"} live current-valuer check, used by
+    dlv_ref_check.py to flag drift against a ref's locally-recorded
+    valuer and surface when/by whom DLV forwarded it. Mirrors
     _lu_lookup_county's county-vs-default + assessor-vs-DLV-stage
     routing exactly, but returns structured data instead of a formatted
     Reference Lookup block."""
@@ -723,13 +794,13 @@ class TestLuCurrentValuer(unittest.TestCase):
     def test_non_county_no_tokens(self):
         with patch.object(lu, "get_valid_tokens", return_value=None):
             result = _run(lu._lu_current_valuer("R1"))
-        self.assertEqual(result, {"tokens_available": False, "found": False, "valuer_name": None})
+        self.assertEqual(result, _expect(False, False, None))
 
     def test_non_county_not_found(self):
         with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
              patch.object(lu, "_lu_search_ref", return_value=None):
             result = _run(lu._lu_current_valuer("R1"))
-        self.assertEqual(result, {"tokens_available": True, "found": False, "valuer_name": None})
+        self.assertEqual(result, _expect(True, False, None))
 
     def test_non_county_found_with_valuation_officer(self):
         item = {"id": "app-1"}
@@ -738,7 +809,7 @@ class TestLuCurrentValuer(unittest.TestCase):
              patch.object(lu, "_lu_search_ref", return_value=item), \
              patch.object(lu, "_lu_fetch_detail", return_value=detail):
             result = _run(lu._lu_current_valuer("R1"))
-        self.assertEqual(result, {"tokens_available": True, "found": True, "valuer_name": "Jane Doe"})
+        self.assertEqual(result, _expect(True, True, "Jane Doe"))
 
     def test_non_county_found_without_valuation_officer(self):
         item = {"id": "app-1"}
@@ -747,13 +818,43 @@ class TestLuCurrentValuer(unittest.TestCase):
              patch.object(lu, "_lu_search_ref", return_value=item), \
              patch.object(lu, "_lu_fetch_detail", return_value=detail):
             result = _run(lu._lu_current_valuer("R1"))
-        self.assertEqual(result, {"tokens_available": True, "found": True, "valuer_name": None})
+        self.assertEqual(result, _expect(True, True, None))
+
+    def test_non_county_found_with_dlv_forwarding_remark(self):
+        item = {"id": "app-1"}
+        detail = {
+            "actors": [{"role": "VALUATION OFFICER", "user_details": {"names": "Jane Doe"}}],
+            "remarks": [
+                {"status": "ASSESSOR APPROVAL REMARKS", "actor_names": "An Assessor",
+                 "date_created": "2026-10-01T11:01:46.785779", "remarks": ["FORWARD TO VALUATION"]},
+                {"status": "DLV_FORWARDING_REMARKS", "actor_names": "George Ruhara Maina",
+                 "date_created": "2026-10-01T13:12:38.013344", "remarks": ["DEAL"]},
+            ],
+        }
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref", return_value=item), \
+             patch.object(lu, "_lu_fetch_detail", return_value=detail):
+            result = _run(lu._lu_current_valuer("R1"))
+        self.assertEqual(
+            result,
+            _expect(True, True, "Jane Doe", "George Ruhara Maina", "2026-10-01T13:12:38.013344", "DEAL"),
+        )
+
+    def test_non_county_found_without_remarks_leaves_forwarding_fields_none(self):
+        item = {"id": "app-1"}
+        detail = {"actors": [], "remarks": []}
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref", return_value=item), \
+             patch.object(lu, "_lu_fetch_detail", return_value=detail):
+            result = _run(lu._lu_current_valuer("R1"))
+        self.assertIsNone(result["dlv_forwarded_by"])
+        self.assertIsNone(result["dlv_forwarded_at"])
 
     # ── County ───────────────────────────────────────────────
     def test_county_no_tokens_at_all(self):
         with patch.object(lu, "get_valid_tokens", return_value=None):
             result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
-        self.assertEqual(result, {"tokens_available": False, "found": False, "valuer_name": None})
+        self.assertEqual(result, _expect(False, False, None))
 
     def test_county_assessor_stage_finds_valuation_officer(self):
         item = {"id": "app-1"}
@@ -762,7 +863,7 @@ class TestLuCurrentValuer(unittest.TestCase):
              patch.object(lu, "_lu_search_ref_county", return_value=item), \
              patch.object(lu, "_lu_fetch_detail_county", return_value=detail):
             result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
-        self.assertEqual(result, {"tokens_available": True, "found": True, "valuer_name": "Jane Doe"})
+        self.assertEqual(result, _expect(True, True, "Jane Doe"))
 
     def test_county_assessor_stage_found_but_no_valuer_falls_through_to_dlv_stage(self):
         """A county ref already past the assessor stage may not list a
@@ -779,7 +880,40 @@ class TestLuCurrentValuer(unittest.TestCase):
              patch.object(lu, "_lu_search_ref_county_dlv", return_value=dlv_item), \
              patch.object(lu, "_lu_fetch_detail", return_value=dlv_detail):
             result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
-        self.assertEqual(result, {"tokens_available": True, "found": True, "valuer_name": "Jane Doe"})
+        self.assertEqual(result, _expect(True, True, "Jane Doe"))
+
+    def test_county_dlv_stage_found_includes_forwarding(self):
+        assessor_item = {"id": "app-1"}
+        assessor_detail = {"officers": [{"role": "COUNTY_REGISTRAR", "names": "A Registrar"}]}
+        dlv_item = {"id": "app-2"}
+        dlv_detail = {
+            "actors": [{"role": "VALUATION OFFICER", "user_details": {"names": "Jane Doe"}}],
+            "remarks": [{"status": "DLV_FORWARDING_REMARKS", "actor_names": "George Ruhara Maina",
+                         "date_created": "2026-10-01T13:12:38.013344", "remarks": ["DEAL"]}],
+        }
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref_county", return_value=assessor_item), \
+             patch.object(lu, "_lu_fetch_detail_county", return_value=assessor_detail), \
+             patch.object(lu, "_lu_search_ref_county_dlv", return_value=dlv_item), \
+             patch.object(lu, "_lu_fetch_detail", return_value=dlv_detail):
+            result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
+        self.assertEqual(
+            result,
+            _expect(True, True, "Jane Doe", "George Ruhara Maina", "2026-10-01T13:12:38.013344", "DEAL"),
+        )
+
+    def test_county_assessor_only_branch_leaves_forwarding_fields_none(self):
+        """The assessor-stage-only early-return branch never fetches a
+        valuationservice detail, so it can't have forwarding data —
+        regression guard against accidentally wiring remarks[] parsing
+        into the wrong (stampdutyservice-shaped) detail."""
+        item = {"id": "app-1"}
+        detail = {"officers": [{"role": "VALUATION OFFICER", "names": "Jane Doe"}]}
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref_county", return_value=item), \
+             patch.object(lu, "_lu_fetch_detail_county", return_value=detail):
+            result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
+        self.assertIsNone(result["dlv_forwarded_by"])
 
     def test_county_dlv_stage_not_found_falls_back_to_assessor_stage_result(self):
         """Neither stage has a VALUATION OFFICER listed, and the DLV
@@ -792,14 +926,14 @@ class TestLuCurrentValuer(unittest.TestCase):
              patch.object(lu, "_lu_fetch_detail_county", return_value=assessor_detail), \
              patch.object(lu, "_lu_search_ref_county_dlv", return_value=None):
             result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
-        self.assertEqual(result, {"tokens_available": True, "found": True, "valuer_name": None})
+        self.assertEqual(result, _expect(True, True, None))
 
     def test_county_neither_stage_finds_the_ref(self):
         with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
              patch.object(lu, "_lu_search_ref_county", return_value=None), \
              patch.object(lu, "_lu_search_ref_county_dlv", return_value=None):
             result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
-        self.assertEqual(result, {"tokens_available": True, "found": False, "valuer_name": None})
+        self.assertEqual(result, _expect(True, False, None))
 
     def test_county_only_dlv_credential_available_skips_assessor_stage(self):
         """Assessor-stage (Support Reg) has no cached token at all — that
@@ -815,7 +949,7 @@ class TestLuCurrentValuer(unittest.TestCase):
              patch.object(lu, "_lu_search_ref_county_dlv", return_value=dlv_item), \
              patch.object(lu, "_lu_fetch_detail", return_value=dlv_detail):
             result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
-        self.assertEqual(result, {"tokens_available": True, "found": True, "valuer_name": "Jane Doe"})
+        self.assertEqual(result, _expect(True, True, "Jane Doe"))
 
 
 class TestLuHandleRefList(unittest.TestCase):

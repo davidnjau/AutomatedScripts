@@ -11,9 +11,13 @@ gets a live cross-check (lookup_reference.py's _lu_current_valuer, the
 same county-vs-default + assessor-vs-DLV-stage routing /lookup uses)
 against the actual current valuer, to catch drift between what this bot
 last recorded and who genuinely holds the ref now (e.g. a takeover made
-outside this bot entirely). The live check is skipped — not treated as
-an error — when there's no cached token for the relevant credential;
-the local report is still shown either way.
+outside this bot entirely). When found live, it also surfaces the live
+DLV_FORWARDING_REMARKS audit-trail entry (who on the DLV side forwarded
+the ref into valuation, and when) — read alongside this record's own
+📅 Queued/📅 Assigned dates, this shows the actual gap between when the
+bot queued/assigned it and when DLV itself handed it off. The live check
+is skipped — not treated as an error — when there's no cached token for
+the relevant credential; the local report is still shown either way.
 
 Three explicit yes/no checks, each backed by a field that persists once
 set (dlv_core's store only ever merges new fields onto a record, never
@@ -140,29 +144,44 @@ def _dc_format_record(ref: str, record: dict) -> str:
 
 
 def _dc_format_live_status(record: dict, live: dict) -> str:
-    """One line summarizing the live cross-check (_lu_current_valuer's
-    return shape) against the local record's own valuer_name — appended
-    after _dc_format_record's block. Distinguishes "no tokens to check
-    with" (not an error) from "checked, but not found live" from an
-    actual match/mismatch against the locally-recorded valuer."""
+    """Live cross-check summary (_lu_current_valuer's return shape)
+    against the local record's own valuer_name — appended after
+    _dc_format_record's block. Distinguishes "no tokens to check with"
+    (not an error) from "checked, but not found live" from an actual
+    match/mismatch against the locally-recorded valuer. When ref was
+    found live and a DLV_FORWARDING_REMARKS audit-trail entry exists
+    (dlv_forwarded_by/_at — see _lu_forwarding_fields), a second line
+    reports who (on the DLV side) forwarded it into valuation and when —
+    so it can be read against this record's own 📅 Queued/📅 Assigned
+    dates to see the actual gap between queuing and DLV's own handoff."""
     if not live.get("tokens_available"):
         return "⚠️ _Live check skipped — no cached tokens._"
     if not live.get("found"):
         return "❓ *Live Status:* Not found live (assessor/DLV search)."
 
+    lines = []
     live_valuer = live.get("valuer_name")
     local_valuer = record.get("valuer_name")
 
     if not live_valuer:
-        return "📋 *Live Status:* No valuer officer listed yet."
-    if not local_valuer:
-        return f"📋 *Live Status:* Currently held by *{md_escape(live_valuer)}*."
-    if local_valuer.strip().upper() == live_valuer.strip().upper():
-        return f"✅ *Live Status:* Confirmed — still held by *{md_escape(live_valuer)}*."
-    return (
-        f"⚠️ *Live Status: TAKEN BY ANOTHER VALUER* — currently held by "
-        f"*{md_escape(live_valuer)}* (local record says {md_escape(local_valuer)})."
-    )
+        lines.append("📋 *Live Status:* No valuer officer listed yet.")
+    elif not local_valuer:
+        lines.append(f"📋 *Live Status:* Currently held by *{md_escape(live_valuer)}*.")
+    elif local_valuer.strip().upper() == live_valuer.strip().upper():
+        lines.append(f"✅ *Live Status:* Confirmed — still held by *{md_escape(live_valuer)}*.")
+    else:
+        lines.append(
+            f"⚠️ *Live Status: TAKEN BY ANOTHER VALUER* — currently held by "
+            f"*{md_escape(live_valuer)}* (local record says {md_escape(local_valuer)})."
+        )
+
+    forwarded_by = live.get("dlv_forwarded_by")
+    forwarded_at = live.get("dlv_forwarded_at")
+    if forwarded_by or forwarded_at:
+        who = md_escape(forwarded_by) if forwarded_by else "—"
+        lines.append(f"📨 *DLV Forwarded:* {who} — {forwarded_at or '—'}")
+
+    return "\n     ".join(lines)
 
 
 async def cmd_dlv_ref_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

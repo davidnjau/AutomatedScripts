@@ -575,6 +575,38 @@ async def cmd_lookup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return LU.REF_INPUT
 
 
+_LU_DLV_FORWARDING_STATUS = "DLV_FORWARDING_REMARKS"
+
+
+def _lu_extract_dlv_forwarding(detail: Optional[Dict]) -> Optional[Dict]:
+    """Earliest remarks[] entry with status DLV_FORWARDING_REMARKS — the
+    audit-trail event recording when (and by which DLV actor) a ref was
+    forwarded from the assessor stage into DLV/valuation. Mirrors
+    task_analytics.py's own remarks[]-scanning approach
+    (_ta_remarks_by_status) but returns the full entry's actor/date/remark
+    text rather than just a parsed timestamp.
+
+    Only ever populated when detail comes from the valuationservice
+    detail-view (_lu_fetch_detail) — the stampdutyservice assessor-stage
+    shape (_lu_fetch_detail_county) has no remarks[] field at all, since
+    forwarding to DLV hasn't happened from that stage's own perspective.
+    Picks the earliest matching entry in the (unusual, but not impossible)
+    case of more than one — returns None if detail is empty or has no
+    such entry."""
+    remarks = (detail or {}).get("remarks") or []
+    candidates = [r for r in remarks if r.get("status") == _LU_DLV_FORWARDING_STATUS]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda r: r.get("date_created") or "")
+    entry = candidates[0]
+    remark_texts = entry.get("remarks") or []
+    return {
+        "actor_names":  entry.get("actor_names"),
+        "date_created": entry.get("date_created"),
+        "remark_text":  ", ".join(remark_texts) if remark_texts else None,
+    }
+
+
 async def _lu_lookup_county(ref: str) -> Optional[str]:
     """A County ref can be at either the assessor/HQ stage (Support Reg,
     stampdutyservice hod-or-clr) or, once past that, the DLV/valuation
@@ -620,20 +652,45 @@ async def _lu_lookup_county(ref: str) -> Optional[str]:
     return None
 
 
+_LU_NO_FORWARDING_FIELDS = {"dlv_forwarded_by": None, "dlv_forwarded_at": None, "dlv_forward_remark": None}
+
+
+def _lu_forwarding_fields(detail: Optional[Dict]) -> Dict:
+    """dlv_forwarded_by/dlv_forwarded_at/dlv_forward_remark, extracted via
+    _lu_extract_dlv_forwarding — all None if detail has no such entry
+    (including when detail itself is the stampdutyservice assessor-stage
+    shape, which never has one). Merged into _lu_current_valuer's return
+    dict so every return path has the same fixed set of keys."""
+    fwd = _lu_extract_dlv_forwarding(detail)
+    if not fwd:
+        return dict(_LU_NO_FORWARDING_FIELDS)
+    return {
+        "dlv_forwarded_by":     fwd["actor_names"],
+        "dlv_forwarded_at":     fwd["date_created"],
+        "dlv_forward_remark":   fwd["remark_text"],
+    }
+
+
 async def _lu_current_valuer(ref: str) -> Dict:
     """Live current-valuer check for ref — the same county-vs-default +
     assessor-vs-DLV-stage routing _lu_lookup_county/_lu_lookup_one use,
     but returning a small structured result instead of a formatted
-    Reference Lookup block: {"tokens_available", "found", "valuer_name"}.
+    Reference Lookup block: {"tokens_available", "found", "valuer_name",
+    "dlv_forwarded_by", "dlv_forwarded_at", "dlv_forward_remark"}.
     valuer_name is None if ref was found live but no VALUATION OFFICER
-    actor/officer is listed yet. Used by dlv_ref_check.py to flag drift
-    between a ref's locally-recorded valuer and who actually holds it
-    live, without re-parsing _lu_lookup_one's markdown output."""
+    actor/officer is listed yet. The dlv_forward* fields (see
+    _lu_forwarding_fields) are only ever populated when a valuationservice
+    detail-view was actually fetched — the assessor-stage-only branches
+    below have no such data available and leave them None. Used by
+    dlv_ref_check.py to flag drift between a ref's locally-recorded valuer
+    and who actually holds it live, and to show when (and by whom on the
+    DLV side) it was forwarded — without re-parsing _lu_lookup_one's
+    markdown output."""
     if _lu_is_county_ref(ref):
         support_tokens = get_valid_tokens(_LU_CRED_COUNTY)
         valuer_tokens  = get_valid_tokens(_LU_CRED_DEFAULT)
         if not support_tokens and not valuer_tokens:
-            return {"tokens_available": False, "found": False, "valuer_name": None}
+            return {"tokens_available": False, "found": False, "valuer_name": None, **_LU_NO_FORWARDING_FIELDS}
 
         assessor_found = False
         assessor_valuer_name = None
@@ -646,7 +703,10 @@ async def _lu_current_valuer(ref: str) -> Dict:
                 assessor_found = True
                 assessor_valuer_name = vo.get("names") if vo else None
                 if vo:
-                    return {"tokens_available": True, "found": True, "valuer_name": assessor_valuer_name}
+                    # Assessor-stage shape (stampdutyservice) never has
+                    # remarks[], so forwarding fields are always None here.
+                    return {"tokens_available": True, "found": True, "valuer_name": assessor_valuer_name,
+                            **_LU_NO_FORWARDING_FIELDS}
 
         if valuer_tokens:
             item = await asyncio.to_thread(_lu_search_ref_county_dlv, valuer_tokens, ref)
@@ -655,23 +715,26 @@ async def _lu_current_valuer(ref: str) -> Dict:
                 actors = (detail or {}).get("actors") or []
                 vo = next((a for a in actors if a.get("role") == "VALUATION OFFICER"), None)
                 valuer_name = (vo.get("user_details") or {}).get("names") if vo else None
-                return {"tokens_available": True, "found": True, "valuer_name": valuer_name}
+                return {"tokens_available": True, "found": True, "valuer_name": valuer_name,
+                        **_lu_forwarding_fields(detail)}
 
         if assessor_found:
-            return {"tokens_available": True, "found": True, "valuer_name": assessor_valuer_name}
-        return {"tokens_available": True, "found": False, "valuer_name": None}
+            return {"tokens_available": True, "found": True, "valuer_name": assessor_valuer_name,
+                    **_LU_NO_FORWARDING_FIELDS}
+        return {"tokens_available": True, "found": False, "valuer_name": None, **_LU_NO_FORWARDING_FIELDS}
 
     tokens = get_valid_tokens(_LU_CRED_DEFAULT)
     if not tokens:
-        return {"tokens_available": False, "found": False, "valuer_name": None}
+        return {"tokens_available": False, "found": False, "valuer_name": None, **_LU_NO_FORWARDING_FIELDS}
     item = await asyncio.to_thread(_lu_search_ref, tokens, ref)
     if not item:
-        return {"tokens_available": True, "found": False, "valuer_name": None}
+        return {"tokens_available": True, "found": False, "valuer_name": None, **_LU_NO_FORWARDING_FIELDS}
     detail = await asyncio.to_thread(_lu_fetch_detail, tokens, item["id"])
     actors = (detail or {}).get("actors") or []
     vo = next((a for a in actors if a.get("role") == "VALUATION OFFICER"), None)
     valuer_name = (vo.get("user_details") or {}).get("names") if vo else None
-    return {"tokens_available": True, "found": True, "valuer_name": valuer_name}
+    return {"tokens_available": True, "found": True, "valuer_name": valuer_name,
+            **_lu_forwarding_fields(detail)}
 
 
 async def _lu_lookup_one(ref: str) -> str:
