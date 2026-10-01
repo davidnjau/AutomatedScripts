@@ -2,9 +2,11 @@
 """
 Unit tests for dlv_ref_check.py — _dc_format_record's three explicit
 checks (New Assignment via `workflow`, DLV Batch Queue via `queued_at`,
-Hold Queue via `hold`) plus the shared status/valuer/timeline fields, and
-the cmd_dlv_ref_check/recv_dc_ref conversation handlers, including the
-"no record at all" vs "has a record" distinction.
+Hold Queue via `hold`) plus the shared status/valuer/timeline fields,
+_dc_format_live_status's match/mismatch/skip rendering, and the
+cmd_dlv_ref_check/recv_dc_ref conversation handlers, including the
+"no record at all" vs "has a record" distinction and the live
+cross-check that runs only for the latter.
 
 Run with: python3 -m unittest discover -s assign/tests -v
 """
@@ -50,10 +52,16 @@ class TestDcFormatRecord(unittest.TestCase):
         block = dc._dc_format_record("R1", record)
         self.assertIn("New Assignment: 🏘 Land Rent", block)
 
-    def test_queued_at_present_shows_queue_date(self):
+    def test_queued_at_present_shows_yes_and_its_own_date_row(self):
         record = {"status": "queued", "queued_at": "2026-01-01T10:00:00"}
         block = dc._dc_format_record("R1", record)
-        self.assertIn("DLV Batch Queue: ✅ Yes — 2026-01-01T10:00:00", block)
+        self.assertIn("DLV Batch Queue: ✅ Yes", block)
+        self.assertIn("📅 Queued: 2026-01-01T10:00:00", block)
+
+    def test_no_queued_at_omits_queued_date_row(self):
+        record = {"status": "assigned"}
+        block = dc._dc_format_record("R1", record)
+        self.assertNotIn("📅 Queued", block)
 
     def test_hold_present_shows_held_for(self):
         record = {"status": "assigned", "hold": {"held_valuer_name": "Byron"}}
@@ -107,6 +115,63 @@ class TestDcFormatRecord(unittest.TestCase):
         self.assertIn("Direct", block)
 
 
+class TestDcFormatLiveStatus(unittest.TestCase):
+    """_dc_format_live_status — match/mismatch/skip rendering against
+    _lu_current_valuer's structured return shape."""
+
+    def test_no_tokens_shows_skip_note_not_an_error(self):
+        live = {"tokens_available": False, "found": False, "valuer_name": None}
+        text = dc._dc_format_live_status({"valuer_name": "Jane Doe"}, live)
+        self.assertIn("Live check skipped", text)
+        self.assertIn("no cached tokens", text)
+
+    def test_not_found_live(self):
+        live = {"tokens_available": True, "found": False, "valuer_name": None}
+        text = dc._dc_format_live_status({"valuer_name": "Jane Doe"}, live)
+        self.assertIn("Not found live", text)
+
+    def test_found_but_no_valuer_officer_listed(self):
+        live = {"tokens_available": True, "found": True, "valuer_name": None}
+        text = dc._dc_format_live_status({"valuer_name": "Jane Doe"}, live)
+        self.assertIn("No valuer officer listed yet", text)
+
+    def test_matching_valuer_confirmed(self):
+        live = {"tokens_available": True, "found": True, "valuer_name": "Jane Doe"}
+        text = dc._dc_format_live_status({"valuer_name": "Jane Doe"}, live)
+        self.assertIn("✅", text)
+        self.assertIn("Confirmed", text)
+        self.assertIn("Jane Doe", text)
+
+    def test_match_is_case_and_whitespace_insensitive(self):
+        live = {"tokens_available": True, "found": True, "valuer_name": "  jane doe  "}
+        text = dc._dc_format_live_status({"valuer_name": "JANE DOE"}, live)
+        self.assertIn("Confirmed", text)
+
+    def test_mismatched_valuer_flags_taken_by_another(self):
+        """The exact reported scenario: local record says one valuer,
+        live search shows a different one actually holding it."""
+        live = {"tokens_available": True, "found": True, "valuer_name": "LYNN NDUTA KABURU"}
+        text = dc._dc_format_live_status({"valuer_name": "NEWTON MUCHEMI WAMBUGU"}, live)
+        self.assertIn("TAKEN BY ANOTHER VALUER", text)
+        self.assertIn("LYNN NDUTA KABURU", text)
+        self.assertIn("NEWTON MUCHEMI WAMBUGU", text)
+
+    def test_no_local_valuer_to_compare_shows_informational_only(self):
+        """A record with no valuer_name at all (e.g. only ever queued,
+        never assigned) has nothing to compare against — informational,
+        not framed as a mismatch."""
+        live = {"tokens_available": True, "found": True, "valuer_name": "Jane Doe"}
+        text = dc._dc_format_live_status({}, live)
+        self.assertIn("Currently held by", text)
+        self.assertNotIn("TAKEN BY ANOTHER VALUER", text)
+
+    def test_valuer_names_are_markdown_escaped(self):
+        live = {"tokens_available": True, "found": True, "valuer_name": "Jane_Doe"}
+        text = dc._dc_format_live_status({"valuer_name": "John_Roe"}, live)
+        self.assertIn("Jane\\_Doe", text)
+        self.assertIn("John\\_Roe", text)
+
+
 class TestCmdDlvRefCheck(unittest.TestCase):
     def test_asks_for_reference_number(self):
         update = _make_update_with_message()
@@ -141,8 +206,10 @@ class TestRecvDcRef(unittest.TestCase):
         update = _make_update_with_message("R1")
         ctx = MagicMock()
         store = {"R1": {"status": "assigned", "assigned_at": "2026-01-02T09:00:00"}}
+        no_tokens = {"tokens_available": False, "found": False, "valuer_name": None}
         with patch.object(dc, "allowed", return_value=True), \
-             patch.object(dc, "_load_consolidated", return_value=store):
+             patch.object(dc, "_load_consolidated", return_value=store), \
+             patch.object(dc, "_lu_current_valuer", new=AsyncMock(return_value=no_tokens)):
             result = _run(dc.recv_dc_ref(update, ctx))
         self.assertEqual(result, dc.ConversationHandler.END)
         sent_text = update.message.reply_text.call_args_list[-1].args[0]
@@ -160,14 +227,53 @@ class TestRecvDcRef(unittest.TestCase):
             "closed_at": "2026-01-05T12:00:00", "closed_reason": "completed",
             "valuer_name": "Jane Doe",
         }}
+        no_tokens = {"tokens_available": False, "found": False, "valuer_name": None}
         with patch.object(dc, "allowed", return_value=True), \
-             patch.object(dc, "_load_consolidated", return_value=store):
+             patch.object(dc, "_load_consolidated", return_value=store), \
+             patch.object(dc, "_lu_current_valuer", new=AsyncMock(return_value=no_tokens)):
             result = _run(dc.recv_dc_ref(update, ctx))
         self.assertEqual(result, dc.ConversationHandler.END)
         sent_text = update.message.reply_text.call_args_list[-1].args[0]
         self.assertIn("New Assignment: 📋 Stamp Duty", sent_text)
         self.assertIn("DLV Batch Queue: ✅ Yes", sent_text)
         self.assertIn("Jane Doe", sent_text)
+
+    def test_live_check_sends_interim_message_before_final_report(self):
+        update = _make_update_with_message("R1")
+        ctx = MagicMock()
+        store = {"R1": {"status": "assigned", "valuer_name": "Jane Doe"}}
+        confirmed = {"tokens_available": True, "found": True, "valuer_name": "Jane Doe"}
+        with patch.object(dc, "allowed", return_value=True), \
+             patch.object(dc, "_load_consolidated", return_value=store), \
+             patch.object(dc, "_lu_current_valuer", new=AsyncMock(return_value=confirmed)):
+            _run(dc.recv_dc_ref(update, ctx))
+        texts = [c.args[0] for c in update.message.reply_text.call_args_list]
+        self.assertIn("Checking live status", texts[0])
+        self.assertIn("Confirmed", texts[-1])
+
+    def test_live_mismatch_surfaces_in_final_report(self):
+        """The exact reported scenario, end to end: local record says one
+        valuer, live search shows a different one actually holding it."""
+        update = _make_update_with_message("R1")
+        ctx = MagicMock()
+        store = {"R1": {"status": "assigned", "valuer_name": "NEWTON MUCHEMI WAMBUGU"}}
+        taken = {"tokens_available": True, "found": True, "valuer_name": "LYNN NDUTA KABURU"}
+        with patch.object(dc, "allowed", return_value=True), \
+             patch.object(dc, "_load_consolidated", return_value=store), \
+             patch.object(dc, "_lu_current_valuer", new=AsyncMock(return_value=taken)):
+            _run(dc.recv_dc_ref(update, ctx))
+        sent_text = update.message.reply_text.call_args_list[-1].args[0]
+        self.assertIn("TAKEN BY ANOTHER VALUER", sent_text)
+        self.assertIn("LYNN NDUTA KABURU", sent_text)
+
+    def test_no_record_at_all_skips_live_check_entirely(self):
+        update = _make_update_with_message("R1")
+        ctx = MagicMock()
+        with patch.object(dc, "allowed", return_value=True), \
+             patch.object(dc, "_load_consolidated", return_value={}), \
+             patch.object(dc, "_lu_current_valuer", new=AsyncMock()) as mock_live:
+            _run(dc.recv_dc_ref(update, ctx))
+        mock_live.assert_not_awaited()
 
     def test_too_many_refs_ends_conversation_without_list_handling(self):
         raw = "\n".join(f"R{i}" for i in range(dc._LIST_INPUT_MAX_ITEMS + 1))
@@ -194,7 +300,9 @@ class TestDcHandleRefList(unittest.TestCase):
     def test_no_record_and_has_record_both_reported(self):
         update = _make_update_with_message()
         store = {"R1": {"status": "queued", "queued_at": "2026-01-01T10:00:00"}}
-        with patch.object(dc, "_load_consolidated", return_value=store):
+        no_tokens = {"tokens_available": False, "found": False, "valuer_name": None}
+        with patch.object(dc, "_load_consolidated", return_value=store), \
+             patch.object(dc, "_lu_current_valuer", new=AsyncMock(return_value=no_tokens)):
             result = _run(dc._dc_handle_ref_list(update, ["R1", "R2"]))
         self.assertEqual(result, dc.ConversationHandler.END)
         sent_texts = [c.args[0] for c in update.message.reply_text.call_args_list]
@@ -203,6 +311,25 @@ class TestDcHandleRefList(unittest.TestCase):
         self.assertIn("DLV Batch Queue: ✅ Yes", combined)
         self.assertIn("R2", combined)
         self.assertIn("no record at all", combined)
+
+    def test_no_record_ref_skips_live_check(self):
+        update = _make_update_with_message()
+        with patch.object(dc, "_load_consolidated", return_value={}), \
+             patch.object(dc, "_lu_current_valuer", new=AsyncMock()) as mock_live:
+            _run(dc._dc_handle_ref_list(update, ["R1"]))
+        mock_live.assert_not_awaited()
+
+    def test_has_record_ref_live_checked_and_mismatch_shown(self):
+        update = _make_update_with_message()
+        store = {"R1": {"status": "assigned", "valuer_name": "NEWTON MUCHEMI WAMBUGU"}}
+        taken = {"tokens_available": True, "found": True, "valuer_name": "LYNN NDUTA KABURU"}
+        with patch.object(dc, "_load_consolidated", return_value=store), \
+             patch.object(dc, "_lu_current_valuer", new=AsyncMock(return_value=taken)):
+            _run(dc._dc_handle_ref_list(update, ["R1"]))
+        sent_texts = [c.args[0] for c in update.message.reply_text.call_args_list]
+        combined = "\n\n".join(sent_texts)
+        self.assertIn("TAKEN BY ANOTHER VALUER", combined)
+        self.assertIn("LYNN NDUTA KABURU", combined)
 
 
 if __name__ == "__main__":

@@ -711,6 +711,113 @@ class TestLuLookupOne(unittest.TestCase):
         self.assertEqual(result, "formatted-county")
 
 
+class TestLuCurrentValuer(unittest.TestCase):
+    """_lu_current_valuer — structured {"tokens_available", "found",
+    "valuer_name"} live current-valuer check, used by dlv_ref_check.py
+    to flag drift against a ref's locally-recorded valuer. Mirrors
+    _lu_lookup_county's county-vs-default + assessor-vs-DLV-stage
+    routing exactly, but returns structured data instead of a formatted
+    Reference Lookup block."""
+
+    # ── Non-county ──────────────────────────────────────────
+    def test_non_county_no_tokens(self):
+        with patch.object(lu, "get_valid_tokens", return_value=None):
+            result = _run(lu._lu_current_valuer("R1"))
+        self.assertEqual(result, {"tokens_available": False, "found": False, "valuer_name": None})
+
+    def test_non_county_not_found(self):
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref", return_value=None):
+            result = _run(lu._lu_current_valuer("R1"))
+        self.assertEqual(result, {"tokens_available": True, "found": False, "valuer_name": None})
+
+    def test_non_county_found_with_valuation_officer(self):
+        item = {"id": "app-1"}
+        detail = {"actors": [{"role": "VALUATION OFFICER", "user_details": {"names": "Jane Doe"}}]}
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref", return_value=item), \
+             patch.object(lu, "_lu_fetch_detail", return_value=detail):
+            result = _run(lu._lu_current_valuer("R1"))
+        self.assertEqual(result, {"tokens_available": True, "found": True, "valuer_name": "Jane Doe"})
+
+    def test_non_county_found_without_valuation_officer(self):
+        item = {"id": "app-1"}
+        detail = {"actors": [{"role": "ASSESSOR_OF_STAMP_DUTY", "user_details": {"names": "An Assessor"}}]}
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref", return_value=item), \
+             patch.object(lu, "_lu_fetch_detail", return_value=detail):
+            result = _run(lu._lu_current_valuer("R1"))
+        self.assertEqual(result, {"tokens_available": True, "found": True, "valuer_name": None})
+
+    # ── County ───────────────────────────────────────────────
+    def test_county_no_tokens_at_all(self):
+        with patch.object(lu, "get_valid_tokens", return_value=None):
+            result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
+        self.assertEqual(result, {"tokens_available": False, "found": False, "valuer_name": None})
+
+    def test_county_assessor_stage_finds_valuation_officer(self):
+        item = {"id": "app-1"}
+        detail = {"officers": [{"role": "VALUATION OFFICER", "names": "Jane Doe"}]}
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref_county", return_value=item), \
+             patch.object(lu, "_lu_fetch_detail_county", return_value=detail):
+            result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
+        self.assertEqual(result, {"tokens_available": True, "found": True, "valuer_name": "Jane Doe"})
+
+    def test_county_assessor_stage_found_but_no_valuer_falls_through_to_dlv_stage(self):
+        """A county ref already past the assessor stage may not list a
+        VALUATION OFFICER there yet even though it's been assigned live
+        in DLV — the DLV stage is checked next rather than reporting the
+        assessor stage's valuer-less result."""
+        assessor_item = {"id": "app-1"}
+        assessor_detail = {"officers": [{"role": "COUNTY_REGISTRAR", "names": "A Registrar"}]}
+        dlv_item = {"id": "app-2"}
+        dlv_detail = {"actors": [{"role": "VALUATION OFFICER", "user_details": {"names": "Jane Doe"}}]}
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref_county", return_value=assessor_item), \
+             patch.object(lu, "_lu_fetch_detail_county", return_value=assessor_detail), \
+             patch.object(lu, "_lu_search_ref_county_dlv", return_value=dlv_item), \
+             patch.object(lu, "_lu_fetch_detail", return_value=dlv_detail):
+            result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
+        self.assertEqual(result, {"tokens_available": True, "found": True, "valuer_name": "Jane Doe"})
+
+    def test_county_dlv_stage_not_found_falls_back_to_assessor_stage_result(self):
+        """Neither stage has a VALUATION OFFICER listed, and the DLV
+        stage doesn't even find the ref — the assessor stage's own
+        (valuer-less) found=True result is the last-resort fallback."""
+        assessor_item = {"id": "app-1"}
+        assessor_detail = {"officers": []}
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref_county", return_value=assessor_item), \
+             patch.object(lu, "_lu_fetch_detail_county", return_value=assessor_detail), \
+             patch.object(lu, "_lu_search_ref_county_dlv", return_value=None):
+            result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
+        self.assertEqual(result, {"tokens_available": True, "found": True, "valuer_name": None})
+
+    def test_county_neither_stage_finds_the_ref(self):
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref_county", return_value=None), \
+             patch.object(lu, "_lu_search_ref_county_dlv", return_value=None):
+            result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
+        self.assertEqual(result, {"tokens_available": True, "found": False, "valuer_name": None})
+
+    def test_county_only_dlv_credential_available_skips_assessor_stage(self):
+        """Assessor-stage (Support Reg) has no cached token at all — that
+        stage is silently skipped, not treated as an error, since the
+        DLV stage alone can still succeed."""
+        dlv_item = {"id": "app-2"}
+        dlv_detail = {"actors": [{"role": "VALUATION OFFICER", "user_details": {"names": "Jane Doe"}}]}
+
+        def _tokens(cred):
+            return TOKENS if cred == lu._LU_CRED_DEFAULT else None
+
+        with patch.object(lu, "get_valid_tokens", side_effect=_tokens), \
+             patch.object(lu, "_lu_search_ref_county_dlv", return_value=dlv_item), \
+             patch.object(lu, "_lu_fetch_detail", return_value=dlv_detail):
+            result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
+        self.assertEqual(result, {"tokens_available": True, "found": True, "valuer_name": "Jane Doe"})
+
+
 class TestLuHandleRefList(unittest.TestCase):
     def test_compiles_one_report_from_each_lookup(self):
         update = _make_update_with_message()

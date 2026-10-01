@@ -620,6 +620,60 @@ async def _lu_lookup_county(ref: str) -> Optional[str]:
     return None
 
 
+async def _lu_current_valuer(ref: str) -> Dict:
+    """Live current-valuer check for ref — the same county-vs-default +
+    assessor-vs-DLV-stage routing _lu_lookup_county/_lu_lookup_one use,
+    but returning a small structured result instead of a formatted
+    Reference Lookup block: {"tokens_available", "found", "valuer_name"}.
+    valuer_name is None if ref was found live but no VALUATION OFFICER
+    actor/officer is listed yet. Used by dlv_ref_check.py to flag drift
+    between a ref's locally-recorded valuer and who actually holds it
+    live, without re-parsing _lu_lookup_one's markdown output."""
+    if _lu_is_county_ref(ref):
+        support_tokens = get_valid_tokens(_LU_CRED_COUNTY)
+        valuer_tokens  = get_valid_tokens(_LU_CRED_DEFAULT)
+        if not support_tokens and not valuer_tokens:
+            return {"tokens_available": False, "found": False, "valuer_name": None}
+
+        assessor_found = False
+        assessor_valuer_name = None
+        if support_tokens:
+            item = await asyncio.to_thread(_lu_search_ref_county, support_tokens, ref)
+            if item:
+                detail = await asyncio.to_thread(_lu_fetch_detail_county, support_tokens, item["id"])
+                officers = (detail or {}).get("officers") or []
+                vo = next((o for o in officers if o.get("role") == "VALUATION OFFICER"), None)
+                assessor_found = True
+                assessor_valuer_name = vo.get("names") if vo else None
+                if vo:
+                    return {"tokens_available": True, "found": True, "valuer_name": assessor_valuer_name}
+
+        if valuer_tokens:
+            item = await asyncio.to_thread(_lu_search_ref_county_dlv, valuer_tokens, ref)
+            if item:
+                detail = await asyncio.to_thread(_lu_fetch_detail, valuer_tokens, item["id"])
+                actors = (detail or {}).get("actors") or []
+                vo = next((a for a in actors if a.get("role") == "VALUATION OFFICER"), None)
+                valuer_name = (vo.get("user_details") or {}).get("names") if vo else None
+                return {"tokens_available": True, "found": True, "valuer_name": valuer_name}
+
+        if assessor_found:
+            return {"tokens_available": True, "found": True, "valuer_name": assessor_valuer_name}
+        return {"tokens_available": True, "found": False, "valuer_name": None}
+
+    tokens = get_valid_tokens(_LU_CRED_DEFAULT)
+    if not tokens:
+        return {"tokens_available": False, "found": False, "valuer_name": None}
+    item = await asyncio.to_thread(_lu_search_ref, tokens, ref)
+    if not item:
+        return {"tokens_available": True, "found": False, "valuer_name": None}
+    detail = await asyncio.to_thread(_lu_fetch_detail, tokens, item["id"])
+    actors = (detail or {}).get("actors") or []
+    vo = next((a for a in actors if a.get("role") == "VALUATION OFFICER"), None)
+    valuer_name = (vo.get("user_details") or {}).get("names") if vo else None
+    return {"tokens_available": True, "found": True, "valuer_name": valuer_name}
+
+
 async def _lu_lookup_one(ref: str) -> str:
     """Look up a single reference end to end — the same county-vs-default
     routing recv_lu_ref uses for its single-ref path — and return its
