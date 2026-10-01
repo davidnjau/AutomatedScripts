@@ -309,6 +309,30 @@ class TestLookupOneRef(unittest.TestCase):
         self.assertIn("not found", text)
         self.assertEqual(ctx, {})
 
+    def test_ref_not_found_warns_about_dlv_batch(self):
+        """Regression: a Stamp Duty ref not found moments after its own
+        assign POST returned success most likely means it hasn't been
+        forwarded to DLV yet — the assignment has nothing to attach to,
+        and a human DLV officer may forward it to someone else first.
+        This must be called out explicitly, not left as a generic
+        "not found" miss."""
+        with patch.object(na, "_lu_search_ref", return_value=None):
+            text, ctx = na._lookup_one_ref(TOKENS, "R1", "stamp_duty")
+        self.assertIn("not found in DLV yet", text)
+        self.assertIn("assessor stage", text)
+        self.assertIn("DLV Batch", text)
+        self.assertEqual(ctx, {})
+
+    def test_land_rent_not_found_keeps_original_message_unchanged(self):
+        """The DLV Batch warning is Stamp Duty-specific (that node model
+        doesn't apply to LRD) — LRD's own "not found" message must stay
+        exactly as it was."""
+        with patch.object(na, "_lu_search_ref_lrd", return_value=None):
+            text, ctx = na._lookup_one_ref(TOKENS, "REG/SECT/AB12CD", "land_rent")
+        self.assertEqual(text, "⚠️ `REG/SECT/AB12CD` — not found in post-assignment lookup")
+        self.assertNotIn("DLV Batch", text)
+        self.assertEqual(ctx, {})
+
     def test_ref_found_returns_formatted_text_and_context(self):
         item = {"id": "app-1", "reference_number": "R1", "registry": "NAIROBI", "county": "NAIROBI"}
         with patch.object(na, "_lu_search_ref", return_value=item), \
