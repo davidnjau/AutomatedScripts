@@ -4,14 +4,21 @@ hold_tasks.py
 =============
 Hold Tasks (✋ Hold Tasks button / /holdtasks) — guard specific assigned DLV
 refs against being reassigned to someone else. Pick tasks (from this bot's
-own tracked assignments, or a live DLV query) and a background job keeps
-re-checking them: if the ref is still at the "valuer report pending" stage
-but the current valuer differs from who it was held for, it's reassigned
-back automatically. Once a held ref moves past that stage for any reason
-(completed, returned, back to unassigned, or simply no longer found), it's
-released from the hold queue on its own — no manual cleanup needed. The
-guard job's default check interval is 1 minute (adjustable 1-10 min from
-the Held Queue viewer).
+own tracked assignments, a live DLV query, or by typing ref number(s) and
+picking a saved valuer) and a background job keeps re-checking them: if the
+ref is still at the "valuer report pending" stage but the current valuer
+differs from who it was held for, it's reassigned back automatically. Once
+a held ref moves past that stage for any reason (completed, returned, back
+to unassigned, or simply no longer found), it's released from the hold
+queue on its own — no manual cleanup needed. The guard job's default check
+interval is 1 minute (adjustable 1-10 min from the Held Queue viewer).
+
+The manual-entry source (✏️ Manual Entry) only offers a pick from
+saved_valuers.json — it never searches the live accounts API or asks for a
+login, unlike New Assignment/Receive Tasks. A ref not yet in tracked
+assignments or the live queue can still be held as long as its intended
+valuer has been saved at least once (New Assignment/Receive Tasks auto-save
+every valuer they use).
 
 Tasks are only ever held or released by explicit user selection — via
 ➕ Add Tasks to Hold and 🗑 Release Task(s) below — never automatically.
@@ -57,14 +64,17 @@ from common import (
     _be_cred_keyboard,
     _CANCEL_FILTER,
     _main_menu_for,
+    _parse_list_input,
     allowed,
     cmd_cancel,
     deny,
     fallback,
     get_valid_tokens,
     load_saved_assignments,
+    load_saved_valuers,
     logger,
     md_escape,
+    not_cancel,
 )
 from dlv_core import (
     _classify_dlv_detail,
@@ -95,9 +105,11 @@ _hold_tasks_interval: int = 60
 # ──────────────────────────────────────────────────────────
 class HT(Enum):
     MENU              = auto()   # "Add Tasks to Hold" vs "View Held Queue"
-    CHOOSE_SOURCE     = auto()   # (Add) tracked assignments vs live DLV query
+    CHOOSE_SOURCE     = auto()   # (Add) tracked assignments vs live DLV query vs manual entry
     LIVE_CRED         = auto()   # (Add + live) pick a credential with a cached token
     SELECT_CANDIDATES = auto()   # multi-select which candidate tasks to hold
+    MANUAL_REF        = auto()   # (Add + manual) type one or more reference numbers
+    MANUAL_VALUER     = auto()   # (Add + manual) pick a saved valuer to hold the typed ref(s) for
     VIEW_QUEUE        = auto()   # held items + interval/check-now/release buttons
     RELEASE_SELECT    = auto()   # multi-select which held refs to manually release
 
@@ -107,6 +119,7 @@ class HTSession:
     cred_type:        str        = ""
     candidates:       List[Dict] = field(default_factory=list)   # [{ref, valuer_name, valuer_uid}]
     selected:         set        = field(default_factory=set)    # refs selected to hold
+    manual_refs:      List[str]  = field(default_factory=list)   # (manual entry) refs awaiting a valuer pick
     release_items:    List[Dict] = field(default_factory=list)   # held-queue snapshot for release
     release_selected: set        = field(default_factory=set)    # refs selected for release
 
@@ -440,8 +453,18 @@ def _ht_source_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📂 Tracked Assignments", callback_data="ht_src:tracked")],
         [InlineKeyboardButton("🌐 Live DLV Queue",       callback_data="ht_src:live")],
+        [InlineKeyboardButton("✏️ Manual Entry",         callback_data="ht_src:manual")],
         [InlineKeyboardButton("🛑 Cancel",               callback_data="ht_src:cancel")],
     ])
+
+
+def _ht_manual_valuer_keyboard(saved: List[Dict]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(f"👤 {sv['name']}", callback_data=f"ht_mval:{i}")]
+        for i, sv in enumerate(saved)
+    ]
+    rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="ht_mval:cancel")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _ht_select_keyboard(candidates: List[Dict], selected: set) -> InlineKeyboardMarkup:
@@ -543,7 +566,7 @@ async def recv_ht_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def recv_ht_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Route the tracked/live/Cancel choice on the Add path.
+    # Route the tracked/live/manual/Cancel choice on the Add path.
     query  = update.callback_query
     await query.answer()
     source = query.data.split(":")[1]
@@ -559,6 +582,12 @@ async def recv_ht_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if source == "tracked":
         sess.candidates = _ht_tracked_candidates(held_refs)
         return await _ht_show_candidates(query.edit_message_text, query.message.chat_id, ctx, sess)
+
+    if source == "manual":
+        await query.edit_message_text(
+            "✏️ Type the reference number(s) to hold — one per line, or comma-separated:",
+        )
+        return HT.MANUAL_REF
 
     kbd = _be_cred_keyboard()
     if not kbd:
@@ -658,6 +687,89 @@ async def recv_ht_confirm_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     refs = ", ".join(f"`{r}`" for r in sorted(sess.selected))
     await query.edit_message_text(f"✋ Now holding *{len(sess.selected)}* task(s):\n{refs}", parse_mode="Markdown")
+    await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
+    return ConversationHandler.END
+
+
+async def recv_ht_manual_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Parse the typed reference number(s), drop any already held, then
+    either prompt for a saved valuer or — if none is saved yet — tell the
+    user to assign one via New Assignment first (New Assignment auto-saves
+    every valuer it assigns to)."""
+    sess      = _get_ht_sess(ctx)
+    held_refs = {i.get("ref") for i in load_hold_tasks()}
+    refs      = list(dict.fromkeys(_parse_list_input(update.message.text)))
+    new_refs  = [r for r in refs if r not in held_refs]
+
+    if not refs:
+        await update.message.reply_text("⚠️ No reference number found. Try again.")
+        return HT.MANUAL_REF
+
+    if not new_refs:
+        await update.message.reply_text("ℹ️ All of those refs are already held.")
+        await update.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(update.message.chat_id))
+        return ConversationHandler.END
+
+    saved = load_saved_valuers()
+    if not saved:
+        await update.message.reply_text(
+            "⚠️ No saved valuers yet — assign a reference via *📋 New Assignment* first "
+            "(it saves the valuer automatically), then try Hold Tasks again.",
+            parse_mode="Markdown",
+        )
+        await update.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(update.message.chat_id))
+        return ConversationHandler.END
+
+    sess.manual_refs = new_refs
+    skipped = len(refs) - len(new_refs)
+    note    = f" ({skipped} already held, skipped)" if skipped else ""
+    await update.message.reply_text(
+        f"✅ *{len(new_refs)} reference(s)* queued{note}.\n\nSelect the valuer to hold them for:",
+        parse_mode="Markdown",
+        reply_markup=_ht_manual_valuer_keyboard(saved),
+    )
+    return HT.MANUAL_VALUER
+
+
+async def recv_ht_manual_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Persist sess.manual_refs as new held items under the picked saved
+    valuer, or cancel."""
+    query = update.callback_query
+    await query.answer()
+    sess = _get_ht_sess(ctx)
+    data = query.data.split(":")[1]  # index into saved valuers, or "cancel"
+
+    if data == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
+        return ConversationHandler.END
+
+    saved = load_saved_valuers()
+    idx   = int(data)
+    if idx >= len(saved):
+        await query.edit_message_text("⚠️ That saved valuer no longer exists. Please start over.")
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
+        return ConversationHandler.END
+
+    sv  = saved[idx]
+    now = datetime.now().isoformat(timespec="seconds")
+    held = load_hold_tasks()
+    for ref in sess.manual_refs:
+        held.append({
+            "ref":              ref,
+            "held_valuer_name": sv.get("name", ""),
+            "held_valuer_uid":  sv.get("uid", ""),
+            "held_at":          now,
+            "last_checked":     "",
+            "last_error":       "",
+        })
+    save_hold_tasks(held)
+
+    refs = ", ".join(f"`{r}`" for r in sorted(sess.manual_refs))
+    await query.edit_message_text(
+        f"✋ Now holding *{len(sess.manual_refs)}* task(s) for *{md_escape(sv.get('name', ''))}*:\n{refs}",
+        parse_mode="Markdown",
+    )
     await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
     return ConversationHandler.END
 
@@ -824,6 +936,8 @@ def register(app: Application) -> None:
                 CallbackQueryHandler(recv_ht_select_toggle, pattern=r"^ht_toggle:"),
                 CallbackQueryHandler(recv_ht_confirm_add,   pattern=r"^ht_confirm$|^ht_cancel$"),
             ],
+            HT.MANUAL_REF:         [MessageHandler(not_cancel, recv_ht_manual_ref)],
+            HT.MANUAL_VALUER:      [CallbackQueryHandler(recv_ht_manual_valuer, pattern=r"^ht_mval:")],
             HT.VIEW_QUEUE:         [CallbackQueryHandler(recv_ht_queue_action, pattern=r"^htq:")],
             HT.RELEASE_SELECT:     [
                 CallbackQueryHandler(recv_ht_release_toggle,  pattern=r"^ht_reltoggle:"),
