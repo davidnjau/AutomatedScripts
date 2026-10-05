@@ -500,6 +500,247 @@ class TestRecvHtManualValuer(unittest.TestCase):
         mock_save.assert_not_called()
 
 
+class TestRecvHtSourceParcel(unittest.TestCase):
+    def test_parcel_source_prompts_for_parcel_number(self):
+        update = _make_update_with_callback("ht_src:parcel")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        with patch.object(ht, "load_hold_tasks", return_value=[]):
+            result = _run(ht.recv_ht_source(update, ctx))
+        self.assertEqual(result, ht.HT.PARCEL_INPUT)
+
+
+class TestRecvHtParcelInput(unittest.TestCase):
+    def test_empty_input_reprompts(self):
+        update = _make_update_with_message("   ")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        result = _run(ht.recv_ht_parcel_input(update, ctx))
+        self.assertEqual(result, ht.HT.PARCEL_INPUT)
+
+    def test_multiple_parcels_reprompts(self):
+        update = _make_update_with_message("PARCEL/A, PARCEL/B")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        result = _run(ht.recv_ht_parcel_input(update, ctx))
+        self.assertEqual(result, ht.HT.PARCEL_INPUT)
+
+    def test_no_cached_tokens_ends_conversation(self):
+        update = _make_update_with_message("PARCEL/A")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        with patch.object(ht, "get_valid_tokens", return_value=None):
+            result = _run(ht.recv_ht_parcel_input(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+
+    def test_no_matches_ends_conversation(self):
+        update = _make_update_with_message("PARCEL/A")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        with patch.object(ht, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(ht, "load_hold_tasks", return_value=[]), \
+             patch.object(ht, "_pl_search_parcel", return_value=[]):
+            result = _run(ht.recv_ht_parcel_input(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+
+    def test_matches_already_held_are_filtered_out(self):
+        update = _make_update_with_message("PARCEL/A")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        matches = [{"reference_number": "REG/TSFR/A", "id": "1"}]
+        with patch.object(ht, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(ht, "load_hold_tasks", return_value=[{"ref": "REG/TSFR/A"}]), \
+             patch.object(ht, "_pl_search_parcel", return_value=matches):
+            result = _run(ht.recv_ht_parcel_input(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+
+    def test_success_stores_matches_and_shows_select_keyboard(self):
+        update = _make_update_with_message("PARCEL/A")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        matches = [{"reference_number": "REG/TSFR/A", "id": "1", "application_status": "ongoing"}]
+        with patch.object(ht, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(ht, "load_hold_tasks", return_value=[]), \
+             patch.object(ht, "_pl_search_parcel", return_value=matches):
+            result = _run(ht.recv_ht_parcel_input(update, ctx))
+        self.assertEqual(result, ht.HT.PARCEL_SELECT)
+        self.assertEqual(ctx.user_data["ht_session"].parcel_matches, matches)
+
+
+class TestRecvHtParcelSelect(unittest.TestCase):
+    def _sess_with_match(self):
+        return ht.HTSession(parcel_matches=[{"reference_number": "REG/TSFR/A", "id": "1"}])
+
+    def test_cancel_ends_conversation(self):
+        update = _make_update_with_callback("ht_pref:cancel")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": self._sess_with_match()}
+        result = _run(ht.recv_ht_parcel_select(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+
+    def test_stale_index_ends_conversation(self):
+        update = _make_update_with_callback("ht_pref:9")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": self._sess_with_match()}
+        result = _run(ht.recv_ht_parcel_select(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+
+    def test_no_cached_tokens_ends_conversation(self):
+        update = _make_update_with_callback("ht_pref:0")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": self._sess_with_match()}
+        with patch.object(ht, "get_valid_tokens", return_value=None):
+            result = _run(ht.recv_ht_parcel_select(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+
+    def test_empty_detail_ends_conversation(self):
+        update = _make_update_with_callback("ht_pref:0")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": self._sess_with_match()}
+        with patch.object(ht, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(ht, "_fetch_ref_detail_dlv", return_value=None):
+            result = _run(ht.recv_ht_parcel_select(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+
+    def test_closed_bucket_ends_conversation(self):
+        update = _make_update_with_callback("ht_pref:0")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": self._sess_with_match()}
+        with patch.object(ht, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(ht, "_fetch_ref_detail_dlv", return_value={"actors": []}), \
+             patch.object(ht, "_classify_dlv_detail", return_value={"bucket": "closed", "closed_reason": "completed"}):
+            result = _run(ht.recv_ht_parcel_select(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+
+    def test_no_saved_valuers_ends_conversation(self):
+        update = _make_update_with_callback("ht_pref:0")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": self._sess_with_match()}
+        with patch.object(ht, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(ht, "_fetch_ref_detail_dlv", return_value={"actors": []}), \
+             patch.object(ht, "_classify_dlv_detail", return_value={"bucket": "open"}), \
+             patch.object(ht, "load_saved_valuers", return_value=[]):
+            result = _run(ht.recv_ht_parcel_select(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+
+    def test_success_stores_ref_and_current_valuer_then_shows_valuer_keyboard(self):
+        update = _make_update_with_callback("ht_pref:0")
+        ctx = MagicMock()
+        sess = self._sess_with_match()
+        ctx.user_data = {"ht_session": sess}
+        detail = {"actors": [{"role": "VALUATION OFFICER", "user_details": {"id": "uid-2", "names": "John Roe"}}]}
+        with patch.object(ht, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(ht, "_fetch_ref_detail_dlv", return_value=detail), \
+             patch.object(ht, "_classify_dlv_detail", return_value={"bucket": "open"}), \
+             patch.object(ht, "load_saved_valuers", return_value=[{"name": "Jane Doe", "uid": "uid-1"}]):
+            result = _run(ht.recv_ht_parcel_select(update, ctx))
+        self.assertEqual(result, ht.HT.PARCEL_VALUER)
+        self.assertEqual(sess.parcel_ref, "REG/TSFR/A")
+        self.assertEqual(sess.parcel_current_valuer, {"id": "uid-2", "names": "John Roe"})
+
+
+class TestRecvHtParcelValuer(unittest.TestCase):
+    def test_cancel_ends_conversation(self):
+        update = _make_update_with_callback("ht_pval:cancel")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        result = _run(ht.recv_ht_parcel_valuer(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+
+    def test_stale_index_ends_conversation(self):
+        update = _make_update_with_callback("ht_pval:9")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        with patch.object(ht, "load_saved_valuers", return_value=[]):
+            result = _run(ht.recv_ht_parcel_valuer(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+
+    def test_unheld_ref_is_held_directly(self):
+        update = _make_update_with_callback("ht_pval:0")
+        ctx = MagicMock()
+        sess = ht.HTSession(parcel_ref="REG/TSFR/A", parcel_current_valuer=None)
+        ctx.user_data = {"ht_session": sess}
+        with patch.object(ht, "load_saved_valuers", return_value=[{"name": "Jane Doe", "uid": "uid-1"}]), \
+             patch.object(ht, "load_hold_tasks", return_value=[]), \
+             patch.object(ht, "save_hold_tasks") as mock_save:
+            result = _run(ht.recv_ht_parcel_valuer(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+        mock_save.assert_called_once()
+        saved = mock_save.call_args[0][0]
+        self.assertEqual(saved[0]["ref"], "REG/TSFR/A")
+        self.assertEqual(saved[0]["held_valuer_uid"], "uid-1")
+
+    def test_already_held_by_same_valuer_is_held_directly(self):
+        update = _make_update_with_callback("ht_pval:0")
+        ctx = MagicMock()
+        sess = ht.HTSession(parcel_ref="REG/TSFR/A", parcel_current_valuer={"id": "uid-1", "names": "Jane Doe"})
+        ctx.user_data = {"ht_session": sess}
+        with patch.object(ht, "load_saved_valuers", return_value=[{"name": "Jane Doe", "uid": "uid-1"}]), \
+             patch.object(ht, "load_hold_tasks", return_value=[]), \
+             patch.object(ht, "save_hold_tasks") as mock_save:
+            result = _run(ht.recv_ht_parcel_valuer(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+        mock_save.assert_called_once()
+
+    def test_held_by_someone_else_goes_to_conflict_confirm(self):
+        update = _make_update_with_callback("ht_pval:0")
+        ctx = MagicMock()
+        sess = ht.HTSession(parcel_ref="REG/TSFR/A", parcel_current_valuer={"id": "uid-2", "names": "John Roe"})
+        ctx.user_data = {"ht_session": sess}
+        with patch.object(ht, "load_saved_valuers", return_value=[{"name": "Jane Doe", "uid": "uid-1"}]), \
+             patch.object(ht, "save_hold_tasks") as mock_save:
+            result = _run(ht.recv_ht_parcel_valuer(update, ctx))
+        self.assertEqual(result, ht.HT.PARCEL_CONFLICT_CONFIRM)
+        mock_save.assert_not_called()
+        self.assertEqual(sess.parcel_valuer["uid"], "uid-1")
+
+
+class TestRecvHtParcelConflictConfirm(unittest.TestCase):
+    def test_no_cancels_without_queuing(self):
+        update = _make_update_with_callback("ht_pconf:no")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        with patch.object(ht, "save_dlv_batch") as mock_save:
+            result = _run(ht.recv_ht_parcel_conflict_confirm(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+        mock_save.assert_not_called()
+
+    def test_yes_appends_item_to_dlv_batch_queue(self):
+        update = _make_update_with_callback("ht_pconf:yes")
+        ctx = MagicMock()
+        sess = ht.HTSession(
+            parcel_ref="REG/TSFR/A",
+            parcel_valuer={"name": "Jane Doe", "uid": "uid-1", "account_number": "acct-1"},
+            parcel_current_valuer={"id": "uid-2", "names": "John Roe"},
+        )
+        ctx.user_data = {"ht_session": sess}
+        with patch.object(ht, "load_dlv_batch", return_value=[]), \
+             patch.object(ht, "save_dlv_batch") as mock_save:
+            result = _run(ht.recv_ht_parcel_conflict_confirm(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+        mock_save.assert_called_once()
+        queued = mock_save.call_args[0][0]
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["ref"], "REG/TSFR/A")
+        self.assertEqual(queued[0]["valuer_uid"], "uid-1")
+        self.assertEqual(queued[0]["valuer_acct"], "acct-1")
+
+    def test_yes_skips_if_already_queued(self):
+        update = _make_update_with_callback("ht_pconf:yes")
+        ctx = MagicMock()
+        sess = ht.HTSession(
+            parcel_ref="REG/TSFR/A",
+            parcel_valuer={"name": "Jane Doe", "uid": "uid-1", "account_number": "acct-1"},
+            parcel_current_valuer={"id": "uid-2", "names": "John Roe"},
+        )
+        ctx.user_data = {"ht_session": sess}
+        with patch.object(ht, "load_dlv_batch", return_value=[{"ref": "REG/TSFR/A"}]), \
+             patch.object(ht, "save_dlv_batch") as mock_save:
+            result = _run(ht.recv_ht_parcel_conflict_confirm(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+        mock_save.assert_not_called()
+
+
 class TestRecvHtSelectToggle(unittest.TestCase):
     def test_toggle_adds_and_removes_ref(self):
         update = _make_update_with_callback("ht_toggle:0")
