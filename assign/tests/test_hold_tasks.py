@@ -413,6 +413,93 @@ class TestRecvHtSource(unittest.TestCase):
         self.assertEqual(result, ht.ConversationHandler.END)
 
 
+class TestRecvHtSourceManual(unittest.TestCase):
+    def test_manual_source_prompts_for_ref(self):
+        update = _make_update_with_callback("ht_src:manual")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        with patch.object(ht, "load_hold_tasks", return_value=[]):
+            result = _run(ht.recv_ht_source(update, ctx))
+        self.assertEqual(result, ht.HT.MANUAL_REF)
+
+
+class TestRecvHtManualRef(unittest.TestCase):
+    def test_parses_refs_and_shows_saved_valuers(self):
+        update = _make_update_with_message("REG/TSFR/A, REG/TSFR/B")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        saved = [{"name": "Jane Doe", "uid": "uid-1"}]
+        with patch.object(ht, "load_hold_tasks", return_value=[]), \
+             patch.object(ht, "load_saved_valuers", return_value=saved):
+            result = _run(ht.recv_ht_manual_ref(update, ctx))
+        self.assertEqual(result, ht.HT.MANUAL_VALUER)
+        sess = ctx.user_data["ht_session"]
+        self.assertEqual(sess.manual_refs, ["REG/TSFR/A", "REG/TSFR/B"])
+
+    def test_no_refs_found_reprompts(self):
+        update = _make_update_with_message("   ")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        result = _run(ht.recv_ht_manual_ref(update, ctx))
+        self.assertEqual(result, ht.HT.MANUAL_REF)
+
+    def test_all_refs_already_held_ends_conversation(self):
+        update = _make_update_with_message("REG/TSFR/A")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        with patch.object(ht, "load_hold_tasks", return_value=[{"ref": "REG/TSFR/A"}]):
+            result = _run(ht.recv_ht_manual_ref(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+
+    def test_no_saved_valuers_tells_user_to_assign_first(self):
+        update = _make_update_with_message("REG/TSFR/A")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        with patch.object(ht, "load_hold_tasks", return_value=[]), \
+             patch.object(ht, "load_saved_valuers", return_value=[]):
+            result = _run(ht.recv_ht_manual_ref(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+        text = update.message.reply_text.call_args_list[0][0][0]
+        self.assertIn("New Assignment", text)
+
+
+class TestRecvHtManualValuer(unittest.TestCase):
+    def test_confirm_persists_all_manual_refs_under_picked_valuer(self):
+        update = _make_update_with_callback("ht_mval:0")
+        ctx = MagicMock()
+        sess = ht.HTSession(manual_refs=["REG/TSFR/A", "REG/TSFR/B"])
+        ctx.user_data = {"ht_session": sess}
+        saved = [{"name": "Jane Doe", "uid": "uid-1"}]
+        with patch.object(ht, "load_hold_tasks", return_value=[]), \
+             patch.object(ht, "load_saved_valuers", return_value=saved), \
+             patch.object(ht, "save_hold_tasks") as mock_save:
+            result = _run(ht.recv_ht_manual_valuer(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+        mock_save.assert_called_once()
+        saved_items = mock_save.call_args[0][0]
+        self.assertEqual(len(saved_items), 2)
+        self.assertTrue(all(i["held_valuer_uid"] == "uid-1" for i in saved_items))
+
+    def test_cancel_ends_without_saving(self):
+        update = _make_update_with_callback("ht_mval:cancel")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession()}
+        with patch.object(ht, "save_hold_tasks") as mock_save:
+            result = _run(ht.recv_ht_manual_valuer(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+        mock_save.assert_not_called()
+
+    def test_stale_index_ends_conversation(self):
+        update = _make_update_with_callback("ht_mval:5")
+        ctx = MagicMock()
+        ctx.user_data = {"ht_session": ht.HTSession(manual_refs=["REG/TSFR/A"])}
+        with patch.object(ht, "load_saved_valuers", return_value=[]), \
+             patch.object(ht, "save_hold_tasks") as mock_save:
+            result = _run(ht.recv_ht_manual_valuer(update, ctx))
+        self.assertEqual(result, ht.ConversationHandler.END)
+        mock_save.assert_not_called()
+
+
 class TestRecvHtSelectToggle(unittest.TestCase):
     def test_toggle_adds_and_removes_ref(self):
         update = _make_update_with_callback("ht_toggle:0")
