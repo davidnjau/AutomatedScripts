@@ -20,6 +20,20 @@ assignments or the live queue can still be held as long as its intended
 valuer has been saved at least once (New Assignment/Receive Tasks auto-save
 every valuer they use).
 
+The by-parcel source (🏞 By Parcel Number) searches a parcel number across
+the Valuation department (DLV + VALUER roles) via parcel_lookup.py's
+_pl_search_parcel, lets the user pick one of the matching reference-number
+tasks, then a saved valuer — same saved_valuers.json-only pick as Manual
+Entry. If the selected ref isn't currently held by anyone (or is already
+held by the picked valuer), it's added straight to the hold queue, same as
+Manual Entry. If it's currently held by someone else, this module never
+calls the reassignment endpoint directly — after a confirm step, the ref is
+instead queued into DLV Batch's own queue (dlv_core.save_dlv_batch) for the
+picked valuer; it only starts being guarded once DLV Batch actually assigns
+it and the user adds it via Hold Tasks' Tracked Assignments source. This
+deliberately avoids Hold Tasks making an unreviewed live reassignment call
+against a ref it didn't originate the hold for.
+
 Tasks are only ever held or released by explicit user selection — via
 ➕ Add Tasks to Hold and 🗑 Release Task(s) below — never automatically.
 
@@ -60,6 +74,7 @@ from common import (
     ALLOWED_IDS,
     BTN_HOLD_TASKS,
     CPARAMS_DLV,
+    CRED_LABELS,
     _any_valid_tokens,
     _be_cred_keyboard,
     _CANCEL_FILTER,
@@ -83,12 +98,16 @@ from dlv_core import (
     _save_consolidated,
     _search_ref_dlv,
     clear_hold_and_remove,
+    load_dlv_batch,
+    save_dlv_batch,
 )
 from endpoints import (
     STAMP_DUTY_APPLICATION_DETAIL_URL,
     STAMP_DUTY_APPLICATION_LIST_URL,
     STAMP_DUTY_FIX_APPLICATION_URL,
 )
+from lookup_reference import _LU_CRED_DEFAULT
+from parcel_lookup import _pl_search_parcel
 from token_rotator import _AllTokensExhausted, _TokenRotator, fetch_with_rotation
 
 _HT_WORKERS = 5   # worker pool size for both live-candidate detail lookups and the guard job
@@ -104,24 +123,33 @@ _hold_tasks_interval: int = 60
 # States — Hold Tasks conversation
 # ──────────────────────────────────────────────────────────
 class HT(Enum):
-    MENU              = auto()   # "Add Tasks to Hold" vs "View Held Queue"
-    CHOOSE_SOURCE     = auto()   # (Add) tracked assignments vs live DLV query vs manual entry
-    LIVE_CRED         = auto()   # (Add + live) pick a credential with a cached token
-    SELECT_CANDIDATES = auto()   # multi-select which candidate tasks to hold
-    MANUAL_REF        = auto()   # (Add + manual) type one or more reference numbers
-    MANUAL_VALUER     = auto()   # (Add + manual) pick a saved valuer to hold the typed ref(s) for
-    VIEW_QUEUE        = auto()   # held items + interval/check-now/release buttons
-    RELEASE_SELECT    = auto()   # multi-select which held refs to manually release
+    MENU                    = auto()   # "Add Tasks to Hold" vs "View Held Queue"
+    CHOOSE_SOURCE           = auto()   # (Add) tracked assignments vs live DLV query vs manual entry vs by-parcel
+    LIVE_CRED               = auto()   # (Add + live) pick a credential with a cached token
+    SELECT_CANDIDATES       = auto()   # multi-select which candidate tasks to hold
+    MANUAL_REF              = auto()   # (Add + manual) type one or more reference numbers
+    MANUAL_VALUER           = auto()   # (Add + manual) pick a saved valuer to hold the typed ref(s) for
+    PARCEL_INPUT            = auto()   # (Add + by-parcel) type a single parcel number
+    PARCEL_SELECT           = auto()   # (Add + by-parcel) pick one matching reference-number task
+    PARCEL_VALUER           = auto()   # (Add + by-parcel) pick a saved valuer for the selected ref
+    PARCEL_CONFLICT_CONFIRM = auto()   # (Add + by-parcel) confirm queuing to DLV Batch when held by someone else
+    VIEW_QUEUE              = auto()   # held items + interval/check-now/release buttons
+    RELEASE_SELECT          = auto()   # multi-select which held refs to manually release
 
 
 @dataclass
 class HTSession:
-    cred_type:        str        = ""
-    candidates:       List[Dict] = field(default_factory=list)   # [{ref, valuer_name, valuer_uid}]
-    selected:         set        = field(default_factory=set)    # refs selected to hold
-    manual_refs:      List[str]  = field(default_factory=list)   # (manual entry) refs awaiting a valuer pick
-    release_items:    List[Dict] = field(default_factory=list)   # held-queue snapshot for release
-    release_selected: set        = field(default_factory=set)    # refs selected for release
+    cred_type:             str          = ""
+    candidates:            List[Dict]   = field(default_factory=list)   # [{ref, valuer_name, valuer_uid}]
+    selected:               set         = field(default_factory=set)    # refs selected to hold
+    manual_refs:           List[str]    = field(default_factory=list)   # (manual entry) refs awaiting a valuer pick
+    parcel_matches:        List[Dict]   = field(default_factory=list)   # (by-parcel) search results awaiting ref pick
+    parcel_ref:            str          = ""                            # (by-parcel) the selected reference number
+    parcel_app_id:         str          = ""                            # (by-parcel) internal application id for the selected ref
+    parcel_current_valuer: Optional[Dict] = None                        # (by-parcel) {"id", "names"} or None if unheld
+    parcel_valuer:         Optional[Dict] = None                        # (by-parcel) the saved valuer picked to hold it for
+    release_items:         List[Dict]   = field(default_factory=list)   # held-queue snapshot for release
+    release_selected:       set         = field(default_factory=set)    # refs selected for release
 
 
 def _get_ht_sess(ctx: ContextTypes.DEFAULT_TYPE) -> HTSession:
@@ -454,6 +482,7 @@ def _ht_source_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📂 Tracked Assignments", callback_data="ht_src:tracked")],
         [InlineKeyboardButton("🌐 Live DLV Queue",       callback_data="ht_src:live")],
         [InlineKeyboardButton("✏️ Manual Entry",         callback_data="ht_src:manual")],
+        [InlineKeyboardButton("🏞 By Parcel Number",     callback_data="ht_src:parcel")],
         [InlineKeyboardButton("🛑 Cancel",               callback_data="ht_src:cancel")],
     ])
 
@@ -465,6 +494,37 @@ def _ht_manual_valuer_keyboard(saved: List[Dict]) -> InlineKeyboardMarkup:
     ]
     rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="ht_mval:cancel")])
     return InlineKeyboardMarkup(rows)
+
+
+def _ht_parcel_select_keyboard(matches: List[Dict]) -> InlineKeyboardMarkup:
+    # One row per parcel-search match — tapping immediately selects that ref (no multi-select).
+    rows = [
+        [InlineKeyboardButton(
+            f"{m.get('reference_number', '?')} — {(m.get('application_status') or '—').upper()}",
+            callback_data=f"ht_pref:{i}",
+        )]
+        for i, m in enumerate(matches)
+    ]
+    rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="ht_pref:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _ht_parcel_valuer_keyboard(saved: List[Dict]) -> InlineKeyboardMarkup:
+    # Same saved-valuer picker shape as Manual Entry, under its own callback
+    # prefix (ht_pval:) to keep the two sources' handlers independently testable.
+    rows = [
+        [InlineKeyboardButton(f"👤 {sv['name']}", callback_data=f"ht_pval:{i}")]
+        for i, sv in enumerate(saved)
+    ]
+    rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="ht_pval:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _ht_parcel_conflict_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📥 Queue in DLV Batch", callback_data="ht_pconf:yes"),
+        InlineKeyboardButton("🛑 Cancel",              callback_data="ht_pconf:no"),
+    ]])
 
 
 def _ht_select_keyboard(candidates: List[Dict], selected: set) -> InlineKeyboardMarkup:
@@ -566,7 +626,7 @@ async def recv_ht_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def recv_ht_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Route the tracked/live/manual/Cancel choice on the Add path.
+    # Route the tracked/live/manual/by-parcel/Cancel choice on the Add path.
     query  = update.callback_query
     await query.answer()
     source = query.data.split(":")[1]
@@ -588,6 +648,13 @@ async def recv_ht_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "✏️ Type the reference number(s) to hold — one per line, or comma-separated:",
         )
         return HT.MANUAL_REF
+
+    if source == "parcel":
+        await query.edit_message_text(
+            "🏞 Type a *parcel number* to search in the Valuation department:",
+            parse_mode="Markdown",
+        )
+        return HT.PARCEL_INPUT
 
     kbd = _be_cred_keyboard()
     if not kbd:
@@ -774,6 +841,227 @@ async def recv_ht_manual_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def recv_ht_parcel_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Search the typed parcel number across the Valuation department
+    (parcel_lookup._pl_search_parcel's DLV+VALUER role combos), drop any
+    match already held, then show the remaining matches to pick one from."""
+    sess = _get_ht_sess(ctx)
+    raw  = (update.message.text or "").strip()
+    parcels = _parse_list_input(raw)
+
+    if not parcels:
+        await update.message.reply_text("⚠️ Please enter a parcel number.")
+        return HT.PARCEL_INPUT
+    if len(parcels) > 1:
+        await update.message.reply_text("⚠️ Enter only one parcel number for this flow. Try again.")
+        return HT.PARCEL_INPUT
+
+    parcel = parcels[0]
+    tokens = get_valid_tokens(_LU_CRED_DEFAULT)
+    if not tokens:
+        await update.message.reply_text(
+            f"❌ No valid cached tokens for *{CRED_LABELS.get(_LU_CRED_DEFAULT, _LU_CRED_DEFAULT)}*. "
+            "Use *🔑 Refresh Auth* first.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu_for(update.message.chat_id),
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text(f"🔍 Searching for `{md_escape(parcel)}`…", parse_mode="Markdown")
+    held_refs = {i.get("ref") for i in load_hold_tasks()}
+    matches   = await asyncio.to_thread(_pl_search_parcel, tokens, parcel)
+    matches   = [m for m in matches if m.get("reference_number") not in held_refs]
+
+    if not matches:
+        await update.message.reply_text(
+            f"❌ No unheld application found for parcel `{md_escape(parcel)}` in the Valuation department.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu_for(update.message.chat_id),
+        )
+        return ConversationHandler.END
+
+    sess.parcel_matches = matches
+    await update.message.reply_text(
+        f"✅ Found *{len(matches)}* task(s) for `{md_escape(parcel)}`. Select one to hold:",
+        parse_mode="Markdown",
+        reply_markup=_ht_parcel_select_keyboard(matches),
+    )
+    return HT.PARCEL_SELECT
+
+
+async def recv_ht_parcel_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Fetch the picked match's live detail to learn whether it's currently
+    held by anyone, bail out if it's already closed, then prompt for a
+    saved valuer to hold it for."""
+    query = update.callback_query
+    await query.answer()
+    sess = _get_ht_sess(ctx)
+    data = query.data.split(":")[1]  # index into sess.parcel_matches, or "cancel"
+
+    if data == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
+        return ConversationHandler.END
+
+    idx = int(data)
+    if idx >= len(sess.parcel_matches):
+        await query.edit_message_text("⚠️ That match is no longer available. Please start over.")
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
+        return ConversationHandler.END
+
+    item   = sess.parcel_matches[idx]
+    ref    = item.get("reference_number", "")
+    app_id = item.get("id", "")
+
+    tokens = get_valid_tokens(_LU_CRED_DEFAULT)
+    if not tokens:
+        await query.edit_message_text(
+            f"❌ No valid cached tokens for *{CRED_LABELS.get(_LU_CRED_DEFAULT, _LU_CRED_DEFAULT)}*. "
+            "Use *🔑 Refresh Auth* first.",
+            parse_mode="Markdown",
+        )
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
+        return ConversationHandler.END
+
+    await query.edit_message_text(f"⏳ Checking `{md_escape(ref)}`'s current status…", parse_mode="Markdown")
+    detail = await asyncio.to_thread(_fetch_ref_detail_dlv, tokens, app_id)
+    if not detail:
+        await query.message.reply_text(
+            "⚠️ Could not fetch that task's detail. Please try again.",
+            reply_markup=_main_menu_for(query.message.chat_id),
+        )
+        return ConversationHandler.END
+
+    info = _classify_dlv_detail(detail)
+    if info["bucket"] == "closed":
+        await query.message.reply_text(
+            f"❌ `{md_escape(ref)}` is already *{info['closed_reason']}* — nothing to hold.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu_for(query.message.chat_id),
+        )
+        return ConversationHandler.END
+
+    saved = load_saved_valuers()
+    if not saved:
+        await query.message.reply_text(
+            "⚠️ No saved valuers yet — assign a reference via *📋 New Assignment* first "
+            "(it saves the valuer automatically), then try Hold Tasks again.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu_for(query.message.chat_id),
+        )
+        return ConversationHandler.END
+
+    current = _ht_current_valuer(detail.get("actors") or [])
+    sess.parcel_ref            = ref
+    sess.parcel_app_id         = app_id
+    sess.parcel_current_valuer = current
+    holder_note = f"\n\nCurrently held by *{md_escape(current['names'])}*." if current else "\n\nNot currently held by anyone."
+
+    await query.message.reply_text(
+        f"✅ Selected `{md_escape(ref)}`.{holder_note}\n\nSelect the valuer to hold it for:",
+        parse_mode="Markdown",
+        reply_markup=_ht_parcel_valuer_keyboard(saved),
+    )
+    return HT.PARCEL_VALUER
+
+
+async def recv_ht_parcel_valuer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Pick a saved valuer for the by-parcel-selected ref. If it's unheld or
+    already held by this same valuer, hold it immediately (same as Manual
+    Entry). If it's held by someone else, defer to a confirm step rather
+    than holding or reassigning right away."""
+    query = update.callback_query
+    await query.answer()
+    sess = _get_ht_sess(ctx)
+    data = query.data.split(":")[1]  # index into saved valuers, or "cancel"
+
+    if data == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
+        return ConversationHandler.END
+
+    saved = load_saved_valuers()
+    idx   = int(data)
+    if idx >= len(saved):
+        await query.edit_message_text("⚠️ That saved valuer no longer exists. Please start over.")
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
+        return ConversationHandler.END
+
+    sv      = saved[idx]
+    ref     = sess.parcel_ref
+    current = sess.parcel_current_valuer
+
+    if not current or str(current.get("id", "")) == str(sv.get("uid", "")):
+        now  = datetime.now().isoformat(timespec="seconds")
+        held = load_hold_tasks()
+        held.append({
+            "ref":              ref,
+            "held_valuer_name": sv.get("name", ""),
+            "held_valuer_uid":  sv.get("uid", ""),
+            "held_at":          now,
+            "last_checked":     "",
+            "last_error":       "",
+        })
+        save_hold_tasks(held)
+        await query.edit_message_text(
+            f"✋ Now holding `{md_escape(ref)}` for *{md_escape(sv.get('name', ''))}*.",
+            parse_mode="Markdown",
+        )
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
+        return ConversationHandler.END
+
+    sess.parcel_valuer = sv
+    await query.edit_message_text(
+        f"⚠️ `{md_escape(ref)}` is currently held by *{md_escape(current.get('names', ''))}*.\n\n"
+        f"Send it to the DLV Batch queue for *{md_escape(sv.get('name', ''))}* instead? "
+        "It will start being guarded by Hold Tasks once it's actually assigned from there.",
+        parse_mode="Markdown",
+        reply_markup=_ht_parcel_conflict_keyboard(),
+    )
+    return HT.PARCEL_CONFLICT_CONFIRM
+
+
+async def recv_ht_parcel_conflict_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Queue the by-parcel-selected ref into DLV Batch for the picked valuer
+    (never a direct reassignment call from this module), or cancel."""
+    query = update.callback_query
+    await query.answer()
+    sess = _get_ht_sess(ctx)
+    data = query.data  # "ht_pconf:yes" | "ht_pconf:no"
+
+    if data == "ht_pconf:no":
+        await query.edit_message_text("❌ Cancelled.")
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
+        return ConversationHandler.END
+
+    ref = sess.parcel_ref
+    sv  = sess.parcel_valuer
+    existing = load_dlv_batch()
+    if any(i.get("ref") == ref for i in existing):
+        await query.edit_message_text(f"ℹ️ `{md_escape(ref)}` is already queued in DLV Batch.", parse_mode="Markdown")
+        await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
+        return ConversationHandler.END
+
+    existing.append({
+        "ref":         ref,
+        "valuer_name": sv.get("name", ""),
+        "valuer_uid":  sv.get("uid", ""),
+        "valuer_acct": sv.get("account_number", ""),
+        "queued_at":   datetime.now().isoformat(timespec="seconds"),
+        "tag":         "",
+    })
+    save_dlv_batch(existing)
+
+    await query.edit_message_text(
+        f"📥 `{md_escape(ref)}` queued in DLV Batch for *{md_escape(sv.get('name', ''))}* "
+        f"(was held by *{md_escape((sess.parcel_current_valuer or {}).get('names', ''))}*).\n\n"
+        "Once it's been assigned there, add it to Hold Tasks via *Tracked Assignments* to start guarding it.",
+        parse_mode="Markdown",
+    )
+    await query.message.reply_text("Use the menu to continue.", reply_markup=_main_menu_for(query.message.chat_id))
+    return ConversationHandler.END
+
+
 async def _ht_show_queue(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     # Render the held-queue report + action keyboard, or end if the queue is empty.
     items = load_hold_tasks()
@@ -938,6 +1226,10 @@ def register(app: Application) -> None:
             ],
             HT.MANUAL_REF:         [MessageHandler(not_cancel, recv_ht_manual_ref)],
             HT.MANUAL_VALUER:      [CallbackQueryHandler(recv_ht_manual_valuer, pattern=r"^ht_mval:")],
+            HT.PARCEL_INPUT:       [MessageHandler(not_cancel, recv_ht_parcel_input)],
+            HT.PARCEL_SELECT:      [CallbackQueryHandler(recv_ht_parcel_select, pattern=r"^ht_pref:")],
+            HT.PARCEL_VALUER:      [CallbackQueryHandler(recv_ht_parcel_valuer, pattern=r"^ht_pval:")],
+            HT.PARCEL_CONFLICT_CONFIRM: [CallbackQueryHandler(recv_ht_parcel_conflict_confirm, pattern=r"^ht_pconf:")],
             HT.VIEW_QUEUE:         [CallbackQueryHandler(recv_ht_queue_action, pattern=r"^htq:")],
             HT.RELEASE_SELECT:     [
                 CallbackQueryHandler(recv_ht_release_toggle,  pattern=r"^ht_reltoggle:"),
