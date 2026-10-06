@@ -8,10 +8,17 @@ parcel_lookup.py's on-demand /parcelcheck (the same relationship Auto
 Fetch has to Fetch Tasks). Reuses parcel_lookup.py's _pl_search_parcel to
 find matching references.
 
+_pl_search_parcel covers both the DLV/Valuer stage and the pre-DLV
+assessor/HQ collector stage (parcel_lookup._PL_CRED_ASSESSOR), so a watch
+also fires on a parcel that's only landed at the HQ/collector stage, not
+yet pushed into DLV's queue.
+
 Once a match is found, each matching reference is enriched with a full
-Reference Lookup — lookup_reference.py's own _lu_fetch_detail +
-_lu_format_result, the same primitives /lookup uses — rather than the
-bare list-item block parcel_lookup.py's own immediate report uses. A
+Reference Lookup. A DLV/Valuer-stage match uses lookup_reference.py's own
+_lu_fetch_detail + _lu_format_result, the same primitives /lookup uses;
+an assessor/HQ-stage match uses _lu_fetch_detail_county +
+_lu_format_county_result instead (see _pw_fetch_enriched) — rather than
+the bare list-item block parcel_lookup.py's own immediate report uses. A
 one-shot background notification (unlike an on-demand /parcelcheck,
 which can return many matches and deliberately skips the extra detail
 call per match to stay fast) can afford the extra per-match API round
@@ -85,8 +92,15 @@ from common import (
     not_cancel,
 )
 from email_service import _send_auto_fetch_email
-from lookup_reference import _LU_CRED_DEFAULT, _lu_fetch_detail, _lu_format_result, _lu_md_escape
-from parcel_lookup import _pl_search_parcel
+from lookup_reference import (
+    _LU_CRED_DEFAULT,
+    _lu_fetch_detail,
+    _lu_fetch_detail_county,
+    _lu_format_county_result,
+    _lu_format_result,
+    _lu_md_escape,
+)
+from parcel_lookup import _PL_CRED_ASSESSOR, _pl_search_parcel
 from telegram_report import _send_chunked_report
 
 SAVED_PARCEL_WATCHES_FILE = os.path.join(DATA_DIR, "saved_parcel_watches.json")
@@ -253,10 +267,11 @@ async def recv_pw_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    if not get_valid_tokens(_LU_CRED_DEFAULT):
+    if not get_valid_tokens(_LU_CRED_DEFAULT) and not get_valid_tokens(_PL_CRED_ASSESSOR):
         await update.message.reply_text(
-            f"❌ No valid cached tokens for *{CRED_LABELS.get(_LU_CRED_DEFAULT, _LU_CRED_DEFAULT)}*. "
-            "Use *🔑 Refresh Auth* first — the background job needs a cached login to check.",
+            f"❌ No valid cached tokens for *{CRED_LABELS.get(_LU_CRED_DEFAULT, _LU_CRED_DEFAULT)}* "
+            f"or *{CRED_LABELS.get(_PL_CRED_ASSESSOR, _PL_CRED_ASSESSOR)}*. "
+            "Use *🔑 Refresh Auth* first — the background job needs at least one cached login to check.",
             parse_mode="Markdown",
             reply_markup=_main_menu_for(update.effective_user.id),
         )
@@ -359,17 +374,35 @@ def _pw_queued_text(watch_ids: List[str]) -> str:
 # Background job
 # ──────────────────────────────────────────────────────────
 
-def _pw_fetch_enriched(tokens, matches: List[Dict]):
+def _pw_fetch_enriched(valuer_tokens, assessor_tokens, matches: List[Dict]):
     """For each matching list-item from _pl_search_parcel, fetch its
-    detail-view via lookup_reference.py's own _lu_fetch_detail — the same
-    primitive /lookup uses — and pair it with the item and its reference
-    number. Synchronous (run via asyncio.to_thread from _pw_check_job, one
-    call covering the whole loop) since it's the same blocking-HTTP-in-a-
-    thread pattern _pl_search_parcel already uses. _lu_fetch_detail
-    catches its own exceptions and returns None on failure, so a single
-    failed detail call degrades that one match to item-only fields rather
-    than failing the whole notification."""
-    return [(item.get("reference_number", "—"), item, _lu_fetch_detail(tokens, item.get("id"))) for item in matches]
+    detail-view and pair it with the item, its reference number, and
+    whether it's an assessor-stage match. A DLV/Valuer-stage match (the
+    default) uses lookup_reference.py's _lu_fetch_detail under
+    valuer_tokens — the same primitive /lookup uses. An assessor/HQ-stage
+    match (item["_assessor_stage"], see
+    parcel_lookup._pl_search_parcel_assessor_stage) instead uses
+    _lu_fetch_detail_county under assessor_tokens, since it comes from the
+    stampdutyservice detail-view (a different shape, and a different
+    credential — Support Reg, not Staff Valuer). Synchronous (run via
+    asyncio.to_thread from _pw_check_job, one call covering the whole
+    loop) since it's the same blocking-HTTP-in-a-thread pattern
+    _pl_search_parcel already uses. Both detail-fetch primitives catch
+    their own exceptions and return None on failure, so a single failed
+    detail call degrades that one match to item-only fields rather than
+    failing the whole notification. A match whose own stage has no cached
+    tokens (the other stage still being searched) skips the detail call
+    outright, same degrade."""
+    enriched = []
+    for item in matches:
+        ref = item.get("reference_number", "—")
+        is_assessor = bool(item.get("_assessor_stage"))
+        if is_assessor:
+            detail = _lu_fetch_detail_county(assessor_tokens, item.get("id")) if assessor_tokens else None
+        else:
+            detail = _lu_fetch_detail(valuer_tokens, item.get("id")) if valuer_tokens else None
+        enriched.append((ref, item, detail, is_assessor))
+    return enriched
 
 
 async def _pw_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -385,22 +418,27 @@ async def _pw_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         context.job.schedule_removal()
         return
 
-    tokens = get_valid_tokens(_LU_CRED_DEFAULT)
-    if not tokens:
+    valuer_tokens   = get_valid_tokens(_LU_CRED_DEFAULT)
+    assessor_tokens = get_valid_tokens(_PL_CRED_ASSESSOR)
+    if not valuer_tokens and not assessor_tokens:
         logger.warning(
-            "Parcel Watch job %s: no valid %s tokens cached — skipping cycle.",
-            watch_id, _LU_CRED_DEFAULT,
+            "Parcel Watch job %s: no valid %s or %s tokens cached — skipping cycle.",
+            watch_id, _LU_CRED_DEFAULT, _PL_CRED_ASSESSOR,
         )
         return
 
-    matches = await asyncio.to_thread(_pl_search_parcel, tokens, watch["parcel"])
+    matches = await asyncio.to_thread(_pl_search_parcel, valuer_tokens, assessor_tokens, watch["parcel"])
     if not matches:
         return
 
-    enriched = await asyncio.to_thread(_pw_fetch_enriched, tokens, matches)
+    enriched = await asyncio.to_thread(_pw_fetch_enriched, valuer_tokens, assessor_tokens, matches)
 
     header = f"🔔 *Parcel Watch* — `{_lu_md_escape(watch['parcel'])}` found on {len(enriched)} application(s)"
-    lines = [header] + [_lu_format_result(ref, item, detail, markdown=True) for ref, item, detail in enriched]
+    lines = [header] + [
+        _lu_format_county_result(ref, item, detail, markdown=True) if is_assessor
+        else _lu_format_result(ref, item, detail, markdown=True)
+        for ref, item, detail, is_assessor in enriched
+    ]
 
     async def _send(text, reply_markup):
         await context.bot.send_message(watch["chat_id"], text, parse_mode="Markdown", reply_markup=reply_markup)
@@ -411,7 +449,11 @@ async def _pw_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             plain_header = f"Parcel Watch — {watch['parcel']} found on {len(enriched)} application(s)"
             body = "\n\n".join(
-                [plain_header] + [_lu_format_result(ref, item, detail, markdown=False) for ref, item, detail in enriched],
+                [plain_header] + [
+                    _lu_format_county_result(ref, item, detail, markdown=False) if is_assessor
+                    else _lu_format_result(ref, item, detail, markdown=False)
+                    for ref, item, detail, is_assessor in enriched
+                ],
             )
             subject = f"Ardhisasa Parcel Watch — {watch['parcel']} — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             await asyncio.to_thread(_send_auto_fetch_email, watch["email"], subject, body)

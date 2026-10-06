@@ -510,11 +510,14 @@ def _lu_fetch_detail_county(tokens: AuthTokens, app_id: str) -> Optional[Dict]:
         return None
 
 
-def _lu_format_county_result(ref: str, item: Dict, detail: Optional[Dict]) -> str:
+def _lu_format_county_result(ref: str, item: Dict, detail: Optional[Dict], markdown: bool = True) -> str:
     """Build the lookup result message for a County reference — same visual
     as _lu_format_result, but pulled from the stampdutyservice detail-view
     shape (officers list, node/application_status directly on the body,
-    parcel/consideration under external_process_details)."""
+    parcel/consideration under external_process_details). markdown=False
+    (parcel_watch.py's emailed notification for an assessor/HQ-stage match)
+    skips Markdown escaping/backticks/header formatting, same convention
+    as _lu_format_result."""
     status = (item.get("application_status") or "—").upper()
     node_raw = ""
     valuer_name = "—"
@@ -542,18 +545,32 @@ def _lu_format_county_result(ref: str, item: Dict, detail: Optional[Dict]) -> st
     parcel      = ext.get("parcel_number") or item.get("parcel_number") or "—"
     created     = item.get("date_created", "—")
 
-    lines = [
-        "🔎 *Reference Lookup*\n",
-        f"📌 *Ref:* `{_lu_md_escape(ref)}`",
-        f"📊 *Status:* {_lu_md_escape(status)}",
-        f"🔄 *Node:* {_lu_md_escape(node_label)}",
-        f"👤 *Valuer:* {_lu_md_escape(valuer_name)}",
-        f"🏢 *Registry:* {_lu_md_escape(registry)}",
-        f"📍 *County:* {_lu_md_escape(county)}",
-        f"💰 *Consideration:* {_lu_md_escape(consideration)}",
-        f"📋 *Parcel:* {_lu_md_escape(parcel)}",
-        f"📅 *Created:* {_lu_md_escape(created)}",
-    ]
+    if markdown:
+        lines = [
+            "🔎 *Reference Lookup*\n",
+            f"📌 *Ref:* `{_lu_md_escape(ref)}`",
+            f"📊 *Status:* {_lu_md_escape(status)}",
+            f"🔄 *Node:* {_lu_md_escape(node_label)}",
+            f"👤 *Valuer:* {_lu_md_escape(valuer_name)}",
+            f"🏢 *Registry:* {_lu_md_escape(registry)}",
+            f"📍 *County:* {_lu_md_escape(county)}",
+            f"💰 *Consideration:* {_lu_md_escape(consideration)}",
+            f"📋 *Parcel:* {_lu_md_escape(parcel)}",
+            f"📅 *Created:* {_lu_md_escape(created)}",
+        ]
+    else:
+        lines = [
+            "Reference Lookup",
+            f"Ref: {ref}",
+            f"Status: {status}",
+            f"Node: {node_label}",
+            f"Valuer: {valuer_name}",
+            f"Registry: {registry}",
+            f"County: {county}",
+            f"Consideration: {consideration}",
+            f"Parcel: {parcel}",
+            f"Created: {created}",
+        ]
     return "\n".join(lines)
 
 

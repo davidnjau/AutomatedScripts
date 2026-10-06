@@ -2,7 +2,8 @@
 """
 Unit tests for parcel_watch.py — the saved-watch persistence layer, the
 setup conversation (parcel -> interval -> delivery -> optional email),
-the _pw_check_job one-shot notify-then-remove pipeline, /parcelwatches'
+the _pw_check_job one-shot notify-then-remove pipeline (covering both the
+DLV/Valuer stage and the pre-DLV assessor/HQ collector stage), /parcelwatches'
 listing + cancel flow, and register()'s startup job restoration.
 
 Run with: python3 -m unittest discover -s assign/tests -v
@@ -121,12 +122,29 @@ class TestRecvPwParcel(unittest.TestCase):
         self.assertEqual(result, pw.PW.PARCEL_INPUT)
 
     def test_no_cached_tokens_ends_conversation(self):
+        # Neither credential cached -> both-missing error branch.
         update = _make_update_with_message("NBI/BLOCK1/123")
         ctx = MagicMock()
         with patch.object(pw, "allowed", return_value=True), \
              patch.object(pw, "get_valid_tokens", return_value=None):
             result = _run(pw.recv_pw_parcel(update, ctx))
         self.assertEqual(result, pw.ConversationHandler.END)
+
+    def test_only_assessor_tokens_cached_still_proceeds(self):
+        # Valuer stage has no cached login, but assessor stage does -> that
+        # alone is enough to proceed (the stage with no tokens is silently
+        # skipped once the job actually runs, not rejected up front).
+        update = _make_update_with_message("NBI/BLOCK1/123")
+        ctx = MagicMock()
+        ctx.user_data = {}
+
+        def _tokens(cred_type):
+            return TOKENS if cred_type == pw._PL_CRED_ASSESSOR else None
+
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "get_valid_tokens", side_effect=_tokens):
+            result = _run(pw.recv_pw_parcel(update, ctx))
+        self.assertEqual(result, pw.PW.INTERVAL)
 
     def test_valid_parcel_stores_and_asks_interval(self):
         update = _make_update_with_message("NBI/BLOCK1/123")
@@ -266,11 +284,27 @@ class TestPwFetchEnriched(unittest.TestCase):
         ]
         details = {"app-1": {"node": "N1"}, "app-2": None}
         with patch.object(pw, "_lu_fetch_detail", side_effect=lambda tokens, app_id: details[app_id]):
-            result = pw._pw_fetch_enriched(TOKENS, matches)
+            result = pw._pw_fetch_enriched(TOKENS, TOKENS, matches)
         self.assertEqual(result, [
-            ("R1", matches[0], {"node": "N1"}),
-            ("R2", matches[1], None),
+            ("R1", matches[0], {"node": "N1"}, False),
+            ("R2", matches[1], None, False),
         ])
+
+    def test_assessor_stage_match_uses_county_detail_primitive_and_assessor_tokens(self):
+        matches = [{"reference_number": "R1", "id": "app-1", "_assessor_stage": True}]
+        with patch.object(pw, "_lu_fetch_detail_county", return_value={"node": "N1"}) as mock_county, \
+             patch.object(pw, "_lu_fetch_detail") as mock_valuer:
+            result = pw._pw_fetch_enriched("valuer-tok", "assessor-tok", matches)
+        self.assertEqual(result, [("R1", matches[0], {"node": "N1"}, True)])
+        mock_county.assert_called_once_with("assessor-tok", "app-1")
+        mock_valuer.assert_not_called()
+
+    def test_assessor_stage_match_with_no_assessor_tokens_skips_detail_call(self):
+        matches = [{"reference_number": "R1", "id": "app-1", "_assessor_stage": True}]
+        with patch.object(pw, "_lu_fetch_detail_county") as mock_county:
+            result = pw._pw_fetch_enriched("valuer-tok", None, matches)
+        self.assertEqual(result, [("R1", matches[0], None, True)])
+        mock_county.assert_not_called()
 
 
 class TestPwCheckJob(unittest.TestCase):
@@ -292,6 +326,7 @@ class TestPwCheckJob(unittest.TestCase):
         self.context.job.schedule_removal.assert_called_once()
 
     def test_no_tokens_skips_cycle_without_removing_job(self):
+        # Neither credential cached -> skip the cycle entirely.
         watch = {"id": "watch-1", "chat_id": 555, "parcel": "P1", "email": ""}
         with patch.object(pw, "get_parcel_watch", return_value=watch), \
              patch.object(pw, "get_valid_tokens", return_value=None), \
@@ -299,6 +334,21 @@ class TestPwCheckJob(unittest.TestCase):
             _run(pw._pw_check_job(self.context))
         mock_search.assert_not_called()
         self.context.job.schedule_removal.assert_not_called()
+
+    def test_only_one_credential_cached_still_runs_the_cycle(self):
+        # Assessor tokens missing, valuer tokens present -> the valuer
+        # stage alone is enough to search (assessor stage silently
+        # skipped inside _pl_search_parcel, not here).
+        watch = {"id": "watch-1", "chat_id": 555, "parcel": "P1", "email": ""}
+
+        def _tokens(cred_type):
+            return TOKENS if cred_type == pw._LU_CRED_DEFAULT else None
+
+        with patch.object(pw, "get_parcel_watch", return_value=watch), \
+             patch.object(pw, "get_valid_tokens", side_effect=_tokens), \
+             patch.object(pw, "_pl_search_parcel", return_value=[]) as mock_search:
+            _run(pw._pw_check_job(self.context))
+        mock_search.assert_called_once_with(TOKENS, None, "P1")
 
     def test_no_matches_does_nothing(self):
         watch = {"id": "watch-1", "chat_id": 555, "parcel": "P1", "email": ""}
@@ -343,6 +393,35 @@ class TestPwCheckJob(unittest.TestCase):
         sent_text = self.context.bot.send_message.call_args_list[-1].args[1]
         self.assertIn("Jane Doe", sent_text)
         self.assertIn("5,000,000.00", sent_text)
+
+    def test_assessor_stage_match_notification_uses_county_formatter(self):
+        """A match found at the pre-DLV assessor/HQ collector stage must
+        render via _lu_format_county_result (stampdutyservice detail-view
+        shape), not _lu_format_result (the DLV/Valuer detail-view shape)."""
+        watch = {"id": "watch-1", "chat_id": 555, "parcel": "NBI/BLOCK1/123", "email": ""}
+        assessor_match = [{
+            "reference_number": "R9", "parcel_number": "NBI/BLOCK1/123",
+            "registry": "Nairobi", "county": "Nairobi", "date_created": "2026-01-01",
+            "id": "app-9", "_assessor_stage": True, "_matched_filter": "Assessor/HQ",
+        }]
+        county_detail = {
+            "node": "SOME_ASSESSOR_NODE",
+            "officers": [{"role": "VALUATION OFFICER", "names": "John Smith"}],
+            "external_process_details": {"consideration_amount": "1000000", "currency_code": "KES"},
+        }
+        with patch.object(pw, "get_parcel_watch", return_value=watch), \
+             patch.object(pw, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pw, "_pl_search_parcel", return_value=assessor_match), \
+             patch.object(pw, "_lu_fetch_detail_county", return_value=county_detail) as mock_county, \
+             patch.object(pw, "_lu_fetch_detail") as mock_valuer, \
+             patch.object(pw, "remove_parcel_watch"):
+            _run(pw._pw_check_job(self.context))
+        mock_county.assert_called_once_with(TOKENS, "app-9")
+        mock_valuer.assert_not_called()
+        sent_text = self.context.bot.send_message.call_args_list[-1].args[1]
+        self.assertIn("R9", sent_text)
+        self.assertIn("John Smith", sent_text)
+        self.assertIn("1,000,000.00", sent_text)
 
     def test_match_found_with_email_also_sends_email(self):
         watch = {"id": "watch-1", "chat_id": 555, "parcel": "NBI/BLOCK1/123", "email": "someone@example.com"}

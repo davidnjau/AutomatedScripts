@@ -18,14 +18,25 @@ Reuses lookup_reference.py's existing filter/role/cparams combo list
 (_LU_SEARCH_COMBOS) and credential (_LU_CRED_DEFAULT) rather than
 duplicating them, so the two searches stay in sync if either changes.
 Scoped to the same non-county Stamp Duty list endpoint lookup_reference.py
-searches by default — no County/LRD routing here; add it later if this
-needs to answer the same question for those workflows.
+searches by default — no LRD routing here; add it later if this needs to
+answer the same question for that workflow.
 
-Deliberately does not fetch per-match detail-view (valuer name, etc.) —
-the list-endpoint response already carries status/node/registry/county/
-date_created (see endpoints.py's STAMP_DUTY_APPLICATION_LIST_URL comment),
-which is enough to answer "has it landed and what state is it in" without
-one extra API round trip per match.
+Also checks the pre-DLV assessor/HQ collector stage (stampdutyservice
+hod-or-clr, both the HQ and County variants — see
+_pl_search_parcel_assessor_stage) under Support Reg (_PL_CRED_ASSESSOR),
+so a parcel that hasn't yet been pushed into DLV's queue still shows up
+rather than reporting "not found." _pl_search_parcel merges both stages;
+either credential's cached tokens may be missing, in which case that
+stage is silently skipped rather than failing the whole search.
+
+Deliberately does not fetch per-match detail-view (valuer name, etc.) for
+either stage — the DLV/Valuer list-endpoint response already carries
+status/node/registry/county/date_created (see endpoints.py's
+STAMP_DUTY_APPLICATION_LIST_URL comment), which is enough to answer "has
+it landed and what state is it in" without one extra API round trip per
+match; the assessor-stage list endpoint carries no status/node at all, so
+those matches are labeled with the stage/variant they were found under
+instead (see _pl_format_match).
 
 Once matches are found, delivery mirrors dlv_tasks.py's DELIVERY/
 EMAIL_INPUT pattern — "💬 View on Telegram" or "📩 Send to Email", the
@@ -51,7 +62,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -69,6 +80,7 @@ from common import (
     BTN_PARCEL_LOOKUP,
     CRED_LABELS,
     _CANCEL_FILTER,
+    _ft_headers,
     _LIST_INPUT_MAX_ITEMS,
     _main_menu_for,
     _NODE_LABELS,
@@ -83,10 +95,24 @@ from common import (
     not_cancel,
 )
 from email_service import _send_auto_fetch_email
-from endpoints import STAMP_DUTY_APPLICATION_LIST_URL
+from endpoints import ASSESSOR_STAGE_LIST_URL, STAMP_DUTY_APPLICATION_LIST_URL
 from lookup_reference import _LU_CRED_DEFAULT, _LU_SEARCH_COMBOS, _lu_md_escape
 from task_block import format_labeled_block
 from telegram_report import _send_chunked_report
+
+# Credential the assessor/HQ collector (pre-DLV) stage is searched under —
+# Support Reg, same credential lookup_reference.py's county-ref assessor-
+# stage search (_lu_search_ref_county) uses.
+_PL_CRED_ASSESSOR = "staff2"
+
+# (stage label, extra query params) variants of the assessor/HQ stage to
+# check — HQ (digitised) and County (from_ardhipay) — mirroring
+# dlv_core._search_ref_stampduty's fallback search, which checks both for
+# the same reason: a parcel/ref alone doesn't say which one it's under.
+_PL_ASSESSOR_VARIANTS = [
+    ("Assessor/HQ",     {}),
+    ("Assessor/County", {"from_ardhipay": "true"}),
+]
 
 
 # ──────────────────────────────────────────────────────────
@@ -152,17 +178,16 @@ def _pl_tokens_match(search_tokens: List[str], candidate_tokens: List[str]) -> b
     return True
 
 
-def _pl_search_parcel(tokens: AuthTokens, parcel: str) -> List[Dict]:
-    """Search every _LU_SEARCH_COMBOS filter/role combo for parcel — a
-    tokenized, order-preserving match against each result's parcel_number
-    (see _pl_tokens_match), not an exact or plain-substring one, so a
-    fragment like "BLOCK209" or "209/309" matches "NAIROBI/BLOCK209/309",
-    an abbreviated word like "Mavoko Muni" matches "Mavoko/Municipality",
-    and formatting differences (separators, spacing, case) never prevent
-    a match that would otherwise be correct. Returns every distinct
-    matching list-item dict, deduped by reference_number, in first-seen
-    order. Shared by Parcel Lookup's on-demand /parcelcheck and Parcel
-    Watch's scheduled checks, so both search the same way."""
+def _pl_search_parcel_valuer_stage(tokens: AuthTokens, parcel: str) -> List[Dict]:
+    """Search every _LU_SEARCH_COMBOS filter/role combo (DLV + Valuer
+    stages, under staff_valuer) for parcel — a tokenized, order-preserving
+    match against each result's parcel_number (see _pl_tokens_match), not
+    an exact or plain-substring one, so a fragment like "BLOCK209" or
+    "209/309" matches "NAIROBI/BLOCK209/309", an abbreviated word like
+    "Mavoko Muni" matches "Mavoko/Municipality", and formatting
+    differences (separators, spacing, case) never prevent a match that
+    would otherwise be correct. Returns every distinct matching list-item
+    dict, deduped by reference_number, in first-seen order."""
     http_sess = build_session()
     hdrs = {
         "Authorization": f"Bearer {tokens.access_token}",
@@ -198,14 +223,84 @@ def _pl_search_parcel(tokens: AuthTokens, parcel: str) -> List[Dict]:
     return list(seen.values())
 
 
+def _pl_search_parcel_assessor_stage(tokens: AuthTokens, parcel: str) -> List[Dict]:
+    """Search the assessor/HQ collector stage (stampdutyservice hod-or-clr
+    — the pre-DLV stage a task sits at before an assessor pushes it into
+    DLV's queue) for parcel, trying both _PL_ASSESSOR_VARIANTS. Same
+    tokenized match as _pl_search_parcel_valuer_stage. Unlike
+    STAMP_DUTY_APPLICATION_LIST_URL, this list endpoint carries no
+    application_status/node on its results (see endpoints.py's
+    ASSESSOR_STAGE_LIST_URL comment), so matches are tagged
+    _assessor_stage=True plus which variant matched; _pl_format_match
+    renders a stage label in place of a real status/node for these."""
+    http_sess = build_session()
+    headers = _ft_headers(tokens)
+    target_tokens = _pl_tokenize_parcel(parcel)
+    seen: Dict[str, Dict] = {}
+    for stage_label, extra_params in _PL_ASSESSOR_VARIANTS:
+        try:
+            resp = http_sess.get(
+                ASSESSOR_STAGE_LIST_URL,
+                headers=headers,
+                params={"filter": "Ongoing", "page": 1, "search": parcel, **extra_params},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            for item in resp.json().get("results", []):
+                candidate_tokens = _pl_tokenize_parcel(item.get("parcel_number") or "")
+                if not target_tokens or not _pl_tokens_match(target_tokens, candidate_tokens):
+                    continue
+                ref = item.get("reference_number")
+                if ref and ref not in seen:
+                    item["_matched_filter"] = stage_label
+                    item["_assessor_stage"] = True
+                    seen[ref] = item
+        except Exception as e:
+            logger.warning("PL assessor-stage search %s failed: %s", stage_label, e)
+    return list(seen.values())
+
+
+def _pl_search_parcel(
+    valuer_tokens: Optional[AuthTokens],
+    assessor_tokens: Optional[AuthTokens],
+    parcel: str,
+) -> List[Dict]:
+    """Search parcel across both pipeline stages — the DLV/Valuer stage
+    (_pl_search_parcel_valuer_stage, staff_valuer) and the pre-DLV
+    assessor/HQ collector stage (_pl_search_parcel_assessor_stage, Support
+    Reg) — and merge into one list, deduped by reference_number
+    (valuer-stage match wins on a collision, though in practice a ref only
+    ever lives in one stage at a time). Either token set may be None (that
+    credential has no cached login), in which case that stage is silently
+    skipped rather than failing the whole search — the same convention
+    lookup_reference.py's county-ref routing already uses. Shared by
+    Parcel Lookup's on-demand /parcelcheck and Parcel Watch's scheduled
+    checks, so both search the same way."""
+    seen: Dict[str, Dict] = {}
+    if valuer_tokens:
+        for item in _pl_search_parcel_valuer_stage(valuer_tokens, parcel):
+            seen.setdefault(item.get("reference_number"), item)
+    if assessor_tokens:
+        for item in _pl_search_parcel_assessor_stage(assessor_tokens, parcel):
+            seen.setdefault(item.get("reference_number"), item)
+    return list(seen.values())
+
+
 def _pl_format_match(i: int, item: Dict, markdown: bool = True) -> str:
     """Render one matching application as a labeled block — Status, Node,
     Registry, County, Created — the fields already available on the list-
-    item without a detail-view call. markdown=False (email body) skips
-    Markdown escaping/ref backticks, same convention as
-    fetch_tasks._ft_format_task_block."""
-    status     = (item.get("application_status") or "—").upper()
-    node_label = _NODE_LABELS.get(item.get("node", ""), item.get("node") or "—")
+    item without a detail-view call. A DLV/Valuer-stage match has a real
+    application_status/node; an assessor/HQ-stage match (_assessor_stage,
+    see _pl_search_parcel_assessor_stage) has neither at the list-item
+    level, so Status/Node instead show which pre-DLV stage/variant it was
+    found under. markdown=False (email body) skips Markdown escaping/ref
+    backticks, same convention as fetch_tasks._ft_format_task_block."""
+    if item.get("_assessor_stage"):
+        status     = f"PRE-DLV ({item.get('_matched_filter', 'Assessor/HQ')})"
+        node_label = "Assessor / HQ Collector stage"
+    else:
+        status     = (item.get("application_status") or "—").upper()
+        node_label = _NODE_LABELS.get(item.get("node", ""), item.get("node") or "—")
     fields = [
         ("📊 Status",   status),
         ("🔄 Node",     node_label),
@@ -218,13 +313,15 @@ def _pl_format_match(i: int, item: Dict, markdown: bool = True) -> str:
 
 async def cmd_parcel_lookup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Entry point — prompts for the parcel number, no credential step
-    # (always searched under Staff Valuer, same as lookup_reference.py's
-    # default non-county path).
+    # (searched under Staff Valuer for the DLV/Valuer stages, same as
+    # lookup_reference.py's default non-county path, plus Support Reg for
+    # the pre-DLV assessor/HQ collector stage).
     if not allowed(update): return await deny(update)
     await update.message.reply_text(
         "🏞 *Parcel Lookup*\n\n"
         "Find out whether a parcel number has landed in the Stamp Duty "
-        "application list, and which reference(s) it's under.\n\n"
+        "pipeline — DLV, Valuer, or the pre-DLV Assessor/HQ collector "
+        "stage — and which reference(s) it's under.\n\n"
         "Enter a *parcel number* to check\n"
         f"_or paste up to {_LIST_INPUT_MAX_ITEMS}, one per line or comma-separated, "
         "for a compiled report._",
@@ -266,10 +363,12 @@ async def recv_pl_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    tokens = get_valid_tokens(_LU_CRED_DEFAULT)
-    if not tokens:
+    valuer_tokens   = get_valid_tokens(_LU_CRED_DEFAULT)
+    assessor_tokens = get_valid_tokens(_PL_CRED_ASSESSOR)
+    if not valuer_tokens and not assessor_tokens:
         await update.message.reply_text(
-            f"❌ No valid cached tokens for *{CRED_LABELS.get(_LU_CRED_DEFAULT, _LU_CRED_DEFAULT)}*. "
+            f"❌ No valid cached tokens for *{CRED_LABELS.get(_LU_CRED_DEFAULT, _LU_CRED_DEFAULT)}* "
+            f"or *{CRED_LABELS.get(_PL_CRED_ASSESSOR, _PL_CRED_ASSESSOR)}*. "
             "Use *🔑 Refresh Auth* first.",
             parse_mode="Markdown",
             reply_markup=_main_menu_for(update.effective_user.id),
@@ -280,7 +379,10 @@ async def recv_pl_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if len(parcels) > 1:
         await update.message.reply_text(f"🔍 Searching {len(parcels)} parcel(s)…", parse_mode="Markdown")
-        batch = [(parcel, await asyncio.to_thread(_pl_search_parcel, tokens, parcel)) for parcel in parcels]
+        batch = [
+            (parcel, await asyncio.to_thread(_pl_search_parcel, valuer_tokens, assessor_tokens, parcel))
+            for parcel in parcels
+        ]
         sess.parcel, sess.matches, sess.batch = "", [], batch
 
         total = sum(len(matches) for _, matches in batch)
@@ -296,11 +398,12 @@ async def recv_pl_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess.batch = []
     await update.message.reply_text(f"🔍 Searching for `{_lu_md_escape(parcel)}`…", parse_mode="Markdown")
 
-    matches = await asyncio.to_thread(_pl_search_parcel, tokens, parcel)
+    matches = await asyncio.to_thread(_pl_search_parcel, valuer_tokens, assessor_tokens, parcel)
     if not matches:
         await update.message.reply_text(
-            f"❌ Parcel `{_lu_md_escape(parcel)}` not found across all filters (Ongoing, Pending, Completed).\n\n"
-            "It hasn't landed in the Stamp Duty list yet — check the parcel number and try again.",
+            f"❌ Parcel `{_lu_md_escape(parcel)}` not found — checked DLV, Valuer, and Assessor/HQ "
+            "collector stages.\n\n"
+            "It hasn't landed in the Stamp Duty pipeline yet — check the parcel number and try again.",
             parse_mode="Markdown",
             reply_markup=_main_menu_for(update.effective_user.id),
         )

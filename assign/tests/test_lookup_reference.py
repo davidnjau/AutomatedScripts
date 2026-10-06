@@ -414,6 +414,21 @@ class TestLuFormatCountyResult(unittest.TestCase):
         result = lu._lu_format_county_result("CNTYINV/AB12CD34EF", item, detail)
         self.assertIn("Jane\\_Doe", result)
 
+    def test_markdown_false_skips_escaping_and_header_formatting(self):
+        """markdown=False (parcel_watch.py's emailed assessor-stage
+        notification) must skip Markdown escaping/backticks/asterisks,
+        same convention as _lu_format_result's own markdown=False path."""
+        item = {"application_status": "ongoing", "date_created": "2026-07-15"}
+        detail = {
+            "node": "STAMP_DUTY_VALUATION",
+            "officers": [{"role": "VALUATION OFFICER", "names": "Jane_Doe"}],
+        }
+        result = lu._lu_format_county_result("CNTYINV/AB12CD34EF", item, detail, markdown=False)
+        self.assertIn("Jane_Doe", result)
+        self.assertNotIn("\\_", result)
+        self.assertNotIn("*", result)
+        self.assertNotIn("`", result)
+
 
 class TestLuSearchRefCountyDlv(unittest.TestCase):
     """_lu_search_ref_county_dlv — the DLV/valuation-stage fallback for a
