@@ -78,6 +78,7 @@ from common import (
     _any_valid_tokens,
     _be_cred_keyboard,
     _CANCEL_FILTER,
+    _DLV_STORE_LOCK,
     _main_menu_for,
     _parse_list_input,
     allowed,
@@ -186,16 +187,21 @@ def save_hold_tasks(items: List[Dict]) -> None:
     currently held but absent from `items` — same "add/refresh only, never
     remove" rule dlv_core.save_dlv_batch follows; both release paths in
     this module call dlv_core.clear_hold_and_remove first for exactly that
-    reason."""
-    store = _load_consolidated()
-    for item in items:
-        ref = item.get("ref")
-        if not ref:
-            continue
-        hold_fields = {k: v for k, v in item.items() if k != "ref"}
-        existing = store.get(ref) or {"ref": ref, "status": "assigned"}
-        store[ref] = {**existing, "hold": hold_fields}
-    _save_consolidated(store)
+    reason. The load-modify-save cycle is serialized by _DLV_STORE_LOCK
+    (see its definition in common.py) against every other writer of the
+    same consolidated store — e.g. dlv_batch_job's save_dlv_batch, which
+    runs on its own concurrent 1-minute job alongside this module's own
+    hold_tasks_job."""
+    with _DLV_STORE_LOCK:
+        store = _load_consolidated()
+        for item in items:
+            ref = item.get("ref")
+            if not ref:
+                continue
+            hold_fields = {k: v for k, v in item.items() if k != "ref"}
+            existing = store.get(ref) or {"ref": ref, "status": "assigned"}
+            store[ref] = {**existing, "hold": hold_fields}
+        _save_consolidated(store)
 
 
 # ──────────────────────────────────────────────────────────

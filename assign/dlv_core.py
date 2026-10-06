@@ -51,6 +51,7 @@ from common import (
     DATA_DIR,
     SAVED_ASSIGNMENTS_FILE,
     _atomic_json_write,
+    _DLV_STORE_LOCK,
     _ft_headers,
     logger,
 )
@@ -255,13 +256,18 @@ def save_dlv_batch(items: List[Dict]) -> None:
     call site drops a ref from its list, something else this same cycle
     (persist_assignment/_append_dlv_closed/mark_removed) already set, or is
     about to set, that ref's real new status; guessing here risks clobbering
-    it, so save_dlv_batch only ever adds/refreshes, never removes."""
-    store = _load_consolidated()
-    for item in items:
-        ref = item.get("ref")
-        if ref:
-            store[ref] = {**store.get(ref, {}), **item, "ref": ref, "status": "queued"}
-    _save_consolidated(store)
+    it, so save_dlv_batch only ever adds/refreshes, never removes. The whole
+    load-modify-save cycle is serialized by _DLV_STORE_LOCK (see its
+    definition in common.py) against every other writer of the same store —
+    otherwise a concurrent save from e.g. hold_tasks_job could load a stale
+    snapshot and silently overwrite what this call just wrote."""
+    with _DLV_STORE_LOCK:
+        store = _load_consolidated()
+        for item in items:
+            ref = item.get("ref")
+            if ref:
+                store[ref] = {**store.get(ref, {}), **item, "ref": ref, "status": "queued"}
+        _save_consolidated(store)
 
 
 def clear_dlv_batch() -> None:
@@ -285,14 +291,16 @@ def load_dlv_closed() -> List[Dict]:
 def save_dlv_closed(items: List[Dict]) -> None:
     """Upsert every item as its own closed status, merged onto whatever the
     store already knows about that ref. No current call site uses this
-    directly (only _append_dlv_closed does) — kept for API parity."""
-    store = _load_consolidated()
-    for item in items:
-        ref = item.get("ref")
-        if ref:
-            status = "completed" if item.get("closed_reason") == "completed" else "returned"
-            store[ref] = {**store.get(ref, {}), **item, "ref": ref, "status": status}
-    _save_consolidated(store)
+    directly (only _append_dlv_closed does) — kept for API parity. See
+    save_dlv_batch for why the cycle is serialized by _DLV_STORE_LOCK."""
+    with _DLV_STORE_LOCK:
+        store = _load_consolidated()
+        for item in items:
+            ref = item.get("ref")
+            if ref:
+                status = "completed" if item.get("closed_reason") == "completed" else "returned"
+                store[ref] = {**store.get(ref, {}), **item, "ref": ref, "status": status}
+        _save_consolidated(store)
 
 
 def _append_dlv_closed(item: Dict) -> None:
@@ -305,16 +313,18 @@ def mark_removed(refs: Iterable[str]) -> None:
     """Mark each ref "removed" (manually dropped from the queue, or released
     from hold — see clear_hold_and_remove) rather than deleting its record
     outright — keeps a removed_at trace instead of silently losing history.
-    No-op for a ref not currently in the store."""
-    store = _load_consolidated()
-    now = datetime.now().isoformat(timespec="seconds")
-    changed = False
-    for ref in refs:
-        if ref in store:
-            store[ref] = {**store[ref], "status": "removed", "removed_at": now}
-            changed = True
-    if changed:
-        _save_consolidated(store)
+    No-op for a ref not currently in the store. See save_dlv_batch for why
+    the cycle is serialized by _DLV_STORE_LOCK."""
+    with _DLV_STORE_LOCK:
+        store = _load_consolidated()
+        now = datetime.now().isoformat(timespec="seconds")
+        changed = False
+        for ref in refs:
+            if ref in store:
+                store[ref] = {**store[ref], "status": "removed", "removed_at": now}
+                changed = True
+        if changed:
+            _save_consolidated(store)
 
 
 def clear_hold_and_remove(refs: Iterable[str]) -> None:
@@ -322,16 +332,18 @@ def clear_hold_and_remove(refs: Iterable[str]) -> None:
     same write. Releasing a hold and manually deleting a queued ref are the
     same kind of event (a tracking-queue exit, not a lifecycle change), so
     they share the terminal "removed" status mark_removed also uses. No-op
-    for a ref not currently in the store."""
-    store = _load_consolidated()
-    now = datetime.now().isoformat(timespec="seconds")
-    changed = False
-    for ref in refs:
-        if ref in store:
-            store[ref] = {**store[ref], "hold": None, "status": "removed", "removed_at": now}
-            changed = True
-    if changed:
-        _save_consolidated(store)
+    for a ref not currently in the store. See save_dlv_batch for why the
+    cycle is serialized by _DLV_STORE_LOCK."""
+    with _DLV_STORE_LOCK:
+        store = _load_consolidated()
+        now = datetime.now().isoformat(timespec="seconds")
+        changed = False
+        for ref in refs:
+            if ref in store:
+                store[ref] = {**store[ref], "hold": None, "status": "removed", "removed_at": now}
+                changed = True
+        if changed:
+            _save_consolidated(store)
 
 
 # Status filters to probe per DLV request type — a queued ref's current status

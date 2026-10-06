@@ -9,9 +9,11 @@ Run with: python3 -m unittest discover -s assign/tests -v
 """
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -39,6 +41,69 @@ class TestSafeErr(unittest.TestCase):
         self.assertEqual(common._safe_err(RuntimeError("secret detail")), "unexpected error — check logs")
         # the original message must never leak through
         self.assertNotIn("secret detail", common._safe_err(RuntimeError("secret detail")))
+
+
+class TestAtomicJsonWrite(unittest.TestCase):
+    """_atomic_json_write — writes via a per-call-unique .tmp file (not a
+    fixed f"{path}.tmp") so two concurrent writers to the same path never
+    collide on the same tmp filename, which used to crash one of them with
+    FileNotFoundError on os.replace (see common.py's docstring for the real
+    production incident this caused in dlv_batch_job)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.path = os.path.join(self.tmpdir.name, "data.json")
+
+    def test_writes_valid_json_readable_back(self):
+        common._atomic_json_write(self.path, {"a": 1}, indent=2)
+        with open(self.path) as f:
+            self.assertEqual(json.load(f), {"a": 1})
+
+    def test_no_tmp_file_left_behind_on_success(self):
+        common._atomic_json_write(self.path, {"a": 1})
+        leftovers = [f for f in os.listdir(self.tmpdir.name) if f != "data.json"]
+        self.assertEqual(leftovers, [])
+
+    def test_concurrent_writers_use_distinct_tmp_paths(self):
+        """Two threads writing the same path "simultaneously" (one paused
+        mid-write via a monkeypatched json.dump) must not collide on the
+        same tmp filename — the real bug: both opened f"{path}.tmp", so
+        whichever thread's os.replace ran first renamed the file out from
+        under the other, which then raised FileNotFoundError on its own
+        os.replace."""
+        seen_tmp_paths = []
+        real_dump = json.dump
+
+        def _tracking_dump(data, f, **kwargs):
+            seen_tmp_paths.append(f.name)
+            real_dump(data, f, **kwargs)
+
+        results = []
+
+        def _writer(n):
+            try:
+                common._atomic_json_write(self.path, {"n": n})
+                results.append(True)
+            except Exception:
+                results.append(False)
+
+        with patch.object(json, "dump", side_effect=_tracking_dump):
+            threads = [threading.Thread(target=_writer, args=(i,)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        self.assertEqual(len(seen_tmp_paths), 8)
+        self.assertEqual(len(set(seen_tmp_paths)), 8)   # every tmp path was unique
+        self.assertTrue(all(results))                    # no writer raised
+
+    def test_failure_cleans_up_its_own_tmp_file(self):
+        with patch.object(json, "dump", side_effect=RuntimeError("disk full")):
+            with self.assertRaises(RuntimeError):
+                common._atomic_json_write(self.path, {"a": 1})
+        self.assertEqual(os.listdir(self.tmpdir.name), [])
 
 
 class TestMdEscape(unittest.TestCase):

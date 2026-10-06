@@ -349,10 +349,15 @@ def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth
                 # (see recv_db_taken_decision) and keep it in the queue so it
                 # isn't lost while awaiting an answer. _process_dlv_batch_items
                 # excludes already-flagged items from further processing/
-                # re-notification until the decision is made.
+                # re-notification until the decision is made. held_prompted_at
+                # records when its Reassign/Maintain/Delete prompt is (about
+                # to be) sent, so _db_resend_stale_taken_prompts can later
+                # tell a never-answered item apart from one whose very first
+                # prompt attempt is still in flight this same cycle.
                 item["awaiting_decision"] = True
                 item["held_by"]     = actor_name
                 item["held_by_uid"] = actor_uid
+                item["held_prompted_at"] = datetime.now().isoformat(timespec="seconds")
                 outcome = {"ref": ref, "status": "⚠️ Taken by another valuer — awaiting your decision",
                            "valuer_name": valuer_name, "held_by": actor_name}
                 return {"item": item, "keep": True, "outcome": outcome, "closed": None}
@@ -531,6 +536,48 @@ async def _send_db_taken_prompts(bot, chat_ids: List[int], newly_awaiting: List[
                 logger.warning("DLV batch taken-prompt send error for %s: %s", chat_id, e)
 
 
+# A dropped Reassign/Maintain/Delete prompt (e.g. _dlv_batch_job crashing
+# between flagging a ref awaiting_decision and ever sending its prompt — see
+# common._atomic_json_write's unique-tmp-file fix for the exact crash this
+# once hit — or a one-off Telegram API failure) used to leave that ref stuck
+# forever: _process_dlv_batch_items excludes already-awaiting items from all
+# further processing/re-notification by design, so without this, nothing
+# ever asks again.
+_DB_STALE_PROMPT_RESEND_MINUTES = 60
+
+
+def _db_resend_stale_taken_prompts(now: Optional[datetime] = None) -> List[Dict]:
+    """Find every still-awaiting-decision ref whose held_prompted_at is
+    missing, unparseable, or older than _DB_STALE_PROMPT_RESEND_MINUTES,
+    stamp a fresh held_prompted_at, persist that stamp immediately, and
+    return those items for the caller to pass to _send_db_taken_prompts —
+    mirrors _process_dlv_batch_items' newly_awaiting contract so both flow
+    through the same send path. Stamping (and saving) before the caller
+    actually sends is deliberate, same tradeoff _process_dlv_batch_item
+    already makes for the first prompt: worst case a transient send failure
+    delays the next resend by one more cycle rather than retrying instantly,
+    which is an acceptable cost for never leaving a ref silently stuck."""
+    now = now or datetime.now()
+    items = load_dlv_batch()
+    stale = []
+    for item in items:
+        if not item.get("awaiting_decision"):
+            continue
+        prompted_at = item.get("held_prompted_at")
+        if prompted_at:
+            try:
+                age_minutes = (now - datetime.fromisoformat(prompted_at)).total_seconds() / 60
+                if age_minutes < _DB_STALE_PROMPT_RESEND_MINUTES:
+                    continue
+            except ValueError:
+                pass  # Unparseable timestamp (shouldn't happen) — treat as stale, resend.
+        item["held_prompted_at"] = now.isoformat(timespec="seconds")
+        stale.append(item)
+    if stale:
+        save_dlv_batch(items)
+    return stale
+
+
 async def recv_db_taken_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle the Reassign-to-New-Valuer / Maintain-Current-Valuer / Delete
     decision for a ref DLV Batch found held by someone other than its queued
@@ -622,6 +669,15 @@ async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if newly_awaiting:
         await _send_db_taken_prompts(context.bot, ALLOWED_IDS, newly_awaiting)
+
+    # Safety net: resend the Reassign/Maintain/Delete prompt for any ref
+    # that's been awaiting a decision for over an hour without one — covers
+    # a prompt dropped by a crashed cycle (see _db_resend_stale_taken_prompts)
+    # or any other one-off send failure, so a ref is never silently stuck
+    # forever just because its one notification never arrived.
+    stale_awaiting = await asyncio.to_thread(_db_resend_stale_taken_prompts)
+    if stale_awaiting:
+        await _send_db_taken_prompts(context.bot, ALLOWED_IDS, stale_awaiting)
 
 
 # ──────────────────────────────────────────────────────────

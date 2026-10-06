@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -348,6 +349,32 @@ class TestDlvQueuePersistence(unittest.TestCase):
     def test_mark_removed_is_a_noop_for_an_untracked_ref(self):
         dlv_core.mark_removed(["NEVER_SEEN"])
         self.assertEqual(dlv_core._load_consolidated(), {})
+
+    def test_concurrent_save_dlv_batch_calls_never_lose_a_write(self):
+        """Regression: save_dlv_batch's load-modify-save cycle used to run
+        with no lock at all — two concurrent callers (e.g. dlv_batch_job and
+        another thread, both writing different refs) could each load the
+        same stale snapshot and the later save would silently clobber the
+        earlier one's ref. _DLV_STORE_LOCK (imported from common.py)
+        serializes every call, so N concurrent single-ref saves must all
+        still be present afterwards."""
+        errors = []
+
+        def _save_one(n):
+            try:
+                dlv_core.save_dlv_batch([{"ref": f"REF{n}", "valuer_name": "Jane"}])
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=_save_one, args=(i,)) for i in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        refs = {i["ref"] for i in dlv_core.load_dlv_batch()}
+        self.assertEqual(refs, {f"REF{i}" for i in range(20)})
 
     def test_migration_from_legacy_batch_and_closed_files(self):
         """First read with no saved_dlv_records.json rebuilds it from the two

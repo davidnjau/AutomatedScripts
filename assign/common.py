@@ -18,6 +18,7 @@ import os
 import threading
 import time
 import re
+import uuid
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -111,18 +112,50 @@ def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
-# Serialises concurrent load-modify-save cycles on the assignments file.
-# persist_assignment() is called from both async handlers and background threads.
-_ASSIGN_LOCK = threading.Lock()
+# Serialises every load-modify-save cycle against the consolidated
+# saved_dlv_records.json store (dlv_core._load_consolidated/_save_consolidated
+# and everything built on them — dlv_core.save_dlv_batch/save_dlv_closed/
+# mark_removed/clear_hold_and_remove, hold_tasks.save_hold_tasks, and
+# persist_assignment below). Without this, two concurrent read-modify-write
+# cycles on the same file (e.g. dlv_batch_job and hold_tasks_job, both
+# running on their own 1-minute repeating jobs) can race: both load the same
+# snapshot, each mutates a different ref, and whichever saves last silently
+# clobbers the other's update — including a ref that was just flagged
+# awaiting_decision (DLV Batch's "taken by another valuer" conflict), which
+# can disappear before its Reassign/Maintain/Delete prompt ever reaches a
+# user. dlv_core.py and hold_tasks.py import this directly (a safe
+# direction — both already import other names from common.py at module
+# level) rather than each defining their own lock, so every writer
+# serializes against the same one.
+_DLV_STORE_LOCK = threading.Lock()
 
 
 def _atomic_json_write(path: str, data, **dump_kwargs) -> None:
-    """Write data as JSON to path atomically (write to .tmp then os.replace)."""
+    """Write data as JSON to path atomically (write to a per-call-unique
+    .tmp file, then os.replace over the real path). The tmp filename
+    includes the PID + thread id + a random suffix rather than a fixed
+    f"{path}.tmp" — two concurrent writers to the same path (e.g. a file
+    with no _DLV_STORE_LOCK-style caller-side guard) used to collide on
+    that one shared tmp filename: whichever thread's os.replace ran first
+    renamed the file out from under the other, which then crashed on its
+    own os.replace with FileNotFoundError, aborting whatever caller was
+    mid-write — this is exactly what happened to dlv_batch_job once,
+    killing that cycle before it could send any pending Reassign/Maintain
+    notifications. A unique tmp path per call makes concurrent writers to
+    the same file independent at this layer; os.remove on failure cleans
+    up this call's own tmp file rather than leaving it behind."""
     _ensure_data_dir()
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, **dump_kwargs)
-    os.replace(tmp, path)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, **dump_kwargs)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _safe_err(e: Exception) -> str:
@@ -214,7 +247,7 @@ def persist_assignment(ref: str, valuer_name: str, valuer_uid: str, extra: Optio
     existing behavior; a count-based cap risked evicting a still-active
     record purely for being chronologically old."""
     import dlv_core
-    with _ASSIGN_LOCK:
+    with _DLV_STORE_LOCK:
         store = dlv_core._load_consolidated()
         record = {
             **store.get(ref, {}),

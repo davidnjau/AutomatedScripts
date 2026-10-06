@@ -252,6 +252,10 @@ class TestProcessDlvBatchItem(unittest.TestCase):
             result = self._run()
         self.assertTrue(result["keep"])
         self.assertIn("Taken by another valuer", result["outcome"]["status"])
+        # held_prompted_at lets _db_resend_stale_taken_prompts later tell a
+        # never-answered item apart from one whose first prompt is still in
+        # flight this same cycle.
+        self.assertIn("held_prompted_at", result["item"])
         self.assertEqual(result["outcome"]["held_by"], "EXISTING VALUER")
         self.assertEqual(result["outcome"]["valuer_name"], "Jane Doe")
         self.assertTrue(result["item"]["awaiting_decision"])
@@ -605,6 +609,7 @@ class TestDlvBatchJob(unittest.TestCase):
         with patch.object(dlv_batch, "load_dlv_batch", side_effect=[[{"ref": "REF1"}], []]), \
              patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
              patch.object(dlv_batch, "_process_dlv_batch_items", return_value=(outcome_lines, [])), \
+             patch.object(dlv_batch, "_db_resend_stale_taken_prompts", return_value=[]), \
              patch.object(dlv_batch, "ALLOWED_IDS", {111}):
             _run(dlv_batch._dlv_batch_job(ctx))
         sent = "\n".join(c.args[1] for c in ctx.bot.send_message.call_args_list)
@@ -619,6 +624,7 @@ class TestDlvBatchJob(unittest.TestCase):
         with patch.object(dlv_batch, "load_dlv_batch", side_effect=[[{"ref": "REF1"}], [{"ref": "REF1"}]]), \
              patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
              patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], newly_awaiting)), \
+             patch.object(dlv_batch, "_db_resend_stale_taken_prompts", return_value=[]), \
              patch.object(dlv_batch, "ALLOWED_IDS", {111, 222}):
             _run(dlv_batch._dlv_batch_job(ctx))
         chat_ids = {c.args[0] for c in ctx.bot.send_message.call_args_list}
@@ -627,6 +633,37 @@ class TestDlvBatchJob(unittest.TestCase):
             self.assertIn("REF1", call.args[1])
             self.assertIn("EXISTING VALUER", call.args[1])
             self.assertIn("reply_markup", call.kwargs)
+
+    def test_stale_awaiting_refs_also_get_a_resent_prompt(self):
+        """The safety net: even with no newly_awaiting this cycle, a ref
+        whose prompt has gone stale (see _db_resend_stale_taken_prompts)
+        must still get sent."""
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        stale = [{"ref": "REF1", "valuer_name": "Jane Doe", "held_by": "EXISTING VALUER",
+                  "held_by_uid": "uid-2"}]
+        with patch.object(dlv_batch, "load_dlv_batch", side_effect=[[{"ref": "REF1"}], [{"ref": "REF1"}]]), \
+             patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
+             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], [])), \
+             patch.object(dlv_batch, "_db_resend_stale_taken_prompts", return_value=stale), \
+             patch.object(dlv_batch, "ALLOWED_IDS", {111}):
+            _run(dlv_batch._dlv_batch_job(ctx))
+        self.assertTrue(ctx.bot.send_message.await_count >= 1)
+        sent = "\n".join(c.args[1] for c in ctx.bot.send_message.call_args_list)
+        self.assertIn("REF1", sent)
+        self.assertIn("EXISTING VALUER", sent)
+
+    def test_no_stale_awaiting_refs_sends_nothing_extra(self):
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=[]), \
+             patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
+             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], [])), \
+             patch.object(dlv_batch, "_db_resend_stale_taken_prompts", return_value=[]) as mock_resend, \
+             patch.object(dlv_batch, "ALLOWED_IDS", {111}):
+            _run(dlv_batch._dlv_batch_job(ctx))
+        mock_resend.assert_not_called()   # load_dlv_batch() returned [] -> job returns early
+        ctx.bot.send_message.assert_not_called()
 
 
 class TestRunDlvBatchBg(unittest.TestCase):
@@ -720,6 +757,74 @@ class TestSendDbTakenPrompts(unittest.TestCase):
         newly_awaiting = [{"ref": "REF1", "valuer_name": "Jane Doe", "held_by": "X"}]
         _run(dlv_batch._send_db_taken_prompts(bot, [111, 222], newly_awaiting))
         self.assertEqual(bot.send_message.call_count, 2)
+
+
+class TestDbResendStaleTakenPrompts(unittest.TestCase):
+    """_db_resend_stale_taken_prompts — the safety net that resends a
+    Reassign/Maintain/Delete prompt for a ref that's been awaiting a
+    decision for too long without one, so a dropped notification doesn't
+    leave a ref stuck forever."""
+
+    def test_item_with_no_held_prompted_at_is_treated_as_stale(self):
+        """A record from before this field existed (or one that was never
+        successfully prompted) has no held_prompted_at at all — must still
+        be resent, not skipped."""
+        items = [{"ref": "REF1", "awaiting_decision": True, "held_by": "X"}]
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save:
+            stale = dlv_batch._db_resend_stale_taken_prompts()
+        self.assertEqual([i["ref"] for i in stale], ["REF1"])
+        self.assertIn("held_prompted_at", stale[0])
+        mock_save.assert_called_once()
+
+    def test_recently_prompted_item_is_not_resent(self):
+        now = datetime(2026, 1, 1, 12, 0, 0)
+        items = [{"ref": "REF1", "awaiting_decision": True,
+                  "held_prompted_at": (now - timedelta(minutes=5)).isoformat(timespec="seconds")}]
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save:
+            stale = dlv_batch._db_resend_stale_taken_prompts(now=now)
+        self.assertEqual(stale, [])
+        mock_save.assert_not_called()
+
+    def test_item_past_the_threshold_is_resent_with_a_fresh_timestamp(self):
+        now = datetime(2026, 1, 1, 12, 0, 0)
+        old_ts = (now - timedelta(minutes=dlv_batch._DB_STALE_PROMPT_RESEND_MINUTES + 1)).isoformat(timespec="seconds")
+        items = [{"ref": "REF1", "awaiting_decision": True, "held_prompted_at": old_ts}]
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save:
+            stale = dlv_batch._db_resend_stale_taken_prompts(now=now)
+        self.assertEqual([i["ref"] for i in stale], ["REF1"])
+        self.assertEqual(stale[0]["held_prompted_at"], now.isoformat(timespec="seconds"))
+        mock_save.assert_called_once()
+        saved_items = mock_save.call_args.args[0]
+        self.assertEqual(saved_items[0]["held_prompted_at"], now.isoformat(timespec="seconds"))
+
+    def test_non_awaiting_item_is_ignored(self):
+        items = [{"ref": "REF1", "awaiting_decision": False}]
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save:
+            stale = dlv_batch._db_resend_stale_taken_prompts()
+        self.assertEqual(stale, [])
+        mock_save.assert_not_called()
+
+    def test_unparseable_timestamp_is_treated_as_stale(self):
+        items = [{"ref": "REF1", "awaiting_decision": True, "held_prompted_at": "not-a-date"}]
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save:
+            stale = dlv_batch._db_resend_stale_taken_prompts()
+        self.assertEqual([i["ref"] for i in stale], ["REF1"])
+        mock_save.assert_called_once()
+
+    def test_no_stale_items_does_not_save(self):
+        now = datetime(2026, 1, 1, 12, 0, 0)
+        items = [{"ref": "REF1", "awaiting_decision": True,
+                  "held_prompted_at": now.isoformat(timespec="seconds")}]
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save:
+            stale = dlv_batch._db_resend_stale_taken_prompts(now=now)
+        self.assertEqual(stale, [])
+        mock_save.assert_not_called()
 
 
 class TestRecvDbTakenDecision(unittest.TestCase):
