@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Unit tests for parcel_lookup.py — _pl_search_parcel's cross-combo dedup/
-case-insensitive matching, _pl_format_match's field rendering, and the
-cmd_parcel_lookup/recv_pl_parcel/recv_pl_delivery/recv_pl_email
-conversation handlers, including the Telegram-vs-email delivery choice.
+Unit tests for parcel_lookup.py — _pl_search_parcel_valuer_stage's
+cross-combo dedup/case-insensitive matching, _pl_search_parcel_assessor_stage's
+pre-DLV HQ/County variants, _pl_search_parcel's merge-of-both-stages
+behavior, _pl_format_match's field rendering (including the assessor-stage
+label path), and the cmd_parcel_lookup/recv_pl_parcel/recv_pl_delivery/
+recv_pl_email conversation handlers, including the Telegram-vs-email
+delivery choice.
 
 Run with: python3 -m unittest discover -s assign/tests -v
 """
@@ -59,14 +62,14 @@ def _make_ctx_with_session(parcel="NBI/BLOCK1/123", matches=None):
     return ctx
 
 
-class TestPlSearchParcel(unittest.TestCase):
+class TestPlSearchParcelValuerStage(unittest.TestCase):
     def test_no_match_across_any_combo_returns_empty(self):
         fake_session = MagicMock()
         fake_session.get.return_value = MagicMock(
             raise_for_status=lambda: None, json=lambda: {"results": []}
         )
         with patch.object(pl, "build_session", return_value=fake_session):
-            result = pl._pl_search_parcel(TOKENS, "NBI/BLOCK1/123")
+            result = pl._pl_search_parcel_valuer_stage(TOKENS, "NBI/BLOCK1/123")
         self.assertEqual(result, [])
         self.assertEqual(fake_session.get.call_count, len(pl._LU_SEARCH_COMBOS))
 
@@ -79,7 +82,7 @@ class TestPlSearchParcel(unittest.TestCase):
             ]},
         )
         with patch.object(pl, "build_session", return_value=fake_session):
-            result = pl._pl_search_parcel(TOKENS, "NBI/BLOCK1/123")
+            result = pl._pl_search_parcel_valuer_stage(TOKENS, "NBI/BLOCK1/123")
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["reference_number"], "R1")
 
@@ -93,7 +96,7 @@ class TestPlSearchParcel(unittest.TestCase):
             ]},
         )
         with patch.object(pl, "build_session", return_value=fake_session):
-            result = pl._pl_search_parcel(TOKENS, "NBI/BLOCK1/123")
+            result = pl._pl_search_parcel_valuer_stage(TOKENS, "NBI/BLOCK1/123")
         self.assertEqual([r["reference_number"] for r in result], ["R1"])
 
     def test_same_ref_across_multiple_combos_is_deduped(self):
@@ -105,7 +108,7 @@ class TestPlSearchParcel(unittest.TestCase):
             ]},
         )
         with patch.object(pl, "build_session", return_value=fake_session):
-            result = pl._pl_search_parcel(TOKENS, "NBI/BLOCK1/123")
+            result = pl._pl_search_parcel_valuer_stage(TOKENS, "NBI/BLOCK1/123")
         self.assertEqual(len(result), 1)
 
     def test_distinct_refs_on_same_parcel_are_both_returned(self):
@@ -118,7 +121,7 @@ class TestPlSearchParcel(unittest.TestCase):
             ]},
         )
         with patch.object(pl, "build_session", return_value=fake_session):
-            result = pl._pl_search_parcel(TOKENS, "NBI/BLOCK1/123")
+            result = pl._pl_search_parcel_valuer_stage(TOKENS, "NBI/BLOCK1/123")
         self.assertEqual(
             sorted(r["reference_number"] for r in result), ["R1", "R2"]
         )
@@ -129,7 +132,7 @@ class TestPlSearchParcel(unittest.TestCase):
             MagicMock(raise_for_status=lambda: None, json=lambda: {"results": []})
         ] * (len(pl._LU_SEARCH_COMBOS) - 1)
         with patch.object(pl, "build_session", return_value=fake_session):
-            result = pl._pl_search_parcel(TOKENS, "NBI/BLOCK1/123")
+            result = pl._pl_search_parcel_valuer_stage(TOKENS, "NBI/BLOCK1/123")
         self.assertEqual(result, [])
         self.assertEqual(fake_session.get.call_count, len(pl._LU_SEARCH_COMBOS))
 
@@ -142,7 +145,7 @@ class TestPlSearchParcel(unittest.TestCase):
             ]},
         )
         with patch.object(pl, "build_session", return_value=fake_session):
-            result = pl._pl_search_parcel(TOKENS, "BLOCK209")
+            result = pl._pl_search_parcel_valuer_stage(TOKENS, "BLOCK209")
         self.assertEqual([r["reference_number"] for r in result], ["R1"])
 
     def test_different_separators_still_match(self):
@@ -156,7 +159,7 @@ class TestPlSearchParcel(unittest.TestCase):
             ]},
         )
         with patch.object(pl, "build_session", return_value=fake_session):
-            result = pl._pl_search_parcel(TOKENS, "NBI-BLOCK1-123")
+            result = pl._pl_search_parcel_valuer_stage(TOKENS, "NBI-BLOCK1-123")
         self.assertEqual([r["reference_number"] for r in result], ["R1"])
 
     def test_unrelated_fragment_does_not_match(self):
@@ -168,7 +171,7 @@ class TestPlSearchParcel(unittest.TestCase):
             ]},
         )
         with patch.object(pl, "build_session", return_value=fake_session):
-            result = pl._pl_search_parcel(TOKENS, "BLOCK9")
+            result = pl._pl_search_parcel_valuer_stage(TOKENS, "BLOCK9")
         self.assertEqual(result, [])
 
     def test_empty_normalized_search_term_matches_nothing(self):
@@ -182,7 +185,7 @@ class TestPlSearchParcel(unittest.TestCase):
             ]},
         )
         with patch.object(pl, "build_session", return_value=fake_session):
-            result = pl._pl_search_parcel(TOKENS, "///")
+            result = pl._pl_search_parcel_valuer_stage(TOKENS, "///")
         self.assertEqual(result, [])
 
     def test_abbreviated_word_matches_full_word_end_to_end(self):
@@ -198,12 +201,12 @@ class TestPlSearchParcel(unittest.TestCase):
             ]},
         )
         with patch.object(pl, "build_session", return_value=fake_session):
-            result = pl._pl_search_parcel(TOKENS, "Mavoko Muni block 123/145/")
+            result = pl._pl_search_parcel_valuer_stage(TOKENS, "Mavoko Muni block 123/145/")
         self.assertEqual([r["reference_number"] for r in result], ["R1"])
 
     def test_short_number_fragment_does_not_match_end_to_end(self):
         """Regression: number tokens must match exactly, even end-to-end
-        through _pl_search_parcel — "12" must not match a parcel
+        through _pl_search_parcel_valuer_stage — "12" must not match a parcel
         containing "123"."""
         fake_session = MagicMock()
         fake_session.get.return_value = MagicMock(
@@ -213,8 +216,111 @@ class TestPlSearchParcel(unittest.TestCase):
             ]},
         )
         with patch.object(pl, "build_session", return_value=fake_session):
-            result = pl._pl_search_parcel(TOKENS, "12")
+            result = pl._pl_search_parcel_valuer_stage(TOKENS, "12")
         self.assertEqual(result, [])
+
+
+class TestPlSearchParcelAssessorStage(unittest.TestCase):
+    """_pl_search_parcel_assessor_stage — the pre-DLV assessor/HQ collector
+    search, tried against both _PL_ASSESSOR_VARIANTS (HQ, County)."""
+
+    def test_match_is_tagged_as_assessor_stage(self):
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(
+            raise_for_status=lambda: None,
+            json=lambda: {"results": [
+                {"reference_number": "R1", "parcel_number": "NBI/BLOCK1/123", "id": "9"},
+            ]},
+        )
+        with patch.object(pl, "build_session", return_value=fake_session):
+            result = pl._pl_search_parcel_assessor_stage(TOKENS, "NBI/BLOCK1/123")
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0]["_assessor_stage"])
+        self.assertIn(result[0]["_matched_filter"], ("Assessor/HQ", "Assessor/County"))
+
+    def test_both_hq_and_county_variants_are_queried(self):
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(
+            raise_for_status=lambda: None, json=lambda: {"results": []}
+        )
+        with patch.object(pl, "build_session", return_value=fake_session):
+            pl._pl_search_parcel_assessor_stage(TOKENS, "NBI/BLOCK1/123")
+        self.assertEqual(fake_session.get.call_count, len(pl._PL_ASSESSOR_VARIANTS))
+        from_ardhipay_values = [
+            call.kwargs["params"].get("from_ardhipay") for call in fake_session.get.call_args_list
+        ]
+        self.assertIn("true", from_ardhipay_values)
+        self.assertIn(None, from_ardhipay_values)
+
+    def test_non_matching_parcel_excluded(self):
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(
+            raise_for_status=lambda: None,
+            json=lambda: {"results": [
+                {"reference_number": "R1", "parcel_number": "NBI/BLOCK1/999"},
+            ]},
+        )
+        with patch.object(pl, "build_session", return_value=fake_session):
+            result = pl._pl_search_parcel_assessor_stage(TOKENS, "NBI/BLOCK1/123")
+        self.assertEqual(result, [])
+
+    def test_same_ref_across_both_variants_is_deduped(self):
+        fake_session = MagicMock()
+        fake_session.get.return_value = MagicMock(
+            raise_for_status=lambda: None,
+            json=lambda: {"results": [
+                {"reference_number": "R1", "parcel_number": "NBI/BLOCK1/123"},
+            ]},
+        )
+        with patch.object(pl, "build_session", return_value=fake_session):
+            result = pl._pl_search_parcel_assessor_stage(TOKENS, "NBI/BLOCK1/123")
+        self.assertEqual(len(result), 1)
+
+    def test_exception_on_one_variant_continues_to_next(self):
+        fake_session = MagicMock()
+        fake_session.get.side_effect = [
+            RuntimeError("network blip"),
+            MagicMock(raise_for_status=lambda: None, json=lambda: {"results": []}),
+        ]
+        with patch.object(pl, "build_session", return_value=fake_session):
+            result = pl._pl_search_parcel_assessor_stage(TOKENS, "NBI/BLOCK1/123")
+        self.assertEqual(result, [])
+        self.assertEqual(fake_session.get.call_count, len(pl._PL_ASSESSOR_VARIANTS))
+
+
+class TestPlSearchParcel(unittest.TestCase):
+    """_pl_search_parcel — merges the valuer-stage and assessor-stage
+    searches, silently skipping either stage when its token set is None."""
+
+    def test_merges_matches_from_both_stages(self):
+        with patch.object(pl, "_pl_search_parcel_valuer_stage", return_value=[{"reference_number": "R1"}]), \
+             patch.object(pl, "_pl_search_parcel_assessor_stage", return_value=[{"reference_number": "R2"}]):
+            result = pl._pl_search_parcel(TOKENS, TOKENS, "NBI/BLOCK1/123")
+        self.assertEqual(sorted(r["reference_number"] for r in result), ["R1", "R2"])
+
+    def test_missing_assessor_tokens_skips_that_stage_only(self):
+        with patch.object(pl, "_pl_search_parcel_valuer_stage", return_value=[{"reference_number": "R1"}]) as mock_valuer, \
+             patch.object(pl, "_pl_search_parcel_assessor_stage") as mock_assessor:
+            result = pl._pl_search_parcel(TOKENS, None, "NBI/BLOCK1/123")
+        self.assertEqual([r["reference_number"] for r in result], ["R1"])
+        mock_valuer.assert_called_once()
+        mock_assessor.assert_not_called()
+
+    def test_missing_valuer_tokens_skips_that_stage_only(self):
+        with patch.object(pl, "_pl_search_parcel_valuer_stage") as mock_valuer, \
+             patch.object(pl, "_pl_search_parcel_assessor_stage", return_value=[{"reference_number": "R2"}]) as mock_assessor:
+            result = pl._pl_search_parcel(None, TOKENS, "NBI/BLOCK1/123")
+        self.assertEqual([r["reference_number"] for r in result], ["R2"])
+        mock_valuer.assert_not_called()
+        mock_assessor.assert_called_once()
+
+    def test_both_tokens_none_returns_empty_without_any_call(self):
+        with patch.object(pl, "_pl_search_parcel_valuer_stage") as mock_valuer, \
+             patch.object(pl, "_pl_search_parcel_assessor_stage") as mock_assessor:
+            result = pl._pl_search_parcel(None, None, "NBI/BLOCK1/123")
+        self.assertEqual(result, [])
+        mock_valuer.assert_not_called()
+        mock_assessor.assert_not_called()
 
 
 class TestPlTokenizeParcel(unittest.TestCase):
@@ -299,6 +405,24 @@ class TestPlFormatMatch(unittest.TestCase):
         item = {"reference_number": "R1"}
         block = pl._pl_format_match(1, item)
         self.assertIn("—", block)
+
+    def test_assessor_stage_match_renders_stage_label_not_raw_status(self):
+        # An assessor-stage item never carries application_status/node —
+        # even if present (shouldn't happen, but assert the stage label
+        # wins regardless) the rendered block shows the pre-DLV stage.
+        item = {
+            "reference_number": "R1",
+            "_assessor_stage": True,
+            "_matched_filter": "Assessor/County",
+            "application_status": "ongoing",
+            "registry": "Nairobi",
+        }
+        block = pl._pl_format_match(1, item)
+        self.assertIn("R1", block)
+        self.assertIn("PRE-DLV", block)
+        self.assertIn("Assessor/County", block)
+        self.assertIn("Assessor", block)
+        self.assertNotIn("ONGOING", block)
 
 
 class TestCmdParcelLookup(unittest.TestCase):
