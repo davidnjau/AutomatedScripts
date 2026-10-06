@@ -81,6 +81,7 @@ import dlv_batch
 import dlv_incremental
 import dlv_ref_check
 import dlv_report_schedule
+import dlv_stale_check
 import dlv_tasks
 import hold_tasks
 import morning_briefing
@@ -805,6 +806,7 @@ def main():
     hold_tasks.register(app)
     dlv_incremental.register(app)
     dlv_report_schedule.register(app)
+    dlv_stale_check.register(app)
 
     # Button handlers outside an active conversation
     # (bare BTN_AUTH handler registered via refresh_auth.register(app) above)
