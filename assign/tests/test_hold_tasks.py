@@ -12,6 +12,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -100,6 +101,43 @@ class TestHoldTasksPersistence(unittest.TestCase):
         store = dlv_core._load_consolidated()
         self.assertEqual(store["NEW_REF"]["status"], "assigned")
         self.assertEqual(store["NEW_REF"]["hold"]["held_valuer_name"], "Jane")
+
+    def test_concurrent_save_hold_tasks_and_save_dlv_batch_never_lose_a_write(self):
+        """Regression: hold_tasks_job and dlv_batch_job both run on their own
+        1-minute repeating job, each independently load-modify-saving the
+        same consolidated store with no coordination between the two
+        modules — a real production incident traced to exactly this race.
+        Both save_hold_tasks (here) and dlv_core.save_dlv_batch now go
+        through the same _DLV_STORE_LOCK, so concurrent calls from both
+        must not clobber each other's refs."""
+        errors = []
+
+        def _save_hold(n):
+            try:
+                ht.save_hold_tasks([{"ref": f"HELD{n}", "held_valuer_name": "Jane"}])
+            except Exception as e:
+                errors.append(e)
+
+        def _save_batch(n):
+            try:
+                dlv_core.save_dlv_batch([{"ref": f"QUEUED{n}", "valuer_name": "Bob"}])
+            except Exception as e:
+                errors.append(e)
+
+        threads = (
+            [threading.Thread(target=_save_hold, args=(i,)) for i in range(10)]
+            + [threading.Thread(target=_save_batch, args=(i,)) for i in range(10)]
+        )
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        held_refs  = {r["ref"] for r in ht.load_hold_tasks()}
+        batch_refs = {i["ref"] for i in dlv_core.load_dlv_batch()}
+        self.assertEqual(held_refs, {f"HELD{i}" for i in range(10)})
+        self.assertEqual(batch_refs, {f"QUEUED{i}" for i in range(10)})
 
 
 # ── Candidate sources ────────────────────────────────────
