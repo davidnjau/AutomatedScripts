@@ -788,9 +788,11 @@ class TestLuExtractDlvForwarding(unittest.TestCase):
         self.assertEqual(result["actor_names"], "George Ruhara Maina")
 
 
-def _expect(tokens_available, found, valuer_name, forwarded_by=None, forwarded_at=None, forward_remark=None):
+def _expect(tokens_available, found, valuer_name, forwarded_by=None, forwarded_at=None, forward_remark=None,
+            parcel_number=None):
     return {
         "tokens_available": tokens_available, "found": found, "valuer_name": valuer_name,
+        "parcel_number": parcel_number,
         "dlv_forwarded_by": forwarded_by, "dlv_forwarded_at": forwarded_at, "dlv_forward_remark": forward_remark,
     }
 
@@ -865,6 +867,30 @@ class TestLuCurrentValuer(unittest.TestCase):
         self.assertIsNone(result["dlv_forwarded_by"])
         self.assertIsNone(result["dlv_forwarded_at"])
 
+    def test_non_county_parcel_number_from_list_item(self):
+        item = {"id": "app-1", "parcel_number": "NBI/BLOCK1/123"}
+        detail = {"actors": []}
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref", return_value=item), \
+             patch.object(lu, "_lu_fetch_detail", return_value=detail):
+            result = _run(lu._lu_current_valuer("R1"))
+        self.assertEqual(result["parcel_number"], "NBI/BLOCK1/123")
+
+    def test_non_county_parcel_number_falls_back_to_detail_external_process_details(self):
+        item = {"id": "app-1"}
+        detail = {"actors": [], "external_process_details": {"parcel_number": "NBI/BLOCK2/456"}}
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref", return_value=item), \
+             patch.object(lu, "_lu_fetch_detail", return_value=detail):
+            result = _run(lu._lu_current_valuer("R1"))
+        self.assertEqual(result["parcel_number"], "NBI/BLOCK2/456")
+
+    def test_non_county_not_found_has_no_parcel_number(self):
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref", return_value=None):
+            result = _run(lu._lu_current_valuer("R1"))
+        self.assertIsNone(result["parcel_number"])
+
     # ── County ───────────────────────────────────────────────
     def test_county_no_tokens_at_all(self):
         with patch.object(lu, "get_valid_tokens", return_value=None):
@@ -879,6 +905,15 @@ class TestLuCurrentValuer(unittest.TestCase):
              patch.object(lu, "_lu_fetch_detail_county", return_value=detail):
             result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
         self.assertEqual(result, _expect(True, True, "Jane Doe"))
+
+    def test_county_parcel_number_from_assessor_stage_list_item(self):
+        item = {"id": "app-1", "parcel_number": "NAIROBI/BLOCK209/309"}
+        detail = {"officers": [{"role": "VALUATION OFFICER", "names": "Jane Doe"}]}
+        with patch.object(lu, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(lu, "_lu_search_ref_county", return_value=item), \
+             patch.object(lu, "_lu_fetch_detail_county", return_value=detail):
+            result = _run(lu._lu_current_valuer("CNTYINV/AB12CD34EF"))
+        self.assertEqual(result["parcel_number"], "NAIROBI/BLOCK209/309")
 
     def test_county_assessor_stage_found_but_no_valuer_falls_through_to_dlv_stage(self):
         """A county ref already past the assessor stage may not list a

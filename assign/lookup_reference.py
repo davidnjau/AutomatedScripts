@@ -688,29 +688,47 @@ def _lu_forwarding_fields(detail: Optional[Dict]) -> Dict:
     }
 
 
+def _lu_result(tokens_available: bool, found: bool, valuer_name: Optional[str],
+                parcel_number: Optional[str] = None, **forwarding) -> Dict:
+    """Build one _lu_current_valuer return dict — keeps the fixed key set
+    (including the dlv_forward* fields, defaulted via _LU_NO_FORWARDING_FIELDS
+    when not passed) consistent across every branch below."""
+    return {
+        "tokens_available": tokens_available, "found": found, "valuer_name": valuer_name,
+        "parcel_number": parcel_number,
+        **(forwarding or _LU_NO_FORWARDING_FIELDS),
+    }
+
+
 async def _lu_current_valuer(ref: str) -> Dict:
     """Live current-valuer check for ref — the same county-vs-default +
     assessor-vs-DLV-stage routing _lu_lookup_county/_lu_lookup_one use,
     but returning a small structured result instead of a formatted
     Reference Lookup block: {"tokens_available", "found", "valuer_name",
-    "dlv_forwarded_by", "dlv_forwarded_at", "dlv_forward_remark"}.
-    valuer_name is None if ref was found live but no VALUATION OFFICER
-    actor/officer is listed yet. The dlv_forward* fields (see
-    _lu_forwarding_fields) are only ever populated when a valuationservice
-    detail-view was actually fetched — the assessor-stage-only branches
-    below have no such data available and leave them None. Used by
-    dlv_ref_check.py to flag drift between a ref's locally-recorded valuer
-    and who actually holds it live, and to show when (and by whom on the
-    DLV side) it was forwarded — without re-parsing _lu_lookup_one's
-    markdown output."""
+    "parcel_number", "dlv_forwarded_by", "dlv_forwarded_at",
+    "dlv_forward_remark"}. valuer_name is None if ref was found live but no
+    VALUATION OFFICER actor/officer is listed yet. parcel_number is pulled
+    from whichever stage's list-item/detail actually carried it (list-item
+    first, then the DLV-stage detail's external_process_details, same
+    precedence _lu_format_result/_lu_format_county_result already use for
+    display) and is None if ref wasn't found anywhere. The dlv_forward*
+    fields (see _lu_forwarding_fields) are only ever populated when a
+    valuationservice detail-view was actually fetched — the assessor-stage-
+    only branches below have no such data available and leave them None.
+    Used by dlv_ref_check.py to flag drift between a ref's locally-recorded
+    valuer and who actually holds it live, and to show when (and by whom on
+    the DLV side) it was forwarded — without re-parsing _lu_lookup_one's
+    markdown output. Also used by dlv_stale_check.py as the single "is a
+    long-pending ref genuinely gone, and if so what's its parcel" check."""
     if _lu_is_county_ref(ref):
         support_tokens = get_valid_tokens(_LU_CRED_COUNTY)
         valuer_tokens  = get_valid_tokens(_LU_CRED_DEFAULT)
         if not support_tokens and not valuer_tokens:
-            return {"tokens_available": False, "found": False, "valuer_name": None, **_LU_NO_FORWARDING_FIELDS}
+            return _lu_result(False, False, None)
 
         assessor_found = False
         assessor_valuer_name = None
+        assessor_parcel_number = None
         if support_tokens:
             item = await asyncio.to_thread(_lu_search_ref_county, support_tokens, ref)
             if item:
@@ -719,11 +737,11 @@ async def _lu_current_valuer(ref: str) -> Dict:
                 vo = next((o for o in officers if o.get("role") == "VALUATION OFFICER"), None)
                 assessor_found = True
                 assessor_valuer_name = vo.get("names") if vo else None
+                assessor_parcel_number = item.get("parcel_number") or None
                 if vo:
                     # Assessor-stage shape (stampdutyservice) never has
                     # remarks[], so forwarding fields are always None here.
-                    return {"tokens_available": True, "found": True, "valuer_name": assessor_valuer_name,
-                            **_LU_NO_FORWARDING_FIELDS}
+                    return _lu_result(True, True, assessor_valuer_name, assessor_parcel_number)
 
         if valuer_tokens:
             item = await asyncio.to_thread(_lu_search_ref_county_dlv, valuer_tokens, ref)
@@ -732,26 +750,27 @@ async def _lu_current_valuer(ref: str) -> Dict:
                 actors = (detail or {}).get("actors") or []
                 vo = next((a for a in actors if a.get("role") == "VALUATION OFFICER"), None)
                 valuer_name = (vo.get("user_details") or {}).get("names") if vo else None
-                return {"tokens_available": True, "found": True, "valuer_name": valuer_name,
-                        **_lu_forwarding_fields(detail)}
+                ext = (detail or {}).get("external_process_details") or {}
+                parcel_number = item.get("parcel_number") or ext.get("parcel_number") or None
+                return _lu_result(True, True, valuer_name, parcel_number, **_lu_forwarding_fields(detail))
 
         if assessor_found:
-            return {"tokens_available": True, "found": True, "valuer_name": assessor_valuer_name,
-                    **_LU_NO_FORWARDING_FIELDS}
-        return {"tokens_available": True, "found": False, "valuer_name": None, **_LU_NO_FORWARDING_FIELDS}
+            return _lu_result(True, True, assessor_valuer_name, assessor_parcel_number)
+        return _lu_result(True, False, None)
 
     tokens = get_valid_tokens(_LU_CRED_DEFAULT)
     if not tokens:
-        return {"tokens_available": False, "found": False, "valuer_name": None, **_LU_NO_FORWARDING_FIELDS}
+        return _lu_result(False, False, None)
     item = await asyncio.to_thread(_lu_search_ref, tokens, ref)
     if not item:
-        return {"tokens_available": True, "found": False, "valuer_name": None, **_LU_NO_FORWARDING_FIELDS}
+        return _lu_result(True, False, None)
     detail = await asyncio.to_thread(_lu_fetch_detail, tokens, item["id"])
     actors = (detail or {}).get("actors") or []
     vo = next((a for a in actors if a.get("role") == "VALUATION OFFICER"), None)
     valuer_name = (vo.get("user_details") or {}).get("names") if vo else None
-    return {"tokens_available": True, "found": True, "valuer_name": valuer_name,
-            **_lu_forwarding_fields(detail)}
+    ext = (detail or {}).get("external_process_details") or {}
+    parcel_number = item.get("parcel_number") or ext.get("parcel_number") or None
+    return _lu_result(True, True, valuer_name, parcel_number, **_lu_forwarding_fields(detail))
 
 
 async def _lu_lookup_one(ref: str) -> str:

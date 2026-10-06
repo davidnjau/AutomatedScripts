@@ -679,6 +679,15 @@ async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if stale_awaiting:
         await _send_db_taken_prompts(context.bot, ALLOWED_IDS, stale_awaiting)
 
+    # Piggyback the Stale Pending checker (dlv_stale_check.py) on this same
+    # 1-minute cycle rather than giving it its own job/interval — a local
+    # import since dlv_stale_check.py never imports back from here (no real
+    # cycle), just following this codebase's established deferred-import
+    # convention (see common.py/dlv_core.py's own "import dlv_core" inside
+    # persist_assignment) defensively.
+    import dlv_stale_check
+    await dlv_stale_check.run_stale_check(context.bot)
+
 
 # ──────────────────────────────────────────────────────────
 # DLV Queue viewer / check-interval persistence

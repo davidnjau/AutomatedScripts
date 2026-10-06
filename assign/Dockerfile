@@ -18,6 +18,7 @@ COPY dlv_incremental.py .
 COPY dlv_ref_check.py .
 COPY dlv_tasks.py .
 COPY dlv_report_schedule.py .
+COPY dlv_stale_check.py .
 COPY hold_tasks.py .
 COPY morning_briefing.py .
 COPY fetch_tasks.py .

@@ -610,6 +610,7 @@ class TestDlvBatchJob(unittest.TestCase):
              patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
              patch.object(dlv_batch, "_process_dlv_batch_items", return_value=(outcome_lines, [])), \
              patch.object(dlv_batch, "_db_resend_stale_taken_prompts", return_value=[]), \
+             patch("dlv_stale_check.run_stale_check", new_callable=AsyncMock), \
              patch.object(dlv_batch, "ALLOWED_IDS", {111}):
             _run(dlv_batch._dlv_batch_job(ctx))
         sent = "\n".join(c.args[1] for c in ctx.bot.send_message.call_args_list)
@@ -625,6 +626,7 @@ class TestDlvBatchJob(unittest.TestCase):
              patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
              patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], newly_awaiting)), \
              patch.object(dlv_batch, "_db_resend_stale_taken_prompts", return_value=[]), \
+             patch("dlv_stale_check.run_stale_check", new_callable=AsyncMock), \
              patch.object(dlv_batch, "ALLOWED_IDS", {111, 222}):
             _run(dlv_batch._dlv_batch_job(ctx))
         chat_ids = {c.args[0] for c in ctx.bot.send_message.call_args_list}
@@ -646,6 +648,7 @@ class TestDlvBatchJob(unittest.TestCase):
              patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
              patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], [])), \
              patch.object(dlv_batch, "_db_resend_stale_taken_prompts", return_value=stale), \
+             patch("dlv_stale_check.run_stale_check", new_callable=AsyncMock), \
              patch.object(dlv_batch, "ALLOWED_IDS", {111}):
             _run(dlv_batch._dlv_batch_job(ctx))
         self.assertTrue(ctx.bot.send_message.await_count >= 1)
