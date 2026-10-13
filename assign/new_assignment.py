@@ -19,15 +19,6 @@ saved record gets a "workflow" field so the two are distinguishable in
 saved_dlv_records.json — this is separate from "tag" (still defaults to
 "Direct" regardless of workflow, unaffected by this).
 
-For Stamp Duty only, right after the workflow is picked, recv_node_select
-asks which node the application should move to (Session.node) — a list of
-_DEFAULT_NODE ("VALUATION_STAMP_DUTY_VALUER_REPORT", today's long-standing
-hardcoded value, always offered and marked as the default) plus any node
-codes previously added via "➕ Add New Node" (recv_node_add, persisted in
-saved_custom_nodes.json via load_custom_nodes/save_custom_nodes — feature-
-local to this module, not common.py, since nothing else reads it). Land
-Rent skips this step entirely since its endpoint has no node field to set.
-
 Reference numbers can be typed manually or extracted from photos via
 pytesseract, falling back to Claude Vision (Anthropic API) when OCR finds
 nothing. Already-assigned references are detected before proceeding and
@@ -49,7 +40,6 @@ Call register(app) from bot.py's main() to wire this feature in.
 import asyncio
 import base64
 import io
-import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_completed
@@ -83,8 +73,6 @@ from common import (
     BTN_ASSIGNMENTS,
     CRED_LABELS,
     CRED_MAP,
-    DATA_DIR,
-    _atomic_json_write,
     _CANCEL_FILTER,
     _cred_keyboard,
     _main_menu_for,
@@ -128,40 +116,12 @@ _WORKFLOW_LABELS = {"stamp_duty": "📋 Stamp Duty", "land_rent": "🏘 Land Ren
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-# Stamp Duty's long-standing hardcoded destination node — kept as the
-# always-offered default in the node picker below so existing behavior is
-# unchanged unless a user deliberately picks (or adds) something else. Land
-# Rent Determination has no node concept at all (see recv_confirm), so this
-# only ever applies to the stamp_duty workflow.
-_DEFAULT_NODE = "VALUATION_STAMP_DUTY_VALUER_REPORT"
-
-# User-added node codes, beyond _DEFAULT_NODE — feature-local to New
-# Assignment, so (per this codebase's convention) it lives here rather than
-# in common.py, which only hosts stores shared by ≥2 feature modules.
-SAVED_CUSTOM_NODES_FILE = os.path.join(DATA_DIR, "saved_custom_nodes.json")
-
-
-def load_custom_nodes() -> List[str]:
-    # Read back every node code a user has ever added via the "add new" step.
-    try:
-        with open(SAVED_CUSTOM_NODES_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-
-
-def save_custom_nodes(nodes: List[str]) -> None:
-    # Persist the full custom-node list so a newly-added one survives restarts.
-    _atomic_json_write(SAVED_CUSTOM_NODES_FILE, nodes, indent=2)
-
 
 # ──────────────────────────────────────────────────────────
 # States
 # ──────────────────────────────────────────────────────────
 class S(Enum):
     WORKFLOW_TYPE      = auto()   # choose Stamp Duty or Land Rent Determination
-    NODE_SELECT        = auto()   # (stamp_duty only) pick the destination node, or add a new one
-    NODE_ADD           = auto()   # text entry for a new node code
     INPUT_METHOD       = auto()   # choose text or photo input
     REF_NUMBERS        = auto()   # typing refs manually
     RECV_PHOTOS        = auto()   # receiving photo(s) for OCR
@@ -181,7 +141,6 @@ class S(Enum):
 @dataclass
 class Session:
     workflow:         str = "stamp_duty"   # "stamp_duty" or "land_rent" — set by recv_workflow_type
-    node:             str = _DEFAULT_NODE  # destination node for stamp_duty assignments — set by recv_node_select/recv_node_add
     refs:             List[str] = field(default_factory=list)
     extracted_refs:   List[str] = field(default_factory=list)   # OCR-extracted refs awaiting confirmation
     already_assigned: List[Dict] = field(default_factory=list)  # [{ref, valuer_name, assigned_at}]
@@ -212,41 +171,6 @@ def _confirm_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("✅ Confirm & Assign", callback_data="confirm:yes"),
         InlineKeyboardButton("❌ Cancel",           callback_data="confirm:no"),
     ]])
-
-
-def _node_summary_line(sess: Session) -> str:
-    # The assignment summary's "*Node:* ..." line — omitted for Land Rent,
-    # which has no node concept at all (see recv_confirm).
-    return f"*Node:* `{sess.node}`\n" if sess.workflow != "land_rent" else ""
-
-
-def _input_method_keyboard() -> InlineKeyboardMarkup:
-    # Shared by both workflows' entry into S.INPUT_METHOD — stamp_duty reaches
-    # it via the node picker, land_rent reaches it straight from the workflow choice.
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Type Reference Numbers", callback_data="input:text")],
-        [InlineKeyboardButton("📷 Add Photo(s)",           callback_data="input:photo")],
-    ])
-
-
-# Sentinel callback value for "add a new node" — distinct from any real node
-# code (which are plain UPPER_SNAKE_CASE API constants with no "__").
-_NODE_ADD_SENTINEL = "node:__add__"
-
-
-def _node_keyboard(nodes: List[str]) -> InlineKeyboardMarkup:
-    # One button per available node (default first, then any custom-added
-    # ones), plus an "add new" escape hatch. The default is marked so it's
-    # obvious which one matches today's unchanged behavior.
-    rows = [
-        [InlineKeyboardButton(
-            f"✅ {n}" if n == _DEFAULT_NODE else n,
-            callback_data=f"node:{n}",
-        )]
-        for n in nodes
-    ]
-    rows.append([InlineKeyboardButton("➕ Add New Node", callback_data=_NODE_ADD_SENTINEL)])
-    return InlineKeyboardMarkup(rows)
 
 
 async def _do_valuer_search(message, sess: Session) -> Optional[List[Dict]]:
@@ -413,8 +337,7 @@ async def cmd_assign(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────
-# Step 1 — workflow chosen → stamp_duty asks which node to assign to;
-# land_rent has no node concept, so it goes straight to reference numbers
+# Step 1 — workflow chosen → ask reference numbers
 # ──────────────────────────────────────────────────────────
 async def recv_workflow_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -422,74 +345,18 @@ async def recv_workflow_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess = get_sess(ctx)
     sess.workflow = query.data.split(":")[1]
 
-    if sess.workflow == "land_rent":
-        await query.edit_message_text(
-            f"✅ Workflow: *{_WORKFLOW_LABELS[sess.workflow]}*\n\n"
-            "Step 1 — How would you like to provide the reference numbers?",
-            parse_mode="Markdown",
-        )
-        await query.message.reply_text("Choose an input method:", reply_markup=_input_method_keyboard())
-        return S.INPUT_METHOD
-
-    nodes = [_DEFAULT_NODE] + [n for n in load_custom_nodes() if n != _DEFAULT_NODE]
     await query.edit_message_text(
         f"✅ Workflow: *{_WORKFLOW_LABELS[sess.workflow]}*\n\n"
-        "Step 1 — Which node should the application be assigned to?\n"
-        "_The ✅ option is the current default — unchanged unless you pick otherwise._",
+        "Step 1 — How would you like to provide the reference numbers?",
         parse_mode="Markdown",
     )
-    await query.message.reply_text("Choose a node:", reply_markup=_node_keyboard(nodes))
-    return S.NODE_SELECT
-
-
-# ──────────────────────────────────────────────────────────
-# Step 1a — node chosen (or "add new" tapped)
-# ──────────────────────────────────────────────────────────
-async def recv_node_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    sess = get_sess(ctx)
-
-    if query.data == _NODE_ADD_SENTINEL:
-        await query.edit_message_text(
-            "✏️ Enter the new node code exactly as the system expects it, "
-            "e.g. `VALUATION_STAMP_DUTY_VALUER_REPORT`:",
-            parse_mode="Markdown",
-        )
-        return S.NODE_ADD
-
-    sess.node = query.data.split(":", 1)[1]
-    await query.edit_message_text(
-        f"✅ Node: `{sess.node}`\n\n"
-        "Step 1b — How would you like to provide the reference numbers?",
-        parse_mode="Markdown",
+    await query.message.reply_text(
+        "Choose an input method:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Type Reference Numbers", callback_data="input:text")],
+            [InlineKeyboardButton("📷 Add Photo(s)",           callback_data="input:photo")],
+        ]),
     )
-    await query.message.reply_text("Choose an input method:", reply_markup=_input_method_keyboard())
-    return S.INPUT_METHOD
-
-
-# ──────────────────────────────────────────────────────────
-# Step 1b — receive a new custom node code → persist it → select it
-# ──────────────────────────────────────────────────────────
-async def recv_node_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    sess = get_sess(ctx)
-    text = update.message.text.strip().upper().replace(" ", "_")
-    if not text:
-        await update.message.reply_text("❌ Please enter a node code.")
-        return S.NODE_ADD
-
-    custom = load_custom_nodes()
-    if text != _DEFAULT_NODE and text not in custom:
-        custom.append(text)
-        save_custom_nodes(custom)
-
-    sess.node = text
-    await update.message.reply_text(
-        f"✅ Added and selected node: `{sess.node}`\n\n"
-        "Step 1b — How would you like to provide the reference numbers?",
-        parse_mode="Markdown",
-    )
-    await update.message.reply_text("Choose an input method:", reply_markup=_input_method_keyboard())
     return S.INPUT_METHOD
 
 
@@ -810,8 +677,7 @@ async def recv_cred_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"🔑 Cached login: *{CRED_LABELS[cred_type]}*\n\n"
                 f"📋 *Assignment Summary*\n\n"
                 f"*Valuer:* {md_escape(sv['name'])}\n"
-                f"*User ID:* `{sv['uid']}`\n"
-                f"{_node_summary_line(sess)}\n"
+                f"*User ID:* `{sv['uid']}`\n\n"
                 f"*References ({len(sess.refs)}):*\n{refs_list}\n\n"
                 f"Proceed?",
                 parse_mode="Markdown",
@@ -928,8 +794,7 @@ async def recv_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📋 *Assignment Summary*\n\n"
             f"*Valuer:* {md_escape(sv['name'])}\n"
-            f"*User ID:* `{sv['uid']}`\n"
-            f"{_node_summary_line(sess)}\n"
+            f"*User ID:* `{sv['uid']}`\n\n"
             f"*References ({len(sess.refs)}):*\n{refs_list}\n\n"
             f"Proceed?",
             parse_mode="Markdown",
@@ -975,8 +840,7 @@ async def recv_valuer_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"📋 *Assignment Summary*\n\n"
         f"*Valuer:* {md_escape(name)}\n"
-        f"*User ID:* `{uid}`\n"
-        f"{_node_summary_line(sess)}\n"
+        f"*User ID:* `{uid}`\n\n"
         f"*References ({len(sess.refs)}):*\n{refs_list}\n\n"
         f"Proceed?",
         parse_mode="Markdown",
@@ -1121,7 +985,7 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if sess.workflow == "land_rent":
                 body = {"reference_number": ref, "valuation_officer": uid}
             else:
-                body = {"reference_number": ref, "valuation_officer": uid, "node": sess.node}
+                body = {"reference_number": ref, "valuation_officer": uid, "node": "VALUATION_STAMP_DUTY_VALUER_REPORT"}
             r = sess.session.post(url, headers=headers, json=body, timeout=30)
             r.raise_for_status()
             ok_refs.append(ref)
@@ -1203,8 +1067,6 @@ def register(app: Application) -> None:
         ],
         states={
             S.WORKFLOW_TYPE:      [CallbackQueryHandler(recv_workflow_type, pattern=r"^workflow:")],
-            S.NODE_SELECT:        [CallbackQueryHandler(recv_node_select, pattern=r"^node:")],
-            S.NODE_ADD:           [MessageHandler(not_cancel, recv_node_add)],
             S.INPUT_METHOD:       [CallbackQueryHandler(recv_input_method, pattern=r"^input:")],
             S.REF_NUMBERS:        [MessageHandler(not_cancel, recv_refs)],
             S.RECV_PHOTOS:        [

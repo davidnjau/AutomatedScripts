@@ -2,8 +2,7 @@
 """
 Unit tests for new_assignment.py — parse_refs/_extract_refs_from_text's
 pure parsing logic, _check_assignments_and_proceed's already-assigned
-routing, the Stamp-Duty-only node-selection step (recv_node_select/
-recv_node_add), and the cmd_assign/recv_refs/recv_cred_choice/recv_confirm
+routing, and the cmd_assign/recv_refs/recv_cred_choice/recv_confirm
 conversation handlers.
 
 Run with: python3 -m unittest discover -s assign/tests -v
@@ -138,87 +137,21 @@ class TestCmdAssign(unittest.TestCase):
 
 
 class TestRecvWorkflowType(unittest.TestCase):
-    def test_stamp_duty_sets_workflow_and_asks_node(self):
-        """Stamp Duty gets a node-selection step before input method."""
+    def test_stamp_duty_sets_workflow_and_asks_input_method(self):
         update = _make_update_with_callback("workflow:stamp_duty")
         ctx = MagicMock()
         ctx.user_data = {"session": na.Session()}
-        with patch.object(na, "load_custom_nodes", return_value=[]):
-            result = _run(na.recv_workflow_type(update, ctx))
-        self.assertEqual(result, na.S.NODE_SELECT)
+        result = _run(na.recv_workflow_type(update, ctx))
+        self.assertEqual(result, na.S.INPUT_METHOD)
         self.assertEqual(ctx.user_data["session"].workflow, "stamp_duty")
 
     def test_land_rent_sets_workflow_and_asks_input_method(self):
-        """Land Rent has no node concept, so it skips straight to input method."""
         update = _make_update_with_callback("workflow:land_rent")
         ctx = MagicMock()
         ctx.user_data = {"session": na.Session()}
         result = _run(na.recv_workflow_type(update, ctx))
         self.assertEqual(result, na.S.INPUT_METHOD)
         self.assertEqual(ctx.user_data["session"].workflow, "land_rent")
-
-
-class TestRecvNodeSelect(unittest.TestCase):
-    def test_picking_a_node_sets_it_and_asks_input_method(self):
-        update = _make_update_with_callback("node:VALUATION_STAMP_DUTY_VALUER_REPORT")
-        ctx = MagicMock()
-        ctx.user_data = {"session": na.Session()}
-        result = _run(na.recv_node_select(update, ctx))
-        self.assertEqual(result, na.S.INPUT_METHOD)
-        self.assertEqual(ctx.user_data["session"].node, "VALUATION_STAMP_DUTY_VALUER_REPORT")
-
-    def test_picking_a_custom_node_sets_it(self):
-        update = _make_update_with_callback("node:CUSTOM_NODE_CODE")
-        ctx = MagicMock()
-        ctx.user_data = {"session": na.Session()}
-        result = _run(na.recv_node_select(update, ctx))
-        self.assertEqual(result, na.S.INPUT_METHOD)
-        self.assertEqual(ctx.user_data["session"].node, "CUSTOM_NODE_CODE")
-
-    def test_add_new_sentinel_asks_for_text_entry(self):
-        update = _make_update_with_callback(na._NODE_ADD_SENTINEL)
-        ctx = MagicMock()
-        ctx.user_data = {"session": na.Session()}
-        result = _run(na.recv_node_select(update, ctx))
-        self.assertEqual(result, na.S.NODE_ADD)
-
-
-class TestRecvNodeAdd(unittest.TestCase):
-    def test_valid_text_persists_and_selects_node(self):
-        update = _make_update_with_message("my new node")
-        ctx = MagicMock()
-        ctx.user_data = {"session": na.Session()}
-        with patch.object(na, "load_custom_nodes", return_value=[]), \
-             patch.object(na, "save_custom_nodes") as mock_save:
-            result = _run(na.recv_node_add(update, ctx))
-        self.assertEqual(result, na.S.INPUT_METHOD)
-        self.assertEqual(ctx.user_data["session"].node, "MY_NEW_NODE")
-        mock_save.assert_called_once_with(["MY_NEW_NODE"])
-
-    def test_already_saved_node_is_not_duplicated(self):
-        update = _make_update_with_message("EXISTING_NODE")
-        ctx = MagicMock()
-        ctx.user_data = {"session": na.Session()}
-        with patch.object(na, "load_custom_nodes", return_value=["EXISTING_NODE"]), \
-             patch.object(na, "save_custom_nodes") as mock_save:
-            _run(na.recv_node_add(update, ctx))
-        mock_save.assert_not_called()
-
-    def test_default_node_is_not_persisted_to_custom_list(self):
-        update = _make_update_with_message(na._DEFAULT_NODE)
-        ctx = MagicMock()
-        ctx.user_data = {"session": na.Session()}
-        with patch.object(na, "load_custom_nodes", return_value=[]), \
-             patch.object(na, "save_custom_nodes") as mock_save:
-            _run(na.recv_node_add(update, ctx))
-        mock_save.assert_not_called()
-
-    def test_empty_text_reprompts(self):
-        update = _make_update_with_message("   ")
-        ctx = MagicMock()
-        ctx.user_data = {"session": na.Session()}
-        result = _run(na.recv_node_add(update, ctx))
-        self.assertEqual(result, na.S.NODE_ADD)
 
 
 class TestRecvRefs(unittest.TestCase):
@@ -343,28 +276,7 @@ class TestRecvConfirm(unittest.TestCase):
         self.assertEqual(call_args.args[0], na.STAMP_DUTY_FIX_APPLICATION_URL)
         self.assertEqual(
             call_args.kwargs["json"],
-            {"reference_number": "R1", "valuation_officer": "1", "node": na._DEFAULT_NODE},
-        )
-
-    def test_custom_node_is_used_in_request_body(self):
-        """Regression: recv_confirm must send sess.node, not the old hardcoded literal."""
-        update = _make_update_with_callback("confirm:yes")
-        ctx = MagicMock()
-        sess = na.Session(
-            refs=["R1"], tokens=TOKENS, workflow="stamp_duty", node="CUSTOM_NODE_CODE",
-            saved_valuer={"name": "Jane", "uid": "1", "account_number": "A1"},
-        )
-        sess.session = MagicMock()
-        sess.session.post.return_value = MagicMock(raise_for_status=lambda: None)
-        ctx.user_data = {"session": sess}
-        with patch.object(na, "persist_valuer"), \
-             patch.object(na, "persist_assignment"), \
-             patch.object(na.asyncio, "to_thread", new=AsyncMock(return_value=([], {}))):
-            _run(na.recv_confirm(update, ctx))
-        call_args = sess.session.post.call_args
-        self.assertEqual(
-            call_args.kwargs["json"],
-            {"reference_number": "R1", "valuation_officer": "1", "node": "CUSTOM_NODE_CODE"},
+            {"reference_number": "R1", "valuation_officer": "1", "node": "VALUATION_STAMP_DUTY_VALUER_REPORT"},
         )
 
     def test_large_result_set_paginates_instead_of_truncating(self):
