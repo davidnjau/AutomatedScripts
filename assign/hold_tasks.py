@@ -37,6 +37,17 @@ against a ref it didn't originate the hold for.
 Tasks are only ever held or released by explicit user selection — via
 ➕ Add Tasks to Hold and 🗑 Release Task(s) below — never automatically.
 
+The Held Queue viewer's "🔧 Change Revert Node" button lets a user change
+which node _process_hold_item's revert POST targets when reverting a
+takeover (_hold_tasks_revert_node, defaulting to _HT_DEFAULT_NODE —
+today's long-standing hardcoded value — same reset-on-restart behavior as
+the check interval above). New codes entered via "➕ Add New Node" persist
+to saved_hold_custom_nodes.json (load_hold_custom_nodes/save_hold_custom_nodes)
+so they're offered again later. This is independent of the hardcoded
+"VALUATION_STAMP_DUTY_VALUER_REPORT" checks in _ht_live_candidates/
+_ht_decide, which classify whether a ref is even at the guardable stage at
+all — those are unaffected by this picker.
+
 load_hold_tasks/save_hold_tasks are adapters over dlv_core's consolidated
 ref-keyed DLV-lifecycle store (Group A JSON consolidation, the last of its
 three phases) — a held ref's `hold` sub-object lives on the same record as
@@ -50,6 +61,8 @@ Call register(app) from bot.py's main() to wire this feature in.
 """
 
 import asyncio
+import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_completed
 from dataclasses import dataclass, field
@@ -75,7 +88,9 @@ from common import (
     BTN_HOLD_TASKS,
     CPARAMS_DLV,
     CRED_LABELS,
+    DATA_DIR,
     _any_valid_tokens,
+    _atomic_json_write,
     _be_cred_keyboard,
     _CANCEL_FILTER,
     _DLV_STORE_LOCK,
@@ -119,6 +134,37 @@ _HT_INTERVAL_OPTIONS = [(f"{m} min", m * 60) for m in range(1, 11)]
 # Current guard-job interval in seconds (default 1 min); changed via the Held Queue viewer
 _hold_tasks_interval: int = 60
 
+# The node _process_hold_item's revert POST sends — today's long-standing
+# hardcoded value, kept as the always-offered default. This is a separate
+# concern from the hardcoded "VALUATION_STAMP_DUTY_VALUER_REPORT" checks in
+# _ht_live_candidates/_ht_decide, which classify whether a ref is even at
+# the guardable valuer-report-pending stage at all — those stay fixed;
+# only the outgoing revert body is user-selectable.
+_HT_DEFAULT_NODE = "VALUATION_STAMP_DUTY_VALUER_REPORT"
+
+# Currently-selected revert node; resets to _HT_DEFAULT_NODE on restart,
+# same as _hold_tasks_interval above — changed via the Held Queue viewer.
+_hold_tasks_revert_node: str = _HT_DEFAULT_NODE
+
+# User-added node codes, beyond _HT_DEFAULT_NODE — feature-local to Hold
+# Tasks, so (per this codebase's convention) it lives here rather than in
+# common.py, which only hosts stores shared by ≥2 feature modules.
+SAVED_HOLD_CUSTOM_NODES_FILE = os.path.join(DATA_DIR, "saved_hold_custom_nodes.json")
+
+
+def load_hold_custom_nodes() -> List[str]:
+    # Read back every node code a user has ever added via the "add new" step.
+    try:
+        with open(SAVED_HOLD_CUSTOM_NODES_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_hold_custom_nodes(nodes: List[str]) -> None:
+    # Persist the full custom-node list so a newly-added one survives restarts.
+    _atomic_json_write(SAVED_HOLD_CUSTOM_NODES_FILE, nodes, indent=2)
+
 
 # ──────────────────────────────────────────────────────────
 # States — Hold Tasks conversation
@@ -136,6 +182,8 @@ class HT(Enum):
     PARCEL_CONFLICT_CONFIRM = auto()   # (Add + by-parcel) confirm queuing to DLV Batch when held by someone else
     VIEW_QUEUE              = auto()   # held items + interval/check-now/release buttons
     RELEASE_SELECT          = auto()   # multi-select which held refs to manually release
+    NODE_SELECT             = auto()   # pick the revert node, or add a new one
+    NODE_ADD                = auto()   # text entry for a new node code
 
 
 @dataclass
@@ -384,7 +432,7 @@ def _process_hold_item(tokens: AuthTokens, http_sess: requests.Session, item: Di
                 json={
                     "reference_number":  ref,
                     "valuation_officer": held_valuer_uid,
-                    "node":              "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                    "node":              _hold_tasks_revert_node,
                 },
                 timeout=30,
             )
@@ -558,9 +606,31 @@ def _ht_queue_keyboard(items: List[Dict], current_interval: int) -> InlineKeyboa
     ]
     rows = [[InlineKeyboardButton("▶️ Check Now", callback_data="htq:now")]]
     rows.extend(interval_buttons[i:i + 2] for i in range(0, len(interval_buttons), 2))
+    rows.append([InlineKeyboardButton("🔧 Change Revert Node", callback_data="htq:node")])
     if items:
         rows.append([InlineKeyboardButton("🗑 Release Task(s)", callback_data="htq:release")])
     rows.append([InlineKeyboardButton("❌ Close", callback_data="htq:close")])
+    return InlineKeyboardMarkup(rows)
+
+
+# Sentinel callback value for "add a new node" — distinct from any real node
+# code (which are plain UPPER_SNAKE_CASE API constants with no "__").
+_HT_NODE_ADD_SENTINEL = "ht_node:__add__"
+
+
+def _ht_node_keyboard(nodes: List[str]) -> InlineKeyboardMarkup:
+    # One button per available node (default first, then any custom-added
+    # ones), plus an "add new" escape hatch. The default is marked so it's
+    # obvious which one matches today's unchanged behavior.
+    rows = [
+        [InlineKeyboardButton(
+            f"✅ {n}" if n == _HT_DEFAULT_NODE else n,
+            callback_data=f"ht_node:{n}",
+        )]
+        for n in nodes
+    ]
+    rows.append([InlineKeyboardButton("➕ Add New Node", callback_data=_HT_NODE_ADD_SENTINEL)])
+    rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="ht_node:cancel")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1083,6 +1153,7 @@ async def _ht_show_queue(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) 
             line += f"\n  ⚠️ _{item['last_error']}_"
         lines.append(line)
     lines.append(f"\n_Current check interval: {_ht_interval_label(_hold_tasks_interval)}_")
+    lines.append(f"_Revert node: `{_hold_tasks_revert_node}`_")
 
     msg = "\n".join(lines)
     if len(msg) > 4000:
@@ -1134,6 +1205,17 @@ async def recv_ht_queue_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return HT.RELEASE_SELECT
 
+    if data == "htq:node":
+        nodes = [_HT_DEFAULT_NODE] + [n for n in load_hold_custom_nodes() if n != _HT_DEFAULT_NODE]
+        await query.edit_message_text(
+            "🔧 *Change Revert Node*\n\n"
+            "Which node should a reverted takeover be reassigned back to?\n"
+            "_The ✅ option is the current default — unchanged unless you pick otherwise._",
+            parse_mode="Markdown",
+            reply_markup=_ht_node_keyboard(nodes),
+        )
+        return HT.NODE_SELECT
+
     if data.startswith("htq:interval:"):
         try:
             new_interval = int(data.split(":")[-1])
@@ -1157,6 +1239,50 @@ async def recv_ht_queue_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return HT.VIEW_QUEUE
 
     return HT.VIEW_QUEUE
+
+
+async def recv_ht_node_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Handle a node pick, "add new", or cancel from the revert-node picker.
+    global _hold_tasks_revert_node
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "ht_node:cancel":
+        return await _ht_show_queue(query.edit_message_text, query.message.chat_id, ctx)
+
+    if query.data == _HT_NODE_ADD_SENTINEL:
+        await query.edit_message_text(
+            "✏️ Enter the new node code exactly as the system expects it, "
+            "e.g. `VALUATION_STAMP_DUTY_VALUER_REPORT`:",
+            parse_mode="Markdown",
+        )
+        return HT.NODE_ADD
+
+    _hold_tasks_revert_node = query.data.split(":", 1)[1]
+    await query.edit_message_text(
+        f"✅ Revert node set to `{_hold_tasks_revert_node}`.", parse_mode="Markdown",
+    )
+    return await _ht_show_queue(query.message.reply_text, query.message.chat_id, ctx)
+
+
+async def recv_ht_node_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Validate, persist, and select a newly-typed node code.
+    global _hold_tasks_revert_node
+    text = update.message.text.strip().upper().replace(" ", "_")
+    if not text:
+        await update.message.reply_text("❌ Please enter a node code.")
+        return HT.NODE_ADD
+
+    custom = load_hold_custom_nodes()
+    if text != _HT_DEFAULT_NODE and text not in custom:
+        custom.append(text)
+        save_hold_custom_nodes(custom)
+
+    _hold_tasks_revert_node = text
+    await update.message.reply_text(
+        f"✅ Added and set revert node to `{_hold_tasks_revert_node}`.", parse_mode="Markdown",
+    )
+    return await _ht_show_queue(update.message.reply_text, update.message.chat_id, ctx)
 
 
 async def recv_ht_release_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1241,6 +1367,8 @@ def register(app: Application) -> None:
                 CallbackQueryHandler(recv_ht_release_toggle,  pattern=r"^ht_reltoggle:"),
                 CallbackQueryHandler(recv_ht_release_confirm, pattern=r"^ht_relconfirm$|^ht_relcancel$"),
             ],
+            HT.NODE_SELECT:        [CallbackQueryHandler(recv_ht_node_select, pattern=r"^ht_node:")],
+            HT.NODE_ADD:           [MessageHandler(not_cancel, recv_ht_node_add)],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),

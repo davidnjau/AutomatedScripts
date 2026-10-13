@@ -3,7 +3,8 @@
 Unit tests for hold_tasks.py — the persisted hold queue, the two candidate
 sources (tracked assignments / live DLV query), the pure guard decision
 (_ht_decide), the per-ref background check (_process_hold_item), the
-repeating job's broadcast condition, and the conversation handlers.
+repeating job's broadcast condition, the revert-node picker
+(recv_ht_node_select/recv_ht_node_add), and the conversation handlers.
 
 Run with: python3 -m unittest discover -s assign/tests -v
 """
@@ -263,7 +264,8 @@ class TestProcessHoldItem(unittest.TestCase):
              patch.object(ht, "_fetch_ref_detail_dlv", return_value=detail), \
              patch.object(ht, "_classify_dlv_detail", return_value={
                  "bucket": "open", "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
-             }):
+             }), \
+             patch.object(ht, "_hold_tasks_revert_node", ht._HT_DEFAULT_NODE):
             result = self._run_item()
         self.assertTrue(result["keep"])
         self.assertIn("taken over by *John Roe*", result["line"])
@@ -273,8 +275,23 @@ class TestProcessHoldItem(unittest.TestCase):
         self.assertEqual(kwargs["json"], {
             "reference_number":  "REG/TSFR/ABC123",
             "valuation_officer": "uid-1",
-            "node":              "VALUATION_STAMP_DUTY_VALUER_REPORT",
+            "node":              ht._HT_DEFAULT_NODE,
         })
+
+    def test_takeover_uses_custom_revert_node(self):
+        """Regression: the revert POST must send whatever node the user has
+        picked via "🔧 Change Revert Node", not a hardcoded literal."""
+        detail = {"actors": [{"role": "VALUATION OFFICER", "user_details": {"id": "uid-2", "names": "John Roe"}}]}
+        self.http_sess.post.return_value = MagicMock(raise_for_status=lambda: None)
+        with patch.object(ht, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(ht, "_fetch_ref_detail_dlv", return_value=detail), \
+             patch.object(ht, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
+             }), \
+             patch.object(ht, "_hold_tasks_revert_node", "CUSTOM_NODE_CODE"):
+            self._run_item()
+        _, kwargs = self.http_sess.post.call_args
+        self.assertEqual(kwargs["json"]["node"], "CUSTOM_NODE_CODE")
 
     def test_search_exception_is_kept_for_retry(self):
         with patch.object(ht, "_search_ref_dlv", side_effect=RuntimeError("boom")):
@@ -868,6 +885,85 @@ class TestRecvHtQueueAction(unittest.TestCase):
         ctx = MagicMock()
         result = _run(ht.recv_ht_queue_action(update, ctx))
         self.assertEqual(result, ht.ConversationHandler.END)
+
+    def test_node_action_shows_picker(self):
+        update = _make_update_with_callback("htq:node")
+        ctx = MagicMock()
+        with patch.object(ht, "load_hold_custom_nodes", return_value=[]):
+            result = _run(ht.recv_ht_queue_action(update, ctx))
+        self.assertEqual(result, ht.HT.NODE_SELECT)
+
+
+class TestRecvHtNodeSelect(unittest.TestCase):
+    def test_picking_a_node_sets_it_and_returns_to_queue(self):
+        update = _make_update_with_callback("ht_node:VALUATION_STAMP_DUTY_VALUER_REPORT")
+        ctx = MagicMock()
+        with patch.object(ht, "load_hold_tasks", return_value=[{"ref": "X", "held_valuer_name": "Jane"}]), \
+             patch.object(ht, "_hold_tasks_revert_node", ht._HT_DEFAULT_NODE):
+            result = _run(ht.recv_ht_node_select(update, ctx))
+            self.assertEqual(ht._hold_tasks_revert_node, "VALUATION_STAMP_DUTY_VALUER_REPORT")
+        self.assertEqual(result, ht.HT.VIEW_QUEUE)
+
+    def test_picking_a_custom_node_sets_it(self):
+        update = _make_update_with_callback("ht_node:CUSTOM_NODE_CODE")
+        ctx = MagicMock()
+        with patch.object(ht, "load_hold_tasks", return_value=[{"ref": "X", "held_valuer_name": "Jane"}]), \
+             patch.object(ht, "_hold_tasks_revert_node", ht._HT_DEFAULT_NODE):
+            _run(ht.recv_ht_node_select(update, ctx))
+            self.assertEqual(ht._hold_tasks_revert_node, "CUSTOM_NODE_CODE")
+
+    def test_add_new_sentinel_asks_for_text_entry(self):
+        update = _make_update_with_callback(ht._HT_NODE_ADD_SENTINEL)
+        ctx = MagicMock()
+        result = _run(ht.recv_ht_node_select(update, ctx))
+        self.assertEqual(result, ht.HT.NODE_ADD)
+
+    def test_cancel_returns_to_queue_without_changing_node(self):
+        update = _make_update_with_callback("ht_node:cancel")
+        ctx = MagicMock()
+        with patch.object(ht, "load_hold_tasks", return_value=[{"ref": "X", "held_valuer_name": "Jane"}]), \
+             patch.object(ht, "_hold_tasks_revert_node", "UNCHANGED_NODE"):
+            result = _run(ht.recv_ht_node_select(update, ctx))
+            self.assertEqual(ht._hold_tasks_revert_node, "UNCHANGED_NODE")
+        self.assertEqual(result, ht.HT.VIEW_QUEUE)
+
+
+class TestRecvHtNodeAdd(unittest.TestCase):
+    def test_valid_text_persists_and_selects_node(self):
+        update = _make_update_with_message("my new node")
+        ctx = MagicMock()
+        with patch.object(ht, "load_hold_custom_nodes", return_value=[]), \
+             patch.object(ht, "save_hold_custom_nodes") as mock_save, \
+             patch.object(ht, "load_hold_tasks", return_value=[{"ref": "X", "held_valuer_name": "Jane"}]), \
+             patch.object(ht, "_hold_tasks_revert_node", ht._HT_DEFAULT_NODE):
+            result = _run(ht.recv_ht_node_add(update, ctx))
+            self.assertEqual(ht._hold_tasks_revert_node, "MY_NEW_NODE")
+        self.assertEqual(result, ht.HT.VIEW_QUEUE)
+        mock_save.assert_called_once_with(["MY_NEW_NODE"])
+
+    def test_already_saved_node_is_not_duplicated(self):
+        update = _make_update_with_message("EXISTING_NODE")
+        ctx = MagicMock()
+        with patch.object(ht, "load_hold_custom_nodes", return_value=["EXISTING_NODE"]), \
+             patch.object(ht, "save_hold_custom_nodes") as mock_save, \
+             patch.object(ht, "load_hold_tasks", return_value=[{"ref": "X", "held_valuer_name": "Jane"}]):
+            _run(ht.recv_ht_node_add(update, ctx))
+        mock_save.assert_not_called()
+
+    def test_default_node_is_not_persisted_to_custom_list(self):
+        update = _make_update_with_message(ht._HT_DEFAULT_NODE)
+        ctx = MagicMock()
+        with patch.object(ht, "load_hold_custom_nodes", return_value=[]), \
+             patch.object(ht, "save_hold_custom_nodes") as mock_save, \
+             patch.object(ht, "load_hold_tasks", return_value=[{"ref": "X", "held_valuer_name": "Jane"}]):
+            _run(ht.recv_ht_node_add(update, ctx))
+        mock_save.assert_not_called()
+
+    def test_empty_text_reprompts(self):
+        update = _make_update_with_message("   ")
+        ctx = MagicMock()
+        result = _run(ht.recv_ht_node_add(update, ctx))
+        self.assertEqual(result, ht.HT.NODE_ADD)
 
 
 class TestRecvHtReleaseConfirm(unittest.TestCase):
