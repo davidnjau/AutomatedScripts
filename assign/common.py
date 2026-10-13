@@ -620,6 +620,7 @@ BTN_TASK_ANALYTICS = "📈 Task Analytics"
 BTN_CLEAR_CHAT    = "🧹 Clear Chat"
 BTN_QUEUE_INTERVAL = "⏱ Queue Check Interval"
 BTN_STALE_THRESHOLD = "⏳ Stale Pending Threshold"
+BTN_BULK_FIELD_UPDATE = "🛠 Bulk Field Update"
 
 # Category buttons — the main menu shows only these six (plus Cancel);
 # tapping one opens that category's own submenu of workflow buttons (see
@@ -681,7 +682,7 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
             "📋 *Assignments*\n\n"
             "Assign, queue, and distribute stamp-duty valuation tasks to valuers."
         ),
-        "buttons": [BTN_ASSIGN, BTN_DLV_BATCH, BTN_DLV_TASKS, BTN_HOLD_TASKS, BTN_JOB_DIST],
+        "buttons": [BTN_ASSIGN, BTN_DLV_BATCH, BTN_DLV_TASKS, BTN_HOLD_TASKS, BTN_JOB_DIST, BTN_BULK_FIELD_UPDATE],
     },
     BTN_CAT_AUTOMATION: {
         "description": (

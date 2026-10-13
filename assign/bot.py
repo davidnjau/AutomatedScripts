@@ -86,6 +86,7 @@ import dlv_tasks
 import hold_tasks
 import morning_briefing
 import apartments
+import bulk_field_update
 import custom_exclusions
 import fetch_tasks
 import job_distribution
@@ -807,6 +808,7 @@ def main():
     dlv_incremental.register(app)
     dlv_report_schedule.register(app)
     dlv_stale_check.register(app)
+    bulk_field_update.register(app)
 
     # Button handlers outside an active conversation
     # (bare BTN_AUTH handler registered via refresh_auth.register(app) above)
