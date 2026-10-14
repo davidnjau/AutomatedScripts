@@ -38,13 +38,33 @@ read-only features.
 No already-assigned/reassign-check — this is a direct bulk-update tool,
 deliberately simpler than New Assignment's guarded assign flow.
 
+Every successful update is logged to saved_bfu_history.json
+(load_bfu_history/append_bfu_history) — reference_number plus the
+valuer/application_status/node triple before and after the change, even
+though a single run only ever updates one of the three. The "before"
+values come from a live lookup (_bfu_fetch_snapshot/_bfu_fetch_snapshots,
+built on dlv_core._search_ref_dlv/_fetch_ref_detail_dlv, the same
+detail-view endpoint hold_tasks.py already uses) run in parallel right
+after Confirm, before the update loop — "after" is just that same
+snapshot with whichever one field changed replaced by the newly-written
+value, so there's no need to look the ref up again post-write. A failed
+lookup for one ref yields an empty snapshot rather than failing the run;
+history is only appended for refs the update itself actually succeeded
+on. _bfu_history_notify_job sends the full history (not just new entries)
+to every ADMIN_IDS admin, daily at 04:00 UTC / 7 AM EAT (same slot
+morning_briefing.py uses), scheduled unconditionally in register() — no
+enable/disable config, unlike Morning Briefing.
+
 Call register(app) from bot.py's main() to wire this feature in.
 """
 
+import asyncio
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_completed
 from dataclasses import dataclass, field
+from datetime import datetime, time as _dtime, timezone
 from enum import Enum, auto
 from typing import Dict, List, Optional
 
@@ -67,6 +87,7 @@ from telegram.ext import (
 
 from ardhisasa_auth import AuthTokens, build_session
 from common import (
+    ADMIN_IDS,
     BTN_BULK_FIELD_UPDATE,
     CRED_LABELS,
     CRED_MAP,
@@ -90,12 +111,14 @@ from common import (
     persist_tokens,
     persist_valuer,
 )
+from dlv_core import _fetch_ref_detail_dlv, _search_ref_dlv
 from endpoints import (
     ACCOUNTS_LIST_URL,
     AUTH_LOGIN_URL,
     AUTH_OTP_VERIFY_URL,
     STAMP_DUTY_FIX_APPLICATION_URL,
 )
+from task_block import format_labeled_block
 from telegram_report import _send_chunked_report
 
 # Human-facing labels for the three updatable fields, in picker display order.
@@ -149,6 +172,29 @@ def load_bfu_custom_nodes() -> List[str]:
 def save_bfu_custom_nodes(values: List[str]) -> None:
     # Persist the full custom node list so new entries survive restarts.
     _atomic_json_write(SAVED_BFU_CUSTOM_NODES_FILE, values, indent=2)
+
+
+# Audit log of every successful update — append-only, unbounded retention
+# (same as saved_dlv_closed.json). Each entry: {reference_number,
+# initial_valuer, initial_application_status, initial_node, new_valuer,
+# new_application_status, new_node, recorded_at}.
+SAVED_BFU_HISTORY_FILE = os.path.join(DATA_DIR, "saved_bfu_history.json")
+
+
+def load_bfu_history() -> List[Dict]:
+    # Read back every Bulk Field Update record ever logged.
+    try:
+        with open(SAVED_BFU_HISTORY_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def append_bfu_history(entries: List[Dict]) -> None:
+    # Append new audit-log rows — never removes or rewrites existing ones.
+    history = load_bfu_history()
+    history.extend(entries)
+    _atomic_json_write(SAVED_BFU_HISTORY_FILE, history, indent=2)
 
 
 # ──────────────────────────────────────────────────────────
@@ -244,6 +290,52 @@ def _bfu_confirm_text(sess: BFUSession, display_value: str) -> str:
         f"*References ({len(sess.refs)}):*\n{refs_list}\n\n"
         f"Proceed?"
     )
+
+
+# ──────────────────────────────────────────────────────────
+# "Before" snapshot — live lookup run just ahead of the update loop
+# ──────────────────────────────────────────────────────────
+
+def _bfu_fetch_snapshot(tokens: AuthTokens, ref: str) -> Dict:
+    """Best-effort live lookup of a ref's current valuer/application_status/
+    node, for the history log's "before" columns. Returns {} on any
+    not-found/error — a missing snapshot just means those history fields
+    come back None, it never blocks the update itself."""
+    try:
+        task = _search_ref_dlv(tokens, ref)
+        if not task:
+            return {}
+        detail = _fetch_ref_detail_dlv(tokens, task["id"])
+        if not detail:
+            return {}
+        actors = detail.get("actors") or []
+        vo = next((a for a in actors if a.get("role") == "VALUATION OFFICER"), None)
+        valuer_name = (vo.get("user_details") or {}).get("names", "") if vo else ""
+        return {
+            "valuer":             valuer_name,
+            "application_status": detail.get("application_status", ""),
+            "node":               detail.get("node", ""),
+        }
+    except Exception as e:
+        logger.warning("Bulk Field Update: snapshot lookup failed for %s: %s", ref, e)
+        return {}
+
+
+def _bfu_fetch_snapshots(tokens: AuthTokens, refs: List[str]) -> Dict[str, Dict]:
+    # Run _bfu_fetch_snapshot for every ref in parallel (same worker-pool
+    # shape as new_assignment.py's _post_assignment_report).
+    snapshots: Dict[str, Dict] = {}
+    workers = min(len(refs), 10)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        fut_map = {pool.submit(_bfu_fetch_snapshot, tokens, ref): ref for ref in refs}
+        for fut in _futures_as_completed(fut_map):
+            ref = fut_map[fut]
+            try:
+                snapshots[ref] = fut.result()
+            except Exception as e:
+                logger.warning("Bulk Field Update: snapshot future failed for %s: %s", ref, e)
+                snapshots[ref] = {}
+    return snapshots
 
 
 # ──────────────────────────────────────────────────────────
@@ -690,6 +782,12 @@ async def recv_bfu_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         value = sess.value
 
     await query.edit_message_text(
+        f"⚙️ Fetching current state for {len(sess.refs)} reference(s)…",
+        parse_mode="Markdown",
+    )
+    snapshots = await asyncio.to_thread(_bfu_fetch_snapshots, sess.tokens, sess.refs)
+
+    await query.message.reply_text(
         f"⚙️ Updating *{_BFU_FIELD_LABELS[sess.update_field]}* on {len(sess.refs)} reference(s)…",
         parse_mode="Markdown",
     )
@@ -701,6 +799,7 @@ async def recv_bfu_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ok_refs, fail_refs = [], []
     result_lines = []
+    history_entries = []
     for ref in sess.refs:
         try:
             body = {"reference_number": ref, sess.update_field: value}
@@ -708,10 +807,32 @@ async def recv_bfu_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             r.raise_for_status()
             ok_refs.append(ref)
             result_lines.append(f"✅ `{ref}`")
+
+            snap = snapshots.get(ref, {})
+            entry = {
+                "reference_number":           ref,
+                "initial_valuer":              snap.get("valuer") or None,
+                "initial_application_status":  snap.get("application_status") or None,
+                "initial_node":                snap.get("node") or None,
+                "new_valuer":                  snap.get("valuer") or None,
+                "new_application_status":      snap.get("application_status") or None,
+                "new_node":                    snap.get("node") or None,
+                "recorded_at":                 datetime.now().isoformat(timespec="seconds"),
+            }
+            if sess.update_field == "valuation_officer":
+                entry["new_valuer"] = name
+            elif sess.update_field == "application_status":
+                entry["new_application_status"] = value
+            else:
+                entry["new_node"] = value
+            history_entries.append(entry)
         except Exception as e:
             logger.error("Bulk field update failed for %s (%s): %s", ref, sess.update_field, e)
             fail_refs.append(ref)
             result_lines.append(f"❌ `{ref}` — {_safe_err(e)}")
+
+    if history_entries:
+        append_bfu_history(history_entries)
 
     if ok_refs and sess.update_field == "valuation_officer":
         persist_valuer(name, uid, acct)   # auto-save valuer for future assignments
@@ -744,11 +865,61 @@ async def recv_bfu_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────
+# Daily admin digest — the full history, every day, no dedup
+# ──────────────────────────────────────────────────────────
+
+def _bfu_history_fields(entry: Dict) -> List:
+    # The before→after lines shown for one history entry, in display order.
+    return [
+        ("👤 Valuer (before → after)",  f"{entry.get('initial_valuer') or '—'} → {entry.get('new_valuer') or '—'}"),
+        ("📶 Status (before → after)",  f"{entry.get('initial_application_status') or '—'} → {entry.get('new_application_status') or '—'}"),
+        ("🔗 Node (before → after)",    f"{entry.get('initial_node') or '—'} → {entry.get('new_node') or '—'}"),
+        ("🕐 Recorded",                 entry.get("recorded_at") or "—"),
+    ]
+
+
+async def _bfu_history_notify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """PTB daily job: send the full Bulk Field Update history to every
+    admin, every day — not just what's new since yesterday (per the
+    chosen digest scope). Sends even when history is empty, same "always
+    fires" precedent as morning_briefing.py's daily job."""
+    history = load_bfu_history()
+    if not history:
+        lines = ["🛠 *Bulk Field Update — Daily Record*\n\nNo records yet."]
+    else:
+        lines = [f"🛠 *Bulk Field Update — Daily Record* ({len(history)} total)\n"]
+        for i, entry in enumerate(history, start=1):
+            lines.append(format_labeled_block(i, entry.get("reference_number", "?"), _bfu_history_fields(entry)))
+
+    for admin_id in ADMIN_IDS:
+        async def _send(text, reply_markup, _admin_id=admin_id):
+            try:
+                await context.bot.send_message(_admin_id, text, parse_mode="Markdown", reply_markup=reply_markup)
+            except Exception as e:
+                logger.warning("Bulk Field Update history notify error for %s: %s", _admin_id, e)
+        await _send_chunked_report(_send, lines, join="\n\n")
+
+
+def _schedule_bfu_history_notify(job_queue) -> None:
+    # Always-on daily job — no enable/disable config, unlike Morning Briefing.
+    for job in job_queue.get_jobs_by_name("bfu_history_notify_job"):
+        job.schedule_removal()
+    job_queue.run_daily(
+        _bfu_history_notify_job,
+        time=_dtime(4, 0, tzinfo=timezone.utc),
+        name="bfu_history_notify_job",
+    )
+
+
+# ──────────────────────────────────────────────────────────
 # Registration
 # ──────────────────────────────────────────────────────────
 
 def register(app: Application) -> None:
-    """Wire the Bulk Field Update conversation into the given Application."""
+    """Wire the Bulk Field Update conversation into the given Application,
+    and schedule the daily admin history digest (always on, no config)."""
+    _schedule_bfu_history_notify(app.job_queue)
+
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("bulkupdate", cmd_bulk_field_update),

@@ -362,7 +362,9 @@ class TestRecvBfuConfirm(unittest.TestCase):
         sess.session.post.return_value = MagicMock(raise_for_status=lambda: None)
         ctx.user_data = {"bfu_session": sess}
         with patch.object(bfu, "persist_assignment") as mock_persist, \
-             patch.object(bfu, "persist_valuer") as mock_persist_valuer:
+             patch.object(bfu, "persist_valuer") as mock_persist_valuer, \
+             patch.object(bfu, "_bfu_fetch_snapshots", return_value={}), \
+             patch.object(bfu, "append_bfu_history") as mock_append:
             result = _run(bfu.recv_bfu_confirm(update, ctx))
         self.assertEqual(result, bfu.ConversationHandler.END)
         call_args = sess.session.post.call_args
@@ -373,6 +375,7 @@ class TestRecvBfuConfirm(unittest.TestCase):
         )
         mock_persist.assert_not_called()
         mock_persist_valuer.assert_not_called()
+        mock_append.assert_called_once()
 
     def test_application_status_update_sends_correct_body(self):
         update = _make_update_with_callback("bfu_confirm:yes")
@@ -383,7 +386,9 @@ class TestRecvBfuConfirm(unittest.TestCase):
         sess.session = MagicMock()
         sess.session.post.return_value = MagicMock(raise_for_status=lambda: None)
         ctx.user_data = {"bfu_session": sess}
-        with patch.object(bfu, "persist_assignment"), patch.object(bfu, "persist_valuer"):
+        with patch.object(bfu, "persist_assignment"), patch.object(bfu, "persist_valuer"), \
+             patch.object(bfu, "_bfu_fetch_snapshots", return_value={}), \
+             patch.object(bfu, "append_bfu_history"):
             _run(bfu.recv_bfu_confirm(update, ctx))
         bodies = [c.kwargs["json"] for c in sess.session.post.call_args_list]
         self.assertEqual(bodies, [
@@ -402,7 +407,9 @@ class TestRecvBfuConfirm(unittest.TestCase):
         sess.session.post.return_value = MagicMock(raise_for_status=lambda: None)
         ctx.user_data = {"bfu_session": sess}
         with patch.object(bfu, "persist_valuer") as mock_persist_valuer, \
-             patch.object(bfu, "persist_assignment") as mock_persist_assignment:
+             patch.object(bfu, "persist_assignment") as mock_persist_assignment, \
+             patch.object(bfu, "_bfu_fetch_snapshots", return_value={}), \
+             patch.object(bfu, "append_bfu_history"):
             _run(bfu.recv_bfu_confirm(update, ctx))
         call_args = sess.session.post.call_args
         self.assertEqual(
@@ -425,12 +432,222 @@ class TestRecvBfuConfirm(unittest.TestCase):
         sess.session.post.side_effect = RuntimeError("boom")
         ctx.user_data = {"bfu_session": sess}
         with patch.object(bfu, "persist_valuer") as mock_persist_valuer, \
-             patch.object(bfu, "persist_assignment") as mock_persist_assignment:
+             patch.object(bfu, "persist_assignment") as mock_persist_assignment, \
+             patch.object(bfu, "_bfu_fetch_snapshots", return_value={}), \
+             patch.object(bfu, "append_bfu_history") as mock_append:
             _run(bfu.recv_bfu_confirm(update, ctx))
         mock_persist_valuer.assert_not_called()
         mock_persist_assignment.assert_not_called()
+        mock_append.assert_not_called()
         sent_texts = [c.args[0] for c in update.callback_query.message.reply_text.call_args_list]
         self.assertTrue(any("boom" in t or "Failed" in t or "1 / 1" in t for t in sent_texts))
+
+    def test_history_entry_captures_before_and_after_for_node_update(self):
+        update = _make_update_with_callback("bfu_confirm:yes")
+        ctx = MagicMock()
+        sess = bfu.BFUSession(
+            refs=["R1"], tokens=TOKENS, update_field="node", value="VALUATION_STAMP_DUTY_COMPLETED",
+        )
+        sess.session = MagicMock()
+        sess.session.post.return_value = MagicMock(raise_for_status=lambda: None)
+        ctx.user_data = {"bfu_session": sess}
+        snapshot = {"R1": {"valuer": "Jane Doe", "application_status": "ONGOING", "node": "VALUATION_STAMP_DUTY_VALUER_REPORT"}}
+        with patch.object(bfu, "_bfu_fetch_snapshots", return_value=snapshot), \
+             patch.object(bfu, "append_bfu_history") as mock_append:
+            _run(bfu.recv_bfu_confirm(update, ctx))
+        entries = mock_append.call_args[0][0]
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["reference_number"], "R1")
+        self.assertEqual(entry["initial_valuer"], "Jane Doe")
+        self.assertEqual(entry["new_valuer"], "Jane Doe")
+        self.assertEqual(entry["initial_application_status"], "ONGOING")
+        self.assertEqual(entry["new_application_status"], "ONGOING")
+        self.assertEqual(entry["initial_node"], "VALUATION_STAMP_DUTY_VALUER_REPORT")
+        self.assertEqual(entry["new_node"], "VALUATION_STAMP_DUTY_COMPLETED")
+        self.assertIn("recorded_at", entry)
+
+    def test_history_entry_captures_before_and_after_for_valuer_update(self):
+        update = _make_update_with_callback("bfu_confirm:yes")
+        ctx = MagicMock()
+        sess = bfu.BFUSession(
+            refs=["R1"], tokens=TOKENS, update_field="valuation_officer",
+            saved_valuer={"name": "John Roe", "uid": "2", "account_number": "A2"},
+        )
+        sess.session = MagicMock()
+        sess.session.post.return_value = MagicMock(raise_for_status=lambda: None)
+        ctx.user_data = {"bfu_session": sess}
+        snapshot = {"R1": {"valuer": "Jane Doe", "application_status": "ONGOING", "node": "VALUATION_STAMP_DUTY_VALUER_REPORT"}}
+        with patch.object(bfu, "persist_valuer"), patch.object(bfu, "persist_assignment"), \
+             patch.object(bfu, "_bfu_fetch_snapshots", return_value=snapshot), \
+             patch.object(bfu, "append_bfu_history") as mock_append:
+            _run(bfu.recv_bfu_confirm(update, ctx))
+        entry = mock_append.call_args[0][0][0]
+        self.assertEqual(entry["initial_valuer"], "Jane Doe")
+        self.assertEqual(entry["new_valuer"], "John Roe")
+        self.assertEqual(entry["initial_node"], "VALUATION_STAMP_DUTY_VALUER_REPORT")
+        self.assertEqual(entry["new_node"], "VALUATION_STAMP_DUTY_VALUER_REPORT")
+
+    def test_missing_snapshot_yields_none_initial_fields(self):
+        update = _make_update_with_callback("bfu_confirm:yes")
+        ctx = MagicMock()
+        sess = bfu.BFUSession(
+            refs=["R1"], tokens=TOKENS, update_field="node", value="VALUATION_STAMP_DUTY_COMPLETED",
+        )
+        sess.session = MagicMock()
+        sess.session.post.return_value = MagicMock(raise_for_status=lambda: None)
+        ctx.user_data = {"bfu_session": sess}
+        with patch.object(bfu, "_bfu_fetch_snapshots", return_value={}), \
+             patch.object(bfu, "append_bfu_history") as mock_append:
+            _run(bfu.recv_bfu_confirm(update, ctx))
+        entry = mock_append.call_args[0][0][0]
+        self.assertIsNone(entry["initial_valuer"])
+        self.assertIsNone(entry["initial_application_status"])
+        self.assertIsNone(entry["initial_node"])
+        self.assertEqual(entry["new_node"], "VALUATION_STAMP_DUTY_COMPLETED")
+
+    def test_no_history_appended_when_all_refs_fail(self):
+        update = _make_update_with_callback("bfu_confirm:yes")
+        ctx = MagicMock()
+        sess = bfu.BFUSession(
+            refs=["R1"], tokens=TOKENS, update_field="node", value="VALUATION_STAMP_DUTY_COMPLETED",
+        )
+        sess.session = MagicMock()
+        sess.session.post.side_effect = RuntimeError("boom")
+        ctx.user_data = {"bfu_session": sess}
+        with patch.object(bfu, "_bfu_fetch_snapshots", return_value={}), \
+             patch.object(bfu, "append_bfu_history") as mock_append:
+            _run(bfu.recv_bfu_confirm(update, ctx))
+        mock_append.assert_not_called()
+
+
+class TestBfuFetchSnapshot(unittest.TestCase):
+    def test_ref_not_found_returns_empty_dict(self):
+        with patch.object(bfu, "_search_ref_dlv", return_value=None):
+            self.assertEqual(bfu._bfu_fetch_snapshot(TOKENS, "R1"), {})
+
+    def test_empty_detail_returns_empty_dict(self):
+        with patch.object(bfu, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(bfu, "_fetch_ref_detail_dlv", return_value=None):
+            self.assertEqual(bfu._bfu_fetch_snapshot(TOKENS, "R1"), {})
+
+    def test_search_exception_returns_empty_dict(self):
+        with patch.object(bfu, "_search_ref_dlv", side_effect=RuntimeError("boom")):
+            self.assertEqual(bfu._bfu_fetch_snapshot(TOKENS, "R1"), {})
+
+    def test_found_detail_extracts_valuer_status_node(self):
+        detail = {
+            "application_status": "ONGOING",
+            "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
+            "actors": [
+                {"role": "ASSESSOR_OF_STAMP_DUTY", "user_details": {"names": "Some Assessor"}},
+                {"role": "VALUATION OFFICER", "user_details": {"names": "Jane Doe"}},
+            ],
+        }
+        with patch.object(bfu, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(bfu, "_fetch_ref_detail_dlv", return_value=detail):
+            snap = bfu._bfu_fetch_snapshot(TOKENS, "R1")
+        self.assertEqual(snap, {
+            "valuer": "Jane Doe", "application_status": "ONGOING", "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
+        })
+
+    def test_no_valuation_officer_actor_yields_empty_valuer(self):
+        detail = {
+            "application_status": "ONGOING", "node": "VALUATION_STAMP_DUTY_CREATED",
+            "actors": [{"role": "ASSESSOR_OF_STAMP_DUTY", "user_details": {"names": "Some Assessor"}}],
+        }
+        with patch.object(bfu, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(bfu, "_fetch_ref_detail_dlv", return_value=detail):
+            snap = bfu._bfu_fetch_snapshot(TOKENS, "R1")
+        self.assertEqual(snap["valuer"], "")
+
+
+class TestBfuFetchSnapshots(unittest.TestCase):
+    def test_returns_one_entry_per_ref(self):
+        def fake_snapshot(tokens, ref):
+            return {"valuer": f"Valuer-{ref}", "application_status": "ONGOING", "node": "N"}
+        with patch.object(bfu, "_bfu_fetch_snapshot", side_effect=fake_snapshot):
+            snapshots = bfu._bfu_fetch_snapshots(TOKENS, ["R1", "R2"])
+        self.assertEqual(snapshots["R1"]["valuer"], "Valuer-R1")
+        self.assertEqual(snapshots["R2"]["valuer"], "Valuer-R2")
+
+    def test_one_ref_exception_does_not_affect_others(self):
+        def fake_snapshot(tokens, ref):
+            if ref == "R1":
+                raise RuntimeError("boom")
+            return {"valuer": "OK", "application_status": "ONGOING", "node": "N"}
+        with patch.object(bfu, "_bfu_fetch_snapshot", side_effect=fake_snapshot):
+            snapshots = bfu._bfu_fetch_snapshots(TOKENS, ["R1", "R2"])
+        self.assertEqual(snapshots["R1"], {})
+        self.assertEqual(snapshots["R2"]["valuer"], "OK")
+
+
+class TestBfuHistoryPersistence(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.data_file = os.path.join(self.tmpdir.name, "saved_bfu_history.json")
+        self._patch = patch.object(bfu, "SAVED_BFU_HISTORY_FILE", self.data_file)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self.tmpdir.cleanup()
+
+    def test_load_missing_file_returns_empty_list(self):
+        self.assertEqual(bfu.load_bfu_history(), [])
+
+    def test_append_then_load_roundtrip(self):
+        bfu.append_bfu_history([{"reference_number": "R1"}])
+        self.assertEqual(bfu.load_bfu_history(), [{"reference_number": "R1"}])
+
+    def test_append_does_not_overwrite_existing_entries(self):
+        bfu.append_bfu_history([{"reference_number": "R1"}])
+        bfu.append_bfu_history([{"reference_number": "R2"}])
+        self.assertEqual(
+            bfu.load_bfu_history(),
+            [{"reference_number": "R1"}, {"reference_number": "R2"}],
+        )
+
+
+class TestBfuHistoryNotifyJob(unittest.TestCase):
+    def setUp(self):
+        self.ctx = MagicMock()
+        self.ctx.bot.send_message = AsyncMock()
+
+    def test_empty_history_still_sends_one_message(self):
+        with patch.object(bfu, "load_bfu_history", return_value=[]), \
+             patch.object(bfu, "ADMIN_IDS", {111}):
+            _run(bfu._bfu_history_notify_job(self.ctx))
+        self.assertEqual(self.ctx.bot.send_message.call_count, 1)
+        text = self.ctx.bot.send_message.call_args[0][1]
+        self.assertIn("No records yet", text)
+
+    def test_sends_to_every_admin_independently(self):
+        history = [{
+            "reference_number": "R1", "initial_valuer": "Jane", "new_valuer": "John",
+            "initial_application_status": "ONGOING", "new_application_status": "ONGOING",
+            "initial_node": "N1", "new_node": "N2", "recorded_at": "2026-01-01T00:00:00",
+        }]
+        with patch.object(bfu, "load_bfu_history", return_value=history), \
+             patch.object(bfu, "ADMIN_IDS", {111, 222}):
+            _run(bfu._bfu_history_notify_job(self.ctx))
+        self.assertEqual(self.ctx.bot.send_message.call_count, 2)
+        sent_ids = {c.args[0] for c in self.ctx.bot.send_message.call_args_list}
+        self.assertEqual(sent_ids, {111, 222})
+        text = self.ctx.bot.send_message.call_args_list[0].args[1]
+        self.assertIn("R1", text)
+        self.assertIn("Jane", text)
+        self.assertIn("John", text)
+
+    def test_one_admin_failure_does_not_block_the_other(self):
+        async def flaky_send(chat_id, *args, **kwargs):
+            if chat_id == 111:
+                raise RuntimeError("blocked the bot")
+        self.ctx.bot.send_message = AsyncMock(side_effect=flaky_send)
+        with patch.object(bfu, "load_bfu_history", return_value=[{"reference_number": "R1"}]), \
+             patch.object(bfu, "ADMIN_IDS", {111, 222}):
+            _run(bfu._bfu_history_notify_job(self.ctx))
+        self.assertEqual(self.ctx.bot.send_message.call_count, 2)
 
 
 if __name__ == "__main__":
