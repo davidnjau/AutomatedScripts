@@ -96,6 +96,16 @@ class TestParcelWatchPersistence(unittest.TestCase):
         self.assertIsNone(watch["valuer"])
         self.assertFalse(watch["hold"])
 
+    def test_add_with_exclude_ref_persists_it(self):
+        watch_id = pw.add_parcel_watch(555, "NBI/BLOCK1/123", 30, "", exclude_ref="REG/TSFR/ABC123")
+        watch = pw.get_parcel_watch(watch_id)
+        self.assertEqual(watch["exclude_ref"], "REG/TSFR/ABC123")
+
+    def test_add_without_exclude_ref_defaults_to_empty(self):
+        watch_id = pw.add_parcel_watch(555, "NBI/BLOCK1/123", 30, "")
+        watch = pw.get_parcel_watch(watch_id)
+        self.assertEqual(watch["exclude_ref"], "")
+
     def test_get_parcel_watch_finds_by_id(self):
         watch_id = pw.add_parcel_watch(555, "P1", 15, "")
         watch = pw.get_parcel_watch(watch_id)
@@ -157,16 +167,16 @@ class TestRecvPwParcel(unittest.TestCase):
         with patch.object(pw, "allowed", return_value=True), \
              patch.object(pw, "get_valid_tokens", side_effect=_tokens):
             result = _run(pw.recv_pw_parcel(update, ctx))
-        self.assertEqual(result, pw.PW.INTERVAL)
+        self.assertEqual(result, pw.PW.EXCLUDE_REF)
 
-    def test_valid_parcel_stores_and_asks_interval(self):
+    def test_valid_parcel_stores_and_asks_exclude_ref(self):
         update = _make_update_with_message("NBI/BLOCK1/123")
         ctx = MagicMock()
         ctx.user_data = {}
         with patch.object(pw, "allowed", return_value=True), \
              patch.object(pw, "get_valid_tokens", return_value=TOKENS):
             result = _run(pw.recv_pw_parcel(update, ctx))
-        self.assertEqual(result, pw.PW.INTERVAL)
+        self.assertEqual(result, pw.PW.EXCLUDE_REF)
         sess = pw._get_pw_sess(ctx)
         self.assertEqual(sess.parcel, "NBI/BLOCK1/123")
         self.assertEqual(sess.parcels, [])
@@ -192,6 +202,33 @@ class TestRecvPwParcel(unittest.TestCase):
         sess = pw._get_pw_sess(ctx)
         self.assertEqual(sess.parcel, "")
         self.assertEqual(sess.parcels, ["P1", "P2"])
+
+
+class TestRecvPwExcludeRef(unittest.TestCase):
+    """The scenario this exists for: a wrong reference is still on a
+    valuer's desk for this parcel and about to be cancelled — ignore it
+    so the watch waits for a genuinely new reference instead of firing
+    on the one already known about."""
+
+    def test_typed_ref_is_stored_uppercased_and_asks_interval(self):
+        update = _make_update_with_message("  reg/tsfr/abc123  ")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        with patch.object(pw, "allowed", return_value=True):
+            result = _run(pw.recv_pw_exclude_ref(update, ctx))
+        self.assertEqual(result, pw.PW.INTERVAL)
+        self.assertEqual(pw._get_pw_sess(ctx).exclude_ref, "REG/TSFR/ABC123")
+
+    def test_skip_leaves_exclude_ref_empty_and_asks_interval(self):
+        update = _make_update_with_callback("pw_exclref:skip")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = pw._get_pw_sess(ctx)
+        sess.exclude_ref = "SOMETHING"
+        with patch.object(pw, "allowed", return_value=True):
+            result = _run(pw.recv_pw_exclude_ref_skip(update, ctx))
+        self.assertEqual(result, pw.PW.INTERVAL)
+        self.assertEqual(sess.exclude_ref, "")
 
 
 class TestRecvPwInterval(unittest.TestCase):
@@ -386,7 +423,7 @@ class TestRecvPwHoldChoice(unittest.TestCase):
             result = _run(pw.recv_pw_hold_choice(update, ctx))
         self.assertEqual(result, pw.ConversationHandler.END)
         self.assertTrue(sess.hold)
-        mock_add.assert_called_once_with(555, "NBI/BLOCK1/123", 30, "", None, True)
+        mock_add.assert_called_once_with(555, "NBI/BLOCK1/123", 30, "", None, True, "")
 
     def test_no_sets_hold_false_and_finalizes(self):
         update = _make_update_with_callback("pw_hold:no")
@@ -400,7 +437,7 @@ class TestRecvPwHoldChoice(unittest.TestCase):
             result = _run(pw.recv_pw_hold_choice(update, ctx))
         self.assertEqual(result, pw.ConversationHandler.END)
         self.assertFalse(sess.hold)
-        mock_add.assert_called_once_with(555, "NBI/BLOCK1/123", 30, "", None, False)
+        mock_add.assert_called_once_with(555, "NBI/BLOCK1/123", 30, "", None, False, "")
 
     def test_list_mode_creates_one_watch_per_parcel(self):
         update = _make_update_with_callback("pw_hold:no")
@@ -414,8 +451,8 @@ class TestRecvPwHoldChoice(unittest.TestCase):
             result = _run(pw.recv_pw_hold_choice(update, ctx))
         self.assertEqual(result, pw.ConversationHandler.END)
         self.assertEqual(mock_add.call_count, 2)
-        mock_add.assert_any_call(555, "P1", 30, "", None, False)
-        mock_add.assert_any_call(555, "P2", 30, "", None, False)
+        mock_add.assert_any_call(555, "P1", 30, "", None, False, "")
+        mock_add.assert_any_call(555, "P2", 30, "", None, False, "")
         self.assertEqual(ctx.job_queue.run_repeating.call_count, 2)
         sent_text = update.callback_query.edit_message_text.call_args_list[-1].args[0]
         self.assertIn("2 watches queued", sent_text)
@@ -644,6 +681,52 @@ class TestPwCheckJob(unittest.TestCase):
             _run(pw._pw_check_job(self.context))
         mock_save.assert_not_called()
 
+    def test_exclude_ref_matching_the_only_result_does_nothing(self):
+        """The wrong ref is still the only thing on this parcel — the
+        watch must keep waiting, not fire on it."""
+        watch = {"id": "watch-1", "chat_id": 555, "parcel": "NBI/BLOCK1/123", "email": "", "exclude_ref": "R1"}
+        with patch.object(pw, "get_parcel_watch", return_value=watch), \
+             patch.object(pw, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pw, "_pl_search_parcel", return_value=list(SAMPLE_MATCHES)), \
+             patch.object(pw, "remove_parcel_watch") as mock_remove:
+            _run(pw._pw_check_job(self.context))
+        self.context.bot.send_message.assert_not_awaited()
+        mock_remove.assert_not_called()
+
+    def test_exclude_ref_is_case_and_whitespace_insensitive(self):
+        watch = {"id": "watch-1", "chat_id": 555, "parcel": "NBI/BLOCK1/123", "email": "", "exclude_ref": " r1 "}
+        with patch.object(pw, "get_parcel_watch", return_value=watch), \
+             patch.object(pw, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pw, "_pl_search_parcel", return_value=list(SAMPLE_MATCHES)), \
+             patch.object(pw, "remove_parcel_watch") as mock_remove:
+            _run(pw._pw_check_job(self.context))
+        mock_remove.assert_not_called()
+
+    def test_a_different_ref_on_the_same_parcel_still_fires(self):
+        """Once the wrong ref is cancelled and a genuinely new reference
+        appears for the same parcel, the watch must fire on it."""
+        watch = {"id": "watch-1", "chat_id": 555, "parcel": "NBI/BLOCK1/123", "email": "", "exclude_ref": "R1"}
+        new_match = [{**SAMPLE_MATCHES[0], "reference_number": "R2"}]
+        with patch.object(pw, "get_parcel_watch", return_value=watch), \
+             patch.object(pw, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pw, "_pl_search_parcel", return_value=new_match), \
+             patch.object(pw, "remove_parcel_watch") as mock_remove:
+            _run(pw._pw_check_job(self.context))
+        self.context.bot.send_message.assert_awaited()
+        sent_text = self.context.bot.send_message.call_args_list[-1].args[1]
+        self.assertIn("R2", sent_text)
+        self.assertIn("Ignored previous ref", sent_text)
+        mock_remove.assert_called_once_with("watch-1")
+
+    def test_no_exclude_ref_fires_on_the_first_match_as_before(self):
+        watch = {"id": "watch-1", "chat_id": 555, "parcel": "NBI/BLOCK1/123", "email": ""}
+        with patch.object(pw, "get_parcel_watch", return_value=watch), \
+             patch.object(pw, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pw, "_pl_search_parcel", return_value=list(SAMPLE_MATCHES)), \
+             patch.object(pw, "remove_parcel_watch") as mock_remove:
+            _run(pw._pw_check_job(self.context))
+        mock_remove.assert_called_once_with("watch-1")
+
 
 class TestCmdParcelWatches(unittest.TestCase):
     def test_no_watches_for_this_chat_shows_empty_message(self):
@@ -682,6 +765,19 @@ class TestCmdParcelWatches(unittest.TestCase):
         sent_text = update.message.reply_text.call_args_list[-1].args[0]
         self.assertIn("Jane Doe", sent_text)
         self.assertIn("✋", sent_text)
+
+    def test_shows_excluded_ref(self):
+        update = _make_update_with_message()
+        ctx = MagicMock()
+        watches = [{
+            "id": "w1", "chat_id": 555, "parcel": "P1", "interval_minutes": 15, "email": "",
+            "exclude_ref": "REG/TSFR/ABC123",
+        }]
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "load_parcel_watches", return_value=watches):
+            _run(pw.cmd_parcel_watches(update, ctx))
+        sent_text = update.message.reply_text.call_args_list[-1].args[0]
+        self.assertIn("REG/TSFR/ABC123", sent_text)
 
 
 class TestRecvPwCancel(unittest.TestCase):

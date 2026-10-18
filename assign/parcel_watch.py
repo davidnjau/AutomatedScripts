@@ -70,6 +70,21 @@ Parcel Watch finds the match). A watch created before this feature simply
 has no "valuer" key — _pw_check_job treats that as "notify only," so
 existing watches keep their prior behavior unchanged.
 
+Single-parcel mode (not list mode) also asks, right after the parcel
+number, whether an existing reference on that parcel should be ignored
+(PWSession.exclude_ref) — the scenario this exists for: a reference was
+raised incorrectly and is still sitting on a valuer's desk, about to be
+cancelled, and a new reference for the same parcel is expected once it
+is. Without this, a watch set up while the wrong ref still exists would
+fire immediately on it, since _pl_search_parcel matches by parcel number
+alone. With exclude_ref set, _pw_check_job filters that exact reference
+out of the search results before deciding anything was found, so the
+watch keeps waiting through "wrong ref cancelled, nothing matches yet"
+and only fires once a genuinely different reference appears for the same
+parcel. List mode skips this step entirely (no prompt, no exclusion) —
+multiple parcels sharing one exclude_ref wouldn't make sense, since each
+would have a different wrong reference, if any.
+
 Call register(app) from bot.py's main() to wire this feature in.
 """
 
@@ -146,6 +161,7 @@ _PW_RESTORE_FIRST_RUN_DELAY = 30
 # ──────────────────────────────────────────────────────────
 class PW(Enum):
     PARCEL_INPUT  = auto()   # enter the parcel number to watch
+    EXCLUDE_REF   = auto()   # (single-parcel only) optional ref number to ignore
     INTERVAL      = auto()   # pick the check interval
     DELIVERY      = auto()   # telegram-only or telegram+email
     EMAIL_INPUT   = auto()   # enter email address (email delivery only)
@@ -159,6 +175,7 @@ class PW(Enum):
 class PWSession:
     parcel:           str = ""              # single-parcel mode: the parcel number
     parcels:          List[str] = field(default_factory=list)   # list mode: every parcel entered
+    exclude_ref:      str = ""              # single-parcel mode only: a known ref to ignore on this parcel
     interval_minutes: int = 60
     email:            str = ""              # "" for Telegram-only delivery
     valuer_name:      str = ""              # search text (search-new path)
@@ -182,8 +199,9 @@ def _get_pw_sess(ctx: ContextTypes.DEFAULT_TYPE) -> PWSession:
 
 def load_parcel_watches() -> List[Dict]:
     """Load every active parcel watch: [{id, chat_id, parcel,
-    interval_minutes, email, valuer, hold, created_at}, ...]. valuer/hold
-    are absent on watches created before this feature existed."""
+    interval_minutes, email, valuer, hold, exclude_ref, created_at}, ...].
+    valuer/hold/exclude_ref are absent on watches created before the
+    feature that introduced each existed."""
     try:
         with open(SAVED_PARCEL_WATCHES_FILE) as f:
             return json.load(f)
@@ -204,12 +222,13 @@ def get_parcel_watch(watch_id: str) -> Optional[Dict]:
 
 def add_parcel_watch(
     chat_id: int, parcel: str, interval_minutes: int, email: str,
-    valuer: Optional[Dict] = None, hold: bool = False,
+    valuer: Optional[Dict] = None, hold: bool = False, exclude_ref: str = "",
 ) -> str:
     """Assign a new id to the watch, append it to the saved list, and
-    return the id. valuer ({"name","uid","account_number"}, or None) and
-    hold are optional so a legacy caller/watch predating this feature
-    still works — _pw_check_job treats a missing valuer as "notify only"."""
+    return the id. valuer ({"name","uid","account_number"}, or None), hold,
+    and exclude_ref are all optional so a legacy caller/watch predating
+    each feature still works — _pw_check_job treats a missing valuer as
+    "notify only" and a missing/empty exclude_ref as "match anything"."""
     watch_id = str(uuid.uuid4())[:8]
     watches  = load_parcel_watches()
     watches.append({
@@ -220,6 +239,7 @@ def add_parcel_watch(
         "email":            email,
         "valuer":           valuer,
         "hold":             hold,
+        "exclude_ref":      exclude_ref,
         "created_at":       datetime.now().isoformat(timespec="seconds"),
     })
     save_parcel_watches(watches)
@@ -239,6 +259,11 @@ def remove_parcel_watch(watch_id: str) -> bool:
 # ──────────────────────────────────────────────────────────
 # Keyboards
 # ──────────────────────────────────────────────────────────
+
+def _pw_exclude_ref_keyboard() -> InlineKeyboardMarkup:
+    """Skip entering a reference number to ignore on this parcel."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data="pw_exclref:skip")]])
+
 
 def _pw_interval_keyboard() -> InlineKeyboardMarkup:
     """Preset interval choices for a new watch, one row plus Cancel."""
@@ -331,10 +356,39 @@ async def recv_pw_parcel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess = _get_pw_sess(ctx)
     if len(parcels) > 1:
         sess.parcel, sess.parcels = "", parcels
-    else:
-        sess.parcel, sess.parcels = parcels[0], []
+        await update.message.reply_text("⏱ How often should it check?", reply_markup=_pw_interval_keyboard())
+        return PW.INTERVAL
 
+    sess.parcel, sess.parcels = parcels[0], []
+    await update.message.reply_text(
+        "🔁 Is there an *existing* reference number on this parcel that should be "
+        "*ignored* — e.g. it was raised incorrectly and will be cancelled? If so, "
+        "the watch will only fire once a *different* reference appears for this parcel.\n\n"
+        "Enter it, or tap Skip for a fresh watch.",
+        parse_mode="Markdown",
+        reply_markup=_pw_exclude_ref_keyboard(),
+    )
+    return PW.EXCLUDE_REF
+
+
+async def recv_pw_exclude_ref(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Typed a reference number to ignore on this parcel.
+    if not allowed(update): return await deny(update)
+    sess = _get_pw_sess(ctx)
+    sess.exclude_ref = (update.message.text or "").strip().upper()
     await update.message.reply_text("⏱ How often should it check?", reply_markup=_pw_interval_keyboard())
+    return PW.INTERVAL
+
+
+async def recv_pw_exclude_ref_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Skipped — no ref to ignore, a fresh watch.
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    sess = _get_pw_sess(ctx)
+    sess.exclude_ref = ""
+    await query.edit_message_text("⏭ Skipped — watching for any match.")
+    await query.message.reply_text("⏱ How often should it check?", reply_markup=_pw_interval_keyboard())
     return PW.INTERVAL
 
 
@@ -551,7 +605,9 @@ def _pw_finalize(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> List[str]:
     parcels = sess.parcels or [sess.parcel]
     watch_ids = []
     for parcel in parcels:
-        watch_id = add_parcel_watch(chat_id, parcel, sess.interval_minutes, sess.email, sess.valuer, sess.hold)
+        watch_id = add_parcel_watch(
+            chat_id, parcel, sess.interval_minutes, sess.email, sess.valuer, sess.hold, sess.exclude_ref,
+        )
         ctx.job_queue.run_repeating(
             _pw_check_job,
             interval=sess.interval_minutes * 60,
@@ -611,7 +667,15 @@ async def _pw_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     continuous polling. Re-reads the watch fresh each cycle (rather than
     closing over it) so a manual cancel (recv_pw_cancel) since the job
     last fired is honored here instead of silently racing a stale
-    in-memory copy."""
+    in-memory copy.
+
+    A watch with exclude_ref set (a reference known to be wrong/about to
+    be cancelled on this parcel) filters that exact reference out of the
+    search results before deciding whether anything was "found" — this is
+    how a watch set up while the wrong ref is still on the valuer's desk
+    waits for it to be cancelled and a genuinely new reference to appear
+    for the same parcel, rather than firing immediately on the one
+    already known about."""
     watch_id = context.job.data
     watch = get_parcel_watch(watch_id)
     if not watch:
@@ -628,6 +692,9 @@ async def _pw_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     matches = await asyncio.to_thread(_pl_search_parcel, valuer_tokens, assessor_tokens, watch["parcel"])
+    exclude_ref = (watch.get("exclude_ref") or "").strip().upper()
+    if exclude_ref:
+        matches = [m for m in matches if (m.get("reference_number") or "").strip().upper() != exclude_ref]
     if not matches:
         return
 
@@ -649,7 +716,11 @@ async def _pw_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         assign_note = f"\n📥 Queued for assignment to *{_lu_md_escape(valuer['name'])}*"
         assign_note += " — will be held once assigned." if watch.get("hold") else "."
 
-    header = f"🔔 *Parcel Watch* — `{_lu_md_escape(watch['parcel'])}` found on {len(enriched)} application(s){assign_note}"
+    exclude_note = f"\n🚫 Ignored previous ref `{_lu_md_escape(exclude_ref)}`." if exclude_ref else ""
+    header = (
+        f"🔔 *Parcel Watch* — `{_lu_md_escape(watch['parcel'])}` found on {len(enriched)} application(s)"
+        f"{exclude_note}{assign_note}"
+    )
     lines = [header] + [
         _lu_format_county_result(ref, item, detail, markdown=True) if is_assessor
         else _lu_format_result(ref, item, detail, markdown=True)
@@ -698,6 +769,7 @@ async def cmd_parcel_watches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         + (f" — 📧 {md_escape(w['email'])}" if w.get("email") else "")
         + (f" — 👤 {md_escape(w['valuer']['name'])}" if w.get("valuer") else "")
         + (" ✋" if w.get("hold") else "")
+        + (f" — 🚫 ignoring `{_lu_md_escape(w['exclude_ref'])}`" if w.get("exclude_ref") else "")
         for i, w in enumerate(watches, 1)
     ]
     await update.message.reply_text(
@@ -737,6 +809,10 @@ def register(app: Application) -> None:
         ],
         states={
             PW.PARCEL_INPUT:  [MessageHandler(not_cancel, recv_pw_parcel)],
+            PW.EXCLUDE_REF:   [
+                CallbackQueryHandler(recv_pw_exclude_ref_skip, pattern=r"^pw_exclref:"),
+                MessageHandler(not_cancel, recv_pw_exclude_ref),
+            ],
             PW.INTERVAL:      [CallbackQueryHandler(recv_pw_interval, pattern=r"^pw_interval:")],
             PW.DELIVERY:      [CallbackQueryHandler(recv_pw_delivery, pattern=r"^pw_delivery:")],
             PW.EMAIL_INPUT:   [MessageHandler(not_cancel, recv_pw_email)],
