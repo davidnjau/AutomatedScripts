@@ -48,6 +48,28 @@ behaves once queued. PWSession.parcels (plural) carries the list;
 PWSession.parcel (singular) is unchanged for the single-parcel case.
 Capped at common._LIST_INPUT_MAX_ITEMS parcels per setup run.
 
+After interval/delivery (and email, if chosen), setup also asks which
+valuer should be assigned once the parcel is found (saved valuer or
+search new — a local, self-contained copy of bulk_field_update.py's
+valuer-pick pattern, reusing whichever of _LU_CRED_DEFAULT/
+_PL_CRED_ASSESSOR cached tokens recv_pw_parcel already confirmed are
+valid; no OTP step), then whether that assignment should be held (guarded
+against takeover). Both apply to every watch created in that setup run
+(list mode shares them, same as interval/email already do).
+
+When a match is found, _pw_check_job queues each matching reference into
+DLV Batch's own queue (dlv_core.save_dlv_batch, tag "Parcel Watch") rather
+than assigning directly — DLV Batch's background job retries until the
+ref is actually at an assignable stage, regardless of whether it was
+still at the assessor stage or already at DLV when Parcel Watch found it.
+If the watch asked for a hold, the queued item carries auto_hold=True;
+dlv_batch.py's _db_maybe_auto_hold enrolls it into Hold Tasks' guard queue
+once DLV Batch actually confirms the assignment (Hold Tasks can't guard
+something that isn't assigned yet, so this can't happen at the moment
+Parcel Watch finds the match). A watch created before this feature simply
+has no "valuer" key — _pw_check_job treats that as "notify only," so
+existing watches keep their prior behavior unchanged.
+
 Call register(app) from bot.py's main() to wire this feature in.
 """
 
@@ -72,6 +94,7 @@ from telegram.ext import (
     filters,
 )
 
+from ardhisasa_auth import build_session
 from common import (
     BTN_PARCEL_WATCH,
     CRED_LABELS,
@@ -87,11 +110,14 @@ from common import (
     deny,
     fallback,
     get_valid_tokens,
+    load_saved_valuers,
     logger,
     md_escape,
     not_cancel,
 )
+from dlv_core import save_dlv_batch
 from email_service import _send_auto_fetch_email
+from endpoints import ACCOUNTS_LIST_URL
 from lookup_reference import (
     _LU_CRED_DEFAULT,
     _lu_fetch_detail,
@@ -119,10 +145,14 @@ _PW_RESTORE_FIRST_RUN_DELAY = 30
 # States — Parcel Watch setup conversation
 # ──────────────────────────────────────────────────────────
 class PW(Enum):
-    PARCEL_INPUT = auto()   # enter the parcel number to watch
-    INTERVAL     = auto()   # pick the check interval
-    DELIVERY     = auto()   # telegram-only or telegram+email
-    EMAIL_INPUT  = auto()   # enter email address (email delivery only)
+    PARCEL_INPUT  = auto()   # enter the parcel number to watch
+    INTERVAL      = auto()   # pick the check interval
+    DELIVERY      = auto()   # telegram-only or telegram+email
+    EMAIL_INPUT   = auto()   # enter email address (email delivery only)
+    VALUER_SOURCE = auto()   # saved valuer vs search new
+    VALUER_NAME   = auto()   # enter name when searching new
+    SELECT_VALUER = auto()   # pick from live search results
+    HOLD_CHOICE   = auto()   # hold the assignment once made, or not
 
 
 @dataclass
@@ -130,6 +160,11 @@ class PWSession:
     parcel:           str = ""              # single-parcel mode: the parcel number
     parcels:          List[str] = field(default_factory=list)   # list mode: every parcel entered
     interval_minutes: int = 60
+    email:            str = ""              # "" for Telegram-only delivery
+    valuer_name:      str = ""              # search text (search-new path)
+    valuers:          List[Dict] = field(default_factory=list)   # live search results, for SELECT_VALUER's index lookup
+    valuer:           Optional[Dict] = None # {"name", "uid", "account_number"} — saved or searched, unified
+    hold:             bool = False
 
 
 def _get_pw_sess(ctx: ContextTypes.DEFAULT_TYPE) -> PWSession:
@@ -147,7 +182,8 @@ def _get_pw_sess(ctx: ContextTypes.DEFAULT_TYPE) -> PWSession:
 
 def load_parcel_watches() -> List[Dict]:
     """Load every active parcel watch: [{id, chat_id, parcel,
-    interval_minutes, email, created_at}, ...]."""
+    interval_minutes, email, valuer, hold, created_at}, ...]. valuer/hold
+    are absent on watches created before this feature existed."""
     try:
         with open(SAVED_PARCEL_WATCHES_FILE) as f:
             return json.load(f)
@@ -166,9 +202,14 @@ def get_parcel_watch(watch_id: str) -> Optional[Dict]:
     return next((w for w in load_parcel_watches() if w.get("id") == watch_id), None)
 
 
-def add_parcel_watch(chat_id: int, parcel: str, interval_minutes: int, email: str) -> str:
+def add_parcel_watch(
+    chat_id: int, parcel: str, interval_minutes: int, email: str,
+    valuer: Optional[Dict] = None, hold: bool = False,
+) -> str:
     """Assign a new id to the watch, append it to the saved list, and
-    return the id."""
+    return the id. valuer ({"name","uid","account_number"}, or None) and
+    hold are optional so a legacy caller/watch predating this feature
+    still works — _pw_check_job treats a missing valuer as "notify only"."""
     watch_id = str(uuid.uuid4())[:8]
     watches  = load_parcel_watches()
     watches.append({
@@ -177,6 +218,8 @@ def add_parcel_watch(chat_id: int, parcel: str, interval_minutes: int, email: st
         "parcel":           parcel,
         "interval_minutes": interval_minutes,
         "email":            email,
+        "valuer":           valuer,
+        "hold":             hold,
         "created_at":       datetime.now().isoformat(timespec="seconds"),
     })
     save_parcel_watches(watches)
@@ -211,6 +254,14 @@ def _pw_delivery_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📧 Telegram + Email", callback_data="pw_delivery:email"),
         ],
     ])
+
+
+def _pw_hold_keyboard() -> InlineKeyboardMarkup:
+    """Hold the assignment once made (guard against takeover), or not."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✋ Hold it",            callback_data="pw_hold:yes"),
+        InlineKeyboardButton("➡️ No, just assign",    callback_data="pw_hold:no"),
+    ]])
 
 
 def _pw_remove_keyboard(watches: List[Dict]) -> InlineKeyboardMarkup:
@@ -310,8 +361,8 @@ async def recv_pw_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def recv_pw_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Telegram-only -> finalize immediately. Telegram+email -> ask for the
-    # address next.
+    # Telegram-only -> move on to the valuer pick. Telegram+email -> ask
+    # for the address first.
     if not allowed(update): return await deny(update)
     query = update.callback_query
     await query.answer()
@@ -321,39 +372,186 @@ async def recv_pw_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📧 Enter the email address to also notify:", parse_mode="Markdown")
         return PW.EMAIL_INPUT
 
-    watch_ids = _pw_finalize(query.message.chat_id, ctx, "")
-    await query.edit_message_text(_pw_queued_text(watch_ids))
-    await query.message.reply_text("Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
-    return ConversationHandler.END
+    sess = _get_pw_sess(ctx)
+    sess.email = ""
+    await query.edit_message_text("✅ Delivery: 💬 Telegram only")
+    return await _pw_proceed_to_valuer_pick(query.message, sess)
 
 
 async def recv_pw_email(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Validate the email, finalize the watch(es) with it attached.
+    # Validate the email, store it, then move on to the valuer pick.
     if not allowed(update): return await deny(update)
     email = (update.message.text or "").strip()
     if "@" not in email or "." not in email.split("@")[-1]:
         await update.message.reply_text("❌ Invalid email. Enter a valid address.", parse_mode="Markdown")
         return PW.EMAIL_INPUT
 
-    watch_ids = _pw_finalize(update.effective_chat.id, ctx, email)
-    await update.message.reply_text(_pw_queued_text(watch_ids), reply_markup=_main_menu_for(update.effective_user.id))
+    sess = _get_pw_sess(ctx)
+    sess.email = email
+    await update.message.reply_text(f"✅ Email: {md_escape(email)}", parse_mode="Markdown")
+    return await _pw_proceed_to_valuer_pick(update.message, sess)
+
+
+# ──────────────────────────────────────────────────────────
+# Valuer pick + hold choice (local, self-contained — mirrors
+# bulk_field_update.py's valuer-search pattern; see module docstring)
+# ──────────────────────────────────────────────────────────
+
+async def _pw_proceed_to_valuer_pick(message, sess: PWSession) -> int:
+    # Show the saved-valuer-or-search picker.
+    saved = load_saved_valuers()
+    if saved:
+        rows = [
+            [InlineKeyboardButton(f"👤 {sv['name']}", callback_data=f"pw_src:{i}")]
+            for i, sv in enumerate(saved)
+        ]
+        rows.append([InlineKeyboardButton("🔍 Search new valuer", callback_data="pw_src:new")])
+        await message.reply_text(
+            "👤 Which valuer should be assigned once it's found?",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return PW.VALUER_SOURCE
+    await message.reply_text(
+        "👤 Enter the *valuer name* to search:\n_Partial names work, e.g._ `JOHN KAMAU`",
+        parse_mode="Markdown",
+    )
+    return PW.VALUER_NAME
+
+
+async def recv_pw_valuer_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Handle the saved-valuer-or-search picker.
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    sess = _get_pw_sess(ctx)
+    data = query.data.split(":")[1]
+
+    if data == "new":
+        await query.edit_message_text(
+            "👤 Enter the *valuer name* to search:\n_Partial names work, e.g._ `JOHN KAMAU`",
+            parse_mode="Markdown",
+        )
+        return PW.VALUER_NAME
+
+    saved = load_saved_valuers()
+    idx = int(data)
+    if idx >= len(saved):
+        await query.edit_message_text(
+            "⚠️ That saved valuer no longer exists. Please start over.",
+            reply_markup=_main_menu_for(update.effective_user.id),
+        )
+        return ConversationHandler.END
+    sess.valuer = saved[idx]
+    await query.edit_message_text(f"✅ Valuer: *{md_escape(sess.valuer['name'])}*", parse_mode="Markdown")
+    await query.message.reply_text(
+        "Should this task be held (guarded against takeover) once it's assigned?",
+        reply_markup=_pw_hold_keyboard(),
+    )
+    return PW.HOLD_CHOICE
+
+
+async def _pw_do_valuer_search(message, tokens, name: str) -> Optional[List[Dict]]:
+    # Search for valuers by name; returns list or None (error already sent).
+    try:
+        http_sess = build_session()
+        headers = {"Authorization": f"Bearer {tokens.access_token}", "JWTAUTH": f"Bearer {tokens.jwt}"}
+        params = {"account_type": "STAFF", "filter_type": "ACTIVE", "page": 1, "search": name}
+        resp = http_sess.get(ACCOUNTS_LIST_URL, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        return resp.json().get("results", [])
+    except Exception as e:
+        await message.reply_text(f"❌ Valuer search failed: `{e}`", parse_mode="Markdown")
+        return None
+
+
+async def recv_pw_valuer_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Receive the typed valuer name and run the live search immediately —
+    # no OTP step, reuses whichever cached tokens recv_pw_parcel already
+    # confirmed are valid.
+    if not allowed(update): return await deny(update)
+    sess = _get_pw_sess(ctx)
+    sess.valuer_name = (update.message.text or "").strip()
+    if not sess.valuer_name:
+        await update.message.reply_text("Please enter a valuer name.")
+        return PW.VALUER_NAME
+
+    tokens = get_valid_tokens(_LU_CRED_DEFAULT) or get_valid_tokens(_PL_CRED_ASSESSOR)
+    await update.message.reply_text(f"🔍 Searching for valuer *{md_escape(sess.valuer_name)}*…", parse_mode="Markdown")
+    results = await _pw_do_valuer_search(update.message, tokens, sess.valuer_name)
+    if results is None:
+        await update.message.reply_text("Use the menu to start again.", reply_markup=_main_menu_for(update.effective_user.id))
+        return ConversationHandler.END
+    if not results:
+        await update.message.reply_text(
+            f"⚠️ No valuers found matching *{md_escape(sess.valuer_name)}*.",
+            parse_mode="Markdown",
+            reply_markup=_main_menu_for(update.effective_user.id),
+        )
+        return ConversationHandler.END
+
+    sess.valuers = results
+    rows = []
+    for i, v in enumerate(results):
+        sd = v.get("staff_details", {})
+        name = " ".join(filter(None, [sd.get("firstname"), sd.get("middlename"), sd.get("lastname")]))
+        rows.append([InlineKeyboardButton(name or f"Valuer {i+1}", callback_data=f"pw_valuer:{i}")])
+    await update.message.reply_text(
+        f"Found *{len(results)}* valuer(s). Select one:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return PW.SELECT_VALUER
+
+
+async def recv_pw_valuer_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Live search result selected -> store it, ask the hold question.
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    sess = _get_pw_sess(ctx)
+    idx = int(query.data.split(":")[1])
+    v = sess.valuers[idx]
+    sd = v.get("staff_details", {})
+    name = " ".join(filter(None, [sd.get("firstname"), sd.get("middlename"), sd.get("lastname")]))
+    uid = sd.get("user_id", v.get("id", "?"))
+    sess.valuer = {"name": name, "uid": uid, "account_number": v.get("account_number", "?")}
+
+    await query.edit_message_text(f"✅ Valuer: *{md_escape(name)}*", parse_mode="Markdown")
+    await query.message.reply_text(
+        "Should this task be held (guarded against takeover) once it's assigned?",
+        reply_markup=_pw_hold_keyboard(),
+    )
+    return PW.HOLD_CHOICE
+
+
+async def recv_pw_hold_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Store the hold choice, then finalize — the last step in setup.
+    if not allowed(update): return await deny(update)
+    query = update.callback_query
+    await query.answer()
+    sess = _get_pw_sess(ctx)
+    sess.hold = query.data.split(":")[1] == "yes"
+
+    watch_ids = _pw_finalize(query.message.chat_id, ctx)
+    await query.edit_message_text(_pw_queued_text(watch_ids))
+    await query.message.reply_text("Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
 
 
-def _pw_finalize(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, email: str) -> List[str]:
-    """Persist the watch(es) and schedule their repeating job(s) — shared
-    by both the Telegram-only and Telegram+email delivery paths. List
-    mode (sess.parcels has entries) creates one independent watch per
-    parcel, all sharing this interval/email; single-parcel mode (the
-    default, sess.parcels empty) creates exactly one, matching prior
-    behavior exactly. first=interval (not 0) so a brand-new watch doesn't
-    fire an immediate check before the user has even seen the
+def _pw_finalize(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> List[str]:
+    """Persist the watch(es) and schedule their repeating job(s) — the
+    last step in setup, reached only after valuer + hold are both chosen.
+    List mode (sess.parcels has entries) creates one independent watch per
+    parcel, all sharing this interval/email/valuer/hold; single-parcel
+    mode (the default, sess.parcels empty) creates exactly one, matching
+    prior behavior exactly. first=interval (not 0) so a brand-new watch
+    doesn't fire an immediate check before the user has even seen the
     confirmation message. Returns every watch id created."""
     sess = _get_pw_sess(ctx)
     parcels = sess.parcels or [sess.parcel]
     watch_ids = []
     for parcel in parcels:
-        watch_id = add_parcel_watch(chat_id, parcel, sess.interval_minutes, email)
+        watch_id = add_parcel_watch(chat_id, parcel, sess.interval_minutes, sess.email, sess.valuer, sess.hold)
         ctx.job_queue.run_repeating(
             _pw_check_job,
             interval=sess.interval_minutes * 60,
@@ -407,11 +605,13 @@ def _pw_fetch_enriched(valuer_tokens, assessor_tokens, matches: List[Dict]):
 
 async def _pw_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Background job for one watch: search the parcel, and if found,
-    notify (Telegram always, email too if configured) then remove the
-    watch — one-shot, unlike Auto Fetch's continuous polling. Re-reads the
-    watch fresh each cycle (rather than closing over it) so a manual
-    cancel (recv_pw_cancel) since the job last fired is honored here
-    instead of silently racing a stale in-memory copy."""
+    queue every matching ref into DLV Batch for the watch's chosen valuer
+    (if any — see module docstring), notify (Telegram always, email too if
+    configured), then remove the watch — one-shot, unlike Auto Fetch's
+    continuous polling. Re-reads the watch fresh each cycle (rather than
+    closing over it) so a manual cancel (recv_pw_cancel) since the job
+    last fired is honored here instead of silently racing a stale
+    in-memory copy."""
     watch_id = context.job.data
     watch = get_parcel_watch(watch_id)
     if not watch:
@@ -433,7 +633,23 @@ async def _pw_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     enriched = await asyncio.to_thread(_pw_fetch_enriched, valuer_tokens, assessor_tokens, matches)
 
-    header = f"🔔 *Parcel Watch* — `{_lu_md_escape(watch['parcel'])}` found on {len(enriched)} application(s)"
+    assign_note = ""
+    valuer = watch.get("valuer")
+    if valuer:
+        for ref, _item, _detail, _is_assessor in enriched:
+            save_dlv_batch([{
+                "ref":         ref,
+                "valuer_name": valuer["name"],
+                "valuer_uid":  valuer["uid"],
+                "valuer_acct": valuer.get("account_number", ""),
+                "queued_at":   datetime.now().isoformat(timespec="seconds"),
+                "tag":         "Parcel Watch",
+                "auto_hold":   watch.get("hold", False),
+            }])
+        assign_note = f"\n📥 Queued for assignment to *{_lu_md_escape(valuer['name'])}*"
+        assign_note += " — will be held once assigned." if watch.get("hold") else "."
+
+    header = f"🔔 *Parcel Watch* — `{_lu_md_escape(watch['parcel'])}` found on {len(enriched)} application(s){assign_note}"
     lines = [header] + [
         _lu_format_county_result(ref, item, detail, markdown=True) if is_assessor
         else _lu_format_result(ref, item, detail, markdown=True)
@@ -480,6 +696,8 @@ async def cmd_parcel_watches(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines += [
         f"{i}. `{_lu_md_escape(w.get('parcel', '?'))}` — every {w.get('interval_minutes', '?')} min"
         + (f" — 📧 {md_escape(w['email'])}" if w.get("email") else "")
+        + (f" — 👤 {md_escape(w['valuer']['name'])}" if w.get("valuer") else "")
+        + (" ✋" if w.get("hold") else "")
         for i, w in enumerate(watches, 1)
     ]
     await update.message.reply_text(
@@ -518,10 +736,14 @@ def register(app: Application) -> None:
             MessageHandler(filters.Regex(f"^{re.escape(BTN_PARCEL_WATCH)}$"), cmd_parcel_watch),
         ],
         states={
-            PW.PARCEL_INPUT: [MessageHandler(not_cancel, recv_pw_parcel)],
-            PW.INTERVAL:     [CallbackQueryHandler(recv_pw_interval, pattern=r"^pw_interval:")],
-            PW.DELIVERY:     [CallbackQueryHandler(recv_pw_delivery, pattern=r"^pw_delivery:")],
-            PW.EMAIL_INPUT:  [MessageHandler(not_cancel, recv_pw_email)],
+            PW.PARCEL_INPUT:  [MessageHandler(not_cancel, recv_pw_parcel)],
+            PW.INTERVAL:      [CallbackQueryHandler(recv_pw_interval, pattern=r"^pw_interval:")],
+            PW.DELIVERY:      [CallbackQueryHandler(recv_pw_delivery, pattern=r"^pw_delivery:")],
+            PW.EMAIL_INPUT:   [MessageHandler(not_cancel, recv_pw_email)],
+            PW.VALUER_SOURCE: [CallbackQueryHandler(recv_pw_valuer_source, pattern=r"^pw_src:")],
+            PW.VALUER_NAME:   [MessageHandler(not_cancel, recv_pw_valuer_name)],
+            PW.SELECT_VALUER: [CallbackQueryHandler(recv_pw_valuer_select, pattern=r"^pw_valuer:")],
+            PW.HOLD_CHOICE:   [CallbackQueryHandler(recv_pw_hold_choice, pattern=r"^pw_hold:")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
