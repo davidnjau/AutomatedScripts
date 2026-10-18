@@ -87,8 +87,10 @@ _CLOSE_AND_ASSIGN_FIELDS = {
 # these (optional), and DLV Tasks' "By Tag" report filters on it. Kept as a
 # closed list (rather than free text) so tags stay consistent and filterable.
 # Shared here since both DLV Batch (sets the tag) and DLV Tasks (reports on
-# it) need the same vocabulary.
-DLV_TAGS = ["Queue", "Direct"]
+# it) need the same vocabulary. "Parcel Watch" is set automatically by
+# parcel_watch.py's _pw_check_job when it queues a found parcel's ref for
+# assignment, not picked manually via DLV Batch's own Tag Tasks step.
+DLV_TAGS = ["Queue", "Direct", "Parcel Watch"]
 
 # dlv_incremental.py's auto-sequenced "B{batch}-T{task}" tag is a third DLV
 # Batch tag option that doesn't fit DLV_TAGS' fixed-vocabulary picker (it's

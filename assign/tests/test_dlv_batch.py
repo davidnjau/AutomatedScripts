@@ -121,6 +121,36 @@ class TestIncrementalAssignTagFor(unittest.TestCase):
         mock_next.assert_not_called()
 
 
+class TestDbMaybeAutoHold(unittest.TestCase):
+    """_db_maybe_auto_hold — the hook that enrolls a ref into Hold Tasks'
+    guard queue once DLV Batch confirms it's assigned, but only for items
+    marked auto_hold (currently only parcel_watch.py's _pw_check_job)."""
+
+    def test_no_auto_hold_flag_does_nothing(self):
+        with patch.object(dlv_batch, "save_hold_tasks") as mock_save:
+            dlv_batch._db_maybe_auto_hold({"ref": "R1"}, "Jane Doe", "uid-1")
+        mock_save.assert_not_called()
+
+    def test_auto_hold_false_does_nothing(self):
+        with patch.object(dlv_batch, "save_hold_tasks") as mock_save:
+            dlv_batch._db_maybe_auto_hold({"ref": "R1", "auto_hold": False}, "Jane Doe", "uid-1")
+        mock_save.assert_not_called()
+
+    def test_auto_hold_true_enrolls_the_ref(self):
+        with patch.object(dlv_batch, "save_hold_tasks") as mock_save:
+            dlv_batch._db_maybe_auto_hold({"ref": "R1", "auto_hold": True}, "Jane Doe", "uid-1")
+        mock_save.assert_called_once()
+        entry = mock_save.call_args[0][0][0]
+        self.assertEqual(entry["ref"], "R1")
+        self.assertEqual(entry["held_valuer_name"], "Jane Doe")
+        self.assertEqual(entry["held_valuer_uid"], "uid-1")
+        self.assertIn("held_at", entry)
+
+    def test_save_failure_is_logged_not_raised(self):
+        with patch.object(dlv_batch, "save_hold_tasks", side_effect=RuntimeError("boom")):
+            dlv_batch._db_maybe_auto_hold({"ref": "R1", "auto_hold": True}, "Jane Doe", "uid-1")   # must not raise
+
+
 class TestProcessDlvBatchItem(unittest.TestCase):
     def setUp(self):
         self.item = {"ref": "REG/TSFR/ABC123", "valuer_name": "Jane Doe", "valuer_uid": "uid-1"}
@@ -376,6 +406,82 @@ class TestProcessDlvBatchItem(unittest.TestCase):
             self.http_sess.post.return_value = MagicMock(raise_for_status=lambda: None)
             self._run()
         self.assertEqual(mock_persist.call_args.kwargs["extra"]["assigned_tag"], "A1-T1")
+
+    def test_fresh_assign_with_auto_hold_enrolls_in_hold_tasks(self):
+        """A ref queued by Parcel Watch (auto_hold=True) must be enrolled
+        into Hold Tasks' guard queue the moment it's freshly assigned."""
+        self.item["auto_hold"] = True
+        with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={"node": "VALUATION_STAMP_DUTY_CREATED"}), \
+             patch.object(dlv_batch, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+                 "node": "VALUATION_STAMP_DUTY_CREATED", "assessor_name": "",
+                 "consideration_amount": "", "currency_code": "", "actor_name": "",
+             }), \
+             patch.object(dlv_batch, "persist_assignment"), \
+             patch.object(dlv_batch, "save_hold_tasks") as mock_hold:
+            self.http_sess.post.return_value = MagicMock(raise_for_status=lambda: None)
+            self._run()
+        mock_hold.assert_called_once()
+        entry = mock_hold.call_args[0][0][0]
+        self.assertEqual(entry["ref"], "REG/TSFR/ABC123")
+        self.assertEqual(entry["held_valuer_name"], "Jane Doe")
+        self.assertEqual(entry["held_valuer_uid"], "uid-1")
+
+    def test_fresh_assign_without_auto_hold_does_not_enroll(self):
+        with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={"node": "VALUATION_STAMP_DUTY_CREATED"}), \
+             patch.object(dlv_batch, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+                 "node": "VALUATION_STAMP_DUTY_CREATED", "assessor_name": "",
+                 "consideration_amount": "", "currency_code": "", "actor_name": "",
+             }), \
+             patch.object(dlv_batch, "persist_assignment"), \
+             patch.object(dlv_batch, "save_hold_tasks") as mock_hold:
+            self.http_sess.post.return_value = MagicMock(raise_for_status=lambda: None)
+            self._run()
+        mock_hold.assert_not_called()
+
+    def test_force_reassign_with_auto_hold_enrolls_in_hold_tasks(self):
+        self.item["force_reassign"] = True
+        self.item["auto_hold"] = True
+        with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                 "actors": [{"role": "VALUATION OFFICER", "user_details": {"id": "uid-2", "names": "EXISTING VALUER"}}],
+             }), \
+             patch.object(dlv_batch, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT", "assessor_name": "",
+                 "consideration_amount": "", "currency_code": "", "actor_name": "",
+             }), \
+             patch.object(dlv_batch, "persist_assignment"), \
+             patch.object(dlv_batch, "save_hold_tasks") as mock_hold:
+            self.http_sess.post.return_value = MagicMock(raise_for_status=lambda: None)
+            self._run()
+        mock_hold.assert_called_once()
+        entry = mock_hold.call_args[0][0][0]
+        self.assertEqual(entry["held_valuer_name"], "Jane Doe")
+        self.assertEqual(entry["held_valuer_uid"], "uid-1")
+
+    def test_already_correctly_assigned_with_auto_hold_enrolls_in_hold_tasks(self):
+        """auto_hold applies here too — the end state is "correctly
+        assigned," regardless of whether persist_assignment ran this
+        cycle (it only does for incremental-tagged refs)."""
+        self.item["auto_hold"] = True
+        with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \
+             patch.object(dlv_batch, "_fetch_ref_detail_dlv", return_value={
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT",
+                 "actors": [{"role": "VALUATION OFFICER", "user_details": {"id": "uid-1", "names": "Jane Doe"}}],
+             }), \
+             patch.object(dlv_batch, "_classify_dlv_detail", return_value={
+                 "bucket": "open", "closed_reason": "", "application_status": "ONGOING",
+                 "node": "VALUATION_STAMP_DUTY_VALUER_REPORT", "assessor_name": "",
+                 "consideration_amount": "", "currency_code": "", "actor_name": "",
+             }), \
+             patch.object(dlv_batch, "save_hold_tasks") as mock_hold:
+            self._run()
+        mock_hold.assert_called_once()
 
     def test_no_valuation_officer_actor_reports_no_actor_listed(self):
         with patch.object(dlv_batch, "_search_ref_dlv", return_value={"id": "1"}), \

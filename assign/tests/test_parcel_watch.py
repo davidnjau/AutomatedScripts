@@ -83,6 +83,19 @@ class TestParcelWatchPersistence(unittest.TestCase):
         self.assertNotEqual(id1, id2)
         self.assertEqual(len(pw.load_parcel_watches()), 2)
 
+    def test_add_with_valuer_and_hold_persists_both(self):
+        valuer = {"name": "Jane Doe", "uid": "1", "account_number": "A1"}
+        watch_id = pw.add_parcel_watch(555, "NBI/BLOCK1/123", 30, "", valuer, True)
+        watch = pw.get_parcel_watch(watch_id)
+        self.assertEqual(watch["valuer"], valuer)
+        self.assertTrue(watch["hold"])
+
+    def test_add_without_valuer_defaults_to_none_and_not_held(self):
+        watch_id = pw.add_parcel_watch(555, "NBI/BLOCK1/123", 30, "")
+        watch = pw.get_parcel_watch(watch_id)
+        self.assertIsNone(watch["valuer"])
+        self.assertFalse(watch["hold"])
+
     def test_get_parcel_watch_finds_by_id(self):
         watch_id = pw.add_parcel_watch(555, "P1", 15, "")
         watch = pw.get_parcel_watch(watch_id)
@@ -200,7 +213,7 @@ class TestRecvPwInterval(unittest.TestCase):
 
 
 class TestRecvPwDelivery(unittest.TestCase):
-    def test_telegram_only_finalizes_and_ends(self):
+    def test_telegram_only_proceeds_to_valuer_pick(self):
         update = _make_update_with_callback("pw_delivery:telegram")
         ctx = MagicMock()
         ctx.user_data = {}
@@ -208,15 +221,22 @@ class TestRecvPwDelivery(unittest.TestCase):
         sess.parcel = "NBI/BLOCK1/123"
         sess.interval_minutes = 30
         with patch.object(pw, "allowed", return_value=True), \
-             patch.object(pw, "add_parcel_watch", return_value="watch-1") as mock_add:
+             patch.object(pw, "load_saved_valuers", return_value=[]):
             result = _run(pw.recv_pw_delivery(update, ctx))
-        self.assertEqual(result, pw.ConversationHandler.END)
-        mock_add.assert_called_once_with(555, "NBI/BLOCK1/123", 30, "")
-        ctx.job_queue.run_repeating.assert_called_once()
-        _, kwargs = ctx.job_queue.run_repeating.call_args
-        self.assertEqual(kwargs["interval"], 30 * 60)
-        self.assertEqual(kwargs["name"], "pl_watch_job:watch-1")
-        self.assertEqual(kwargs["data"], "watch-1")
+        self.assertEqual(result, pw.PW.VALUER_NAME)
+        self.assertEqual(sess.email, "")
+
+    def test_telegram_only_with_saved_valuers_shows_source_picker(self):
+        update = _make_update_with_callback("pw_delivery:telegram")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = pw._get_pw_sess(ctx)
+        sess.parcel = "NBI/BLOCK1/123"
+        saved = [{"name": "Jane Doe", "uid": "1", "account_number": "A1"}]
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "load_saved_valuers", return_value=saved):
+            result = _run(pw.recv_pw_delivery(update, ctx))
+        self.assertEqual(result, pw.PW.VALUER_SOURCE)
 
     def test_email_mode_prompts_for_address(self):
         update = _make_update_with_callback("pw_delivery:email")
@@ -225,24 +245,6 @@ class TestRecvPwDelivery(unittest.TestCase):
             result = _run(pw.recv_pw_delivery(update, ctx))
         self.assertEqual(result, pw.PW.EMAIL_INPUT)
         ctx.job_queue.run_repeating.assert_not_called()
-
-    def test_list_mode_creates_one_watch_per_parcel(self):
-        update = _make_update_with_callback("pw_delivery:telegram")
-        ctx = MagicMock()
-        ctx.user_data = {}
-        sess = pw._get_pw_sess(ctx)
-        sess.parcels = ["P1", "P2"]
-        sess.interval_minutes = 30
-        with patch.object(pw, "allowed", return_value=True), \
-             patch.object(pw, "add_parcel_watch", side_effect=["watch-1", "watch-2"]) as mock_add:
-            result = _run(pw.recv_pw_delivery(update, ctx))
-        self.assertEqual(result, pw.ConversationHandler.END)
-        self.assertEqual(mock_add.call_count, 2)
-        mock_add.assert_any_call(555, "P1", 30, "")
-        mock_add.assert_any_call(555, "P2", 30, "")
-        self.assertEqual(ctx.job_queue.run_repeating.call_count, 2)
-        sent_text = update.callback_query.edit_message_text.call_args_list[-1].args[0]
-        self.assertIn("2 watches queued", sent_text)
 
 
 class TestRecvPwEmail(unittest.TestCase):
@@ -253,7 +255,7 @@ class TestRecvPwEmail(unittest.TestCase):
             result = _run(pw.recv_pw_email(update, ctx))
         self.assertEqual(result, pw.PW.EMAIL_INPUT)
 
-    def test_valid_email_finalizes_and_ends(self):
+    def test_valid_email_stores_it_and_proceeds_to_valuer_pick(self):
         update = _make_update_with_message("someone@example.com")
         ctx = MagicMock()
         ctx.user_data = {}
@@ -261,11 +263,162 @@ class TestRecvPwEmail(unittest.TestCase):
         sess.parcel = "NBI/BLOCK1/123"
         sess.interval_minutes = 15
         with patch.object(pw, "allowed", return_value=True), \
-             patch.object(pw, "add_parcel_watch", return_value="watch-2") as mock_add:
+             patch.object(pw, "load_saved_valuers", return_value=[]):
             result = _run(pw.recv_pw_email(update, ctx))
+        self.assertEqual(result, pw.PW.VALUER_NAME)
+        self.assertEqual(sess.email, "someone@example.com")
+
+
+class TestPwProceedToValuerPick(unittest.TestCase):
+    def test_saved_valuers_show_source_picker(self):
+        message = MagicMock()
+        message.reply_text = AsyncMock()
+        sess = pw.PWSession()
+        saved = [{"name": "Jane Doe", "uid": "1", "account_number": "A1"}]
+        with patch.object(pw, "load_saved_valuers", return_value=saved):
+            result = _run(pw._pw_proceed_to_valuer_pick(message, sess))
+        self.assertEqual(result, pw.PW.VALUER_SOURCE)
+
+    def test_no_saved_valuers_asks_for_name(self):
+        message = MagicMock()
+        message.reply_text = AsyncMock()
+        sess = pw.PWSession()
+        with patch.object(pw, "load_saved_valuers", return_value=[]):
+            result = _run(pw._pw_proceed_to_valuer_pick(message, sess))
+        self.assertEqual(result, pw.PW.VALUER_NAME)
+
+
+class TestRecvPwValuerSource(unittest.TestCase):
+    def test_new_asks_for_name(self):
+        update = _make_update_with_callback("pw_src:new")
+        ctx = MagicMock()
+        ctx.user_data = {"pw_session": pw.PWSession()}
+        with patch.object(pw, "allowed", return_value=True):
+            result = _run(pw.recv_pw_valuer_source(update, ctx))
+        self.assertEqual(result, pw.PW.VALUER_NAME)
+
+    def test_saved_valuer_asks_hold_choice(self):
+        update = _make_update_with_callback("pw_src:0")
+        ctx = MagicMock()
+        ctx.user_data = {"pw_session": pw.PWSession()}
+        saved = [{"name": "Jane Doe", "uid": "1", "account_number": "A1"}]
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "load_saved_valuers", return_value=saved):
+            result = _run(pw.recv_pw_valuer_source(update, ctx))
+        self.assertEqual(result, pw.PW.HOLD_CHOICE)
+        self.assertEqual(ctx.user_data["pw_session"].valuer, saved[0])
+
+    def test_stale_index_ends_conversation(self):
+        update = _make_update_with_callback("pw_src:5")
+        ctx = MagicMock()
+        ctx.user_data = {"pw_session": pw.PWSession()}
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "load_saved_valuers", return_value=[]):
+            result = _run(pw.recv_pw_valuer_source(update, ctx))
         self.assertEqual(result, pw.ConversationHandler.END)
-        mock_add.assert_called_once_with(555, "NBI/BLOCK1/123", 15, "someone@example.com")
-        ctx.job_queue.run_repeating.assert_called_once()
+
+
+class TestRecvPwValuerName(unittest.TestCase):
+    def test_empty_name_reprompts(self):
+        update = _make_update_with_message("   ")
+        ctx = MagicMock()
+        ctx.user_data = {"pw_session": pw.PWSession()}
+        with patch.object(pw, "allowed", return_value=True):
+            result = _run(pw.recv_pw_valuer_name(update, ctx))
+        self.assertEqual(result, pw.PW.VALUER_NAME)
+
+    def test_search_failure_ends_conversation(self):
+        update = _make_update_with_message("Jane Doe")
+        ctx = MagicMock()
+        ctx.user_data = {"pw_session": pw.PWSession()}
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pw, "_pw_do_valuer_search", new=AsyncMock(return_value=None)):
+            result = _run(pw.recv_pw_valuer_name(update, ctx))
+        self.assertEqual(result, pw.ConversationHandler.END)
+
+    def test_no_results_ends_conversation(self):
+        update = _make_update_with_message("Jane Doe")
+        ctx = MagicMock()
+        ctx.user_data = {"pw_session": pw.PWSession()}
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pw, "_pw_do_valuer_search", new=AsyncMock(return_value=[])):
+            result = _run(pw.recv_pw_valuer_name(update, ctx))
+        self.assertEqual(result, pw.ConversationHandler.END)
+
+    def test_results_show_select_keyboard(self):
+        update = _make_update_with_message("Jane Doe")
+        ctx = MagicMock()
+        ctx.user_data = {"pw_session": pw.PWSession()}
+        results = [{"staff_details": {"firstname": "Jane", "lastname": "Doe"}, "id": "1"}]
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pw, "_pw_do_valuer_search", new=AsyncMock(return_value=results)):
+            result = _run(pw.recv_pw_valuer_name(update, ctx))
+        self.assertEqual(result, pw.PW.SELECT_VALUER)
+        self.assertEqual(ctx.user_data["pw_session"].valuers, results)
+
+
+class TestRecvPwValuerSelect(unittest.TestCase):
+    def test_sets_valuer_and_asks_hold_choice(self):
+        update = _make_update_with_callback("pw_valuer:0")
+        ctx = MagicMock()
+        sess = pw.PWSession()
+        sess.valuers = [{"staff_details": {"firstname": "Jane", "lastname": "Doe", "user_id": "42"}, "account_number": "A1"}]
+        ctx.user_data = {"pw_session": sess}
+        with patch.object(pw, "allowed", return_value=True):
+            result = _run(pw.recv_pw_valuer_select(update, ctx))
+        self.assertEqual(result, pw.PW.HOLD_CHOICE)
+        self.assertEqual(sess.valuer, {"name": "Jane Doe", "uid": "42", "account_number": "A1"})
+
+
+class TestRecvPwHoldChoice(unittest.TestCase):
+    def test_yes_sets_hold_true_and_finalizes(self):
+        update = _make_update_with_callback("pw_hold:yes")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = pw._get_pw_sess(ctx)
+        sess.parcel = "NBI/BLOCK1/123"
+        sess.interval_minutes = 30
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "add_parcel_watch", return_value="watch-1") as mock_add:
+            result = _run(pw.recv_pw_hold_choice(update, ctx))
+        self.assertEqual(result, pw.ConversationHandler.END)
+        self.assertTrue(sess.hold)
+        mock_add.assert_called_once_with(555, "NBI/BLOCK1/123", 30, "", None, True)
+
+    def test_no_sets_hold_false_and_finalizes(self):
+        update = _make_update_with_callback("pw_hold:no")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = pw._get_pw_sess(ctx)
+        sess.parcel = "NBI/BLOCK1/123"
+        sess.interval_minutes = 30
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "add_parcel_watch", return_value="watch-1") as mock_add:
+            result = _run(pw.recv_pw_hold_choice(update, ctx))
+        self.assertEqual(result, pw.ConversationHandler.END)
+        self.assertFalse(sess.hold)
+        mock_add.assert_called_once_with(555, "NBI/BLOCK1/123", 30, "", None, False)
+
+    def test_list_mode_creates_one_watch_per_parcel(self):
+        update = _make_update_with_callback("pw_hold:no")
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = pw._get_pw_sess(ctx)
+        sess.parcels = ["P1", "P2"]
+        sess.interval_minutes = 30
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "add_parcel_watch", side_effect=["watch-1", "watch-2"]) as mock_add:
+            result = _run(pw.recv_pw_hold_choice(update, ctx))
+        self.assertEqual(result, pw.ConversationHandler.END)
+        self.assertEqual(mock_add.call_count, 2)
+        mock_add.assert_any_call(555, "P1", 30, "", None, False)
+        mock_add.assert_any_call(555, "P2", 30, "", None, False)
+        self.assertEqual(ctx.job_queue.run_repeating.call_count, 2)
+        sent_text = update.callback_query.edit_message_text.call_args_list[-1].args[0]
+        self.assertIn("2 watches queued", sent_text)
 
 
 class TestPwQueuedText(unittest.TestCase):
@@ -445,6 +598,52 @@ class TestPwCheckJob(unittest.TestCase):
         mock_remove.assert_called_once_with("watch-1")
         self.context.job.schedule_removal.assert_called_once()
 
+    def test_watch_with_valuer_queues_match_into_dlv_batch(self):
+        """Regression: a match for a watch that has a valuer attached must
+        be queued into DLV Batch (tag "Parcel Watch"), not assigned
+        directly — DLV Batch's own job handles whichever stage it's at."""
+        valuer = {"name": "Jane Doe", "uid": "42", "account_number": "A1"}
+        watch = {"id": "watch-1", "chat_id": 555, "parcel": "NBI/BLOCK1/123", "email": "", "valuer": valuer, "hold": False}
+        with patch.object(pw, "get_parcel_watch", return_value=watch), \
+             patch.object(pw, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pw, "_pl_search_parcel", return_value=list(SAMPLE_MATCHES)), \
+             patch.object(pw, "remove_parcel_watch"), \
+             patch.object(pw, "save_dlv_batch") as mock_save:
+            _run(pw._pw_check_job(self.context))
+        mock_save.assert_called_once()
+        queued = mock_save.call_args[0][0][0]
+        self.assertEqual(queued["ref"], "R1")
+        self.assertEqual(queued["valuer_name"], "Jane Doe")
+        self.assertEqual(queued["valuer_uid"], "42")
+        self.assertEqual(queued["tag"], "Parcel Watch")
+        self.assertEqual(queued["auto_hold"], False)
+
+    def test_watch_with_hold_queues_with_auto_hold_true(self):
+        valuer = {"name": "Jane Doe", "uid": "42", "account_number": "A1"}
+        watch = {"id": "watch-1", "chat_id": 555, "parcel": "NBI/BLOCK1/123", "email": "", "valuer": valuer, "hold": True}
+        with patch.object(pw, "get_parcel_watch", return_value=watch), \
+             patch.object(pw, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pw, "_pl_search_parcel", return_value=list(SAMPLE_MATCHES)), \
+             patch.object(pw, "remove_parcel_watch"), \
+             patch.object(pw, "save_dlv_batch") as mock_save:
+            _run(pw._pw_check_job(self.context))
+        queued = mock_save.call_args[0][0][0]
+        self.assertTrue(queued["auto_hold"])
+        sent_text = self.context.bot.send_message.call_args_list[-1].args[1]
+        self.assertIn("will be held", sent_text)
+
+    def test_legacy_watch_without_valuer_skips_queuing(self):
+        """A watch created before this feature has no "valuer" key —
+        must notify only, exactly like before, with no DLV Batch call."""
+        watch = {"id": "watch-1", "chat_id": 555, "parcel": "NBI/BLOCK1/123", "email": ""}
+        with patch.object(pw, "get_parcel_watch", return_value=watch), \
+             patch.object(pw, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(pw, "_pl_search_parcel", return_value=list(SAMPLE_MATCHES)), \
+             patch.object(pw, "remove_parcel_watch"), \
+             patch.object(pw, "save_dlv_batch") as mock_save:
+            _run(pw._pw_check_job(self.context))
+        mock_save.assert_not_called()
+
 
 class TestCmdParcelWatches(unittest.TestCase):
     def test_no_watches_for_this_chat_shows_empty_message(self):
@@ -469,6 +668,20 @@ class TestCmdParcelWatches(unittest.TestCase):
         sent_text = update.message.reply_text.call_args_list[-1].args[0]
         self.assertIn("P1", sent_text)
         self.assertNotIn("P2", sent_text)
+
+    def test_shows_valuer_name_and_hold_marker(self):
+        update = _make_update_with_message()
+        ctx = MagicMock()
+        watches = [{
+            "id": "w1", "chat_id": 555, "parcel": "P1", "interval_minutes": 15, "email": "",
+            "valuer": {"name": "Jane Doe", "uid": "1", "account_number": "A1"}, "hold": True,
+        }]
+        with patch.object(pw, "allowed", return_value=True), \
+             patch.object(pw, "load_parcel_watches", return_value=watches):
+            _run(pw.cmd_parcel_watches(update, ctx))
+        sent_text = update.message.reply_text.call_args_list[-1].args[0]
+        self.assertIn("Jane Doe", sent_text)
+        self.assertIn("✋", sent_text)
 
 
 class TestRecvPwCancel(unittest.TestCase):
