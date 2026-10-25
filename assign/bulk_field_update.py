@@ -53,7 +53,11 @@ history is only appended for refs the update itself actually succeeded
 on. _bfu_history_notify_job sends the full history (not just new entries)
 to every ADMIN_IDS admin, daily at 04:00 UTC / 7 AM EAT (same slot
 morning_briefing.py uses), scheduled unconditionally in register() — no
-enable/disable config, unlike Morning Briefing.
+enable/disable config, unlike Morning Briefing. cmd_bulk_field_update_history
+(📜 Bulk Update History button / /bulkupdatehistory) is the on-demand
+counterpart — the same full-history rendering, sent only to whoever asks
+rather than broadcast, and open to anyone with Assignments category
+access rather than admin-gated like the daily digest.
 
 Call register(app) from bot.py's main() to wire this feature in.
 """
@@ -89,6 +93,7 @@ from ardhisasa_auth import AuthTokens, build_session
 from common import (
     ADMIN_IDS,
     BTN_BULK_FIELD_UPDATE,
+    BTN_BULK_FIELD_UPDATE_HISTORY,
     CRED_LABELS,
     CRED_MAP,
     DATA_DIR,
@@ -878,6 +883,31 @@ def _bfu_history_fields(entry: Dict) -> List:
     ]
 
 
+async def cmd_bulk_field_update_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """On-demand history viewer (📜 Bulk Update History button / /bulkupdatehistory)
+    — the full log, sent only to whoever asked, not broadcast like
+    _bfu_history_notify_job's daily admin digest. Open to anyone with
+    Assignments category access, not admin-gated, since this is about
+    checking your own/the team's past updates rather than an audit feed."""
+    if not allowed(update): return await deny(update)
+    history = load_bfu_history()
+    if not history:
+        await update.message.reply_text(
+            "ℹ️ No Bulk Field Update records yet.",
+            reply_markup=_main_menu_for(update.effective_user.id),
+        )
+        return
+
+    lines = [f"🛠 *Bulk Field Update — History* ({len(history)} total)\n"]
+    for i, entry in enumerate(history, start=1):
+        lines.append(format_labeled_block(i, entry.get("reference_number", "?"), _bfu_history_fields(entry)))
+
+    async def _send(text, reply_markup):
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+
+    await _send_chunked_report(_send, lines, join="\n\n", reply_markup=_main_menu_for(update.effective_user.id))
+
+
 async def _bfu_history_notify_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """PTB daily job: send the full Bulk Field Update history to every
     admin, every day — not just what's new since yesterday (per the
@@ -946,3 +976,5 @@ def register(app: Application) -> None:
         per_message=False,
     )
     app.add_handler(conv)
+    app.add_handler(CommandHandler("bulkupdatehistory", cmd_bulk_field_update_history))
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_BULK_FIELD_UPDATE_HISTORY)}$"), cmd_bulk_field_update_history))

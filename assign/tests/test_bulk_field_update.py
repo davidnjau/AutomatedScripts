@@ -609,6 +609,46 @@ class TestBfuHistoryPersistence(unittest.TestCase):
         )
 
 
+class TestCmdBulkFieldUpdateHistory(unittest.TestCase):
+    """The on-demand viewer — sends only to whoever asked (not a broadcast
+    like _bfu_history_notify_job), and isn't admin-gated."""
+
+    def test_empty_history_shows_no_records_message(self):
+        update = _make_update_with_message()
+        ctx = MagicMock()
+        with patch.object(bfu, "allowed", return_value=True), \
+             patch.object(bfu, "load_bfu_history", return_value=[]):
+            _run(bfu.cmd_bulk_field_update_history(update, ctx))
+        sent_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("No Bulk Field Update records yet", sent_text)
+
+    def test_history_is_rendered_and_sent_to_the_requester_only(self):
+        update = _make_update_with_message()
+        ctx = MagicMock()
+        history = [{
+            "reference_number": "R1", "initial_valuer": "Jane", "new_valuer": "John",
+            "initial_application_status": "ONGOING", "new_application_status": "COMPLETED",
+            "initial_node": "N1", "new_node": "N2", "recorded_at": "2026-01-01T00:00:00",
+        }]
+        with patch.object(bfu, "allowed", return_value=True), \
+             patch.object(bfu, "load_bfu_history", return_value=history):
+            _run(bfu.cmd_bulk_field_update_history(update, ctx))
+        sent_text = update.message.reply_text.call_args_list[-1].args[0]
+        self.assertIn("R1", sent_text)
+        self.assertIn("Jane", sent_text)
+        self.assertIn("John", sent_text)
+
+    def test_not_allowed_user_is_denied(self):
+        update = _make_update_with_message()
+        ctx = MagicMock()
+        with patch.object(bfu, "allowed", return_value=False), \
+             patch.object(bfu, "deny", new=AsyncMock()) as mock_deny, \
+             patch.object(bfu, "load_bfu_history") as mock_load:
+            _run(bfu.cmd_bulk_field_update_history(update, ctx))
+        mock_deny.assert_awaited_once()
+        mock_load.assert_not_called()
+
+
 class TestBfuHistoryNotifyJob(unittest.TestCase):
     def setUp(self):
         self.ctx = MagicMock()
