@@ -8,3 +8,12 @@ anthropic>=0.87.0
 apscheduler>=3.10.0
 openpyxl>=3.1.0
 matplotlib>=3.8.0
+# Pinned below 2.0: numpy's 2.x manylinux wheels require an x86-64-v2 CPU
+# baseline (SSE4.2/POPCNT) at import time and crash immediately otherwise
+# ("NumPy was built with baseline optimizations... but your machine
+# doesn't support") — hit on a deploy target whose virtualized CPU exposes
+# none of sse3/ssse3/sse4_1/sse4_2/popcnt/avx. 1.26.x's wheels only require
+# SSE2 (true x86-64 baseline), so they run anywhere. Nothing in this
+# codebase imports numpy directly — it's pulled in transitively by
+# openpyxl/matplotlib — so downgrading has no functional impact.
+numpy<2
