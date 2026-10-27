@@ -54,7 +54,11 @@ jobs:
   deploy-assign:
     needs: test
     if: github.ref == 'refs/heads/assign' && github.event_name == 'push'
-    runs-on: [self-hosted, ardhisasa-bot]
+    # ardhisasa-bot-2 (games_server) is a distinct runner from
+    # ardhisasa-bot (the original assign_server, still live and handling
+    # entries-ci.yml's deploy-entries job) — kept as separate labels so a
+    # push to assign can never get routed to assign_server by accident.
+    runs-on: [self-hosted, ardhisasa-bot-2]
     defaults:
       run:
         working-directory: assign

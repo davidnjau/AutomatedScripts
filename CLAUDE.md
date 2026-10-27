@@ -10,9 +10,10 @@ Python automation scripts for the Ardhisasa Kenyan government land valuation sys
 
 ```
 AutomatedScripts/
-├── assign/        # Telegram bot for Ardhisasa valuation officer assignment (has its own CLAUDE.md)
-├── entries/       # Telegram bot for updating land registry encumbrance/proprietorship entries (has its own CLAUDE.md)
-└── nse/           # Telegram bot for NSE morning market briefs (see below)
+├── assign/                # Telegram bot for Ardhisasa valuation officer assignment (has its own CLAUDE.md)
+├── entries/               # Telegram bot for updating land registry encumbrance/proprietorship entries (has its own CLAUDE.md)
+├── nse/                   # Telegram bot for NSE morning market briefs (see below)
+└── ardhi-repo-analyser/   # Telegram bot: daily QA-activity digest for local git repos, cross-checked against a GitLab reference repo (has its own CLAUDE.md)
 ```
 
 Refer to `assign/CLAUDE.md` when working inside `assign/`, and `entries/CLAUDE.md` when working inside `entries/` — each enforces isolation from the other (never read/edit/move/delete files across the two, never import code between them). `entries/README.md` documents that bot's flow, files, and environment variables in full; it is a completely separate codebase from `assign/` — its own bot token, its own Ardhisasa credential, its own Docker container (`ardhisasa_entries_bot`), no shared test suite.
@@ -90,12 +91,21 @@ python token_refresh_daemon.py
 
 ## CI/CD
 
-Each bot has its own workflow, path-filtered so a change to one module never triggers the other's pipeline, and both deploy to the same self-hosted runner (label `[self-hosted, ardhisasa-bot]`) registered on the internal server that hosts both containers:
+Each bot has its own workflow, path-filtered so a change to one module never triggers the other's pipeline. `assign` and `entries` deploy to **separate** self-hosted runners/servers as of the `games_server` migration (below) — previously both shared one runner/server:
 
-- **`.github/workflows/ci.yml`** — triggers on push/PR to `main`/`assign` touching `assign/**` (`assign` is this bot's actual mainline — PRs land there, not `main`). A `test` job installs `assign/requirements.txt` and runs `python3 -m unittest discover -s tests -v` (dummy credential env vars supplied in the workflow — `ardhisasa_auth.py` reads them at import time but no test hits the real API). A `deploy-assign` job (needs `test`, only on push to `assign`) checks out the repo on the runner and runs `docker-compose up --build -d` inside `assign/`, then prunes dangling images.
-- **`.github/workflows/entries-ci.yml`** — triggers on push/PR to `main`/`entries` touching `entries/**` (`entries` is this bot's mainline, same convention as `assign`). No test job — `entries/` has no test suite. A `deploy-entries` job (only on push to `entries`) runs `docker-compose up --build -d` inside `entries/`, then prunes dangling images.
+- **`.github/workflows/ci.yml`** — triggers on push/PR to `main`/`assign` touching `assign/**` (`assign` is this bot's actual mainline — PRs land there, not `main`). A `test` job installs `assign/requirements.txt` and runs `python3 -m unittest discover -s tests -v` (dummy credential env vars supplied in the workflow — `ardhisasa_auth.py` reads them at import time but no test hits the real API). A `deploy-assign` job (needs `test`, only on push to `assign`) runs on the `[self-hosted, ardhisasa-bot-2]` runner (`games_server`) — checks out the repo and runs `docker-compose up --build -d` inside `assign/`, then prunes dangling images.
+- **`.github/workflows/entries-ci.yml`** — triggers on push/PR to `main`/`entries` touching `entries/**` (`entries` is this bot's mainline, same convention as `assign`). No test job — `entries/` has no test suite. A `deploy-entries` job (only on push to `entries`) runs on the `[self-hosted, ardhisasa-bot]` runner (`assign_server`, the original box — its containers were later switched off and `assign` moved off of it, but the runner itself is still live and still handles this job) — runs `docker-compose up --build -d` inside `entries/`, then prunes dangling images.
 
-Both deploy jobs assume the self-hosted runner's checkout directory basename matches the bot's original manual-deployment directory name (`assign` / `entries`) — Docker Compose derives its named volume (`bot_data` / `entries_data`) from that basename, so a mismatch would start the container against a fresh empty volume instead of the one holding cached tokens/data.
+Both deploy jobs assume their runner's checkout directory basename matches the bot's original manual-deployment directory name (`assign` / `entries`) — Docker Compose derives its named volume (`bot_data` / `entries_data`) from that basename, so a mismatch would start the container against a fresh empty volume instead of the one holding cached tokens/data.
+
+### `assign`'s deploy target: `games_server` (migrated from `assign_server`)
+
+`assign` was moved from its original server (`assign_server`, self-hosted runner named `test-1`, label `ardhisasa-bot`) to a new one (`games_server`, self-hosted runner named `games_server`, label `ardhisasa-bot-2`) — a shared box that also independently runs an unrelated `games-games-1` container. The two runners are kept on **distinct labels** specifically so `deploy-assign` can never land back on `assign_server` by accident (both runners stay registered and online — `assign_server`'s is still required for `entries`' own deploy job, which was intentionally left untouched).
+
+Operational notes specific to `games_server`:
+- The runner process runs as a dedicated non-root `runner` user (in the `docker` group) — the GitHub Actions runner binary refuses to run as root/with sudo.
+- Only the `docker compose` plugin (v2, space-separated) ships on this box by default, not the standalone hyphenated `docker-compose` binary `ci.yml` invokes — a `/usr/local/bin/docker-compose` shim (`exec docker compose "$@"`) bridges this.
+- `games_server`'s virtualized CPU exposes none of `sse3`/`ssse3`/`sse4_1`/`sse4_2`/`popcnt`/`avx` — below the x86-64-v2 baseline NumPy's 2.x wheels require at import time (crashes immediately via `openpyxl`'s transitive `numpy` import). `requirements.txt` pins `numpy<2` for this reason (1.26.x's wheels only need SSE2, true x86-64 baseline) — see that file's inline comment.
 
 ## Known Issues
 
