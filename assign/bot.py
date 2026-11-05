@@ -98,6 +98,7 @@ import post_board
 import receive_tasks
 import refresh_auth
 import sectional_properties
+import sms_sender
 import task_analytics
 import valuer_tasks
 
@@ -809,6 +810,7 @@ def main():
     dlv_report_schedule.register(app)
     dlv_stale_check.register(app)
     bulk_field_update.register(app)
+    sms_sender.register(app)
 
     # Button handlers outside an active conversation
     # (bare BTN_AUTH handler registered via refresh_auth.register(app) above)
