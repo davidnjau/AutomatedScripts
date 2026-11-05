@@ -12,6 +12,7 @@ Run with: python3 -m unittest discover -s assign/tests -v
 import asyncio
 import json
 import os
+import string
 import sys
 import tempfile
 import unittest
@@ -57,6 +58,35 @@ class TestGenCode(unittest.TestCase):
             self.assertTrue(c.isdigit())
 
 
+class TestGenRef(unittest.TestCase):
+    def test_ten_char_upper_alnum(self):
+        for _ in range(200):
+            r = sms._gen_ref()
+            self.assertEqual(len(r), 10)
+            self.assertTrue(all(c in (string.ascii_uppercase + string.digits) for c in r))
+
+
+class TestRenderMessage(unittest.TestCase):
+    def test_code_placeholder_becomes_six_digits(self):
+        out = sms._render_message("code is:{code}")
+        self.assertTrue(out.startswith("code is:"))
+        tail = out[len("code is:"):]
+        self.assertEqual(len(tail), 6)
+        self.assertTrue(tail.isdigit())
+
+    def test_ref_placeholder_becomes_ten_char_token(self):
+        out = sms._render_message("REG/TSFR/{ref} ok")
+        self.assertRegex(out, r"^REG/TSFR/[A-Z0-9]{10} ok$")
+
+    def test_no_placeholder_left_after_render(self):
+        out = sms._render_message("a {ref} b {code} c {ref}")
+        self.assertNotIn("{ref}", out)
+        self.assertNotIn("{code}", out)
+
+    def test_plain_text_unchanged(self):
+        self.assertEqual(sms._render_message("no placeholders here"), "no placeholders here")
+
+
 class TestNormalizeMsisdn(unittest.TestCase):
     def test_local_zero_prefixed(self):
         self.assertEqual(sms._normalize_msisdn("0716060198"), "254716060198")
@@ -97,9 +127,9 @@ class TestBuildRecipients(unittest.TestCase):
 
 
 class TestBuildPayload(unittest.TestCase):
-    def test_shape_creds_and_per_entry_code(self):
+    def test_shape_creds_and_rendered_message(self):
         with patch.dict(os.environ, _ENV, clear=False):
-            payload = sms._build_payload(["254700000001", "254700000002"], "MSG:")
+            payload = sms._build_payload(["254700000001", "254700000002"], "MSG:{code}")
         self.assertEqual(payload["count"], 2)
         self.assertEqual(len(payload["smslist"]), 2)
         item = payload["smslist"][0]
@@ -108,17 +138,16 @@ class TestBuildPayload(unittest.TestCase):
         self.assertEqual(item["pass_type"], sms._SMS_PASS_TYPE)
         self.assertEqual(item["shortcode"], sms._SMS_SHORTCODE)
         self.assertEqual(item["mobile"], "254700000001")
-        # message = template + a fresh 6-digit code
+        # message rendered: placeholder substituted, none left behind
         self.assertTrue(item["message"].startswith("MSG:"))
-        self.assertEqual(len(item["message"]) - len("MSG:"), 6)
+        self.assertNotIn("{code}", item["message"])
         self.assertTrue(item["message"][-6:].isdigit())
 
-    def test_codes_are_per_recipient(self):
-        # Overwhelmingly likely distinct; asserts the code is generated per entry,
-        # not once and reused.
+    def test_values_are_rendered_per_recipient(self):
+        # Asserts each entry is rendered independently, not once and reused.
         with patch.dict(os.environ, _ENV, clear=False), \
              patch.object(sms, "_gen_code", side_effect=["111111", "222222"]):
-            payload = sms._build_payload(["254700000001", "254700000002"], "C:")
+            payload = sms._build_payload(["254700000001", "254700000002"], "C:{code}")
         self.assertEqual(payload["smslist"][0]["message"], "C:111111")
         self.assertEqual(payload["smslist"][1]["message"], "C:222222")
 
@@ -142,8 +171,11 @@ class TestPersistence(unittest.TestCase):
         self._p1.start(); self._p2.start()
         self.addCleanup(self._p1.stop); self.addCleanup(self._p2.stop)
 
-    def test_templates_seed_default_on_first_load(self):
-        self.assertEqual(sms.load_sms_templates(), [sms._DEFAULT_TEMPLATE])
+    def test_templates_seed_defaults_on_first_load(self):
+        loaded = sms.load_sms_templates()
+        self.assertEqual(loaded, list(sms._DEFAULT_TEMPLATES))
+        # every seeded sample carries the test prefix
+        self.assertTrue(all(t.startswith("ARDHISASA: Test :") for t in loaded))
 
     def test_templates_roundtrip(self):
         sms.save_sms_templates(["A", "B"])

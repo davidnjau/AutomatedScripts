@@ -17,11 +17,12 @@ private IP the deployed bot can't even reach), so this module only ever
 Flow: pick a mode (🧪 Simulate — default — or 📤 Send real), a count
 (1–_SMS_MAX_PER_RUN), and a message template (a saved one, or a new one
 that gets saved for reuse). On confirm it cycles the pool to `count`
-numbers, appends a fresh random 6-digit code to the template for each, and
-either shows the would-be payload (Simulate, nothing sent) or POSTs the
-single bulk request to the gateway. Simulate is the default and a real
-send needs an explicit second confirmation; the apikey is never rendered
-in any preview.
+numbers, renders the template per recipient (placeholder substitution —
+each {code} → a fresh 6-digit code, each {ref} → a fresh 10-char
+reference token, see _render_message), and either shows the would-be
+payload (Simulate, nothing sent) or POSTs the single bulk request to the
+gateway. Simulate is the default and a real send needs an explicit second
+confirmation; the apikey is never rendered in any preview.
 
 Gateway credentials come from the environment (SMS_PARTNER_ID /
 SMS_API_KEY, already in .env). The gateway is NOT an Ardhisasa endpoint,
@@ -34,6 +35,7 @@ import json
 import os
 import random
 import re
+import string
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Dict, List, Optional
@@ -78,10 +80,18 @@ _SMS_MAX_PER_RUN = 50   # safety cap: most texts a single run may send
 SAVED_SMS_TEST_NUMBERS_FILE = os.path.join(DATA_DIR, "saved_sms_test_numbers.json")
 SAVED_SMS_TEMPLATES_FILE    = os.path.join(DATA_DIR, "saved_sms_templates.json")
 
-# The sample message, used to seed the template store on first use. The
-# verification code is NOT part of the stored template — a fresh one is
-# appended per recipient at send time (see _build_payload).
-_DEFAULT_TEMPLATE = "ARDHISASA: Your Ardhisasa login verification code is:"
+# Sample messages used to seed the template store on first use. Each uses
+# placeholder tokens that are randomized per recipient at send time (see
+# _render_message): {code} → a fresh 6-digit verification code, {ref} → a
+# fresh 10-char uppercase-alphanumeric reference (the literal prefixes like
+# REG/TSFR/ / CNTYINV/ stay as part of the template). All carry the
+# "ARDHISASA: Test :" prefix so a recipient can tell it's a test.
+_DEFAULT_TEMPLATES = [
+    "ARDHISASA: Test : Your Ardhisasa login verification code is:{code}",
+    "ARDHISASA: Test : Transfer application reference REG/TSFR/{ref} has been submitted successfully to the ministry",
+    "ARDHISASA: Test : Application request CNTYINV/{ref} has been submitted for valuation. Check portal for more",
+    "ARDHISASA: Test : Payment of Ksh 5,000.00 has been received for invoice reference number {ref}",
+]
 
 # Matches a normalized Kenyan MSISDN (254 + 9 digits).
 _MSISDN_RE = re.compile(r"^254\d{9}$")
@@ -110,8 +120,8 @@ def load_sms_templates() -> List[str]:
             return templates
     except (FileNotFoundError, ValueError):
         pass
-    save_sms_templates([_DEFAULT_TEMPLATE])
-    return [_DEFAULT_TEMPLATE]
+    save_sms_templates(list(_DEFAULT_TEMPLATES))
+    return list(_DEFAULT_TEMPLATES)
 
 
 def save_sms_templates(templates: List[str]) -> None:
@@ -126,6 +136,22 @@ def save_sms_templates(templates: List[str]) -> None:
 def _gen_code() -> str:
     # A fresh random 6-digit verification code, zero-padded.
     return f"{random.randint(0, 999999):06d}"
+
+
+def _gen_ref() -> str:
+    # A fresh random 10-char uppercase-alphanumeric reference token (the
+    # form the Ardhisasa reference/invoice numbers take after their prefix).
+    return "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
+
+
+def _render_message(template: str) -> str:
+    """Substitute placeholders with fresh random values: each {code} → a new
+    6-digit code, each {ref} → a new 10-char reference token. Every
+    occurrence is randomized independently; plain text passes through
+    unchanged."""
+    out = re.sub(r"\{code\}", lambda _m: _gen_code(), template)
+    out = re.sub(r"\{ref\}",  lambda _m: _gen_ref(),  out)
+    return out
 
 
 def _normalize_msisdn(raw: str) -> Optional[str]:
@@ -150,9 +176,9 @@ def _build_recipients(pool: List[str], count: int) -> List[str]:
 
 def _build_payload(numbers: List[str], message: str) -> Dict:
     """Build the TextSMS sendbulk body: one smslist entry per number, each
-    with its own freshly-generated code appended to `message`. Credentials
-    are read from the environment per entry (the gateway expects them inside
-    each item)."""
+    with its own freshly-rendered message (placeholders substituted per
+    recipient — see _render_message). Credentials are read from the
+    environment per entry (the gateway expects them inside each item)."""
     partner_id = os.getenv("SMS_PARTNER_ID", "")
     api_key    = os.getenv("SMS_API_KEY", "")
     smslist = [
@@ -161,7 +187,7 @@ def _build_payload(numbers: List[str], message: str) -> Dict:
             "apikey":    api_key,
             "pass_type": _SMS_PASS_TYPE,
             "mobile":    n,
-            "message":   f"{message}{_gen_code()}",
+            "message":   _render_message(message),
             "shortcode": _SMS_SHORTCODE,
         }
         for n in numbers
@@ -335,8 +361,9 @@ async def recv_sms_template(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "new":
         await query.edit_message_text(
-            "✏️ Enter the message text (the 6-digit code is appended automatically, "
-            "so end it where the code should go, e.g. `… code is:`):",
+            "✏️ Enter the message text. Use `{code}` where a random 6-digit code "
+            "should go and `{ref}` for a random 10-char reference "
+            "(e.g. `ARDHISASA: Test : …REG/TSFR/{ref}…`):",
             parse_mode="Markdown",
         )
         return SMS.TEMPLATE_ADD
@@ -375,7 +402,8 @@ async def _sms_show_confirm(message, ctx: ContextTypes.DEFAULT_TYPE, user_id: in
         f"📋 *Confirm*\n\n"
         f"*Mode:* {mode}\n"
         f"*Texts:* {sess.count}\n"
-        f"*Message:* {md_escape(sess.message)}{{code}}\n\n"
+        f"*Template:* {md_escape(sess.message)}\n"
+        "_`{code}`/`{ref}` are randomized per text._\n\n"
         "Proceed?",
         parse_mode="Markdown",
         reply_markup=_sms_confirm_keyboard(sess.simulate),
