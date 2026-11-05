@@ -622,6 +622,7 @@ BTN_QUEUE_INTERVAL = "⏱ Queue Check Interval"
 BTN_STALE_THRESHOLD = "⏳ Stale Pending Threshold"
 BTN_BULK_FIELD_UPDATE = "🛠 Bulk Field Update"
 BTN_BULK_FIELD_UPDATE_HISTORY = "📜 Bulk Update History"
+BTN_SMS_SENDER    = "📱 Send SMS"
 
 # Category buttons — the main menu shows only these six (plus Cancel);
 # tapping one opens that category's own submenu of workflow buttons (see
@@ -661,7 +662,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_APARTMENTS)}"
     f"|{re.escape(BTN_HOLD_TASKS)}|{re.escape(BTN_INCREMENTAL)}|{re.escape(BTN_DLV_REPORT_SCHEDULE)}"
     f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}|{re.escape(BTN_TASK_ANALYTICS)}|{re.escape(BTN_CLEAR_CHAT)}"
-    f"|{re.escape(BTN_QUEUE_INTERVAL)}|{re.escape(BTN_STALE_THRESHOLD)}"
+    f"|{re.escape(BTN_QUEUE_INTERVAL)}|{re.escape(BTN_STALE_THRESHOLD)}|{re.escape(BTN_SMS_SENDER)}"
     f"|{re.escape(BTN_CAT_ASSIGNMENTS)}|{re.escape(BTN_CAT_AUTOMATION)}|{re.escape(BTN_CAT_ANALYTICS)}"
     f"|{re.escape(BTN_CAT_LOOKUPS)}|{re.escape(BTN_CAT_VALUERS)}|{re.escape(BTN_CAT_SETTINGS)}"
     f"|{re.escape(BTN_CAT_POST_BOARD)}|{re.escape(BTN_PB_POST)}|{re.escape(BTN_PB_VIEW)}"
@@ -727,7 +728,7 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
             "Manage login sessions, the token refresh daemon, and the bot process itself."
         ),
         "buttons": [BTN_AUTH, BTN_TOKEN_STATUS, BTN_DAEMON, BTN_RESTART, BTN_HELP, BTN_CLEAR_CHAT,
-                    BTN_QUEUE_INTERVAL, BTN_STALE_THRESHOLD],
+                    BTN_QUEUE_INTERVAL, BTN_STALE_THRESHOLD, BTN_SMS_SENDER],
     },
     BTN_CAT_POST_BOARD: {
         "description": (

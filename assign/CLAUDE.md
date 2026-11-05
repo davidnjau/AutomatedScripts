@@ -177,7 +177,7 @@ These apply to every change in this codebase, not just new-module extractions:
 - **📈 Analytics** — Task Analytics, Export Valuation Report, Export Status, Error Report
 - **🔎 Look Ups** — Lookup Reference, Parcel Lookup, Parcel Watch, DLV Ref Check
 - **👥 Valuers** — Saved Valuers, Delete Valuer
-- **⚙️ Bot Settings** — Refresh Auth, Token Status, Token Daemon, Restart Bot, Help
+- **⚙️ Bot Settings** — Refresh Auth, Token Status, Token Daemon, Restart Bot, Help, Send SMS
 - **📥 Post Board** — ➕ Post New Item(s), 📋 View Queue (see its own paragraph below — a single feature given its own category, rather than a member of another one, so it's independently grantable via Manage Access)
 
 Five buttons are intentionally left out of every category — `🗂 AF Results`, `📜 Assignments`, `👤 Valuer Tasks`, `🔲 Sectional`, `🏬 Apartments` — each still fully works via its own `/command` (`/sectional`, `/apartments`, `/valuertasks`) or, for AF Results/Assignments (which never had a slash command), by sending the exact button text; this is unchanged from before the category reorganization, just no longer surfaced in any menu (flat or categorized). Receive Tasks (`/receive`) and DLV Queue (`🔍 DLV Queue`, reached from within the DLV Batch flow) have no top-level menu entry; Hold Tasks' own "View Held Queue" sub-view is reached from within `✋ Hold Tasks` the same way.
@@ -233,6 +233,8 @@ JSON files in `./data/` (mounted as Docker volume `bot_data`):
 - `saved_af_results.json` — Auto Fetch run history (last 20 runs across all schedules), each record tagged with `schedule_id`/`schedule_label` so runs from different schedules are distinguishable in 🗂 AF Results
 - `saved_af_email_state.json` — `{schedule_id: [ref, ...]}`, every ref ever actually emailed for that Auto Fetch schedule (cumulative, not just last cycle); each cycle drops already-sent refs before emailing and skips entirely if nothing new is left (the Telegram summary still sends every cycle regardless, unfiltered) — cleared for a schedule when it's removed via 🗑 Remove Schedule
 - `saved_post_board.json` — `[{id, type ("text"|"photo"), text (ref number, text items only), photo_file_id / caption (photo items only), posted_by, posted_by_name, posted_at, broadcasts: [{chat_id, message_id}, ...]}]`, Post Board's pending shared queue (`post_board.py`) — `broadcasts` accumulates one entry per delivery (the initial push plus any later View Queue catch-up) so `✅ Done` can find and edit every copy; an item is removed outright the moment `✅ Done` is tapped, no archive/history kept
+- `saved_sms_test_numbers.json` — `["254XXXXXXXXX", ...]`, the test-env phone-number pool the Send SMS tool (`sms_sender.py`, 📱 Send SMS / `/sms`) cycles through. Seeded **out of band** (pulled + normalized from the test-env `list-user-accounts` endpoint, which is on a private IP the deployed bot can't reach) — the module only ever reads it. Admin-only; not in git (under gitignored `data/`)
+- `saved_sms_templates.json` — `[message, ...]`, saved SMS message bases (`sms_sender.py`), seeded with the ARDHISASA verification-code sample; a fresh random 6-digit code is appended per recipient at send time (not stored in the template). The tool defaults to a Simulate dry-run and caps a run at 50 texts; gateway creds come from `SMS_PARTNER_ID`/`SMS_API_KEY` in `.env`, and `SMS_SEND_URL` (TextSMS, not an Ardhisasa endpoint) lives in the module, not `endpoints.py`
 - `daemon.pid` / `daemon.log` — token refresh daemon process tracking
 
 ## Git Workflow
