@@ -339,33 +339,111 @@ class TestRecvSmsGo(unittest.TestCase):
         sent = " ".join(c.args[0] for c in update.callback_query.message.reply_text.call_args_list)
         self.assertNotIn("secret-key", sent)
 
-    def test_real_posts_correct_body(self):
+    def test_real_posts_correct_body_and_bumps_count(self):
         update = _make_update_with_callback("sms_go:yes")
         ctx = MagicMock(); ctx.user_data = {"sms_session": self._sess(False)}
-        resp = MagicMock(status_code=200, text='{"responses":[]}')
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"responses": [
+            {"response-code": 200, "response-description": "Success", "mobile": "254700000001", "messageid": "979295131"},
+            {"response-code": 200, "response-description": "Success", "mobile": "254700000002", "messageid": "979295132"},
+            {"response-code": 200, "response-description": "Success", "mobile": "254700000001", "messageid": "979295133"},
+        ]}
         with patch.object(sms, "load_sms_test_numbers", return_value=["254700000001", "254700000002"]), \
              patch.object(sms.requests, "post", return_value=resp) as mock_post, \
+             patch.object(sms, "_bump_sms_sent_count", return_value=103) as mock_bump, \
              patch.dict(os.environ, _ENV, clear=False):
             result = _run(sms.recv_sms_go(update, ctx))
         self.assertEqual(result, sms.ConversationHandler.END)
-        mock_post.assert_called_once()
         self.assertEqual(mock_post.call_args.args[0], sms.SMS_SEND_URL)
         body = mock_post.call_args.kwargs["json"]
         self.assertEqual(body["count"], 3)
-        self.assertEqual(len(body["smslist"]), 3)
         self.assertEqual(body["smslist"][0]["partnerID"], "10709")
         self.assertEqual(body["smslist"][0]["shortcode"], "Text")
+        mock_bump.assert_called_once_with(3)   # all 3 accepted
+        sent = " ".join(c.args[0] for c in update.callback_query.message.reply_text.call_args_list)
+        self.assertIn("979295131", sent)                 # formatted per-message detail
+        self.assertIn("Total texts sent to date: 103", sent)
+
+    def test_real_send_counts_only_accepted(self):
+        update = _make_update_with_callback("sms_go:yes")
+        ctx = MagicMock(); ctx.user_data = {"sms_session": self._sess(False)}
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"responses": [
+            {"response-code": 200, "response-description": "Success", "mobile": "254700000001", "messageid": "1"},
+            {"response-code": 1006, "response-description": "Invalid", "mobile": "254700000002", "messageid": None},
+            {"response-code": 200, "response-description": "Success", "mobile": "254700000001", "messageid": "3"},
+        ]}
+        with patch.object(sms, "load_sms_test_numbers", return_value=["254700000001", "254700000002"]), \
+             patch.object(sms.requests, "post", return_value=resp), \
+             patch.object(sms, "_bump_sms_sent_count", return_value=2) as mock_bump, \
+             patch.dict(os.environ, _ENV, clear=False):
+            _run(sms.recv_sms_go(update, ctx))
+        mock_bump.assert_called_once_with(2)   # 2 of 3 accepted, failed one not counted
 
     def test_real_send_failure_is_reported_not_raised(self):
         update = _make_update_with_callback("sms_go:yes")
         ctx = MagicMock(); ctx.user_data = {"sms_session": self._sess(False)}
         with patch.object(sms, "load_sms_test_numbers", return_value=["254700000001"]), \
              patch.object(sms.requests, "post", side_effect=RuntimeError("gateway down")), \
+             patch.object(sms, "_bump_sms_sent_count") as mock_bump, \
              patch.dict(os.environ, _ENV, clear=False):
             result = _run(sms.recv_sms_go(update, ctx))
         self.assertEqual(result, sms.ConversationHandler.END)
+        mock_bump.assert_not_called()   # nothing accepted on a transport failure
         sent = " ".join(c.args[0] for c in update.callback_query.message.reply_text.call_args_list)
         self.assertIn("failed", sent.lower())
+
+
+class TestSummarizeSendResponse(unittest.TestCase):
+    def test_parses_the_gateway_sample(self):
+        resp = MagicMock()
+        resp.json.return_value = {"responses": [
+            {"response-code": 200, "response-description": "Success", "mobile": "254700147275",
+             "messageid": "979295131", "clientsmsid": None, "networkid": 1},
+        ]}
+        lines, ok, fail = sms._summarize_send_response(resp)
+        self.assertEqual((ok, fail), (1, 0))
+        self.assertEqual(len(lines), 1)
+        self.assertIn("254700147275", lines[0])
+        self.assertIn("979295131", lines[0])
+        self.assertIn("✅", lines[0])
+
+    def test_counts_failures(self):
+        resp = MagicMock()
+        resp.json.return_value = {"responses": [
+            {"response-code": 200, "mobile": "a", "messageid": "1"},
+            {"response-code": 1007, "response-description": "No credit", "mobile": "b", "messageid": None},
+        ]}
+        lines, ok, fail = sms._summarize_send_response(resp)
+        self.assertEqual((ok, fail), (1, 1))
+        self.assertIn("❌", lines[1])
+
+    def test_non_json_falls_back_to_raw(self):
+        resp = MagicMock(text="<html>gateway error</html>")
+        resp.json.side_effect = ValueError("not json")
+        lines, ok, fail = sms._summarize_send_response(resp)
+        self.assertEqual((ok, fail), (0, 0))
+        self.assertIn("Unrecognized", lines[0])
+
+
+class TestSentCountPersistence(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._p = patch.object(sms, "SAVED_SMS_SENT_COUNT_FILE", os.path.join(self.tmp.name, "c.json"))
+        self._p.start(); self.addCleanup(self._p.stop)
+
+    def test_missing_returns_zero(self):
+        self.assertEqual(sms.load_sms_sent_count(), 0)
+
+    def test_bump_accumulates(self):
+        self.assertEqual(sms._bump_sms_sent_count(3), 3)
+        self.assertEqual(sms._bump_sms_sent_count(2), 5)
+        self.assertEqual(sms.load_sms_sent_count(), 5)
+
+    def test_bump_ignores_negative(self):
+        sms._bump_sms_sent_count(4)
+        self.assertEqual(sms._bump_sms_sent_count(-10), 4)
 
 
 if __name__ == "__main__":

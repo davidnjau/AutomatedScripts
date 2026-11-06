@@ -38,7 +38,7 @@ import re
 import string
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -79,6 +79,7 @@ _SMS_MAX_PER_RUN = 50   # safety cap: most texts a single run may send
 
 SAVED_SMS_TEST_NUMBERS_FILE = os.path.join(DATA_DIR, "saved_sms_test_numbers.json")
 SAVED_SMS_TEMPLATES_FILE    = os.path.join(DATA_DIR, "saved_sms_templates.json")
+SAVED_SMS_SENT_COUNT_FILE   = os.path.join(DATA_DIR, "saved_sms_sent_count.json")
 
 # Sample messages used to seed the template store on first use. Each uses
 # placeholder tokens that are randomized per recipient at send time (see
@@ -127,6 +128,23 @@ def load_sms_templates() -> List[str]:
 def save_sms_templates(templates: List[str]) -> None:
     # Persist the full template list so a newly-added message survives restarts.
     _atomic_json_write(SAVED_SMS_TEMPLATES_FILE, templates, indent=2)
+
+
+def load_sms_sent_count() -> int:
+    # Cumulative count of texts the gateway has accepted across all real
+    # runs (0 if never sent / file absent).
+    try:
+        with open(SAVED_SMS_SENT_COUNT_FILE) as f:
+            return int(json.load(f).get("total_sent", 0))
+    except (FileNotFoundError, ValueError, TypeError, AttributeError):
+        return 0
+
+
+def _bump_sms_sent_count(n: int) -> int:
+    # Add `n` accepted texts to the running total; returns the new total.
+    total = load_sms_sent_count() + max(0, n)
+    _atomic_json_write(SAVED_SMS_SENT_COUNT_FILE, {"total_sent": total}, indent=2)
+    return total
 
 
 # ──────────────────────────────────────────────────────────
@@ -201,6 +219,38 @@ def _redact(payload: Dict) -> Dict:
         "count": payload.get("count"),
         "smslist": [{**item, "apikey": "***"} for item in payload.get("smslist", [])],
     }
+
+
+def _summarize_send_response(resp) -> Tuple[List[str], int, int]:
+    """Turn a TextSMS sendbulk response into readable per-message lines plus
+    (success_count, fail_count). Each `responses` entry carries its own
+    response-code (200 = accepted), mobile, and messageid. Falls back to
+    showing the raw body if the response isn't the expected JSON shape."""
+    try:
+        data = resp.json()
+        responses = data.get("responses", []) if isinstance(data, dict) else []
+    except Exception:
+        responses = []
+
+    if not responses:
+        raw = (getattr(resp, "text", "") or "")[:400]
+        return ([f"⚠️ Unrecognized gateway response:\n`{md_escape(raw)}`"], 0, 0)
+
+    lines: List[str] = []
+    ok = fail = 0
+    for i, r in enumerate(responses, 1):
+        code   = r.get("response-code")
+        desc   = r.get("response-description", "")
+        mobile = r.get("mobile", "—")
+        msgid  = r.get("messageid", "—")
+        accepted = str(code) == "200"
+        ok, fail = (ok + 1, fail) if accepted else (ok, fail + 1)
+        icon = "✅" if accepted else "❌"
+        lines.append(
+            f"{i}. {icon} `{md_escape(str(mobile))}` — {md_escape(str(desc))} "
+            f"({md_escape(str(code))}) · msg id `{md_escape(str(msgid))}`"
+        )
+    return (lines, ok, fail)
 
 
 # ──────────────────────────────────────────────────────────
@@ -300,7 +350,8 @@ async def cmd_sms(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["sms_session"] = SMSSession()
     await update.message.reply_text(
         "📱 *Send SMS* — fire a batch of test verification-code texts to the "
-        f"test-number pool (*{len(pool)}* numbers, cycled).\n\n"
+        f"test-number pool (*{len(pool)}* numbers, cycled).\n"
+        f"📊 Total texts sent to date: *{load_sms_sent_count()}*\n\n"
         "Step 1 — Simulate first, or send for real?",
         parse_mode="Markdown",
         reply_markup=_sms_mode_keyboard(),
@@ -440,14 +491,20 @@ async def recv_sms_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"📤 Sending {payload['count']} text(s)…")
     try:
         resp = requests.post(SMS_SEND_URL, json=payload, timeout=30)
-        body = resp.text[:500]
-        logger.info("SMS real send: %d text(s), HTTP %s", payload["count"], resp.status_code)
-        await query.message.reply_text(
-            f"🏁 *Sent {payload['count']} text(s)* — gateway HTTP {resp.status_code}\n"
-            f"`{md_escape(body)}`",
-            parse_mode="Markdown",
-            reply_markup=_main_menu_for(update.effective_user.id),
+        detail_lines, ok, fail = _summarize_send_response(resp)
+        total = _bump_sms_sent_count(ok)   # running total only counts accepted texts
+        logger.info(
+            "SMS real send: %d attempted, %d accepted, %d failed, HTTP %s (total sent to date: %d)",
+            payload["count"], ok, fail, resp.status_code, total,
         )
+        header = (
+            f"🏁 *Send complete* — gateway HTTP {resp.status_code}\n"
+            f"✅ Accepted: {ok}   ❌ Failed: {fail}\n"
+            f"📊 Total texts sent to date: {total}"
+        )
+        async def _send(text, reply_markup):
+            await query.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+        await _send_chunked_report(_send, [header] + detail_lines, reply_markup=_main_menu_for(update.effective_user.id))
     except Exception as e:
         logger.error("SMS real send failed: %s", e)
         await query.message.reply_text(
