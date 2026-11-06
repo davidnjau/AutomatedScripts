@@ -592,22 +592,33 @@ class TestDbFormatPendingGroup(unittest.TestCase):
         self.assertLess(block.index("OLDER"), block.index("NEWER"))
 
 
-class TestProcessDlvBatchItems(unittest.TestCase):
-    """_process_dlv_batch_items — aggregates per-ref outcomes into a list of
-    numbered blocks (for _send_chunked_report, no manual truncation), and
-    separately returns refs newly flagged awaiting_decision this cycle."""
+def _outcome(ref, status="✅ Assigned", valuer_name="Jane Doe", added_by=111):
+    # A completed-outcome dict shaped like _process_dlv_batch_items emits.
+    return {"ref": ref, "status": status, "valuer_name": valuer_name, "held_by": "", "added_by": added_by}
 
-    def _item(self, ref, valuer_name="Jane Doe", **overrides):
-        item = {"ref": ref, "valuer_name": valuer_name, "valuer_uid": "uid-1"}
+
+def _identity_filter(recs, uid):
+    # Stand-in for filter_own_records that passes everything through, so job/bg
+    # send-behaviour tests don't depend on admin config.
+    return list(recs)
+
+
+class TestProcessDlvBatchItems(unittest.TestCase):
+    """_process_dlv_batch_items — returns structured (outcomes, still_pending,
+    newly_awaiting); each outcome carries its queuer's added_by for per-user
+    report filtering. Formatting lives in _db_render_report (tested below)."""
+
+    def _item(self, ref, valuer_name="Jane Doe", added_by=111, **overrides):
+        item = {"ref": ref, "valuer_name": valuer_name, "valuer_uid": "uid-1", "added_by": added_by}
         item.update(overrides)
         return item
 
-    def test_empty_queue_returns_empty_list(self):
+    def test_empty_queue_returns_three_empty_lists(self):
         with patch.object(dlv_batch, "load_dlv_batch", return_value=[]):
-            self.assertEqual(dlv_batch._process_dlv_batch_items(TOKENS), ([], []))
+            self.assertEqual(dlv_batch._process_dlv_batch_items(TOKENS), ([], [], []))
 
-    def test_completed_outcomes_become_numbered_blocks(self):
-        items = [self._item("REF1"), self._item("REF2")]
+    def test_completed_outcomes_carry_added_by(self):
+        items = [self._item("REF1", added_by=111), self._item("REF2", added_by=222)]
         with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
              patch.object(dlv_batch, "save_dlv_batch"), \
              patch.object(dlv_batch, "build_session", return_value=MagicMock()), \
@@ -619,46 +630,24 @@ class TestProcessDlvBatchItems(unittest.TestCase):
                  "currency_code": "", "actor_name": "",
              }), \
              patch.object(dlv_batch, "persist_assignment"):
-            lines, newly_awaiting = dlv_batch._process_dlv_batch_items(TOKENS)
-        self.assertEqual(len(lines), 2)
+            outcomes, still_pending, newly_awaiting = dlv_batch._process_dlv_batch_items(TOKENS)
+        self.assertEqual(len(outcomes), 2)
+        self.assertEqual(still_pending, [])
         self.assertEqual(newly_awaiting, [])
-        refs_in_lines = {l.split("`")[1] for l in lines}
-        self.assertEqual(refs_in_lines, {"REF1", "REF2"})
-        for line in lines:
-            self.assertIn("📊 Status: ✅ Assigned", line)
-            self.assertIn("👤 Valuer: Jane Doe", line)
+        self.assertEqual({o["ref"]: o["added_by"] for o in outcomes}, {"REF1": 111, "REF2": 222})
+        for o in outcomes:
+            self.assertIn("Assigned", o["status"])
 
-    def test_still_pending_refs_grouped_by_valuer(self):
+    def test_not_found_refs_returned_as_still_pending(self):
         items = [self._item("REF1", valuer_name="Jane Doe"), self._item("REF2", valuer_name="John Roe")]
         with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
              patch.object(dlv_batch, "save_dlv_batch"), \
              patch.object(dlv_batch, "build_session", return_value=MagicMock()), \
              patch.object(dlv_batch, "_search_ref_dlv", return_value=None):
-            lines, newly_awaiting = dlv_batch._process_dlv_batch_items(TOKENS)
-        # 1 header line + 1 group block per distinct valuer
-        self.assertEqual(len(lines), 3)
-        self.assertIn("Still pending", lines[0])
-        self.assertIn("2 ref(s)", lines[0])
-        group_text = "\n".join(lines[1:])
-        self.assertIn("Jane Doe", group_text)
-        self.assertIn("REF1", group_text)
-        self.assertIn("John Roe", group_text)
-        self.assertIn("REF2", group_text)
+            outcomes, still_pending, newly_awaiting = dlv_batch._process_dlv_batch_items(TOKENS)
+        self.assertEqual(outcomes, [])
+        self.assertEqual({i["ref"] for i in still_pending}, {"REF1", "REF2"})
         self.assertEqual(newly_awaiting, [])
-
-    def test_still_pending_same_valuer_grouped_into_one_block(self):
-        items = [self._item("REF1", valuer_name="Jane Doe"), self._item("REF2", valuer_name="Jane Doe")]
-        with patch.object(dlv_batch, "load_dlv_batch", return_value=items), \
-             patch.object(dlv_batch, "save_dlv_batch"), \
-             patch.object(dlv_batch, "build_session", return_value=MagicMock()), \
-             patch.object(dlv_batch, "_search_ref_dlv", return_value=None):
-            lines, newly_awaiting = dlv_batch._process_dlv_batch_items(TOKENS)
-        # 1 header line + 1 group block (both refs share the same valuer)
-        self.assertEqual(len(lines), 2)
-        self.assertIn("Jane Doe", lines[1])
-        self.assertIn("2 pending", lines[1])
-        self.assertIn("REF1", lines[1])
-        self.assertIn("REF2", lines[1])
 
     def test_taken_by_another_valuer_returned_as_newly_awaiting_not_still_pending(self):
         items = [self._item("REF1")]
@@ -675,14 +664,13 @@ class TestProcessDlvBatchItems(unittest.TestCase):
                  "node": "VALUATION_STAMP_DUTY_VALUER_REPORT", "assessor_name": "",
                  "consideration_amount": "", "currency_code": "", "actor_name": "",
              }):
-            lines, newly_awaiting = dlv_batch._process_dlv_batch_items(TOKENS)
+            outcomes, still_pending, newly_awaiting = dlv_batch._process_dlv_batch_items(TOKENS)
         self.assertEqual(len(newly_awaiting), 1)
         self.assertEqual(newly_awaiting[0]["ref"], "REF1")
         self.assertTrue(newly_awaiting[0]["awaiting_decision"])
-        # kept in the queue (still saved), not reported as a retry candidate
         saved_refs = [i["ref"] for i in mock_save.call_args[0][0]]
         self.assertEqual(saved_refs, ["REF1"])
-        self.assertFalse(any("Still pending" in l for l in lines))
+        self.assertEqual(still_pending, [])   # the awaiting item is not a retry candidate
 
     def test_already_awaiting_items_are_not_reprocessed_or_renotified(self):
         items = [self._item("REF1", awaiting_decision=True, held_by="EXISTING VALUER", held_by_uid="uid-2")]
@@ -690,17 +678,48 @@ class TestProcessDlvBatchItems(unittest.TestCase):
              patch.object(dlv_batch, "save_dlv_batch") as mock_save, \
              patch.object(dlv_batch, "build_session") as mock_build_session, \
              patch.object(dlv_batch, "_search_ref_dlv") as mock_search:
-            lines, newly_awaiting = dlv_batch._process_dlv_batch_items(TOKENS)
-        self.assertEqual((lines, newly_awaiting), ([], []))
+            self.assertEqual(dlv_batch._process_dlv_batch_items(TOKENS), ([], [], []))
         mock_search.assert_not_called()
         mock_build_session.assert_not_called()
         mock_save.assert_not_called()
 
 
+class TestDbRenderReport(unittest.TestCase):
+    """_db_render_report — formats structured outcomes + still-pending into
+    numbered blocks (completed) and valuer-grouped blocks (pending)."""
+
+    def test_empty_inputs_yield_no_lines(self):
+        self.assertEqual(dlv_batch._db_render_report([], []), [])
+
+    def test_completed_outcomes_become_numbered_blocks(self):
+        lines = dlv_batch._db_render_report([_outcome("REF1"), _outcome("REF2")], [])
+        self.assertEqual(len(lines), 2)
+        self.assertEqual({l.split("`")[1] for l in lines}, {"REF1", "REF2"})
+        for line in lines:
+            self.assertIn("📊 Status: ✅ Assigned", line)
+            self.assertIn("👤 Valuer: Jane Doe", line)
+
+    def test_still_pending_grouped_by_valuer(self):
+        pending = [{"ref": "REF1", "valuer_name": "Jane Doe"}, {"ref": "REF2", "valuer_name": "John Roe"}]
+        lines = dlv_batch._db_render_report([], pending)
+        self.assertIn("Still pending", lines[0])
+        self.assertIn("2 ref(s)", lines[0])
+        group_text = "\n".join(lines[1:])
+        for token in ("Jane Doe", "REF1", "John Roe", "REF2"):
+            self.assertIn(token, group_text)
+
+    def test_still_pending_same_valuer_one_block(self):
+        pending = [{"ref": "REF1", "valuer_name": "Jane Doe"}, {"ref": "REF2", "valuer_name": "Jane Doe"}]
+        lines = dlv_batch._db_render_report([], pending)
+        self.assertEqual(len(lines), 2)   # header + one group
+        self.assertIn("2 pending", lines[1])
+        self.assertIn("REF1", lines[1])
+        self.assertIn("REF2", lines[1])
+
+
 class TestDlvBatchJob(unittest.TestCase):
-    """_dlv_batch_job — the 5-minute repeating job; must use
-    _send_chunked_report rather than manually truncating at 4000 chars,
-    since blocks are now much taller than the old one-liner."""
+    """_dlv_batch_job — the repeating job; renders a per-recipient report
+    (admin sees all, non-admin only their own added refs) via _db_render_report."""
 
     def test_no_items_does_nothing(self):
         ctx = MagicMock()
@@ -711,29 +730,53 @@ class TestDlvBatchJob(unittest.TestCase):
     def test_completed_outcomes_are_sent_as_blocks(self):
         ctx = MagicMock()
         ctx.bot.send_message = AsyncMock()
-        outcome_lines = ["  1. 📌 *Ref:* `REF1`\n     📊 Status: ✅ Assigned"]
         with patch.object(dlv_batch, "load_dlv_batch", side_effect=[[{"ref": "REF1"}], []]), \
              patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
-             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=(outcome_lines, [])), \
+             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([_outcome("REF1")], [], [])), \
+             patch.object(dlv_batch, "filter_own_records", side_effect=_identity_filter), \
              patch.object(dlv_batch, "_db_resend_stale_taken_prompts", return_value=[]), \
              patch("dlv_stale_check.run_stale_check", new_callable=AsyncMock), \
              patch.object(dlv_batch, "ALLOWED_IDS", {111}):
             _run(dlv_batch._dlv_batch_job(ctx))
         sent = "\n".join(c.args[1] for c in ctx.bot.send_message.call_args_list)
         self.assertIn("📋 *DLV Batch (auto)*", sent)
-        self.assertIn("📌 *Ref:* `REF1`", sent)
+        self.assertIn("REF1", sent)
 
-    def test_newly_awaiting_refs_get_a_taken_prompt_to_every_allowed_id(self):
+    def test_report_filtered_per_recipient(self):
+        # REF1 added by 111, REF2 by 222: each non-admin recipient sees only
+        # their own; filter_own_records here is the real one driven by added_by.
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        outcomes = [_outcome("REF1", added_by=111), _outcome("REF2", added_by=222)]
+        with patch.object(dlv_batch, "load_dlv_batch", side_effect=[[{"ref": "REF1"}, {"ref": "REF2"}], []]), \
+             patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
+             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=(outcomes, [], [])), \
+             patch.object(dlv_batch, "filter_own_records",
+                          side_effect=lambda recs, uid: [r for r in recs if r.get("added_by") == uid]), \
+             patch.object(dlv_batch, "_db_resend_stale_taken_prompts", return_value=[]), \
+             patch("dlv_stale_check.run_stale_check", new_callable=AsyncMock), \
+             patch.object(dlv_batch, "ALLOWED_IDS", [111, 222]):
+            _run(dlv_batch._dlv_batch_job(ctx))
+        by_chat = {}
+        for c in ctx.bot.send_message.call_args_list:
+            by_chat.setdefault(c.args[0], []).append(c.args[1])
+        self.assertIn("REF1", "\n".join(by_chat.get(111, [])))
+        self.assertNotIn("REF2", "\n".join(by_chat.get(111, [])))
+        self.assertIn("REF2", "\n".join(by_chat.get(222, [])))
+        self.assertNotIn("REF1", "\n".join(by_chat.get(222, [])))
+
+    def test_newly_awaiting_refs_get_a_taken_prompt_filtered_per_recipient(self):
         ctx = MagicMock()
         ctx.bot.send_message = AsyncMock()
         newly_awaiting = [{"ref": "REF1", "valuer_name": "Jane Doe", "held_by": "EXISTING VALUER",
-                            "held_by_uid": "uid-2"}]
+                            "held_by_uid": "uid-2", "added_by": 111}]
         with patch.object(dlv_batch, "load_dlv_batch", side_effect=[[{"ref": "REF1"}], [{"ref": "REF1"}]]), \
              patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
-             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], newly_awaiting)), \
+             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], [], newly_awaiting)), \
+             patch.object(dlv_batch, "filter_own_records", side_effect=_identity_filter), \
              patch.object(dlv_batch, "_db_resend_stale_taken_prompts", return_value=[]), \
              patch("dlv_stale_check.run_stale_check", new_callable=AsyncMock), \
-             patch.object(dlv_batch, "ALLOWED_IDS", {111, 222}):
+             patch.object(dlv_batch, "ALLOWED_IDS", [111, 222]):
             _run(dlv_batch._dlv_batch_job(ctx))
         chat_ids = {c.args[0] for c in ctx.bot.send_message.call_args_list}
         self.assertEqual(chat_ids, {111, 222})
@@ -743,16 +786,14 @@ class TestDlvBatchJob(unittest.TestCase):
             self.assertIn("reply_markup", call.kwargs)
 
     def test_stale_awaiting_refs_also_get_a_resent_prompt(self):
-        """The safety net: even with no newly_awaiting this cycle, a ref
-        whose prompt has gone stale (see _db_resend_stale_taken_prompts)
-        must still get sent."""
         ctx = MagicMock()
         ctx.bot.send_message = AsyncMock()
         stale = [{"ref": "REF1", "valuer_name": "Jane Doe", "held_by": "EXISTING VALUER",
-                  "held_by_uid": "uid-2"}]
+                  "held_by_uid": "uid-2", "added_by": 111}]
         with patch.object(dlv_batch, "load_dlv_batch", side_effect=[[{"ref": "REF1"}], [{"ref": "REF1"}]]), \
              patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
-             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], [])), \
+             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], [], [])), \
+             patch.object(dlv_batch, "filter_own_records", side_effect=_identity_filter), \
              patch.object(dlv_batch, "_db_resend_stale_taken_prompts", return_value=stale), \
              patch("dlv_stale_check.run_stale_check", new_callable=AsyncMock), \
              patch.object(dlv_batch, "ALLOWED_IDS", {111}):
@@ -767,7 +808,7 @@ class TestDlvBatchJob(unittest.TestCase):
         ctx.bot.send_message = AsyncMock()
         with patch.object(dlv_batch, "load_dlv_batch", return_value=[]), \
              patch.object(dlv_batch, "_any_valid_tokens", return_value=TOKENS), \
-             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], [])), \
+             patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], [], [])), \
              patch.object(dlv_batch, "_db_resend_stale_taken_prompts", return_value=[]) as mock_resend, \
              patch.object(dlv_batch, "ALLOWED_IDS", {111}):
             _run(dlv_batch._dlv_batch_job(ctx))
@@ -776,13 +817,14 @@ class TestDlvBatchJob(unittest.TestCase):
 
 
 class TestRunDlvBatchBg(unittest.TestCase):
-    """_run_dlv_batch_bg — the post-confirm background processor; same
-    chunked-sending requirement as the periodic job."""
+    """_run_dlv_batch_bg — the post-confirm background processor; renders the
+    submitter's own view (admin → all) via _db_render_report."""
 
     def test_empty_report_sends_batch_already_empty_message(self):
         ctx = MagicMock()
         ctx.bot.send_message = AsyncMock()
-        with patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], [])):
+        with patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([], [], [])), \
+             patch.object(dlv_batch, "filter_own_records", side_effect=_identity_filter):
             _run(dlv_batch._run_dlv_batch_bg(ctx, 111, TOKENS))
         ctx.bot.send_message.assert_called_once()
         self.assertIn("already empty", ctx.bot.send_message.call_args[0][1])
@@ -790,20 +832,21 @@ class TestRunDlvBatchBg(unittest.TestCase):
     def test_outcome_blocks_sent_via_chunked_report(self):
         ctx = MagicMock()
         ctx.bot.send_message = AsyncMock()
-        outcome_lines = ["  1. 📌 *Ref:* `REF1`\n     📊 Status: ✅ Assigned"]
-        with patch.object(dlv_batch, "_process_dlv_batch_items", return_value=(outcome_lines, [])):
+        with patch.object(dlv_batch, "_process_dlv_batch_items", return_value=([_outcome("REF1")], [], [])), \
+             patch.object(dlv_batch, "filter_own_records", side_effect=_identity_filter):
             _run(dlv_batch._run_dlv_batch_bg(ctx, 111, TOKENS))
         sent = "\n".join(c.args[1] for c in ctx.bot.send_message.call_args_list)
         self.assertIn("📋 *DLV Batch Report*", sent)
-        self.assertIn("📌 *Ref:* `REF1`", sent)
+        self.assertIn("REF1", sent)
 
     def test_newly_awaiting_ref_gets_a_taken_prompt(self):
         ctx = MagicMock()
         ctx.bot.send_message = AsyncMock()
-        outcome_lines = ["  1. 📌 *Ref:* `REF1`\n     📊 Status: ⚠️ Taken by another valuer — awaiting your decision"]
+        outcomes = [_outcome("REF1", status="⚠️ Taken by another valuer — awaiting your decision")]
         newly_awaiting = [{"ref": "REF1", "valuer_name": "Jane Doe", "held_by": "EXISTING VALUER",
-                            "held_by_uid": "uid-2"}]
-        with patch.object(dlv_batch, "_process_dlv_batch_items", return_value=(outcome_lines, newly_awaiting)):
+                            "held_by_uid": "uid-2", "added_by": 111}]
+        with patch.object(dlv_batch, "_process_dlv_batch_items", return_value=(outcomes, [], newly_awaiting)), \
+             patch.object(dlv_batch, "filter_own_records", side_effect=_identity_filter):
             _run(dlv_batch._run_dlv_batch_bg(ctx, 111, TOKENS))
         prompt_call = ctx.bot.send_message.call_args_list[-1]
         self.assertEqual(prompt_call.args[0], 111)
@@ -1183,6 +1226,7 @@ class TestCmdDlvQueue(unittest.TestCase):
         items = [{"ref": "REF1", "valuer_name": "Jane Doe", "awaiting_decision": True,
                   "held_by": "EXISTING VALUER", "last_error": "stale error"}]
         with patch.object(dlv_batch, "allowed", return_value=True), \
+             patch.object(dlv_batch, "filter_own_records", side_effect=lambda recs, uid: list(recs)), \
              patch.object(dlv_batch, "load_dlv_batch", return_value=items):
             _run(dlv_batch.cmd_dlv_queue(update, MagicMock()))
         text = update.message.reply_text.call_args[0][0]
@@ -1193,11 +1237,25 @@ class TestCmdDlvQueue(unittest.TestCase):
         update = self._update()
         items = [{"ref": "REF1", "valuer_name": "Jane Doe", "last_error": "Not found in DLV endpoint"}]
         with patch.object(dlv_batch, "allowed", return_value=True), \
+             patch.object(dlv_batch, "filter_own_records", side_effect=lambda recs, uid: list(recs)), \
              patch.object(dlv_batch, "load_dlv_batch", return_value=items):
             _run(dlv_batch.cmd_dlv_queue(update, MagicMock()))
         text = update.message.reply_text.call_args[0][0]
         self.assertIn("Not found in DLV endpoint", text)
         self.assertNotIn("awaiting your decision", text)
+
+    def test_non_admin_sees_only_their_own_refs(self):
+        update = self._update()
+        update.effective_user.id = 111
+        items = [{"ref": "MINE", "valuer_name": "Jane Doe", "added_by": 111},
+                 {"ref": "THEIRS", "valuer_name": "John Roe", "added_by": 222}]
+        with patch.object(dlv_batch, "allowed", return_value=True), \
+             patch("dlv_core.is_admin", return_value=False), \
+             patch.object(dlv_batch, "load_dlv_batch", return_value=items):
+            _run(dlv_batch.cmd_dlv_queue(update, MagicMock()))
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("MINE", text)
+        self.assertNotIn("THEIRS", text)
 
 
 class TestRecvDlvQueueAction(unittest.TestCase):
@@ -1395,6 +1453,25 @@ class TestRecvDbConfirmAttachesTag(unittest.TestCase):
                         "valuer_acct": "a1", "status": "resolved"}]
         saved_items = self._confirm(ctx)
         self.assertEqual(saved_items[0]["tag"], "")
+
+    def test_new_item_records_adder_for_per_user_filtering(self):
+        ctx = MagicMock()
+        ctx.user_data = {}
+        sess = dlv_batch._get_db_sess(ctx)
+        sess.groups = [{"refs": ["REF1"], "valuer_name": "Jane", "valuer_uid": "u1",
+                        "valuer_acct": "a1", "status": "resolved"}]
+        update = _make_query_update("db:confirm")
+        update.effective_user.id = 111
+        update.effective_user.full_name = "D Major"
+        with patch.object(dlv_batch, "load_dlv_batch", return_value=[]), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save, \
+             patch.object(dlv_batch, "_fetch_tasks_log_lookup", return_value=None), \
+             patch.object(dlv_batch, "_fetch_tasks_log_remove"), \
+             patch.object(dlv_batch, "_any_valid_tokens", return_value=None):
+            _run(dlv_batch.recv_db_confirm(update, ctx))
+        item = mock_save.call_args[0][0][0]
+        self.assertEqual(item["added_by"], 111)
+        self.assertEqual(item["added_by_name"], "D Major")
 
     def test_retagging_an_already_queued_ref_updates_it_in_place(self):
         """Resubmitting a ref that's already in the queue just to tag it must

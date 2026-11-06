@@ -259,6 +259,29 @@ class TestFetchStampdutyDetail(unittest.TestCase):
         self.assertEqual(det, {"officers": []})
 
 
+class TestFilterOwnRecords(unittest.TestCase):
+    """filter_own_records — admin sees all; a non-admin sees only records
+    whose added_by matches them."""
+
+    def _records(self):
+        return [{"ref": "A", "added_by": 111}, {"ref": "B", "added_by": 222}, {"ref": "C"}]
+
+    def test_admin_sees_everything(self):
+        with patch("dlv_core.is_admin", return_value=True):
+            out = dlv_core.filter_own_records(self._records(), 111)
+        self.assertEqual([r["ref"] for r in out], ["A", "B", "C"])
+
+    def test_non_admin_sees_only_own_added(self):
+        with patch("dlv_core.is_admin", return_value=False):
+            out = dlv_core.filter_own_records(self._records(), 111)
+        self.assertEqual([r["ref"] for r in out], ["A"])
+
+    def test_non_admin_sees_nothing_when_no_match(self):
+        with patch("dlv_core.is_admin", return_value=False):
+            out = dlv_core.filter_own_records(self._records(), 999)
+        self.assertEqual(out, [])   # records with no added_by are admin-only
+
+
 class TestDlvQueuePersistence(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
