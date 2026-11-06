@@ -23,9 +23,12 @@ number drawn from the pulled pool, saved_sms_ref_numbers.json, cycled (a
 random token only as a fallback when that pool is empty); {purpose} → the
 department phrase derived from that reference's prefix so the wording
 matches its workflow — see _render_message), and either shows a compact
-summary of what would be
-sent (Simulate, nothing sent) or POSTs the single bulk request and
-summarizes the gateway's per-message result. Both outputs are compact —
+summary of what would be sent (Simulate, nothing sent) or hands the run to
+a background job (_sms_send_job) that splits it into _SMS_CHUNK_SIZE-sized
+sub-batches, POSTs each off the event loop (asyncio.to_thread) so the bot
+stays responsive, posts a running progress line, then a final compact
+summary of the gateway's result. A module-level guard (_sms_run_active)
+blocks a second real run while one is draining. Both outputs are compact —
 accepted/failed counts plus a sample message and sample numbers, not a
 full per-recipient dump. Simulate is the default and a real send needs an
 explicit second confirmation; the apikey is never rendered in any preview.
@@ -37,6 +40,7 @@ so its URL lives here rather than in endpoints.py.
 Call register(app) from bot.py's main() to wire this feature in.
 """
 
+import asyncio
 import json
 import os
 import random
@@ -80,7 +84,13 @@ from common import (
 SMS_SEND_URL   = "https://sms.textsms.co.ke/api/services/sendbulk/"
 _SMS_SHORTCODE = "Text"
 _SMS_PASS_TYPE = "plain"
-_SMS_MAX_PER_RUN = 50   # safety cap: most texts a single run may send
+_SMS_MAX_PER_RUN = 20000   # safety cap: most texts a single run may send
+# A large run is split into sub-batches, one sendbulk POST each, so no single
+# request blows past the gateway's per-request limit. Each POST runs off the
+# event loop (asyncio.to_thread) with a short pause between chunks, so the bot
+# stays responsive for every other feature while a 20k run drains.
+_SMS_CHUNK_SIZE = 1000     # recipients per sendbulk POST
+_SMS_CHUNK_DELAY = 1.0     # seconds to pause between chunks (gateway courtesy)
 
 SAVED_SMS_TEST_NUMBERS_FILE = os.path.join(DATA_DIR, "saved_sms_test_numbers.json")
 SAVED_SMS_REF_NUMBERS_FILE  = os.path.join(DATA_DIR, "saved_sms_ref_numbers.json")
@@ -263,6 +273,20 @@ def _build_payload(numbers: List[str], message: str, refs: Optional[List[str]] =
         for i, n in enumerate(numbers)
     ]
     return {"count": len(smslist), "smslist": smslist}
+
+
+def _chunk_recipients(
+    numbers: List[str], refs: Optional[List[str]], chunk_size: int
+) -> List[Tuple[List[str], Optional[List[str]]]]:
+    """Split the parallel numbers/refs lists into (numbers, refs) sub-batches
+    of at most `chunk_size`, so each becomes one sendbulk POST. `refs` may be
+    None (each chunk's refs is then None too). Empty input → []."""
+    chunks: List[Tuple[List[str], Optional[List[str]]]] = []
+    for start in range(0, len(numbers), chunk_size):
+        num_chunk = numbers[start:start + chunk_size]
+        ref_chunk = refs[start:start + chunk_size] if refs else None
+        chunks.append((num_chunk, ref_chunk))
+    return chunks
 
 
 def _sample_summary(payload: Dict, max_numbers: int = 3) -> List[str]:
@@ -526,56 +550,126 @@ async def _sms_show_confirm(message, ctx: ContextTypes.DEFAULT_TYPE, user_id: in
     return SMS.CONFIRM
 
 
+# True while a real background send is draining; blocks a second real run so
+# the gateway can't be double-blasted. Simulate runs never set it (nothing is
+# sent). Module-level because the bot is single-process/single-loop.
+_sms_run_active = False
+
+
 async def recv_sms_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Final step: build the payload and either preview it (Simulate) or POST it.
+    # Final step: preview it (Simulate, inline) or queue a background send.
+    global _sms_run_active
     query = update.callback_query
     await query.answer()
+    menu = _main_menu_for(update.effective_user.id)
     if query.data == "sms_go:no":
         await query.edit_message_text("🛑 Cancelled.")
-        await query.message.reply_text("Main menu.", reply_markup=_main_menu_for(update.effective_user.id))
+        await query.message.reply_text("Main menu.", reply_markup=menu)
         return ConversationHandler.END
 
     sess = _get_sms_sess(ctx)
-    numbers = _build_recipients(load_sms_test_numbers(), sess.count)
-    refs = _build_recipients(load_sms_ref_numbers(), sess.count) or None
-    payload = _build_payload(numbers, sess.message, refs)
-    menu = _main_menu_for(update.effective_user.id)
 
     if sess.simulate:
+        numbers = _build_recipients(load_sms_test_numbers(), sess.count)
+        refs = _build_recipients(load_sms_ref_numbers(), sess.count) or None
+        payload = _build_payload(numbers, sess.message, refs)
         lines = [f"🧪 *SIMULATION — nothing sent*\n{payload['count']} text(s) would be sent."]
         lines += _sample_summary(payload)
         await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=menu)
         logger.info("SMS simulate: %d text(s), message=%r", payload["count"], sess.message)
         return ConversationHandler.END
 
-    await query.edit_message_text(f"📤 Sending {payload['count']} text(s)…")
-    try:
-        resp = requests.post(SMS_SEND_URL, json=payload, timeout=30)
-        _, ok, fail = _summarize_send_response(resp)
-        total = _bump_sms_sent_count(ok)   # running total only counts accepted texts
-        logger.info(
-            "SMS real send: %d attempted, %d accepted, %d failed, HTTP %s (total sent to date: %d)",
-            payload["count"], ok, fail, resp.status_code, total,
-        )
-        if ok + fail > 0:
-            status_line = f"✅ {ok} message(s) success   ❌ {fail} message(s) failed"
-        else:
-            status_line = f"⚠️ Gateway HTTP {resp.status_code} — response not recognized"
-        lines = [
-            f"🏁 *Send complete* — gateway HTTP {resp.status_code}",
-            status_line,
-            f"📊 Total texts sent to date: {total}",
-            "",
-        ] + _sample_summary(payload)
-        await query.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=menu)
-    except Exception as e:
-        logger.error("SMS real send failed: %s", e)
-        await query.message.reply_text(
-            f"❌ Send failed: `{md_escape(str(e)[:200])}`",
-            parse_mode="Markdown",
+    # Real send: hand off to a background job so the event loop stays free.
+    if _sms_run_active:
+        await query.edit_message_text(
+            "⚠️ A send run is already in progress — wait for it to finish before starting another.",
             reply_markup=menu,
         )
+        return ConversationHandler.END
+
+    _sms_run_active = True
+    ctx.application.job_queue.run_once(
+        _sms_send_job, when=0,
+        data={"chat_id": query.message.chat_id, "count": sess.count, "message": sess.message},
+        name="sms_send_run",
+    )
+    n_chunks = -(-sess.count // _SMS_CHUNK_SIZE)   # ceil division
+    await query.edit_message_text(
+        f"✅ Queued *{sess.count}* text(s) — sending in the background in {n_chunks} "
+        f"batch(es) of up to {_SMS_CHUNK_SIZE}. Progress posts here; the bot stays usable meanwhile.",
+        parse_mode="Markdown",
+        reply_markup=menu,
+    )
     return ConversationHandler.END
+
+
+async def _sms_send_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    # Background driver for a real send: POST each chunk off the event loop,
+    # edit a running progress line, then post a final compact summary.
+    global _sms_run_active
+    data = ctx.job.data
+    chat_id = data["chat_id"]
+    message = data["message"]
+    numbers = _build_recipients(load_sms_test_numbers(), data["count"])
+    refs = _build_recipients(load_sms_ref_numbers(), data["count"]) or None
+    chunks = _chunk_recipients(numbers, refs, _SMS_CHUNK_SIZE)
+    total = len(numbers)
+    ok = fail = done = 0
+
+    status = await ctx.bot.send_message(
+        chat_id, f"📤 Sending {total} text(s) in {len(chunks)} batch(es)…"
+    )
+    try:
+        for idx, (num_chunk, ref_chunk) in enumerate(chunks, 1):
+            payload = _build_payload(num_chunk, message, ref_chunk)
+            try:
+                resp = await asyncio.to_thread(
+                    requests.post, SMS_SEND_URL, json=payload, timeout=60
+                )
+                _, chunk_ok, chunk_fail = _summarize_send_response(resp)
+                ok += chunk_ok
+                fail += chunk_fail
+            except Exception as e:
+                logger.error("SMS chunk %d/%d failed: %s", idx, len(chunks), e)
+                fail += len(num_chunk)
+            done += len(num_chunk)
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=chat_id, message_id=status.message_id,
+                    text=f"📤 Sending… {done}/{total} processed  (✅ {ok}  ❌ {fail})",
+                )
+            except Exception:
+                pass   # a failed progress edit must never abort the run
+            if idx < len(chunks):
+                await asyncio.sleep(_SMS_CHUNK_DELAY)
+
+        grand = _bump_sms_sent_count(ok)   # running total only counts accepted texts
+        logger.info(
+            "SMS background run: %d attempted, %d accepted, %d failed (total sent to date: %d)",
+            total, ok, fail, grand,
+        )
+        sample = _sample_summary(_build_payload(numbers[:3], message, (refs[:3] if refs else None)))
+        lines = [
+            f"🏁 *Send complete* — {total} attempted",
+            f"✅ {ok} message(s) success   ❌ {fail} message(s) failed",
+            f"📊 Total texts sent to date: {grand}",
+            "",
+        ] + sample
+        await ctx.bot.send_message(
+            chat_id, "\n".join(lines), parse_mode="Markdown",
+            reply_markup=_main_menu_for(chat_id),
+        )
+    except Exception as e:
+        logger.error("SMS background run aborted: %s", e)
+        try:
+            await ctx.bot.send_message(
+                chat_id, f"❌ Send run failed: `{md_escape(str(e)[:200])}`",
+                parse_mode="Markdown", reply_markup=_main_menu_for(chat_id),
+            )
+        except Exception:
+            pass
+    finally:
+        _sms_run_active = False
 
 
 # ──────────────────────────────────────────────────────────
