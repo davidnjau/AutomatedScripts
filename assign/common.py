@@ -342,6 +342,17 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+def admin_recipients() -> List[int]:
+    """Telegram IDs that should receive an admin-only broadcast (e.g. the
+    Morning Briefing, the DLV Batch auto report's full version): the
+    configured admins. Safety fallback — identical to get_user_categories —
+    if no admin is configured at all (ADMIN_IDS empty), there is no
+    restriction to enforce, so every allowed user receives it."""
+    if not ADMIN_IDS:
+        return list(ALLOWED_IDS)
+    return list(ADMIN_IDS)
+
+
 def get_user_categories(user_id: int) -> List[str]:
     """Every menu category label user_id may open. Admins always get
     every category, regardless of what's explicitly granted to them.

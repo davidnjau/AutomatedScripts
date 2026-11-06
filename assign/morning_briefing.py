@@ -32,17 +32,18 @@ from telegram.ext import (
 import re
 
 from common import (
-    ALLOWED_IDS,
     BTN_BRIEFING,
     DATA_DIR,
     _any_valid_tokens,
     _atomic_json_write,
     _CANCEL_FILTER,
     _main_menu_for,
+    admin_recipients,
     allowed,
     cmd_cancel,
     deny,
     fallback,
+    is_admin,
     logger,
     md_escape,
     not_cancel,
@@ -81,7 +82,8 @@ def save_briefing_config(cfg: Dict) -> None:
 # ──────────────────────────────────────────────────────────
 
 async def _send_briefing(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    for chat_id in ALLOWED_IDS:
+    # Admin-only broadcast — the Morning Briefing is restricted to admins.
+    for chat_id in admin_recipients():
         try:
             await context.bot.send_message(chat_id, text, parse_mode="Markdown")
         except Exception as e:
@@ -127,7 +129,7 @@ async def _run_morning_briefing(context: ContextTypes.DEFAULT_TYPE, delivery: st
         return
 
     await _send_briefing(context, f"🌅 *Morning Briefing — {today}* — {len(rows)} Open DLV Task(s)")
-    for chat_id in ALLOWED_IDS:
+    for chat_id in admin_recipients():
         try:
             await _dt_send_telegram(chat_id, rows, context.bot)
         except Exception as e:
@@ -173,7 +175,14 @@ def _mb_menu_keyboard(enabled: bool) -> InlineKeyboardMarkup:
 
 
 async def cmd_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Admin-only: the Morning Briefing (configure + receive) is restricted to admins.
     if not allowed(update): return await deny(update)
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text(
+            "🔒 Morning Briefing is admin-only.",
+            reply_markup=_main_menu_for(update.effective_user.id),
+        )
+        return ConversationHandler.END
     cfg      = load_briefing_config() or {}
     enabled  = cfg.get("enabled", False)
     delivery = cfg.get("delivery", "telegram")

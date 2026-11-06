@@ -149,14 +149,40 @@ class TestRunMorningBriefing(unittest.TestCase):
             _run(mb._run_morning_briefing(self.context, "telegram", ""))
         self.assertIn("No Open DLV Tasks", mock_send.call_args[0][1])
 
-    def test_telegram_delivery_broadcasts_to_all_allowed_ids(self):
+    def test_telegram_delivery_broadcasts_to_admins_only(self):
+        # Admin-only: the per-chat DLV send goes to admin_recipients(), not all allowed.
         with patch.object(mb, "_any_valid_tokens", return_value=TOKENS), \
              patch("asyncio.to_thread", new_callable=AsyncMock, return_value=[{"ref": "A"}]), \
-             patch.object(mb, "ALLOWED_IDS", {111, 222}), \
+             patch.object(mb, "admin_recipients", return_value=[111, 222]), \
              patch.object(mb, "_dt_send_telegram", new_callable=AsyncMock) as mock_dt_send, \
              patch.object(mb, "_send_briefing", new_callable=AsyncMock):
             _run(mb._run_morning_briefing(self.context, "telegram", ""))
         self.assertEqual(mock_dt_send.call_count, 2)
+        self.assertEqual({c.args[0] for c in mock_dt_send.call_args_list}, {111, 222})
+
+
+class TestCmdBriefingAdminOnly(unittest.TestCase):
+    def _update(self, uid):
+        u = MagicMock()
+        u.effective_user.id = uid
+        u.message.reply_text = AsyncMock()
+        return u
+
+    def test_non_admin_is_blocked(self):
+        update = self._update(999)
+        with patch.object(mb, "allowed", return_value=True), \
+             patch.object(mb, "is_admin", return_value=False):
+            result = _run(mb.cmd_briefing(update, MagicMock()))
+        self.assertEqual(result, mb.ConversationHandler.END)
+        self.assertIn("admin-only", update.message.reply_text.call_args[0][0].lower())
+
+    def test_admin_reaches_menu(self):
+        update = self._update(111)
+        with patch.object(mb, "allowed", return_value=True), \
+             patch.object(mb, "is_admin", return_value=True), \
+             patch.object(mb, "load_briefing_config", return_value=None):
+            result = _run(mb.cmd_briefing(update, MagicMock()))
+        self.assertEqual(result, mb.MB.MENU)
 
 
 class TestRecvMbEmail(unittest.TestCase):
