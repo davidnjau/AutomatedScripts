@@ -104,6 +104,7 @@ from dlv_core import (
     _classify_dlv_detail,
     _fetch_ref_detail_dlv,
     _search_ref_dlv,
+    filter_own_records,
     is_incremental_tag,
     load_dlv_batch,
     mark_removed,
@@ -458,7 +459,7 @@ def _db_format_pending_group(valuer_name: str, items: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-def _process_dlv_batch_items(tokens: AuthTokens) -> Tuple[List[str], List[Dict]]:
+def _process_dlv_batch_items(tokens: AuthTokens) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
     Process the flat batch queue (list of {ref, valuer_name, valuer_uid, valuer_acct})
     across worker threads — each ref's search/detail-view/assign calls are
@@ -471,19 +472,21 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> Tuple[List[str], List[Dict]]
     prior cycle, still waiting on a Reassign/Remove answer — see
     recv_db_taken_decision) are held out of processing entirely, so they're
     neither re-searched nor re-prompted every cycle.
-    Returns (report lines/blocks for completed items — for
-    _send_chunked_report, callers must not manually truncate this — or []
-    if nothing was processed, newly-flagged awaiting_decision items this
-    cycle, for callers to send a Reassign/Remove prompt for).
+    Returns (outcomes, still_pending, newly_awaiting) as structured dicts —
+    each outcome carries its queuer's `added_by` so a caller can filter to
+    one user's own refs before rendering (filter_own_records) and hand the
+    result to _db_render_report. newly_awaiting is the refs newly flagged
+    awaiting_decision this cycle, for callers to send a Reassign/Remove
+    prompt for.
     """
     items = load_dlv_batch()
     if not items:
-        return [], []
+        return [], [], []
 
     to_process = [i for i in items if not i.get("awaiting_decision")]
     held_back  = [i for i in items if i.get("awaiting_decision")]
     if not to_process:
-        return [], []
+        return [], [], []
 
     http_sess = build_session()
     assign_url = STAMP_DUTY_FIX_APPLICATION_URL
@@ -503,8 +506,12 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> Tuple[List[str], List[Dict]]
             for item in to_process
         }
         for fut in _futures_as_completed(fut_map):
+            src    = fut_map[fut]
             result = fut.result()
             if result["outcome"]:
+                # Carry the queuer's id onto the outcome so per-user report
+                # filtering (filter_own_records) can attribute it later.
+                result["outcome"].setdefault("added_by", src.get("added_by"))
                 outcomes.append(result["outcome"])
             if result["keep"]:
                 remaining.append(result["item"])
@@ -518,18 +525,25 @@ def _process_dlv_batch_items(tokens: AuthTokens) -> Tuple[List[str], List[Dict]]
     for closed_record in closed_items:
         _append_dlv_closed(closed_record)
 
-    completed_lines = [_db_format_outcome_block(i, o) for i, o in enumerate(outcomes, 1)]
-
     still_pending = [i for i in remaining if not i.get("awaiting_decision")]
+    return outcomes, still_pending, newly_awaiting
+
+
+def _db_render_report(outcomes: List[Dict], still_pending: List[Dict]) -> List[str]:
+    """Build the report lines/blocks for a set of completed outcomes plus the
+    still-pending items (grouped by queued valuer). Split out of
+    _process_dlv_batch_items so a caller can filter outcomes/pending to one
+    user's own added refs first (see filter_own_records) and render just
+    those. Returns [] when both inputs are empty (nothing to show)."""
+    lines = [_db_format_outcome_block(i, o) for i, o in enumerate(outcomes, 1)]
     if still_pending:
         by_valuer: Dict[str, List[Dict]] = {}
         for item in still_pending:
             by_valuer.setdefault(item.get("valuer_name") or "Unknown", []).append(item)
-        completed_lines.append(f"⏳ *Still pending* (retry in 5 min) — {len(still_pending)} ref(s):")
+        lines.append(f"⏳ *Still pending* (retry in 5 min) — {len(still_pending)} ref(s):")
         for valuer_name in sorted(by_valuer, key=lambda v: -len(by_valuer[v])):
-            completed_lines.append(_db_format_pending_group(valuer_name, by_valuer[valuer_name]))
-
-    return completed_lines, newly_awaiting
+            lines.append(_db_format_pending_group(valuer_name, by_valuer[valuer_name]))
+    return lines
 
 
 def _db_taken_keyboard(ref: str) -> InlineKeyboardMarkup:
@@ -689,21 +703,34 @@ async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     before_count = len(items)
-    report_lines, newly_awaiting = await asyncio.to_thread(_process_dlv_batch_items, tokens)
+    outcomes, still_pending, newly_awaiting = await asyncio.to_thread(_process_dlv_batch_items, tokens)
     after_count  = len(load_dlv_batch())
 
-    # Only notify if something was actually completed (queue shrank)
-    if report_lines and after_count < before_count:
+    # Only notify if something was actually completed (queue shrank). Each
+    # recipient gets a report filtered to what they can see: an admin sees
+    # every outcome, a non-admin only the refs they themselves queued — so a
+    # recipient with nothing of their own this cycle is simply skipped.
+    if after_count < before_count:
         for chat_id in ALLOWED_IDS:
+            lines = _db_render_report(
+                filter_own_records(outcomes, chat_id),
+                filter_own_records(still_pending, chat_id),
+            )
+            if not lines:
+                continue
             async def _send(text, reply_markup, chat_id=chat_id):
                 try:
                     await context.bot.send_message(chat_id, text, parse_mode="Markdown")
                 except Exception as e:
                     logger.warning("DLV batch job notify error for %s: %s", chat_id, e)
-            await _send_chunked_report(_send, ["📋 *DLV Batch (auto)*"] + report_lines, join="\n\n")
+            await _send_chunked_report(_send, ["📋 *DLV Batch (auto)*"] + lines, join="\n\n")
 
     if newly_awaiting:
-        await _send_db_taken_prompts(context.bot, ALLOWED_IDS, newly_awaiting)
+        # A non-admin is only prompted about refs they queued; admins get all.
+        for chat_id in ALLOWED_IDS:
+            own = filter_own_records(newly_awaiting, chat_id)
+            if own:
+                await _send_db_taken_prompts(context.bot, [chat_id], own)
 
     # Safety net: resend the Reassign/Maintain/Delete prompt for any ref
     # that's been awaiting a decision for over an hour without one — covers
@@ -712,7 +739,10 @@ async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     # forever just because its one notification never arrived.
     stale_awaiting = await asyncio.to_thread(_db_resend_stale_taken_prompts)
     if stale_awaiting:
-        await _send_db_taken_prompts(context.bot, ALLOWED_IDS, stale_awaiting)
+        for chat_id in ALLOWED_IDS:
+            own = filter_own_records(stale_awaiting, chat_id)
+            if own:
+                await _send_db_taken_prompts(context.bot, [chat_id], own)
 
     # Piggyback the Stale Pending checker (dlv_stale_check.py) on this same
     # 1-minute cycle rather than giving it its own job/interval — a local
@@ -820,7 +850,8 @@ async def cmd_queue_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_dlv_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
 
-    items = load_dlv_batch()
+    # Admin sees the whole queue; a non-admin sees only refs they added.
+    items = filter_own_records(load_dlv_batch(), update.effective_user.id)
     if not items:
         await update.message.reply_text(
             "✅ DLV Queue is empty — no pending assignments.",
@@ -878,15 +909,18 @@ async def recv_dlv_queue_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("✅ Queue is empty — nothing to process.")
             return
         await query.edit_message_text(f"⏳ Processing {len(items_before)} ref(s), please wait…")
-        report_lines, newly_awaiting = await asyncio.to_thread(_process_dlv_batch_items, tokens)
-        remaining = load_dlv_batch()
+        outcomes, still_pending, newly_awaiting = await asyncio.to_thread(_process_dlv_batch_items, tokens)
+
+        # Admin sees the full result; a non-admin only their own added refs.
+        uid = update.effective_user.id
+        report_lines = _db_render_report(
+            filter_own_records(outcomes, uid),
+            filter_own_records(still_pending, uid),
+        )
 
         if not report_lines:
             await query.edit_message_text("ℹ️ Nothing processed.")
             return
-
-        if remaining:
-            report_lines = report_lines + [f"⏳ *{len(remaining)} ref(s) still pending*"]
 
         first_chunk_done = False
 
@@ -901,7 +935,9 @@ async def recv_dlv_queue_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _send_chunked_report(_send, ["📋 *DLV Queue — Query Result*"] + report_lines, join="\n\n")
 
         if newly_awaiting:
-            await _send_db_taken_prompts(ctx.bot, [query.message.chat_id], newly_awaiting)
+            own = filter_own_records(newly_awaiting, uid)
+            if own:
+                await _send_db_taken_prompts(ctx.bot, [query.message.chat_id], own)
         return
 
     if data.startswith("dlvq:interval:"):
@@ -1124,6 +1160,10 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Flatten groups to individual ref+valuer items for per-ref retry tracking
     existing      = load_dlv_batch()
     existing_by_ref = {item["ref"]: item for item in existing}
+    # Record who added these refs so per-user report filtering can later show a
+    # non-admin only their own additions (see dlv_core.filter_own_records).
+    adder_id   = update.effective_user.id
+    adder_name = update.effective_user.full_name or str(adder_id)
     new_items = []
     for g in to_save:
         for ref in g["refs"]:
@@ -1141,6 +1181,8 @@ async def recv_db_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "valuer_acct": g["valuer_acct"],
                     "queued_at":   datetime.now().isoformat(timespec="seconds"),
                     "tag":         tag,
+                    "added_by":      adder_id,
+                    "added_by_name": adder_name,
                 }
                 cached = _fetch_tasks_log_lookup(ref)
                 if cached:
@@ -1247,12 +1289,17 @@ async def _run_dlv_batch_bg(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, tokens
     back, followed by a Reassign/Remove prompt for any ref newly found held
     by someone else."""
     try:
-        report_lines, newly_awaiting = await asyncio.to_thread(_process_dlv_batch_items, tokens)
+        outcomes, still_pending, newly_awaiting = await asyncio.to_thread(_process_dlv_batch_items, tokens)
     except Exception as e:
         logger.error("DLV batch background processing failed: %s", e, exc_info=True)
         await ctx.bot.send_message(chat_id, f"❌ DLV Batch processing failed: `{e}`", parse_mode="Markdown")
         return
 
+    # The submitter sees the result for their own added refs; an admin sees all.
+    report_lines = _db_render_report(
+        filter_own_records(outcomes, chat_id),
+        filter_own_records(still_pending, chat_id),
+    )
     if not report_lines:
         await ctx.bot.send_message(chat_id, "ℹ️ Batch was already empty.", parse_mode="Markdown")
         return
@@ -1263,7 +1310,9 @@ async def _run_dlv_batch_bg(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, tokens
     await _send_chunked_report(_send, ["📋 *DLV Batch Report*"] + report_lines, join="\n\n")
 
     if newly_awaiting:
-        await _send_db_taken_prompts(ctx.bot, [chat_id], newly_awaiting)
+        own = filter_own_records(newly_awaiting, chat_id)
+        if own:
+            await _send_db_taken_prompts(ctx.bot, [chat_id], own)
 
 
 # ──────────────────────────────────────────────────────────
