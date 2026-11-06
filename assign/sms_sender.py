@@ -18,11 +18,15 @@ Flow: pick a mode (🧪 Simulate — default — or 📤 Send real), a count
 (1–_SMS_MAX_PER_RUN), and a message template (a saved one, or a new one
 that gets saved for reuse). On confirm it cycles the pool to `count`
 numbers, renders the template per recipient (placeholder substitution —
-each {code} → a fresh 6-digit code, each {ref} → a fresh 10-char
-reference token, see _render_message), and either shows the would-be
-payload (Simulate, nothing sent) or POSTs the single bulk request to the
-gateway. Simulate is the default and a real send needs an explicit second
-confirmation; the apikey is never rendered in any preview.
+each {code} → a fresh random 6-digit code; each {ref} → a real reference
+number drawn from the pulled pool, saved_sms_ref_numbers.json, cycled; a
+random token only as a fallback when that pool is empty — see
+_render_message), and either shows a compact summary of what would be
+sent (Simulate, nothing sent) or POSTs the single bulk request and
+summarizes the gateway's per-message result. Both outputs are compact —
+accepted/failed counts plus a sample message and sample numbers, not a
+full per-recipient dump. Simulate is the default and a real send needs an
+explicit second confirmation; the apikey is never rendered in any preview.
 
 Gateway credentials come from the environment (SMS_PARTNER_ID /
 SMS_API_KEY, already in .env). The gateway is NOT an Ardhisasa endpoint,
@@ -38,7 +42,7 @@ import re
 import string
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -67,7 +71,6 @@ from common import (
     md_escape,
     not_cancel,
 )
-from telegram_report import _send_chunked_report
 
 # ──────────────────────────────────────────────────────────
 # Gateway constants (TextSMS — not an Ardhisasa endpoint, so local)
@@ -78,18 +81,21 @@ _SMS_PASS_TYPE = "plain"
 _SMS_MAX_PER_RUN = 50   # safety cap: most texts a single run may send
 
 SAVED_SMS_TEST_NUMBERS_FILE = os.path.join(DATA_DIR, "saved_sms_test_numbers.json")
+SAVED_SMS_REF_NUMBERS_FILE  = os.path.join(DATA_DIR, "saved_sms_ref_numbers.json")
 SAVED_SMS_TEMPLATES_FILE    = os.path.join(DATA_DIR, "saved_sms_templates.json")
+SAVED_SMS_SENT_COUNT_FILE   = os.path.join(DATA_DIR, "saved_sms_sent_count.json")
 
-# Sample messages used to seed the template store on first use. Each uses
-# placeholder tokens that are randomized per recipient at send time (see
-# _render_message): {code} → a fresh 6-digit verification code, {ref} → a
-# fresh 10-char uppercase-alphanumeric reference (the literal prefixes like
-# REG/TSFR/ / CNTYINV/ stay as part of the template). All carry the
-# "ARDHISASA: Test :" prefix so a recipient can tell it's a test.
+# Sample messages used to seed the template store on first use. Placeholders
+# are filled per recipient at send time (see _render_message): {code} → a
+# fresh random 6-digit verification code; {ref} → a real reference number
+# drawn from the pulled pool (saved_sms_ref_numbers.json, cycled) — these
+# carry their own prefix (REG/TSFR/…, CNTYINV/…, etc.), which is why the
+# templates no longer hard-code one. All carry the "ARDHISASA: Test :"
+# prefix so a recipient can tell it's a test.
 _DEFAULT_TEMPLATES = [
     "ARDHISASA: Test : Your Ardhisasa login verification code is:{code}",
-    "ARDHISASA: Test : Transfer application reference REG/TSFR/{ref} has been submitted successfully to the ministry",
-    "ARDHISASA: Test : Application request CNTYINV/{ref} has been submitted for valuation. Check portal for more",
+    "ARDHISASA: Test : Transfer application reference {ref} has been submitted successfully to the ministry",
+    "ARDHISASA: Test : Application request {ref} has been submitted for valuation. Check portal for more",
     "ARDHISASA: Test : Payment of Ksh 5,000.00 has been received for invoice reference number {ref}",
 ]
 
@@ -107,6 +113,18 @@ def load_sms_test_numbers() -> List[str]:
         with open(SAVED_SMS_TEST_NUMBERS_FILE) as f:
             nums = json.load(f)
         return [n for n in nums if isinstance(n, str)]
+    except (FileNotFoundError, ValueError):
+        return []
+
+
+def load_sms_ref_numbers() -> List[str]:
+    # The test-env reference-number pool (seeded out of band from the DLV/
+    # survey/adjudication list endpoints); [] if not seeded yet. When empty,
+    # _render_message falls back to a random token so sends still work.
+    try:
+        with open(SAVED_SMS_REF_NUMBERS_FILE) as f:
+            refs = json.load(f)
+        return [r for r in refs if isinstance(r, str)]
     except (FileNotFoundError, ValueError):
         return []
 
@@ -129,6 +147,23 @@ def save_sms_templates(templates: List[str]) -> None:
     _atomic_json_write(SAVED_SMS_TEMPLATES_FILE, templates, indent=2)
 
 
+def load_sms_sent_count() -> int:
+    # Cumulative count of texts the gateway has accepted across all real
+    # runs (0 if never sent / file absent).
+    try:
+        with open(SAVED_SMS_SENT_COUNT_FILE) as f:
+            return int(json.load(f).get("total_sent", 0))
+    except (FileNotFoundError, ValueError, TypeError, AttributeError):
+        return 0
+
+
+def _bump_sms_sent_count(n: int) -> int:
+    # Add `n` accepted texts to the running total; returns the new total.
+    total = load_sms_sent_count() + max(0, n)
+    _atomic_json_write(SAVED_SMS_SENT_COUNT_FILE, {"total_sent": total}, indent=2)
+    return total
+
+
 # ──────────────────────────────────────────────────────────
 # Pure helpers (unit-tested)
 # ──────────────────────────────────────────────────────────
@@ -144,13 +179,13 @@ def _gen_ref() -> str:
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
 
 
-def _render_message(template: str) -> str:
-    """Substitute placeholders with fresh random values: each {code} → a new
-    6-digit code, each {ref} → a new 10-char reference token. Every
-    occurrence is randomized independently; plain text passes through
-    unchanged."""
+def _render_message(template: str, ref: Optional[str] = None) -> str:
+    """Fill placeholders for one recipient: each {code} → a fresh random
+    6-digit code; each {ref} → the supplied real reference number (from the
+    pulled pool), or a random token fallback when the pool is empty. Plain
+    text passes through unchanged."""
     out = re.sub(r"\{code\}", lambda _m: _gen_code(), template)
-    out = re.sub(r"\{ref\}",  lambda _m: _gen_ref(),  out)
+    out = re.sub(r"\{ref\}",  lambda _m: ref if ref else _gen_ref(), out)
     return out
 
 
@@ -174,33 +209,78 @@ def _build_recipients(pool: List[str], count: int) -> List[str]:
     return [pool[i % len(pool)] for i in range(count)]
 
 
-def _build_payload(numbers: List[str], message: str) -> Dict:
+def _build_payload(numbers: List[str], message: str, refs: Optional[List[str]] = None) -> Dict:
     """Build the TextSMS sendbulk body: one smslist entry per number, each
-    with its own freshly-rendered message (placeholders substituted per
-    recipient — see _render_message). Credentials are read from the
-    environment per entry (the gateway expects them inside each item)."""
+    with its own rendered message (placeholders filled per recipient — see
+    _render_message). `refs` (parallel to `numbers`) supplies the real
+    reference per entry for {ref}; if None/short, that entry falls back to a
+    random token. Credentials are read from the environment per entry (the
+    gateway expects them inside each item)."""
     partner_id = os.getenv("SMS_PARTNER_ID", "")
     api_key    = os.getenv("SMS_API_KEY", "")
+    refs = refs or []
     smslist = [
         {
             "partnerID": partner_id,
             "apikey":    api_key,
             "pass_type": _SMS_PASS_TYPE,
             "mobile":    n,
-            "message":   _render_message(message),
+            "message":   _render_message(message, refs[i] if i < len(refs) else None),
             "shortcode": _SMS_SHORTCODE,
         }
-        for n in numbers
+        for i, n in enumerate(numbers)
     ]
     return {"count": len(smslist), "smslist": smslist}
 
 
-def _redact(payload: Dict) -> Dict:
-    # A display-safe copy with every apikey masked.
-    return {
-        "count": payload.get("count"),
-        "smslist": [{**item, "apikey": "***"} for item in payload.get("smslist", [])],
-    }
+def _sample_summary(payload: Dict, max_numbers: int = 3) -> List[str]:
+    """Compact, display-safe lines for a batch: one sample rendered message
+    plus the first few mobiles (with a '+N more' tail). Never includes the
+    apikey — only the message text and mobile numbers are shown."""
+    smslist = payload.get("smslist", [])
+    if not smslist:
+        return []
+    sample_msg = smslist[0].get("message", "—")
+    mobiles = [item.get("mobile", "—") for item in smslist]
+    shown = mobiles[:max_numbers]
+    extra = len(mobiles) - len(shown)
+    nums = ", ".join(shown) + (f" (+{extra} more)" if extra > 0 else "")
+    return [
+        f"📝 Sample message: {md_escape(sample_msg)}",
+        f"📞 Sample numbers: `{nums}`",
+    ]
+
+
+def _summarize_send_response(resp) -> Tuple[List[str], int, int]:
+    """Turn a TextSMS sendbulk response into readable per-message lines plus
+    (success_count, fail_count). Each `responses` entry carries its own
+    response-code (200 = accepted), mobile, and messageid. Falls back to
+    showing the raw body if the response isn't the expected JSON shape."""
+    try:
+        data = resp.json()
+        responses = data.get("responses", []) if isinstance(data, dict) else []
+    except Exception:
+        responses = []
+
+    if not responses:
+        raw = (getattr(resp, "text", "") or "")[:400]
+        return ([f"⚠️ Unrecognized gateway response:\n`{md_escape(raw)}`"], 0, 0)
+
+    lines: List[str] = []
+    ok = fail = 0
+    for i, r in enumerate(responses, 1):
+        code   = r.get("response-code")
+        desc   = r.get("response-description", "")
+        mobile = r.get("mobile", "—")
+        msgid  = r.get("messageid", "—")
+        accepted = str(code) == "200"
+        ok, fail = (ok + 1, fail) if accepted else (ok, fail + 1)
+        icon = "✅" if accepted else "❌"
+        lines.append(
+            f"{i}. {icon} `{md_escape(str(mobile))}` — {md_escape(str(desc))} "
+            f"({md_escape(str(code))}) · msg id `{md_escape(str(msgid))}`"
+        )
+    return (lines, ok, fail)
 
 
 # ──────────────────────────────────────────────────────────
@@ -300,7 +380,8 @@ async def cmd_sms(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["sms_session"] = SMSSession()
     await update.message.reply_text(
         "📱 *Send SMS* — fire a batch of test verification-code texts to the "
-        f"test-number pool (*{len(pool)}* numbers, cycled).\n\n"
+        f"test-number pool (*{len(pool)}* numbers, cycled).\n"
+        f"📊 Total texts sent to date: *{load_sms_sent_count()}*\n\n"
         "Step 1 — Simulate first, or send for real?",
         parse_mode="Markdown",
         reply_markup=_sms_mode_keyboard(),
@@ -422,38 +503,43 @@ async def recv_sms_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     sess = _get_sms_sess(ctx)
     numbers = _build_recipients(load_sms_test_numbers(), sess.count)
-    payload = _build_payload(numbers, sess.message)
+    refs = _build_recipients(load_sms_ref_numbers(), sess.count) or None
+    payload = _build_payload(numbers, sess.message, refs)
+    menu = _main_menu_for(update.effective_user.id)
 
     if sess.simulate:
-        await query.edit_message_text("🧪 *SIMULATION — nothing sent*", parse_mode="Markdown")
-        lines = [f"🧪 *Simulation* — {payload['count']} text(s) that *would* be sent:"]
-        lines += [
-            f"{i}. `{item['mobile']}` → {md_escape(item['message'])}"
-            for i, item in enumerate(_redact(payload)["smslist"], 1)
-        ]
-        async def _send(text, reply_markup):
-            await query.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-        await _send_chunked_report(_send, lines, reply_markup=_main_menu_for(update.effective_user.id))
+        lines = [f"🧪 *SIMULATION — nothing sent*\n{payload['count']} text(s) would be sent."]
+        lines += _sample_summary(payload)
+        await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=menu)
         logger.info("SMS simulate: %d text(s), message=%r", payload["count"], sess.message)
         return ConversationHandler.END
 
     await query.edit_message_text(f"📤 Sending {payload['count']} text(s)…")
     try:
         resp = requests.post(SMS_SEND_URL, json=payload, timeout=30)
-        body = resp.text[:500]
-        logger.info("SMS real send: %d text(s), HTTP %s", payload["count"], resp.status_code)
-        await query.message.reply_text(
-            f"🏁 *Sent {payload['count']} text(s)* — gateway HTTP {resp.status_code}\n"
-            f"`{md_escape(body)}`",
-            parse_mode="Markdown",
-            reply_markup=_main_menu_for(update.effective_user.id),
+        _, ok, fail = _summarize_send_response(resp)
+        total = _bump_sms_sent_count(ok)   # running total only counts accepted texts
+        logger.info(
+            "SMS real send: %d attempted, %d accepted, %d failed, HTTP %s (total sent to date: %d)",
+            payload["count"], ok, fail, resp.status_code, total,
         )
+        if ok + fail > 0:
+            status_line = f"✅ {ok} message(s) success   ❌ {fail} message(s) failed"
+        else:
+            status_line = f"⚠️ Gateway HTTP {resp.status_code} — response not recognized"
+        lines = [
+            f"🏁 *Send complete* — gateway HTTP {resp.status_code}",
+            status_line,
+            f"📊 Total texts sent to date: {total}",
+            "",
+        ] + _sample_summary(payload)
+        await query.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=menu)
     except Exception as e:
         logger.error("SMS real send failed: %s", e)
         await query.message.reply_text(
             f"❌ Send failed: `{md_escape(str(e)[:200])}`",
             parse_mode="Markdown",
-            reply_markup=_main_menu_for(update.effective_user.id),
+            reply_markup=menu,
         )
     return ConversationHandler.END
 
