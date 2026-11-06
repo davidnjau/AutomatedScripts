@@ -41,6 +41,7 @@ def _make_update_with_callback(data):
     q.data = data
     q.answer = AsyncMock()
     q.edit_message_text = AsyncMock()
+    q.edit_message_reply_markup = AsyncMock()
     q.message.reply_text = AsyncMock()
     q.message.chat_id = 555
     update.effective_user.id = 111
@@ -190,6 +191,15 @@ class TestBuildPayload(unittest.TestCase):
             )
         self.assertEqual(payload["smslist"][0]["message"], "ref REG/TSFR/AAA")
         self.assertEqual(payload["smslist"][1]["message"], "ref CNTYINV/BBB")
+
+    def test_multiple_templates_spread_randomly(self):
+        # Each recipient gets one of the selected templates at random; over
+        # many recipients every template appears.
+        with patch.dict(os.environ, _ENV, clear=False):
+            payload = sms._build_payload([f"25470000{i:04d}" for i in range(40)], ["AAA", "BBB"])
+        msgs = {item["message"] for item in payload["smslist"]}
+        self.assertTrue(msgs.issubset({"AAA", "BBB"}))   # only the selected templates
+        self.assertEqual(msgs, {"AAA", "BBB"})            # both appear across 40 recipients
 
 
 class TestSampleSummary(unittest.TestCase):
@@ -345,13 +355,40 @@ class TestRecvSmsTemplate(unittest.TestCase):
         result = _run(sms.recv_sms_template(update, ctx))
         self.assertEqual(result, sms.SMS.TEMPLATE_ADD)
 
-    def test_pick_sets_message_and_confirms(self):
+    def test_toggle_selects_and_stays_on_picker(self):
         update = _make_update_with_callback("sms_tpl:0")
         ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession()}
-        with patch.object(sms, "load_sms_templates", return_value=["Hello:"]):
+        with patch.object(sms, "load_sms_templates", return_value=["Hello:", "Bye:"]):
+            result = _run(sms.recv_sms_template(update, ctx))
+        self.assertEqual(result, sms.SMS.TEMPLATE)
+        self.assertEqual(ctx.user_data["sms_session"].selected, {0})
+        update.callback_query.edit_message_reply_markup.assert_called()   # picker re-rendered
+
+    def test_toggle_twice_deselects(self):
+        ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession()}
+        with patch.object(sms, "load_sms_templates", return_value=["Hello:", "Bye:"]):
+            _run(sms.recv_sms_template(_make_update_with_callback("sms_tpl:1"), ctx))
+            _run(sms.recv_sms_template(_make_update_with_callback("sms_tpl:1"), ctx))
+        self.assertEqual(ctx.user_data["sms_session"].selected, set())
+
+    def test_done_with_selection_resolves_messages_and_confirms(self):
+        update = _make_update_with_callback("sms_tpl:done")
+        sess = sms.SMSSession(); sess.selected = {0, 2}
+        ctx = MagicMock(); ctx.user_data = {"sms_session": sess}
+        with patch.object(sms, "load_sms_templates", return_value=["A:", "B:", "C:"]):
             result = _run(sms.recv_sms_template(update, ctx))
         self.assertEqual(result, sms.SMS.CONFIRM)
-        self.assertEqual(ctx.user_data["sms_session"].message, "Hello:")
+        self.assertEqual(sess.messages, ["A:", "C:"])            # sorted selected indices
+        update.callback_query.edit_message_reply_markup.assert_called_once_with(reply_markup=None)
+
+    def test_done_with_none_selected_reprompts(self):
+        update = _make_update_with_callback("sms_tpl:done")
+        ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession()}
+        with patch.object(sms, "load_sms_templates", return_value=["A:", "B:"]):
+            result = _run(sms.recv_sms_template(update, ctx))
+        self.assertEqual(result, sms.SMS.TEMPLATE)
+        self.assertEqual(ctx.user_data["sms_session"].messages, [])
+        self.assertIn("at least one", update.callback_query.message.reply_text.call_args[0][0].lower())
 
 
 class TestRecvSmsTemplateAdd(unittest.TestCase):
@@ -361,15 +398,15 @@ class TestRecvSmsTemplateAdd(unittest.TestCase):
         result = _run(sms.recv_sms_template_add(update, ctx))
         self.assertEqual(result, sms.SMS.TEMPLATE_ADD)
 
-    def test_valid_saves_and_confirms(self):
+    def test_valid_saves_selects_and_returns_to_picker(self):
         update = _make_update_with_message("New msg:")
         ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession()}
         with patch.object(sms, "load_sms_templates", return_value=["Old:"]), \
              patch.object(sms, "save_sms_templates") as mock_save:
             result = _run(sms.recv_sms_template_add(update, ctx))
-        self.assertEqual(result, sms.SMS.CONFIRM)
-        self.assertEqual(ctx.user_data["sms_session"].message, "New msg:")
+        self.assertEqual(result, sms.SMS.TEMPLATE)                # back to multi-select, not confirm
         mock_save.assert_called_once_with(["Old:", "New msg:"])
+        self.assertIn(1, ctx.user_data["sms_session"].selected)   # the new template auto-selected
 
 
 class TestRecvSmsGo(unittest.TestCase):
@@ -382,7 +419,7 @@ class TestRecvSmsGo(unittest.TestCase):
         sms._sms_run_active = False
 
     def _sess(self, simulate):
-        return sms.SMSSession(simulate=simulate, count=3, message="ARDHISASA code:")
+        return sms.SMSSession(simulate=simulate, count=3, messages=["ARDHISASA code:"])
 
     def test_no_cancels(self):
         update = _make_update_with_callback("sms_go:no")
@@ -425,7 +462,7 @@ class TestRecvSmsGo(unittest.TestCase):
         ctx.application.job_queue.run_once.assert_called_once()
         kw = ctx.application.job_queue.run_once.call_args.kwargs
         self.assertEqual(kw["name"], "sms_send_run")
-        self.assertEqual(kw["data"], {"chat_id": 555, "count": 3, "message": "ARDHISASA code:"})
+        self.assertEqual(kw["data"], {"chat_id": 555, "count": 3, "messages": ["ARDHISASA code:"]})
         self.assertTrue(sms._sms_run_active)                   # guard is now held
 
     def test_real_blocked_while_a_run_is_active(self):
@@ -447,8 +484,10 @@ class TestSmsSendJob(unittest.TestCase):
         sms._sms_run_active = False
 
     def _ctx(self, count, message):
+        # `message` may be a single template string or a list of templates.
+        messages = [message] if isinstance(message, str) else message
         ctx = MagicMock()
-        ctx.job.data = {"chat_id": 555, "count": count, "message": message}
+        ctx.job.data = {"chat_id": 555, "count": count, "messages": messages}
         ctx.bot.send_message = AsyncMock(return_value=MagicMock(message_id=42))
         ctx.bot.edit_message_text = AsyncMock()
         return ctx
@@ -507,6 +546,19 @@ class TestSmsSendJob(unittest.TestCase):
             _run(sms._sms_send_job(ctx))
         msgs = [i["message"] for i in mock_post.call_args.kwargs["json"]["smslist"]]
         self.assertEqual(msgs, ["ref REG/TSFR/AAA", "ref CNTYINV/BBB"])
+
+    def test_multiple_templates_randomised_across_recipients(self):
+        ctx = self._ctx(40, ["AAA", "BBB"])   # two templates, no placeholders
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"responses": [{"response-code": 200, "mobile": "x", "messageid": "1"}]}
+        with patch.object(sms, "load_sms_test_numbers", return_value=[f"25470000{i:04d}" for i in range(40)]), \
+             patch.object(sms, "load_sms_ref_numbers", return_value=[]), \
+             patch.object(sms.requests, "post", return_value=resp) as mock_post, \
+             patch.object(sms, "_bump_sms_sent_count", return_value=40), \
+             patch.dict(os.environ, _ENV, clear=False):
+            _run(sms._sms_send_job(ctx))
+        msgs = {i["message"] for i in mock_post.call_args.kwargs["json"]["smslist"]}
+        self.assertEqual(msgs, {"AAA", "BBB"})   # both templates spread across the 40 recipients
 
     def test_counts_only_accepted(self):
         ctx = self._ctx(3, "hi")
@@ -583,7 +635,7 @@ class TestReplyMarkupNotOnEdit(unittest.TestCase):
 
     def test_simulate_restores_menu_via_reply_text(self):
         update = _make_update_with_callback("sms_go:yes")
-        ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession(simulate=True, count=2, message="hi")}
+        ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession(simulate=True, count=2, messages=["hi"])}
         with patch.object(sms, "load_sms_test_numbers", return_value=["254700000001"]), \
              patch.object(sms, "load_sms_ref_numbers", return_value=[]), \
              patch.dict(os.environ, _ENV, clear=False):
@@ -592,7 +644,7 @@ class TestReplyMarkupNotOnEdit(unittest.TestCase):
 
     def test_real_queue_restores_menu_via_reply_text(self):
         update = _make_update_with_callback("sms_go:yes")
-        ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession(simulate=False, count=2, message="hi")}
+        ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession(simulate=False, count=2, messages=["hi"])}
         with patch.object(sms.requests, "post"), patch.dict(os.environ, _ENV, clear=False):
             _run(sms.recv_sms_go(update, ctx))
         self._assert_clean(update)
@@ -600,7 +652,7 @@ class TestReplyMarkupNotOnEdit(unittest.TestCase):
     def test_blocked_run_restores_menu_via_reply_text(self):
         sms._sms_run_active = True
         update = _make_update_with_callback("sms_go:yes")
-        ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession(simulate=False, count=2, message="hi")}
+        ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession(simulate=False, count=2, messages=["hi"])}
         with patch.dict(os.environ, _ENV, clear=False):
             _run(sms.recv_sms_go(update, ctx))
         self._assert_clean(update)
