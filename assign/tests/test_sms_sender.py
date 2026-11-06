@@ -90,6 +90,32 @@ class TestRenderMessage(unittest.TestCase):
     def test_plain_text_unchanged(self):
         self.assertEqual(sms._render_message("no placeholders here"), "no placeholders here")
 
+    def test_purpose_derived_from_supplied_ref_prefix(self):
+        out = sms._render_message("{ref} submitted for {purpose}", ref="REG/TSFR/ZVAW5IFLQZ")
+        self.assertEqual(out, "REG/TSFR/ZVAW5IFLQZ submitted for registration")
+
+    def test_purpose_and_ref_stay_consistent_with_fallback_ref(self):
+        # No ref supplied: {ref} gets a random prefix-less token, so {purpose}
+        # resolves to the no-prefix "survey" and both agree on one reference.
+        out = sms._render_message("{ref} for {purpose}", ref=None)
+        self.assertRegex(out, r"^[A-Z0-9]{10} for survey$")
+
+
+class TestRefPurpose(unittest.TestCase):
+    def test_known_prefixes(self):
+        self.assertEqual(sms._ref_purpose("REG/TSFR/ABC"), "registration")
+        self.assertEqual(sms._ref_purpose("DLA/LEASE/ABC"), "land administration")
+        self.assertEqual(sms._ref_purpose("LAS/ADJ/ABC"), "adjudication")
+
+    def test_prefix_is_case_insensitive(self):
+        self.assertEqual(sms._ref_purpose("reg/tsfr/abc"), "registration")
+
+    def test_no_prefix_token_is_survey(self):
+        self.assertEqual(sms._ref_purpose("ZZBFEG2D6K"), "survey")
+
+    def test_unknown_prefix_falls_back_to_processing(self):
+        self.assertEqual(sms._ref_purpose("XYZ/FOO/ABC"), "processing")
+
 
 class TestNormalizeMsisdn(unittest.TestCase):
     def test_local_zero_prefixed(self):

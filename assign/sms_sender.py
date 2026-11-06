@@ -19,9 +19,11 @@ Flow: pick a mode (🧪 Simulate — default — or 📤 Send real), a count
 that gets saved for reuse). On confirm it cycles the pool to `count`
 numbers, renders the template per recipient (placeholder substitution —
 each {code} → a fresh random 6-digit code; each {ref} → a real reference
-number drawn from the pulled pool, saved_sms_ref_numbers.json, cycled; a
-random token only as a fallback when that pool is empty — see
-_render_message), and either shows a compact summary of what would be
+number drawn from the pulled pool, saved_sms_ref_numbers.json, cycled (a
+random token only as a fallback when that pool is empty); {purpose} → the
+department phrase derived from that reference's prefix so the wording
+matches its workflow — see _render_message), and either shows a compact
+summary of what would be
 sent (Simulate, nothing sent) or POSTs the single bulk request and
 summarizes the gateway's per-message result. Both outputs are compact —
 accepted/failed counts plus a sample message and sample numbers, not a
@@ -89,15 +91,31 @@ SAVED_SMS_SENT_COUNT_FILE   = os.path.join(DATA_DIR, "saved_sms_sent_count.json"
 # are filled per recipient at send time (see _render_message): {code} → a
 # fresh random 6-digit verification code; {ref} → a real reference number
 # drawn from the pulled pool (saved_sms_ref_numbers.json, cycled) — these
-# carry their own prefix (REG/TSFR/…, CNTYINV/…, etc.), which is why the
-# templates no longer hard-code one. All carry the "ARDHISASA: Test :"
-# prefix so a recipient can tell it's a test.
+# carry their own prefix (REG/TSFR/…, DLA/LEASE/…, LAS/ADJ/…, etc.), which is
+# why the templates no longer hard-code one; {purpose} → the department phrase
+# derived from that same reference's prefix (see _ref_purpose) so the wording
+# matches where the reference actually came from (e.g. a REG/… ref reads
+# "submitted for registration", not "for valuation"). All carry the
+# "ARDHISASA: Test :" prefix so a recipient can tell it's a test.
 _DEFAULT_TEMPLATES = [
     "ARDHISASA: Test : Your Ardhisasa login verification code is:{code}",
-    "ARDHISASA: Test : Transfer application reference {ref} has been submitted successfully to the ministry",
-    "ARDHISASA: Test : Application request {ref} has been submitted for valuation. Check portal for more",
+    "ARDHISASA: Test : Application reference {ref} has been submitted for {purpose}. Check portal for more",
+    "ARDHISASA: Test : Your {purpose} request {ref} has been submitted successfully to the ministry",
     "ARDHISASA: Test : Payment of Ksh 5,000.00 has been received for invoice reference number {ref}",
 ]
+
+# Maps a reference's leading prefix segment to the department/workflow phrase
+# the message should use. A reference carries its workflow in its own prefix
+# (REG/… = land registration, DLA/… = land administration, LAS/… = land
+# adjudication); a reference with no "/" prefix is a survey mutation number.
+# Anything unrecognised falls back to _REF_PURPOSE_DEFAULT.
+_REF_PURPOSE = {
+    "REG": "registration",
+    "DLA": "land administration",
+    "LAS": "adjudication",
+}
+_REF_PURPOSE_NO_PREFIX = "survey"
+_REF_PURPOSE_DEFAULT = "processing"
 
 # Matches a normalized Kenyan MSISDN (254 + 9 digits).
 _MSISDN_RE = re.compile(r"^254\d{9}$")
@@ -179,13 +197,27 @@ def _gen_ref() -> str:
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
 
 
+def _ref_purpose(ref: str) -> str:
+    """Department/workflow phrase for a reference, derived from its prefix:
+    REG/… → registration, DLA/… → land administration, LAS/… → adjudication,
+    a prefix-less token → survey, anything else → processing."""
+    if "/" not in ref:
+        return _REF_PURPOSE_NO_PREFIX
+    prefix = ref.split("/", 1)[0].upper()
+    return _REF_PURPOSE.get(prefix, _REF_PURPOSE_DEFAULT)
+
+
 def _render_message(template: str, ref: Optional[str] = None) -> str:
     """Fill placeholders for one recipient: each {code} → a fresh random
-    6-digit code; each {ref} → the supplied real reference number (from the
-    pulled pool), or a random token fallback when the pool is empty. Plain
-    text passes through unchanged."""
+    6-digit code; {ref} → the supplied real reference number (from the pulled
+    pool), or a random token fallback when the pool is empty; {purpose} → the
+    department phrase derived from that same reference's prefix. {ref} and
+    {purpose} always resolve against the one reference so they stay
+    consistent. Plain text passes through unchanged."""
+    resolved_ref = ref if ref else _gen_ref()
     out = re.sub(r"\{code\}", lambda _m: _gen_code(), template)
-    out = re.sub(r"\{ref\}",  lambda _m: ref if ref else _gen_ref(), out)
+    out = out.replace("{ref}", resolved_ref)
+    out = out.replace("{purpose}", _ref_purpose(resolved_ref))
     return out
 
 
@@ -442,9 +474,11 @@ async def recv_sms_template(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "new":
         await query.edit_message_text(
-            "✏️ Enter the message text. Use `{code}` where a random 6-digit code "
-            "should go and `{ref}` for a random 10-char reference "
-            "(e.g. `ARDHISASA: Test : …REG/TSFR/{ref}…`):",
+            "✏️ Enter the message text. Use `{code}` for a random 6-digit code, "
+            "`{ref}` for a real reference from the pool, and `{purpose}` for the "
+            "reference's department phrase (REG→registration, DLA→land "
+            "administration, LAS→adjudication, survey otherwise) — e.g. "
+            "`ARDHISASA: Test : Application reference {ref} submitted for {purpose}`:",
             parse_mode="Markdown",
         )
         return SMS.TEMPLATE_ADD
@@ -484,7 +518,7 @@ async def _sms_show_confirm(message, ctx: ContextTypes.DEFAULT_TYPE, user_id: in
         f"*Mode:* {mode}\n"
         f"*Texts:* {sess.count}\n"
         f"*Template:* {md_escape(sess.message)}\n"
-        "_`{code}`/`{ref}` are randomized per text._\n\n"
+        "_`{code}` is random; `{ref}`/`{purpose}` come from the reference pool per text._\n\n"
         "Proceed?",
         parse_mode="Markdown",
         reply_markup=_sms_confirm_keyboard(sess.simulate),
