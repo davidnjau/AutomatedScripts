@@ -309,7 +309,7 @@ class TestRecvSmsMode(unittest.TestCase):
 
 class TestRecvSmsCount(unittest.TestCase):
     def test_out_of_range_reprompts(self):
-        for bad in ["0", "51", "abc", "-3"]:
+        for bad in ["0", "20001", "abc", "-3"]:
             update = _make_update_with_message(bad)
             ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession()}
             result = _run(sms.recv_sms_count(update, ctx))
@@ -322,6 +322,14 @@ class TestRecvSmsCount(unittest.TestCase):
             result = _run(sms.recv_sms_count(update, ctx))
         self.assertEqual(result, sms.SMS.TEMPLATE)
         self.assertEqual(ctx.user_data["sms_session"].count, 5)
+
+    def test_max_count_is_accepted(self):
+        update = _make_update_with_message("20000")
+        ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession()}
+        with patch.object(sms, "load_sms_templates", return_value=["T"]):
+            result = _run(sms.recv_sms_count(update, ctx))
+        self.assertEqual(result, sms.SMS.TEMPLATE)
+        self.assertEqual(ctx.user_data["sms_session"].count, 20000)
 
 
 class TestRecvSmsTemplate(unittest.TestCase):
@@ -365,6 +373,14 @@ class TestRecvSmsTemplateAdd(unittest.TestCase):
 
 
 class TestRecvSmsGo(unittest.TestCase):
+    def setUp(self):
+        # The real-send guard is a module global; reset it so each test starts
+        # with no run "in progress".
+        sms._sms_run_active = False
+
+    def tearDown(self):
+        sms._sms_run_active = False
+
     def _sess(self, simulate):
         return sms.SMSSession(simulate=simulate, count=3, message="ARDHISASA code:")
 
@@ -398,78 +414,152 @@ class TestRecvSmsGo(unittest.TestCase):
         self.assertIn("Sample message", shown)
         self.assertNotIn("secret-key", shown)
 
-    def test_real_posts_correct_body_and_bumps_count(self):
+    def test_real_queues_background_job_and_does_not_post(self):
         update = _make_update_with_callback("sms_go:yes")
         ctx = MagicMock(); ctx.user_data = {"sms_session": self._sess(False)}
+        with patch.object(sms.requests, "post") as mock_post, \
+             patch.dict(os.environ, _ENV, clear=False):
+            result = _run(sms.recv_sms_go(update, ctx))
+        self.assertEqual(result, sms.ConversationHandler.END)
+        mock_post.assert_not_called()                          # the handler never sends inline
+        ctx.application.job_queue.run_once.assert_called_once()
+        kw = ctx.application.job_queue.run_once.call_args.kwargs
+        self.assertEqual(kw["name"], "sms_send_run")
+        self.assertEqual(kw["data"], {"chat_id": 555, "count": 3, "message": "ARDHISASA code:"})
+        self.assertTrue(sms._sms_run_active)                   # guard is now held
+
+    def test_real_blocked_while_a_run_is_active(self):
+        sms._sms_run_active = True
+        update = _make_update_with_callback("sms_go:yes")
+        ctx = MagicMock(); ctx.user_data = {"sms_session": self._sess(False)}
+        with patch.dict(os.environ, _ENV, clear=False):
+            result = _run(sms.recv_sms_go(update, ctx))
+        self.assertEqual(result, sms.ConversationHandler.END)
+        ctx.application.job_queue.run_once.assert_not_called()
+        self.assertIn("in progress", update.callback_query.edit_message_text.call_args[0][0].lower())
+
+
+class TestSmsSendJob(unittest.TestCase):
+    def setUp(self):
+        sms._sms_run_active = True   # the handler would have set this before scheduling
+
+    def tearDown(self):
+        sms._sms_run_active = False
+
+    def _ctx(self, count, message):
+        ctx = MagicMock()
+        ctx.job.data = {"chat_id": 555, "count": count, "message": message}
+        ctx.bot.send_message = AsyncMock(return_value=MagicMock(message_id=42))
+        ctx.bot.edit_message_text = AsyncMock()
+        return ctx
+
+    def test_posts_correct_body_bumps_count_and_clears_guard(self):
+        ctx = self._ctx(3, "ARDHISASA code:")
         resp = MagicMock(status_code=200)
         resp.json.return_value = {"responses": [
-            {"response-code": 200, "response-description": "Success", "mobile": "254700000001", "messageid": "979295131"},
-            {"response-code": 200, "response-description": "Success", "mobile": "254700000002", "messageid": "979295132"},
-            {"response-code": 200, "response-description": "Success", "mobile": "254700000001", "messageid": "979295133"},
+            {"response-code": 200, "mobile": "254700000001", "messageid": "1"},
+            {"response-code": 200, "mobile": "254700000002", "messageid": "2"},
+            {"response-code": 200, "mobile": "254700000001", "messageid": "3"},
         ]}
         with patch.object(sms, "load_sms_test_numbers", return_value=["254700000001", "254700000002"]), \
              patch.object(sms, "load_sms_ref_numbers", return_value=[]), \
              patch.object(sms.requests, "post", return_value=resp) as mock_post, \
              patch.object(sms, "_bump_sms_sent_count", return_value=103) as mock_bump, \
              patch.dict(os.environ, _ENV, clear=False):
-            result = _run(sms.recv_sms_go(update, ctx))
-        self.assertEqual(result, sms.ConversationHandler.END)
+            _run(sms._sms_send_job(ctx))
+        self.assertEqual(mock_post.call_count, 1)              # 3 ≤ chunk size → one POST
         self.assertEqual(mock_post.call_args.args[0], sms.SMS_SEND_URL)
         body = mock_post.call_args.kwargs["json"]
         self.assertEqual(body["count"], 3)
         self.assertEqual(body["smslist"][0]["partnerID"], "10709")
         self.assertEqual(body["smslist"][0]["shortcode"], "Text")
-        mock_bump.assert_called_once_with(3)   # all 3 accepted
-        sent = " ".join(c.args[0] for c in update.callback_query.message.reply_text.call_args_list)
-        self.assertIn("3 message(s) success", sent)       # compact count summary
-        self.assertIn("Total texts sent to date: 103", sent)
-        self.assertIn("254700000001", sent)               # sample number, not a full dump
+        mock_bump.assert_called_once_with(3)                   # all 3 accepted
+        final = " ".join(c.args[1] for c in ctx.bot.send_message.call_args_list)
+        self.assertIn("3 message(s) success", final)
+        self.assertIn("Total texts sent to date: 103", final)
+        self.assertFalse(sms._sms_run_active)                  # guard released
 
-    def test_real_uses_reference_pool(self):
-        update = _make_update_with_callback("sms_go:yes")
-        sess = sms.SMSSession(simulate=False, count=2, message="ref {ref}")
-        ctx = MagicMock(); ctx.user_data = {"sms_session": sess}
+    def test_chunks_large_run_into_multiple_posts(self):
+        ctx = self._ctx(5, "hi")
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"responses": [{"response-code": 200, "mobile": "x", "messageid": "1"}]}
+        with patch.object(sms, "load_sms_test_numbers", return_value=["254700000001", "254700000002"]), \
+             patch.object(sms, "load_sms_ref_numbers", return_value=[]), \
+             patch.object(sms, "_SMS_CHUNK_SIZE", 2), \
+             patch.object(sms, "_SMS_CHUNK_DELAY", 0), \
+             patch.object(sms.requests, "post", return_value=resp) as mock_post, \
+             patch.object(sms, "_bump_sms_sent_count", return_value=5), \
+             patch.dict(os.environ, _ENV, clear=False):
+            _run(sms._sms_send_job(ctx))
+        self.assertEqual(mock_post.call_count, 3)              # 5 over size-2 chunks → 3 POSTs
+        sizes = [len(c.kwargs["json"]["smslist"]) for c in mock_post.call_args_list]
+        self.assertEqual(sizes, [2, 2, 1])
+
+    def test_uses_reference_pool(self):
+        ctx = self._ctx(2, "ref {ref}")
         resp = MagicMock(status_code=200)
         resp.json.return_value = {"responses": [{"response-code": 200, "mobile": "x", "messageid": "1"}]}
         with patch.object(sms, "load_sms_test_numbers", return_value=["254700000001", "254700000002"]), \
              patch.object(sms, "load_sms_ref_numbers", return_value=["REG/TSFR/AAA", "CNTYINV/BBB"]), \
              patch.object(sms.requests, "post", return_value=resp) as mock_post, \
-             patch.object(sms, "_bump_sms_sent_count", return_value=1), \
+             patch.object(sms, "_bump_sms_sent_count", return_value=2), \
              patch.dict(os.environ, _ENV, clear=False):
-            _run(sms.recv_sms_go(update, ctx))
+            _run(sms._sms_send_job(ctx))
         msgs = [i["message"] for i in mock_post.call_args.kwargs["json"]["smslist"]]
-        self.assertEqual(msgs, ["ref REG/TSFR/AAA", "ref CNTYINV/BBB"])   # real refs, cycled per recipient
+        self.assertEqual(msgs, ["ref REG/TSFR/AAA", "ref CNTYINV/BBB"])
 
-    def test_real_send_counts_only_accepted(self):
-        update = _make_update_with_callback("sms_go:yes")
-        ctx = MagicMock(); ctx.user_data = {"sms_session": self._sess(False)}
+    def test_counts_only_accepted(self):
+        ctx = self._ctx(3, "hi")
         resp = MagicMock(status_code=200)
         resp.json.return_value = {"responses": [
-            {"response-code": 200, "response-description": "Success", "mobile": "254700000001", "messageid": "1"},
-            {"response-code": 1006, "response-description": "Invalid", "mobile": "254700000002", "messageid": None},
-            {"response-code": 200, "response-description": "Success", "mobile": "254700000001", "messageid": "3"},
+            {"response-code": 200, "mobile": "a", "messageid": "1"},
+            {"response-code": 1006, "mobile": "b", "messageid": None},
+            {"response-code": 200, "mobile": "c", "messageid": "3"},
         ]}
         with patch.object(sms, "load_sms_test_numbers", return_value=["254700000001", "254700000002"]), \
              patch.object(sms, "load_sms_ref_numbers", return_value=[]), \
              patch.object(sms.requests, "post", return_value=resp), \
              patch.object(sms, "_bump_sms_sent_count", return_value=2) as mock_bump, \
              patch.dict(os.environ, _ENV, clear=False):
-            _run(sms.recv_sms_go(update, ctx))
-        mock_bump.assert_called_once_with(2)   # 2 of 3 accepted, failed one not counted
+            _run(sms._sms_send_job(ctx))
+        mock_bump.assert_called_once_with(2)                   # 2 of 3 accepted
 
-    def test_real_send_failure_is_reported_not_raised(self):
-        update = _make_update_with_callback("sms_go:yes")
-        ctx = MagicMock(); ctx.user_data = {"sms_session": self._sess(False)}
-        with patch.object(sms, "load_sms_test_numbers", return_value=["254700000001"]), \
+    def test_chunk_failure_is_counted_not_raised_and_clears_guard(self):
+        ctx = self._ctx(2, "hi")
+        with patch.object(sms, "load_sms_test_numbers", return_value=["254700000001", "254700000002"]), \
              patch.object(sms, "load_sms_ref_numbers", return_value=[]), \
              patch.object(sms.requests, "post", side_effect=RuntimeError("gateway down")), \
-             patch.object(sms, "_bump_sms_sent_count") as mock_bump, \
+             patch.object(sms, "_bump_sms_sent_count", return_value=0) as mock_bump, \
              patch.dict(os.environ, _ENV, clear=False):
-            result = _run(sms.recv_sms_go(update, ctx))
-        self.assertEqual(result, sms.ConversationHandler.END)
-        mock_bump.assert_not_called()   # nothing accepted on a transport failure
-        sent = " ".join(c.args[0] for c in update.callback_query.message.reply_text.call_args_list)
-        self.assertIn("failed", sent.lower())
+            _run(sms._sms_send_job(ctx))
+        mock_bump.assert_called_once_with(0)                   # nothing accepted
+        final = " ".join(c.args[1] for c in ctx.bot.send_message.call_args_list)
+        self.assertIn("2 message(s) failed", final)
+        self.assertFalse(sms._sms_run_active)                  # guard released even on failure
+
+
+class TestChunkRecipients(unittest.TestCase):
+    def test_even_split_preserves_order_and_ref_alignment(self):
+        nums = ["n1", "n2", "n3", "n4", "n5"]
+        refs = ["r1", "r2", "r3", "r4", "r5"]
+        chunks = sms._chunk_recipients(nums, refs, 2)
+        self.assertEqual(chunks, [
+            (["n1", "n2"], ["r1", "r2"]),
+            (["n3", "n4"], ["r3", "r4"]),
+            (["n5"], ["r5"]),
+        ])
+
+    def test_refs_none_yields_none_per_chunk(self):
+        chunks = sms._chunk_recipients(["n1", "n2", "n3"], None, 2)
+        self.assertEqual(chunks, [(["n1", "n2"], None), (["n3"], None)])
+
+    def test_empty_input(self):
+        self.assertEqual(sms._chunk_recipients([], None, 1000), [])
+
+    def test_count_matches_ceil_division(self):
+        chunks = sms._chunk_recipients([str(i) for i in range(20000)], None, 1000)
+        self.assertEqual(len(chunks), 20)
+        self.assertTrue(all(len(c[0]) == 1000 for c in chunks))
 
 
 class TestSummarizeSendResponse(unittest.TestCase):
