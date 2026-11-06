@@ -15,9 +15,11 @@ private IP the deployed bot can't even reach), so this module only ever
 *reads* it.
 
 Flow: pick a mode (🧪 Simulate — default — or 📤 Send real), a count
-(1–_SMS_MAX_PER_RUN), and a message template (a saved one, or a new one
-that gets saved for reuse). On confirm it cycles the pool to `count`
-numbers, renders the template per recipient (placeholder substitution —
+(1–_SMS_MAX_PER_RUN), and one or more message templates via a toggle
+multi-select (saved ones, and/or a new one that gets saved for reuse).
+On confirm it cycles the pool to `count` numbers and, for each recipient,
+picks one of the selected templates at random and renders it (placeholder
+substitution —
 each {code} → a fresh random 6-digit code; each {ref} → a real reference
 number drawn from the pulled pool, saved_sms_ref_numbers.json, cycled (a
 random token only as a fallback when that pool is empty); {purpose} → the
@@ -46,7 +48,7 @@ import os
 import random
 import re
 import string
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
 
@@ -251,15 +253,20 @@ def _build_recipients(pool: List[str], count: int) -> List[str]:
     return [pool[i % len(pool)] for i in range(count)]
 
 
-def _build_payload(numbers: List[str], message: str, refs: Optional[List[str]] = None) -> Dict:
+def _build_payload(numbers: List[str], messages, refs: Optional[List[str]] = None) -> Dict:
     """Build the TextSMS sendbulk body: one smslist entry per number, each
     with its own rendered message (placeholders filled per recipient — see
-    _render_message). `refs` (parallel to `numbers`) supplies the real
-    reference per entry for {ref}; if None/short, that entry falls back to a
-    random token. Credentials are read from the environment per entry (the
-    gateway expects them inside each item)."""
+    _render_message). `messages` is a single template string, or a list of
+    templates of which one is chosen at random per recipient — so selecting
+    several templates spreads them randomly across the numbers. `refs`
+    (parallel to `numbers`) supplies the real reference per entry for {ref};
+    if None/short, that entry falls back to a random token. Credentials are
+    read from the environment per entry (the gateway expects them inside each
+    item)."""
     partner_id = os.getenv("SMS_PARTNER_ID", "")
     api_key    = os.getenv("SMS_API_KEY", "")
+    if isinstance(messages, str):
+        messages = [messages]
     refs = refs or []
     smslist = [
         {
@@ -267,7 +274,7 @@ def _build_payload(numbers: List[str], message: str, refs: Optional[List[str]] =
             "apikey":    api_key,
             "pass_type": _SMS_PASS_TYPE,
             "mobile":    n,
-            "message":   _render_message(message, refs[i] if i < len(refs) else None),
+            "message":   _render_message(random.choice(messages), refs[i] if i < len(refs) else None),
             "shortcode": _SMS_SHORTCODE,
         }
         for i, n in enumerate(numbers)
@@ -354,7 +361,8 @@ class SMS(Enum):
 class SMSSession:
     simulate: bool = True
     count:    int = 0
-    message:  str = ""
+    selected: set = field(default_factory=set)   # template indices toggled in the picker
+    messages: list = field(default_factory=list)  # resolved templates to send (1+, randomised per recipient)
 
 
 def _get_sms_sess(ctx: ContextTypes.DEFAULT_TYPE) -> SMSSession:
@@ -377,18 +385,21 @@ def _sms_mode_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def _sms_template_keyboard(templates: List[str]) -> InlineKeyboardMarkup:
-    # One button per saved template (index-based callback to dodge the
-    # 64-byte callback_data limit on long messages), plus add-new/cancel.
-    rows = [
-        [InlineKeyboardButton(
-            (t[:40] + "…") if len(t) > 40 else t,
-            callback_data=f"sms_tpl:{i}",
-        )]
-        for i, t in enumerate(templates)
-    ]
+def _sms_template_keyboard(templates: List[str], selected) -> InlineKeyboardMarkup:
+    # Multi-select: one toggle button per saved template (☑️/☐ by whether its
+    # index is in `selected`; index-based callback to dodge the 64-byte
+    # callback_data limit on long messages), plus add-new / Done / Cancel.
+    # Each selected template is randomised across the recipients at send time.
+    rows = []
+    for i, t in enumerate(templates):
+        mark = "☑️" if i in selected else "☐"
+        label = (t[:36] + "…") if len(t) > 36 else t
+        rows.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"sms_tpl:{i}")])
     rows.append([InlineKeyboardButton("➕ New message", callback_data="sms_tpl:new")])
-    rows.append([InlineKeyboardButton("🛑 Cancel",      callback_data="sms_tpl:cancel")])
+    rows.append([
+        InlineKeyboardButton("✅ Done",   callback_data="sms_tpl:done"),
+        InlineKeyboardButton("🛑 Cancel", callback_data="sms_tpl:cancel"),
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -476,20 +487,22 @@ async def recv_sms_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return SMS.COUNT
     sess.count = int(raw)
+    sess.selected = set()
     await update.message.reply_text(
-        f"✅ Count: *{sess.count}*\n\nStep 3 — Choose a message (a fresh 6-digit code "
-        "is appended to each):",
+        f"✅ Count: *{sess.count}*\n\nStep 3 — Select one or more messages (tap to toggle). "
+        "Each recipient gets a random one of the selected messages. Then tap *✅ Done*:",
         parse_mode="Markdown",
-        reply_markup=_sms_template_keyboard(load_sms_templates()),
+        reply_markup=_sms_template_keyboard(load_sms_templates(), sess.selected),
     )
     return SMS.TEMPLATE
 
 
 async def recv_sms_template(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Pick a saved template, add a new one, or cancel.
+    # Toggle templates in the multi-select, add a new one, finish (Done), or cancel.
     query = update.callback_query
     await query.answer()
     data = query.data.split(":", 1)[1]
+    sess = _get_sms_sess(ctx)
 
     if data == "cancel":
         await query.edit_message_text("🛑 Cancelled.")
@@ -508,6 +521,16 @@ async def recv_sms_template(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return SMS.TEMPLATE_ADD
 
     templates = load_sms_templates()
+
+    if data == "done":
+        sess.messages = [templates[i] for i in sorted(sess.selected) if i < len(templates)]
+        if not sess.messages:
+            await query.message.reply_text("⚠️ Select at least one message first (tap to toggle), then ✅ Done.")
+            return SMS.TEMPLATE
+        await query.edit_message_reply_markup(reply_markup=None)   # freeze the picker
+        return await _sms_show_confirm(query.message, ctx, update.effective_user.id)
+
+    # Otherwise it's a template index → toggle it and re-render the picker.
     idx = int(data)
     if idx >= len(templates):
         await query.edit_message_text(
@@ -515,12 +538,14 @@ async def recv_sms_template(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
-    _get_sms_sess(ctx).message = templates[idx]
-    return await _sms_show_confirm(query.message, ctx, update.effective_user.id)
+    sess.selected.discard(idx) if idx in sess.selected else sess.selected.add(idx)
+    await query.edit_message_reply_markup(reply_markup=_sms_template_keyboard(templates, sess.selected))
+    return SMS.TEMPLATE
 
 
 async def recv_sms_template_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Save a newly-typed message for reuse, then go to confirm.
+    # Save a newly-typed message for reuse, auto-select it, and return to the
+    # picker so it can be combined with others before Done.
     text = (update.message.text or "").strip()
     if not text:
         await update.message.reply_text("⚠️ Please enter a non-empty message.")
@@ -529,19 +554,30 @@ async def recv_sms_template_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text not in templates:
         templates.append(text)
         save_sms_templates(templates)
-    _get_sms_sess(ctx).message = text
-    return await _sms_show_confirm(update.message, ctx, update.effective_user.id)
+    sess = _get_sms_sess(ctx)
+    sess.selected.add(templates.index(text))
+    await update.message.reply_text(
+        "✅ Added & selected. Select more or tap *✅ Done*:",
+        parse_mode="Markdown",
+        reply_markup=_sms_template_keyboard(templates, sess.selected),
+    )
+    return SMS.TEMPLATE
 
 
 async def _sms_show_confirm(message, ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
     # Summarize what will happen and ask for the final go/no-go.
     sess = _get_sms_sess(ctx)
     mode = "🧪 Simulate (nothing sent)" if sess.simulate else "📤 *SEND REAL TEXTS*"
+    if len(sess.messages) == 1:
+        tmpl_line = f"*Template:* {md_escape(sess.messages[0])}"
+    else:
+        tmpl_line = (f"*Templates ({len(sess.messages)}, randomised per recipient):*\n"
+                     + "\n".join(f"  • {md_escape(m)}" for m in sess.messages))
     await message.reply_text(
         f"📋 *Confirm*\n\n"
         f"*Mode:* {mode}\n"
         f"*Texts:* {sess.count}\n"
-        f"*Template:* {md_escape(sess.message)}\n"
+        f"{tmpl_line}\n"
         "_`{code}` is random; `{ref}`/`{purpose}` come from the reference pool per text._\n\n"
         "Proceed?",
         parse_mode="Markdown",
@@ -572,8 +608,9 @@ async def recv_sms_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if sess.simulate:
         numbers = _build_recipients(load_sms_test_numbers(), sess.count)
         refs = _build_recipients(load_sms_ref_numbers(), sess.count) or None
-        payload = _build_payload(numbers, sess.message, refs)
-        lines = [f"🧪 *SIMULATION — nothing sent*\n{payload['count']} text(s) would be sent."]
+        payload = _build_payload(numbers, sess.messages, refs)
+        lines = [f"🧪 *SIMULATION — nothing sent*\n{payload['count']} text(s) would be sent "
+                 f"across {len(sess.messages)} message(s)."]
         lines += _sample_summary(payload)
         # edit_message_text only accepts inline keyboards, so the result is
         # edited without markup and the main menu (a reply keyboard) is
@@ -581,7 +618,7 @@ async def recv_sms_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # branch above.
         await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
         await query.message.reply_text("Main menu.", reply_markup=menu)
-        logger.info("SMS simulate: %d text(s), message=%r", payload["count"], sess.message)
+        logger.info("SMS simulate: %d text(s), %d template(s)", payload["count"], len(sess.messages))
         return ConversationHandler.END
 
     # Real send: hand off to a background job so the event loop stays free.
@@ -595,7 +632,7 @@ async def recv_sms_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _sms_run_active = True
     ctx.application.job_queue.run_once(
         _sms_send_job, when=0,
-        data={"chat_id": query.message.chat_id, "count": sess.count, "message": sess.message},
+        data={"chat_id": query.message.chat_id, "count": sess.count, "messages": sess.messages},
         name="sms_send_run",
     )
     n_chunks = -(-sess.count // _SMS_CHUNK_SIZE)   # ceil division
@@ -614,7 +651,7 @@ async def _sms_send_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     global _sms_run_active
     data = ctx.job.data
     chat_id = data["chat_id"]
-    message = data["message"]
+    messages = data["messages"]
     numbers = _build_recipients(load_sms_test_numbers(), data["count"])
     refs = _build_recipients(load_sms_ref_numbers(), data["count"]) or None
     chunks = _chunk_recipients(numbers, refs, _SMS_CHUNK_SIZE)
@@ -626,7 +663,7 @@ async def _sms_send_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
     try:
         for idx, (num_chunk, ref_chunk) in enumerate(chunks, 1):
-            payload = _build_payload(num_chunk, message, ref_chunk)
+            payload = _build_payload(num_chunk, messages, ref_chunk)
             try:
                 resp = await asyncio.to_thread(
                     requests.post, SMS_SEND_URL, json=payload, timeout=60
@@ -653,7 +690,7 @@ async def _sms_send_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "SMS background run: %d attempted, %d accepted, %d failed (total sent to date: %d)",
             total, ok, fail, grand,
         )
-        sample = _sample_summary(_build_payload(numbers[:3], message, (refs[:3] if refs else None)))
+        sample = _sample_summary(_build_payload(numbers[:3], messages, (refs[:3] if refs else None)))
         lines = [
             f"🏁 *Send complete* — {total} attempted",
             f"✅ {ok} message(s) success   ❌ {fail} message(s) failed",
