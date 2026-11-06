@@ -575,16 +575,21 @@ async def recv_sms_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         payload = _build_payload(numbers, sess.message, refs)
         lines = [f"🧪 *SIMULATION — nothing sent*\n{payload['count']} text(s) would be sent."]
         lines += _sample_summary(payload)
-        await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=menu)
+        # edit_message_text only accepts inline keyboards, so the result is
+        # edited without markup and the main menu (a reply keyboard) is
+        # restored with a follow-up reply_text — same pattern as the cancel
+        # branch above.
+        await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
+        await query.message.reply_text("Main menu.", reply_markup=menu)
         logger.info("SMS simulate: %d text(s), message=%r", payload["count"], sess.message)
         return ConversationHandler.END
 
     # Real send: hand off to a background job so the event loop stays free.
     if _sms_run_active:
         await query.edit_message_text(
-            "⚠️ A send run is already in progress — wait for it to finish before starting another.",
-            reply_markup=menu,
+            "⚠️ A send run is already in progress — wait for it to finish before starting another."
         )
+        await query.message.reply_text("Main menu.", reply_markup=menu)
         return ConversationHandler.END
 
     _sms_run_active = True
@@ -598,8 +603,8 @@ async def recv_sms_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Queued *{sess.count}* text(s) — sending in the background in {n_chunks} "
         f"batch(es) of up to {_SMS_CHUNK_SIZE}. Progress posts here; the bot stays usable meanwhile.",
         parse_mode="Markdown",
-        reply_markup=menu,
     )
+    await query.message.reply_text("Main menu.", reply_markup=menu)
     return ConversationHandler.END
 
 
