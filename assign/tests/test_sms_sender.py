@@ -562,6 +562,50 @@ class TestChunkRecipients(unittest.TestCase):
         self.assertTrue(all(len(c[0]) == 1000 for c in chunks))
 
 
+class TestReplyMarkupNotOnEdit(unittest.TestCase):
+    # Regression: edit_message_text only accepts inline keyboards, so the main
+    # menu (a reply keyboard) must never be passed to it — doing so raised a
+    # live "telegram.error.BadRequest: Inline keyboard expected". The menu is
+    # restored with a follow-up reply_text instead.
+    def setUp(self):
+        sms._sms_run_active = False
+
+    def tearDown(self):
+        sms._sms_run_active = False
+
+    def _assert_clean(self, update):
+        for call in update.callback_query.edit_message_text.call_args_list:
+            self.assertIsNone(
+                call.kwargs.get("reply_markup"),
+                "edit_message_text must never carry a reply keyboard",
+            )
+        update.callback_query.message.reply_text.assert_called()   # menu restored separately
+
+    def test_simulate_restores_menu_via_reply_text(self):
+        update = _make_update_with_callback("sms_go:yes")
+        ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession(simulate=True, count=2, message="hi")}
+        with patch.object(sms, "load_sms_test_numbers", return_value=["254700000001"]), \
+             patch.object(sms, "load_sms_ref_numbers", return_value=[]), \
+             patch.dict(os.environ, _ENV, clear=False):
+            _run(sms.recv_sms_go(update, ctx))
+        self._assert_clean(update)
+
+    def test_real_queue_restores_menu_via_reply_text(self):
+        update = _make_update_with_callback("sms_go:yes")
+        ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession(simulate=False, count=2, message="hi")}
+        with patch.object(sms.requests, "post"), patch.dict(os.environ, _ENV, clear=False):
+            _run(sms.recv_sms_go(update, ctx))
+        self._assert_clean(update)
+
+    def test_blocked_run_restores_menu_via_reply_text(self):
+        sms._sms_run_active = True
+        update = _make_update_with_callback("sms_go:yes")
+        ctx = MagicMock(); ctx.user_data = {"sms_session": sms.SMSSession(simulate=False, count=2, message="hi")}
+        with patch.dict(os.environ, _ENV, clear=False):
+            _run(sms.recv_sms_go(update, ctx))
+        self._assert_clean(update)
+
+
 class TestSummarizeSendResponse(unittest.TestCase):
     def test_parses_the_gateway_sample(self):
         resp = MagicMock()
