@@ -62,7 +62,7 @@ from telegram.ext import (
 )
 
 from common import (
-    ALLOWED_IDS,
+    report_recipients,
     BTN_STALE_THRESHOLD,
     DATA_DIR,
     _atomic_json_write,
@@ -270,7 +270,7 @@ async def _send_stale_match_prompt(bot, item: Dict) -> None:
     # best-effort per chat, matching dlv_batch._send_db_taken_prompts.
     text   = _sc_match_prompt_text(item)
     markup = _sc_match_keyboard(item.get("ref", ""), item.get("stale_matches", []))
-    for chat_id in ALLOWED_IDS:
+    for chat_id in report_recipients():
         try:
             await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
         except Exception as e:
@@ -488,7 +488,7 @@ async def run_stale_check(bot) -> None:
     save_dlv_batch([i for i in items if i.get("ref") not in removed_refs])
 
     for text in notices:
-        for chat_id in ALLOWED_IDS:
+        for chat_id in report_recipients():
             try:
                 await bot.send_message(chat_id, text, parse_mode="Markdown")
             except Exception as e:

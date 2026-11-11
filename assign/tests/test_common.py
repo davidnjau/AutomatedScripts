@@ -198,6 +198,39 @@ class TestAdminRecipients(unittest.TestCase):
             self.assertEqual(set(common.admin_recipients()), {333, 444})
 
 
+class TestReportRecipients(unittest.TestCase):
+    def test_excludes_no_report_ids(self):
+        with patch.object(common, "ALLOWED_IDS", {111, 222, 333}), \
+             patch.object(common, "NO_REPORT_IDS", {222}):
+            self.assertEqual(set(common.report_recipients()), {111, 333})
+
+    def test_all_allowed_when_none_excluded(self):
+        with patch.object(common, "ALLOWED_IDS", {111, 222}), \
+             patch.object(common, "NO_REPORT_IDS", set()):
+            self.assertEqual(set(common.report_recipients()), {111, 222})
+
+
+class TestInquiryCategory(unittest.TestCase):
+    def test_inquiry_holds_lookup_and_parcel_watch(self):
+        self.assertIn(common.BTN_CAT_INQUIRY, common._MENU_CATEGORIES)
+        self.assertEqual(
+            common._MENU_CATEGORIES[common.BTN_CAT_INQUIRY]["buttons"],
+            [common.BTN_LOOKUP, common.BTN_PARCEL_WATCH],
+        )
+
+    def test_lookups_no_longer_has_those_two(self):
+        lookups = common._MENU_CATEGORIES[common.BTN_CAT_LOOKUPS]["buttons"]
+        self.assertNotIn(common.BTN_LOOKUP, lookups)
+        self.assertNotIn(common.BTN_PARCEL_WATCH, lookups)
+        self.assertIn(common.BTN_PARCEL_LOOKUP, lookups)
+        self.assertIn(common.BTN_DLV_REF_CHECK, lookups)
+
+    def test_inquiry_is_independently_grantable_via_get_user_categories(self):
+        # An admin always has every category (incl. the new one).
+        with patch.object(common, "ADMIN_IDS", {5}):
+            self.assertIn(common.BTN_CAT_INQUIRY, common.get_user_categories(5))
+
+
 class TestUserNamesPersistence(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()

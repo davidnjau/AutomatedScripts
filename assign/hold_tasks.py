@@ -71,7 +71,7 @@ from telegram.ext import (
 
 from ardhisasa_auth import AuthTokens, build_session
 from common import (
-    ALLOWED_IDS,
+    report_recipients,
     BTN_HOLD_TASKS,
     CPARAMS_DLV,
     CRED_LABELS,
@@ -464,7 +464,7 @@ async def _hold_tasks_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = f"✋ *Hold Tasks (auto)*\n{report}"
     if len(msg) > 4000:
         msg = msg[:4000] + "\n…_(truncated)_"
-    for chat_id in ALLOWED_IDS:
+    for chat_id in report_recipients():
         try:
             await context.bot.send_message(chat_id, msg, parse_mode="Markdown")
         except Exception as e:

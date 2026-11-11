@@ -322,7 +322,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_dlv_batch", return_value=[]), \
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
-             patch.object(af, "ALLOWED_IDS", {111}):
+             patch.object(af, "report_recipients", return_value=list({111})):
             _run(af._auto_fetch_job(self.context))
         sent = "\n".join(c.args[1] for c in self.context.bot.send_message.call_args_list)
         self.assertIn("📌 *Ref:* `REG/TSFR/AAA111`", sent)
@@ -343,7 +343,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
              patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
-             patch.object(af, "ALLOWED_IDS", set()), \
+             patch.object(af, "report_recipients", return_value=list(set())), \
              patch.object(af, "_send_auto_fetch_email") as mock_email:
             _run(af._auto_fetch_job(self.context))
         mock_email.assert_called_once()
@@ -365,7 +365,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
              patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
-             patch.object(af, "ALLOWED_IDS", set()), \
+             patch.object(af, "report_recipients", return_value=list(set())), \
              patch.object(af, "_send_auto_fetch_email") as mock_email:
             _run(af._auto_fetch_job(self.context))
         body = mock_email.call_args[0][2]
@@ -389,7 +389,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
              patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
-             patch.object(af, "ALLOWED_IDS", set()), \
+             patch.object(af, "report_recipients", return_value=list(set())), \
              patch.object(af, "_send_auto_fetch_email") as mock_email:
             _run(af._auto_fetch_job(self.context))
         body = mock_email.call_args[0][2]
@@ -406,7 +406,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
              patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
-             patch.object(af, "ALLOWED_IDS", set()), \
+             patch.object(af, "report_recipients", return_value=list(set())), \
              patch.object(af, "_send_auto_fetch_email") as mock_block_email, \
              patch.object(af, "_send_bulk_export_email") as mock_excel_email:
             _run(af._auto_fetch_job(self.context))
@@ -426,7 +426,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
              patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
-             patch.object(af, "ALLOWED_IDS", set()), \
+             patch.object(af, "report_recipients", return_value=list(set())), \
              patch.object(af, "_send_auto_fetch_email") as mock_block_email, \
              patch.object(af, "_send_bulk_export_email") as mock_excel_email:
             _run(af._auto_fetch_job(self.context))
@@ -445,7 +445,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
              patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
-             patch.object(af, "ALLOWED_IDS", set()), \
+             patch.object(af, "report_recipients", return_value=list(set())), \
              patch.object(af, "_send_auto_fetch_email") as mock_block_email, \
              patch.object(af, "_send_bulk_export_email") as mock_excel_email:
             _run(af._auto_fetch_job(self.context))
@@ -467,7 +467,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_dlv_batch", return_value=[]), \
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
-             patch.object(af, "ALLOWED_IDS", {111}):
+             patch.object(af, "report_recipients", return_value=list({111})):
             _run(af._auto_fetch_job(ctx))
         ctx.bot.send_document.assert_called_once()
         ctx.bot.send_message.assert_not_called()
@@ -488,7 +488,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_dlv_batch", return_value=[]), \
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
-             patch.object(af, "ALLOWED_IDS", {111}):
+             patch.object(af, "report_recipients", return_value=list({111})):
             _run(af._auto_fetch_job(ctx))
         ctx.bot.send_document.assert_not_called()
         ctx.bot.send_message.assert_called()
@@ -501,7 +501,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
              patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
-             patch.object(af, "ALLOWED_IDS", set()), \
+             patch.object(af, "report_recipients", return_value=list(set())), \
              patch.object(af, "_send_auto_fetch_email") as mock_email:
             _run(af._auto_fetch_job(self.context))
         return mock_email
@@ -555,7 +555,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
              patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
-             patch.object(af, "ALLOWED_IDS", set()), \
+             patch.object(af, "report_recipients", return_value=list(set())), \
              patch.object(af, "_send_auto_fetch_email", side_effect=RuntimeError("smtp down")):
             _run(af._auto_fetch_job(self.context))
 
@@ -571,7 +571,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_dlv_batch", return_value=[]), \
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
-             patch.object(af, "ALLOWED_IDS", {111}):
+             patch.object(af, "report_recipients", return_value=list({111})):
             _run(af._auto_fetch_job(self.context))
         return self.context.bot.send_message
 
@@ -608,7 +608,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_dlv_batch", return_value=[]), \
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
-             patch.object(af, "ALLOWED_IDS", {111}), \
+             patch.object(af, "report_recipients", return_value=list({111})), \
              patch.object(af, "_send_auto_fetch_email"):
             _run(af._auto_fetch_job(self.context))
         self.context.bot.send_message.assert_not_called()
@@ -633,7 +633,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
              patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
-             patch.object(af, "ALLOWED_IDS", {111}), \
+             patch.object(af, "report_recipients", return_value=list({111})), \
              patch.object(af, "_send_auto_fetch_email", side_effect=RuntimeError("smtp down")):
             _run(af._auto_fetch_job(self.context))
         self.context.bot.send_message.assert_any_call(
@@ -651,7 +651,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "load_sectional_config", return_value=None), \
              patch.object(af, "persist_af_result"), \
              patch.object(af, "_send_chunked_report", new_callable=AsyncMock), \
-             patch.object(af, "ALLOWED_IDS", {111}), \
+             patch.object(af, "report_recipients", return_value=list({111})), \
              patch.object(af, "_send_auto_fetch_email", side_effect=RuntimeError("smtp down")):
             _run(af._auto_fetch_job(self.context))
         self.context.bot.send_message.assert_any_call(
@@ -698,7 +698,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "build_session", return_value=fake_session), \
              patch.object(af, "persist_assignment") as mock_persist_assign, \
              patch.object(af, "persist_af_result") as mock_persist_result, \
-             patch.object(af, "ALLOWED_IDS", set()):
+             patch.object(af, "report_recipients", return_value=list(set())):
             _run(af._auto_fetch_job(self.context))
         mock_persist_assign.assert_called_once_with("R-SEC", "Jane Specialist", "uid-1")
         # sectional task should be removed from the remaining/persisted set
@@ -799,7 +799,7 @@ class TestAutoFetchJob(unittest.TestCase):
              patch.object(af, "build_session", return_value=fake_session), \
              patch.object(af, "persist_assignment") as mock_persist_assign, \
              patch.object(af, "persist_af_result") as mock_persist_result, \
-             patch.object(af, "ALLOWED_IDS", set()):
+             patch.object(af, "report_recipients", return_value=list(set())):
             _run(af._auto_fetch_job(self.context))
         mock_persist_assign.assert_called_once_with("R-APT", "John Specialist", "uid-2")
         # apartment task should be removed from the remaining/persisted set
