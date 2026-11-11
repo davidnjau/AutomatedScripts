@@ -96,7 +96,7 @@ from telegram.ext import (
 from ardhisasa_auth import build_session
 
 from common import (
-    ALLOWED_IDS,
+    report_recipients,
     BTN_AF_RESULTS,
     BTN_AUTO_FETCH,
     CPARAMS_VALUER_ROLE,
@@ -1033,7 +1033,7 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         sc_msg += "\n".join(f"  ✅ {r}" for r in assigned_sc[:10])
                     if failed_sc:
                         sc_msg += "\n" + "\n".join(f"  ❌ {r}" for r in failed_sc[:5])
-                    for chat_id in ALLOWED_IDS:
+                    for chat_id in report_recipients():
                         try:
                             await context.bot.send_message(chat_id, sc_msg, parse_mode="Markdown")
                         except Exception as e:
@@ -1085,7 +1085,7 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         ap_msg += "\n".join(f"  ✅ {r}" for r in assigned_ap[:10])
                     if failed_ap:
                         ap_msg += "\n" + "\n".join(f"  ❌ {r}" for r in failed_ap[:5])
-                    for chat_id in ALLOWED_IDS:
+                    for chat_id in report_recipients():
                         try:
                             await context.bot.send_message(chat_id, ap_msg, parse_mode="Markdown")
                         except Exception as e:
@@ -1130,7 +1130,7 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Auto Fetch Telegram skipped for schedule %s — all %d task(s) already notified previously.",
                 schedule_id, len(tasks),
             )
-        elif not ALLOWED_IDS:
+        elif not report_recipients():
             # No one to notify — don't mark these refs as sent, since nothing
             # was actually shown to anyone (state must reflect what recipients
             # have seen, not what was merely eligible to send).
@@ -1145,7 +1145,7 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             if report_format == "excel":
                 xlsx_bytes = _af_build_excel(tg_new_tasks)
                 filename   = f"auto_fetch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-                for chat_id in ALLOWED_IDS:
+                for chat_id in report_recipients():
                     try:
                         await context.bot.send_document(
                             chat_id, document=io.BytesIO(xlsx_bytes), filename=filename,
@@ -1155,7 +1155,7 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         logger.warning("Auto Fetch notify error for %s: %s", chat_id, e)
             else:
                 lines = [_ft_format_task_block(i, t, markdown=True) for i, t in enumerate(tg_new_tasks, 1)]
-                for chat_id in ALLOWED_IDS:
+                for chat_id in report_recipients():
                     async def _send(text, reply_markup, chat_id=chat_id):
                         try:
                             await context.bot.send_message(chat_id, text, parse_mode="Markdown")
@@ -1212,7 +1212,7 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             # user's side. Notify the same way Bulk Export/DLV Tasks/Morning
             # Briefing already do on email failure.
             logger.warning("Auto Fetch email failed: %s", e)
-            for chat_id in ALLOWED_IDS:
+            for chat_id in report_recipients():
                 try:
                     await context.bot.send_message(
                         chat_id, f"⚠️ Auto Fetch email delivery to *{md_escape(email)}* failed: `{e}`",

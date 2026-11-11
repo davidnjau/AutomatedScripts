@@ -89,6 +89,14 @@ ALLOWED_IDS: List[int] = [
     for x in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",")
     if x.strip()
 ]
+# Allowed users who must never receive pushed alerts (e.g. an inquiry-only
+# user) — same REPORT_EXCLUDED_TELEGRAM_IDS env var as common.NO_REPORT_IDS;
+# the daemon is a separate process, so it reads it independently here.
+NO_REPORT_IDS: set = {
+    int(x.strip())
+    for x in os.getenv("REPORT_EXCLUDED_TELEGRAM_IDS", "").split(",")
+    if x.strip()
+}
 
 CRED_LABELS = {
     "publicuser":   "👤 Public User",
@@ -179,7 +187,10 @@ def _tg_send(chat_id: int, text: str) -> None:
 
 
 def _tg_broadcast(text: str) -> None:
+    # Skip report-excluded users (inquiry-only), same as common.report_recipients.
     for chat_id in ALLOWED_IDS:
+        if chat_id in NO_REPORT_IDS:
+            continue
         _tg_send(chat_id, text)
 
 

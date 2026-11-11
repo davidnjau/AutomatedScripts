@@ -910,7 +910,7 @@ class TestIcNotifyJob(unittest.TestCase):
         ctx = self._make_ctx()
         items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared", "valuer_name": "Jane Doe"}]
         with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "emails": []}), \
-             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "report_recipients", return_value=list([111])), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=items), \
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
@@ -934,7 +934,7 @@ class TestIcNotifyJob(unittest.TestCase):
         ctx = self._make_ctx()
         items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "queued", "valuer_name": "Jane Doe"}]
         with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "emails": []}), \
-             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "report_recipients", return_value=list([111])), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=items), \
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
@@ -975,7 +975,7 @@ class TestIcNotifyJob(unittest.TestCase):
         items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared",
                   "valuer_name": "Jane Doe", "assigned_at": "2026-07-17 09:00:00"}]
         with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "emails": []}), \
-             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "report_recipients", return_value=list([111])), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=items), \
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
@@ -996,7 +996,7 @@ class TestIcNotifyJob(unittest.TestCase):
                   "valuer_name": "Jane Doe", "assigned_at": "2026-07-17 09:00:00"}]
         with patch.object(ic, "load_notify_config",
                            return_value={"enabled": True, "interval_minutes": 30, "emails": ["a@b.com"]}), \
-             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "report_recipients", return_value=list([111])), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=items), \
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
@@ -1016,7 +1016,7 @@ class TestIcNotifyJob(unittest.TestCase):
         with patch.object(ic, "load_notify_config",
                            return_value={"enabled": True, "interval_minutes": 30,
                                          "emails": ["a@b.com", "c@d.com"]}), \
-             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "report_recipients", return_value=list([111])), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=items), \
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
@@ -1037,7 +1037,7 @@ class TestIcNotifyJob(unittest.TestCase):
         with patch.object(ic, "load_notify_config",
                            return_value={"enabled": True, "interval_minutes": 30,
                                          "emails": ["bad@b.com", "good@d.com"]}), \
-             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "report_recipients", return_value=list([111])), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=items), \
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
@@ -1056,7 +1056,7 @@ class TestIcNotifyJob(unittest.TestCase):
                   "valuer_name": "Jane Doe", "assigned_at": "2026-07-17 09:00:00"}]
         with patch.object(ic, "load_notify_config",
                            return_value={"enabled": True, "interval_minutes": 30, "emails": ["a@b.com"]}), \
-             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "report_recipients", return_value=list([111])), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=items), \
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
@@ -1078,7 +1078,7 @@ class TestIcNotifyJob(unittest.TestCase):
         items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "cleared",
                   "valuer_name": "Jane Doe", "assigned_at": "2026-07-17 09:00:00"}]
         with patch.object(ic, "load_notify_config", return_value={"enabled": True, "interval_minutes": 30, "emails": []}), \
-             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "report_recipients", return_value=list([111])), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=items), \
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \
@@ -1142,7 +1142,7 @@ class TestRecvIcNotifyMenu(unittest.TestCase):
         items = [{"ref": "R1", "batch_number": 2, "task_number": 1, "status": "queued", "valuer_name": "Jane Doe"}]
         with patch.object(ic, "allowed", return_value=True), \
              patch.object(ic, "load_notify_config", return_value={"enabled": False, "emails": []}), \
-             patch.object(ic, "ALLOWED_IDS", [111]), \
+             patch.object(ic, "report_recipients", return_value=list([111])), \
              patch.object(ic, "get_batch_size", return_value=6), \
              patch.object(ic, "_ic_gather_items", return_value=items), \
              patch.object(ic, "_ic_group_by_batch", return_value={2: items}), \

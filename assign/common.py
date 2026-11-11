@@ -82,6 +82,16 @@ ADMIN_IDS = set(
     if x.strip()
 )
 
+# Allowed users who must never receive any pushed report/notification (e.g. an
+# inquiry-only user who just uses a lookup menu). They can still use the bot
+# normally; they're only skipped by every broadcast loop — see
+# report_recipients(). A subset of ALLOWED_IDS, maintained in its own env var.
+NO_REPORT_IDS = set(
+    int(x.strip())
+    for x in os.getenv("REPORT_EXCLUDED_TELEGRAM_IDS", "").split(",")
+    if x.strip()
+)
+
 # SMTP config for email notifications (all optional)
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587").strip())
@@ -351,6 +361,14 @@ def admin_recipients() -> List[int]:
     if not ADMIN_IDS:
         return list(ALLOWED_IDS)
     return list(ADMIN_IDS)
+
+
+def report_recipients() -> List[int]:
+    """Allowed users who should receive a broadcast report/notification —
+    every allowed user except those in NO_REPORT_IDS. Used by every recurring
+    report's send loop (Auto Fetch, stale check, hold tasks, incremental
+    notify, token daemon) so an inquiry-only user never gets pushed reports."""
+    return [uid for uid in ALLOWED_IDS if uid not in NO_REPORT_IDS]
 
 
 def get_user_categories(user_id: int) -> List[str]:
@@ -643,6 +661,7 @@ BTN_CAT_ASSIGNMENTS = "📋 Assignments"
 BTN_CAT_AUTOMATION  = "🤖 Automation"
 BTN_CAT_ANALYTICS   = "📈 Analytics"
 BTN_CAT_LOOKUPS     = "🔎 Look Ups"
+BTN_CAT_INQUIRY     = "🧭 Inquiry"
 BTN_CAT_VALUERS     = "👥 Valuers"
 BTN_CAT_SETTINGS    = "⚙️ Bot Settings"
 BTN_CAT_POST_BOARD  = "📥 Post Board"
@@ -675,7 +694,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}|{re.escape(BTN_TASK_ANALYTICS)}|{re.escape(BTN_CLEAR_CHAT)}"
     f"|{re.escape(BTN_QUEUE_INTERVAL)}|{re.escape(BTN_STALE_THRESHOLD)}|{re.escape(BTN_SMS_SENDER)}"
     f"|{re.escape(BTN_CAT_ASSIGNMENTS)}|{re.escape(BTN_CAT_AUTOMATION)}|{re.escape(BTN_CAT_ANALYTICS)}"
-    f"|{re.escape(BTN_CAT_LOOKUPS)}|{re.escape(BTN_CAT_VALUERS)}|{re.escape(BTN_CAT_SETTINGS)}"
+    f"|{re.escape(BTN_CAT_LOOKUPS)}|{re.escape(BTN_CAT_INQUIRY)}|{re.escape(BTN_CAT_VALUERS)}|{re.escape(BTN_CAT_SETTINGS)}"
     f"|{re.escape(BTN_CAT_POST_BOARD)}|{re.escape(BTN_PB_POST)}|{re.escape(BTN_PB_VIEW)}"
     f"|{re.escape(BTN_BACK)}|{re.escape(BTN_MANAGE_ACCESS)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
@@ -721,9 +740,17 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
     BTN_CAT_LOOKUPS: {
         "description": (
             "🔎 *Look Ups*\n\n"
-            "Check a reference or parcel number's status, on demand or via a standing watch."
+            "Check a parcel number's status or a DLV reference, on demand."
         ),
-        "buttons": [BTN_LOOKUP, BTN_PARCEL_LOOKUP, BTN_PARCEL_WATCH, BTN_DLV_REF_CHECK],
+        "buttons": [BTN_PARCEL_LOOKUP, BTN_DLV_REF_CHECK],
+    },
+    BTN_CAT_INQUIRY: {
+        "description": (
+            "🧭 *Inquiry*\n\n"
+            "Look up a reference number's status on demand, or set a standing "
+            "watch on a parcel number."
+        ),
+        "buttons": [BTN_LOOKUP, BTN_PARCEL_WATCH],
     },
     BTN_CAT_VALUERS: {
         "description": (

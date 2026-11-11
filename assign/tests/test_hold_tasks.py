@@ -380,7 +380,7 @@ class TestHoldTasksJob(unittest.TestCase):
         with patch.object(ht, "load_hold_tasks", return_value=[{"ref": "X"}]), \
              patch.object(ht, "_any_valid_tokens", return_value=TOKENS), \
              patch.object(ht, "_process_hold_items", return_value="🔁 `X` reverted"), \
-             patch.object(ht, "ALLOWED_IDS", {111, 222}):
+             patch.object(ht, "report_recipients", return_value=list({111, 222})):
             _run(ht._hold_tasks_job(self.ctx))
         self.assertEqual(self.ctx.bot.send_message.call_count, 2)
 

@@ -132,7 +132,7 @@ from telegram.ext import (
 )
 
 from common import (
-    ALLOWED_IDS,
+    report_recipients,
     BTN_INCREMENTAL,
     DATA_DIR,
     _atomic_json_write,
@@ -637,7 +637,7 @@ async def _ic_run_notify_cycle(context: ContextTypes.DEFAULT_TYPE) -> bool:
     lines.append("")
     lines += _ic_format_newly_cleared_section(new_cleared, batch_size)
 
-    for chat_id in ALLOWED_IDS:
+    for chat_id in report_recipients():
         async def _send(text, reply_markup, chat_id=chat_id):
             try:
                 await context.bot.send_message(chat_id, text, parse_mode="Markdown")
@@ -650,7 +650,7 @@ async def _ic_run_notify_cycle(context: ContextTypes.DEFAULT_TYPE) -> bool:
             _send_auto_fetch_email(email, "Incremental — Notify on Fill", "\n\n".join(lines))
         except Exception as e:
             logger.warning("Incremental Notify on Fill email to %s failed: %s", email, e)
-            for chat_id in ALLOWED_IDS:
+            for chat_id in report_recipients():
                 try:
                     await context.bot.send_message(
                         chat_id, f"⚠️ Incremental notify email delivery to *{md_escape(email)}* failed: `{e}`",

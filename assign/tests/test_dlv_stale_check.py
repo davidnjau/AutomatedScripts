@@ -216,7 +216,7 @@ class TestSendStaleMatchPrompt(unittest.TestCase):
         bot.send_message = AsyncMock()
         item = {"ref": "OLD1", "parcel": "P1", "valuer_name": "Jane", "stale_matches": ["NEW1"],
                 "queued_at": datetime.now().isoformat()}
-        with patch.object(sc, "ALLOWED_IDS", {111, 222}):
+        with patch.object(sc, "report_recipients", return_value=list({111, 222})):
             _run(sc._send_stale_match_prompt(bot, item))
         chat_ids = {c.args[0] for c in bot.send_message.call_args_list}
         self.assertEqual(chat_ids, {111, 222})
@@ -226,7 +226,7 @@ class TestSendStaleMatchPrompt(unittest.TestCase):
         bot.send_message = AsyncMock(side_effect=[RuntimeError("blocked"), None])
         item = {"ref": "OLD1", "parcel": "P1", "valuer_name": "Jane", "stale_matches": ["NEW1"],
                 "queued_at": datetime.now().isoformat()}
-        with patch.object(sc, "ALLOWED_IDS", {111, 222}):
+        with patch.object(sc, "report_recipients", return_value=list({111, 222})):
             _run(sc._send_stale_match_prompt(bot, item))
         self.assertEqual(bot.send_message.call_count, 2)
 
@@ -344,7 +344,7 @@ class TestRunStaleCheck(unittest.TestCase):
                           return_value={"tokens_available": True, "found": False, "parcel_number": None}), \
              patch.object(sc, "mark_removed") as mock_remove, \
              patch.object(sc, "save_dlv_batch") as mock_save, \
-             patch.object(sc, "ALLOWED_IDS", {111}):
+             patch.object(sc, "report_recipients", return_value=list({111})):
             _run(sc.run_stale_check(bot))
         mock_remove.assert_called_once_with(["OLD1"])
         saved_refs = [i["ref"] for i in mock_save.call_args[0][0]]
@@ -365,7 +365,7 @@ class TestRunStaleCheck(unittest.TestCase):
              patch.object(sc, "_pl_search_parcel", return_value=[]), \
              patch.object(sc, "mark_removed") as mock_remove, \
              patch.object(sc, "save_dlv_batch"), \
-             patch.object(sc, "ALLOWED_IDS", {111}):
+             patch.object(sc, "report_recipients", return_value=list({111})):
             _run(sc.run_stale_check(bot))
         mock_remove.assert_called_once_with(["OLD1"])
         text = bot.send_message.call_args[0][1]
@@ -384,7 +384,7 @@ class TestRunStaleCheck(unittest.TestCase):
              patch.object(sc, "_pl_search_parcel", return_value=matches), \
              patch.object(sc, "mark_removed") as mock_remove, \
              patch.object(sc, "save_dlv_batch") as mock_save, \
-             patch.object(sc, "ALLOWED_IDS", {111}):
+             patch.object(sc, "report_recipients", return_value=list({111})):
             _run(sc.run_stale_check(bot))
         mock_remove.assert_not_called()
         saved_item = mock_save.call_args[0][0][0]
@@ -411,7 +411,7 @@ class TestRunStaleCheck(unittest.TestCase):
              patch.object(sc, "_pl_search_parcel", return_value=[{"reference_number": "NEW1"}]), \
              patch.object(sc, "mark_removed"), \
              patch.object(sc, "save_dlv_batch") as mock_save, \
-             patch.object(sc, "ALLOWED_IDS", {111}):
+             patch.object(sc, "report_recipients", return_value=list({111})):
             _run(sc.run_stale_check(bot))
         saved_item = mock_save.call_args[0][0][0]
         self.assertEqual(saved_item["parcel"], "NBI/BLOCK9/1")
@@ -428,7 +428,7 @@ class TestRunStaleCheck(unittest.TestCase):
              patch.object(sc, "_pl_search_parcel", return_value=matches), \
              patch.object(sc, "mark_removed"), \
              patch.object(sc, "save_dlv_batch") as mock_save, \
-             patch.object(sc, "ALLOWED_IDS", {111}):
+             patch.object(sc, "report_recipients", return_value=list({111})):
             _run(sc.run_stale_check(bot))
         saved_item = mock_save.call_args[0][0][0]
         self.assertEqual(len(saved_item["stale_matches"]), sc._STALE_MAX_MATCHES_SHOWN)
@@ -446,7 +446,7 @@ class TestRunStaleCheck(unittest.TestCase):
              patch.object(sc, "_lu_current_valuer", new_callable=AsyncMock) as mock_lookup, \
              patch.object(sc, "_pl_search_parcel") as mock_parcel_search, \
              patch.object(sc, "save_dlv_batch"), \
-             patch.object(sc, "ALLOWED_IDS", {111}):
+             patch.object(sc, "report_recipients", return_value=list({111})):
             _run(sc.run_stale_check(bot))
         mock_lookup.assert_not_called()
         mock_parcel_search.assert_not_called()
