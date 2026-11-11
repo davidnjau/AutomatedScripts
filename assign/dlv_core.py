@@ -53,6 +53,7 @@ from common import (
     _atomic_json_write,
     _DLV_STORE_LOCK,
     _ft_headers,
+    is_admin,
     logger,
 )
 from endpoints import (
@@ -91,6 +92,19 @@ _CLOSE_AND_ASSIGN_FIELDS = {
 # parcel_watch.py's _pw_check_job when it queues a found parcel's ref for
 # assignment, not picked manually via DLV Batch's own Tag Tasks step.
 DLV_TAGS = ["Queue", "Direct", "Parcel Watch"]
+
+# Per-user report visibility: admins see every record; a non-admin sees only
+# records they personally added to the DLV Batch queue (the `added_by`
+# Telegram id captured at queue time in dlv_batch.recv_db_confirm). Records
+# with no `added_by` (added before this feature, or via a non-DLV-Batch path)
+# are therefore admin-only in these reports — there's no owner to attribute
+# them to. Used by the DLV Batch auto report / 🔍 DLV Queue viewer and every
+# DLV Tasks report.
+def filter_own_records(records: List[Dict], user_id: int) -> List[Dict]:
+    """Admin → all records; non-admin → only those with added_by == user_id."""
+    if is_admin(user_id):
+        return list(records)
+    return [r for r in records if r.get("added_by") == user_id]
 
 # dlv_incremental.py's auto-sequenced "B{batch}-T{task}" tag is a third DLV
 # Batch tag option that doesn't fit DLV_TAGS' fixed-vocabulary picker (it's

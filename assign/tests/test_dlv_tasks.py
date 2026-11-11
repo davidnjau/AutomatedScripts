@@ -1085,6 +1085,7 @@ class TestRecvDtPeriodTagMode(unittest.TestCase):
         queued = [{"ref": "REF1", "tag": "Queue"}, {"ref": "REF2", "tag": "Direct"}]
         closed = [{"ref": "REF3", "tag": "Queue", "closed_at": "2026-07-01"}]
         with patch.object(dlv_tasks, "allowed", return_value=True), \
+             patch.object(dlv_tasks, "filter_own_records", side_effect=lambda recs, uid: list(recs)), \
              patch.object(dlv_tasks, "load_dlv_batch", return_value=queued), \
              patch.object(dlv_tasks, "load_dlv_closed", return_value=closed), \
              patch.object(dlv_tasks, "load_saved_assignments", return_value={}), \
@@ -1131,6 +1132,7 @@ class TestRecvDtPeriodTagMode(unittest.TestCase):
             "REF2": {"valuer_uid": "u1", "assigned_at": "2026-07-10 09:00:00"},   # still at desk
         }
         with patch.object(dlv_tasks, "allowed", return_value=True), \
+             patch.object(dlv_tasks, "filter_own_records", side_effect=lambda recs, uid: list(recs)), \
              patch.object(dlv_tasks, "load_dlv_batch", return_value=[]), \
              patch.object(dlv_tasks, "load_dlv_closed", return_value=closed), \
              patch.object(dlv_tasks, "load_saved_assignments", return_value=assignments), \
@@ -1152,6 +1154,7 @@ class TestRecvDtPeriodTagMode(unittest.TestCase):
             "REF2": {"tag": "Direct", "assigned_at": "2026-07-10 09:00:00"},
         }
         with patch.object(dlv_tasks, "allowed", return_value=True), \
+             patch.object(dlv_tasks, "filter_own_records", side_effect=lambda recs, uid: list(recs)), \
              patch.object(dlv_tasks, "load_dlv_batch", return_value=[]), \
              patch.object(dlv_tasks, "load_dlv_closed", return_value=[]), \
              patch.object(dlv_tasks, "load_saved_assignments", return_value=assignments), \
@@ -1159,6 +1162,41 @@ class TestRecvDtPeriodTagMode(unittest.TestCase):
             _run(dlv_tasks.recv_dt_period(update, ctx))
         sent_desk = mock_send.call_args[0][3]
         self.assertEqual([i["ref"] for i in sent_desk], ["REF1"])
+
+
+class TestDtOwnershipFiltering(unittest.TestCase):
+    """Per-user visibility: _dt_gather_report_data / _dt_collect_valuers
+    narrow to a non-admin's own added refs; user_id=None (schedules) is
+    unfiltered."""
+
+    def test_gather_filters_sources_for_non_admin(self):
+        batch  = [{"ref": "MINE", "valuer_uid": "u1", "added_by": 111},
+                  {"ref": "THEIRS", "valuer_uid": "u1", "added_by": 222}]
+        with patch.object(dlv_tasks, "load_dlv_batch", return_value=batch), \
+             patch.object(dlv_tasks, "load_dlv_closed", return_value=[]), \
+             patch.object(dlv_tasks, "load_saved_assignments", return_value={}), \
+             patch("dlv_core.is_admin", return_value=False):
+            queued, _desk, _closed = dlv_tasks._dt_gather_report_data("valuer", "u1", 0, user_id=111)
+        self.assertEqual([i["ref"] for i in queued], ["MINE"])
+
+    def test_gather_unfiltered_when_user_id_none(self):
+        batch = [{"ref": "A", "valuer_uid": "u1", "added_by": 111},
+                 {"ref": "B", "valuer_uid": "u1", "added_by": 222}]
+        with patch.object(dlv_tasks, "load_dlv_batch", return_value=batch), \
+             patch.object(dlv_tasks, "load_dlv_closed", return_value=[]), \
+             patch.object(dlv_tasks, "load_saved_assignments", return_value={}):
+            queued, _desk, _closed = dlv_tasks._dt_gather_report_data("valuer", "u1", 0)
+        self.assertEqual({i["ref"] for i in queued}, {"A", "B"})
+
+    def test_collect_valuers_filters_for_non_admin(self):
+        batch = [{"ref": "MINE", "valuer_uid": "u1", "valuer_name": "Jane", "added_by": 111},
+                 {"ref": "THEIRS", "valuer_uid": "u2", "valuer_name": "John", "added_by": 222}]
+        with patch.object(dlv_tasks, "load_dlv_batch", return_value=batch), \
+             patch.object(dlv_tasks, "load_dlv_closed", return_value=[]), \
+             patch.object(dlv_tasks, "load_saved_assignments", return_value={}), \
+             patch("dlv_core.is_admin", return_value=False):
+            valuers = dlv_tasks._dt_collect_valuers(111)
+        self.assertEqual([v["name"] for v in valuers], ["Jane"])
 
 
 if __name__ == "__main__":

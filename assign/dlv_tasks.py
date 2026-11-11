@@ -77,6 +77,7 @@ from dlv_core import (
     _resolve_assessor,
     _search_ref_dlv,
     _search_ref_stampduty,
+    filter_own_records,
     is_incremental_tag,
     load_dlv_batch,
     load_dlv_closed,
@@ -168,6 +169,7 @@ def _dt_fetch_tasks(tokens: AuthTokens) -> List[dict]:
             "date_created":  item.get("queued_at", ""),   # fallback: when queued
             "valuer_name":   item.get("valuer_name", ""),
             "valuer_uid":    item.get("valuer_uid", ""),
+            "added_by":      item.get("added_by"),         # who queued it, for per-user report filtering
             "assessor":      "",
             "status":        "",   # application/stamp-duty status, e.g. "ONGOING"
             "node":          "",   # workflow node code, mapped to a label via _NODE_LABELS
@@ -328,7 +330,8 @@ def _dt_delete_keyboard(items: List[dict], selected_refs: set) -> InlineKeyboard
 
 async def _dt_run_delete_select(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
     """Show the open DLV queue with a multi-select keyboard for bulk deletion."""
-    items = load_dlv_batch()
+    # A non-admin can only see (and thus delete) refs they added.
+    items = filter_own_records(load_dlv_batch(), chat_id)
     if not items:
         await edit_fn("ℹ️ The DLV queue is empty — nothing to delete.")
         await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu_for(chat_id))
@@ -392,8 +395,11 @@ def _dt_build_excel(rows: List[dict]) -> bytes:
 
 async def cmd_dlv_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update): return await deny(update)
-    open_count   = len(load_dlv_batch())
-    closed_count = len(load_dlv_closed())
+    # Counts reflect visibility: admins see the whole store, a non-admin only
+    # the refs they added (same filter every DLV Tasks report below applies).
+    uid = update.effective_user.id
+    open_count   = len(filter_own_records(load_dlv_batch(), uid))
+    closed_count = len(filter_own_records(load_dlv_closed(), uid))
     await update.message.reply_text(
         f"📋 *DLV Tasks*\n\nOpen: *{open_count}* task(s) · Closed: *{closed_count}* task(s)\n\n"
         "Open Tasks are still ONGOING/CREATED and available for reallocation.\n"
@@ -429,6 +435,9 @@ async def _dt_run_open_tasks(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TY
         await edit_fn(f"❌ Failed to fetch tasks: `{exc}`", parse_mode="Markdown")
         await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu_for(chat_id))
         return ConversationHandler.END
+
+    # Admin sees every open task; a non-admin only those they added.
+    rows = filter_own_records(rows, chat_id)
 
     if not rows:
         await edit_fn("ℹ️ No open DLV tasks — queue is empty or every item has since closed.")
@@ -519,12 +528,18 @@ def _dt_load_assignment_items() -> List[dict]:
     return [{**info, "ref": ref} for ref, info in load_saved_assignments().items()]
 
 
-def _dt_collect_valuers() -> List[dict]:
+def _dt_collect_valuers(user_id: Optional[int] = None) -> List[dict]:
     """Dedup, name-sorted list of every valuer seen in the open queue, at a
     valuer's desk (assigned but not yet closed), or in closed history, for
-    the By Valuer picker: [{"key": uid-or-name, "name": display name}]."""
+    the By Valuer picker: [{"key": uid-or-name, "name": display name}].
+    With user_id set, only records that user added are considered (so a
+    non-admin's picker lists just the valuers appearing in their own refs);
+    user_id=None (the default, used by dlv_report_schedule.py) considers all."""
+    records = load_dlv_batch() + _dt_load_assignment_items() + load_dlv_closed()
+    if user_id is not None:
+        records = filter_own_records(records, user_id)
     seen: dict = {}
-    for item in load_dlv_batch() + _dt_load_assignment_items() + load_dlv_closed():
+    for item in records:
         key = _dt_valuer_key(item)
         if not key or key in seen:
             continue
@@ -587,7 +602,7 @@ def _dt_view_keyboard() -> InlineKeyboardMarkup:
 
 async def _dt_run_valuer_select(edit_fn, chat_id: int, ctx: ContextTypes.DEFAULT_TYPE):
     """Show the valuer picker built from everyone currently queued or in closed history."""
-    valuers = _dt_collect_valuers()
+    valuers = _dt_collect_valuers(chat_id)   # non-admin: only valuers in their own refs
     if not valuers:
         await edit_fn("ℹ️ No queued or historical DLV tasks yet — nothing to report on.")
         await ctx.bot.send_message(chat_id, "Main menu.", reply_markup=_main_menu_for(chat_id))
@@ -948,24 +963,36 @@ def _dt_tag_matches(item: dict, target_key: str) -> bool:
     return item.get("tag") == target_key
 
 
-def _dt_gather_report_data(scope: str, target_key: str, period_days: int) -> Tuple[List[dict], List[dict], List[dict]]:
+def _dt_gather_report_data(scope: str, target_key: str, period_days: int,
+                           user_id: Optional[int] = None) -> Tuple[List[dict], List[dict], List[dict]]:
     """Gather (queued, at-desk, closed-within-period) for a given scope
     ("valuer" or "tag") + target — the data-gathering half of By
     Valuer/By Tag, factored out of recv_dt_period so
     dlv_report_schedule.py's background job can reuse the exact same
-    filtering logic for its own scheduled runs rather than duplicating it."""
+    filtering logic for its own scheduled runs rather than duplicating it.
+    With user_id set, the three source stores are first narrowed to that
+    user's own added refs (admin → all); user_id=None (the default, used by
+    dlv_report_schedule.py's emailed runs) leaves them unfiltered."""
+    batch_src  = load_dlv_batch()
+    closed_src = load_dlv_closed()
+    desk_src   = _dt_load_assignment_items()
+    if user_id is not None:
+        batch_src  = filter_own_records(batch_src, user_id)
+        closed_src = filter_own_records(closed_src, user_id)
+        desk_src   = filter_own_records(desk_src, user_id)
+
     if scope == "tag":
-        queued = [i for i in load_dlv_batch() if _dt_tag_matches(i, target_key)]
-        closed = [c for c in load_dlv_closed() if _dt_tag_matches(c, target_key)]
+        queued = [i for i in batch_src if _dt_tag_matches(i, target_key)]
+        closed = [c for c in closed_src if _dt_tag_matches(c, target_key)]
     else:
-        queued = [i for i in load_dlv_batch() if _dt_valuer_key(i) == target_key]
-        closed = [c for c in load_dlv_closed() if _dt_valuer_key(c) == target_key]
+        queued = [i for i in batch_src if _dt_valuer_key(i) == target_key]
+        closed = [c for c in closed_src if _dt_valuer_key(c) == target_key]
 
     closed_refs = {c["ref"] for c in closed}
     if scope == "tag":
-        desk = [a for a in _dt_load_assignment_items() if _dt_tag_matches(a, target_key) and a["ref"] not in closed_refs]
+        desk = [a for a in desk_src if _dt_tag_matches(a, target_key) and a["ref"] not in closed_refs]
     else:
-        desk = [a for a in _dt_load_assignment_items()
+        desk = [a for a in desk_src
                 if _dt_valuer_key(a) == target_key and a["ref"] not in closed_refs]
 
     if period_days:
@@ -994,16 +1021,17 @@ async def recv_dt_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess = _get_dt_sess(ctx)
     period_label = next((label for label, d in _DT_PERIOD_OPTIONS if d == days), "All time")
 
+    uid = query.message.chat_id   # == requesting user in this 1:1 bot; admin → all, else own
     if sess.report_mode == "tag":
         tag = sess.selected_tag
-        queued, desk, closed = _dt_gather_report_data("tag", tag, days)
+        queued, desk, closed = _dt_gather_report_data("tag", tag, days, user_id=uid)
         await query.edit_message_text(f"⏳ Building report for tag *{_dt_tag_display(tag)}*…", parse_mode="Markdown")
         await _dt_send_tag_report(query.message.chat_id, tag, queued, desk, closed, period_label, ctx.bot,
                                    view=sess.report_view)
     else:
         valuer = sess.selected_valuer
         key    = valuer["key"]
-        queued, desk, closed = _dt_gather_report_data("valuer", key, days)
+        queued, desk, closed = _dt_gather_report_data("valuer", key, days, user_id=uid)
         await query.edit_message_text(f"⏳ Building report for *{md_escape(valuer['name'])}*…", parse_mode="Markdown")
         await _dt_send_valuer_report(query.message.chat_id, valuer["name"], queued, desk, closed, period_label, ctx.bot)
 
@@ -1024,7 +1052,8 @@ async def recv_dt_scope(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await _dt_run_tag_select(query.edit_message_text, query.message.chat_id, ctx)
 
     if scope == "closed":
-        rows = load_dlv_closed()
+        # Admin sees all closed tasks; a non-admin only those they added.
+        rows = filter_own_records(load_dlv_closed(), query.message.chat_id)
         if not rows:
             await query.edit_message_text("ℹ️ No closed tasks yet.")
             await ctx.bot.send_message(query.message.chat_id, "Main menu.", reply_markup=_main_menu_for(query.message.chat_id))
