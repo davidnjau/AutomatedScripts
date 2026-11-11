@@ -186,6 +186,18 @@ class TestCategoryAccessPersistence(unittest.TestCase):
         self.assertEqual(common.load_category_access(), {"111": [common.BTN_CAT_LOOKUPS]})
 
 
+class TestAdminRecipients(unittest.TestCase):
+    def test_returns_configured_admins(self):
+        with patch.object(common, "ADMIN_IDS", {111, 222}), \
+             patch.object(common, "ALLOWED_IDS", {111, 222, 333, 444}):
+            self.assertEqual(set(common.admin_recipients()), {111, 222})
+
+    def test_falls_back_to_all_allowed_when_no_admin_configured(self):
+        with patch.object(common, "ADMIN_IDS", set()), \
+             patch.object(common, "ALLOWED_IDS", {333, 444}):
+            self.assertEqual(set(common.admin_recipients()), {333, 444})
+
+
 class TestUserNamesPersistence(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
