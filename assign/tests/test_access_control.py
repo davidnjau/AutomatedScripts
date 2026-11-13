@@ -197,28 +197,53 @@ class TestRecvMaCategory(unittest.TestCase):
             _run(ac.recv_ma_category(update, ctx))
         self.assertEqual(ac._get_ma_sess(ctx).selected, set())
 
-    def test_done_persists_selection_and_ends(self):
+    def test_done_persists_categories_and_opens_customize(self):
+        # Done with a non-empty selection now saves the categories and moves
+        # to the per-button customization step (not straight to END).
         update = _make_update_with_callback("ma_cat:done", user_id=1)
         ctx = MagicMock()
         ctx.user_data = {"ma_session": ac.MASession(target_user_id=2, selected={common.BTN_CAT_LOOKUPS})}
         with patch.object(ac, "is_admin", return_value=True), \
              patch.object(ac, "load_category_access", return_value={}), \
              patch.object(ac, "load_user_names", return_value={}), \
+             patch.object(ac, "load_button_access", return_value={}), \
+             patch.object(ac, "save_button_access"), \
              patch.object(ac, "save_category_access") as mock_save:
             result = _run(ac.recv_ma_category(update, ctx))
-        self.assertEqual(result, ac.ConversationHandler.END)
+        self.assertEqual(result, ac.MA.PICK_CUST_CAT)
         mock_save.assert_called_once_with({"2": [common.BTN_CAT_LOOKUPS]})
 
-    def test_done_with_empty_selection_revokes_all(self):
+    def test_done_with_empty_selection_revokes_all_and_ends(self):
         update = _make_update_with_callback("ma_cat:done", user_id=1)
         ctx = MagicMock()
         ctx.user_data = {"ma_session": ac.MASession(target_user_id=2, selected=set())}
         with patch.object(ac, "is_admin", return_value=True), \
              patch.object(ac, "load_category_access", return_value={"2": [common.BTN_CAT_LOOKUPS]}), \
              patch.object(ac, "load_user_names", return_value={}), \
+             patch.object(ac, "load_button_access", return_value={}), \
+             patch.object(ac, "save_button_access"), \
              patch.object(ac, "save_category_access") as mock_save:
-            _run(ac.recv_ma_category(update, ctx))
+            result = _run(ac.recv_ma_category(update, ctx))
+        self.assertEqual(result, ac.ConversationHandler.END)
         mock_save.assert_called_once_with({"2": []})
+
+    def test_done_prunes_button_access_for_dropped_categories(self):
+        # A category the user no longer has must have its button allow-list
+        # dropped — a button restriction only means anything inside a granted
+        # category.
+        update = _make_update_with_callback("ma_cat:done", user_id=1)
+        ctx = MagicMock()
+        ctx.user_data = {"ma_session": ac.MASession(target_user_id=2, selected={common.BTN_CAT_LOOKUPS})}
+        existing_ba = {"2": {common.BTN_CAT_LOOKUPS: ["x"], common.BTN_CAT_ANALYTICS: ["y"]}}
+        with patch.object(ac, "is_admin", return_value=True), \
+             patch.object(ac, "load_category_access", return_value={}), \
+             patch.object(ac, "load_user_names", return_value={}), \
+             patch.object(ac, "load_button_access", return_value=existing_ba), \
+             patch.object(ac, "save_button_access") as mock_save_ba, \
+             patch.object(ac, "save_category_access"):
+            _run(ac.recv_ma_category(update, ctx))
+        # Analytics restriction pruned; Lookups kept.
+        mock_save_ba.assert_called_once_with({"2": {common.BTN_CAT_LOOKUPS: ["x"]}})
 
     def test_done_confirmation_shows_cached_name(self):
         update = _make_update_with_callback("ma_cat:done", user_id=1)
@@ -227,10 +252,124 @@ class TestRecvMaCategory(unittest.TestCase):
         with patch.object(ac, "is_admin", return_value=True), \
              patch.object(ac, "load_category_access", return_value={}), \
              patch.object(ac, "load_user_names", return_value={"2": "Jane Doe"}), \
+             patch.object(ac, "load_button_access", return_value={}), \
+             patch.object(ac, "save_button_access"), \
              patch.object(ac, "save_category_access"):
             _run(ac.recv_ma_category(update, ctx))
         sent_text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("Jane Doe", sent_text)
+
+
+class TestMaButtonKeyboard(unittest.TestCase):
+    """_ma_button_keyboard — ☑/☐ per button (by index) + Done."""
+
+    def test_checked_buttons_reflect_selection(self):
+        cat = common.BTN_CAT_ASSIGNMENTS
+        buttons = common._MENU_CATEGORIES[cat]["buttons"]
+        selected = {buttons[0]}
+        kb = ac._ma_button_keyboard(cat, selected)
+        rows = {row[0].text: row[0] for row in kb.inline_keyboard if row[0].text != "✅ Done"}
+        checked = [t for t in rows if t.startswith("☑")]
+        self.assertEqual(len(checked), 1)
+        self.assertIn(buttons[0], checked[0])
+
+    def test_callback_data_is_index_based(self):
+        cat = common.BTN_CAT_ASSIGNMENTS
+        kb = ac._ma_button_keyboard(cat, set())
+        datas = [row[0].callback_data for row in kb.inline_keyboard]
+        self.assertIn("ma_btn:0", datas)
+        self.assertIn("ma_btn:done", datas)
+
+
+class TestMaCustomizeKeyboard(unittest.TestCase):
+    """_ma_customize_keyboard — one button per granted category + Finish,
+    with a 🔧 marker on button-restricted categories."""
+
+    def test_only_granted_categories_shown(self):
+        kb = ac._ma_customize_keyboard({common.BTN_CAT_LOOKUPS}, {})
+        texts = [row[0].text for row in kb.inline_keyboard if row[0].callback_data != "ma_bcat:done"]
+        self.assertEqual(len(texts), 1)
+        self.assertIn(common.BTN_CAT_LOOKUPS, texts[0])
+
+    def test_restricted_category_gets_wrench_marker(self):
+        kb = ac._ma_customize_keyboard({common.BTN_CAT_LOOKUPS}, {common.BTN_CAT_LOOKUPS: ["x"]})
+        text = [row[0].text for row in kb.inline_keyboard if row[0].callback_data != "ma_bcat:done"][0]
+        self.assertTrue(text.startswith("🔧"))
+
+    def test_finish_button_present(self):
+        kb = ac._ma_customize_keyboard(set(), {})
+        datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+        self.assertIn("ma_bcat:done", datas)
+
+
+class TestRecvMaCustomizePick(unittest.TestCase):
+    def test_finish_ends_with_summary(self):
+        update = _make_update_with_callback("ma_bcat:done", user_id=1)
+        ctx = MagicMock()
+        ctx.user_data = {"ma_session": ac.MASession(target_user_id=2, selected={common.BTN_CAT_LOOKUPS})}
+        with patch.object(ac, "is_admin", return_value=True), \
+             patch.object(ac, "load_category_access", return_value={"2": [common.BTN_CAT_LOOKUPS]}), \
+             patch.object(ac, "load_button_access", return_value={}), \
+             patch.object(ac, "load_user_names", return_value={}):
+            result = _run(ac.recv_ma_customize_pick(update, ctx))
+        self.assertEqual(result, ac.ConversationHandler.END)
+
+    def test_picking_category_opens_button_toggles_all_checked_by_default(self):
+        cat = common.BTN_CAT_ASSIGNMENTS
+        update = _make_update_with_callback(f"ma_bcat:{cat}", user_id=1)
+        ctx = MagicMock()
+        ctx.user_data = {"ma_session": ac.MASession(target_user_id=2, selected={cat})}
+        with patch.object(ac, "is_admin", return_value=True), \
+             patch.object(ac, "load_button_access", return_value={}):
+            result = _run(ac.recv_ma_customize_pick(update, ctx))
+        self.assertEqual(result, ac.MA.PICK_BUTTONS)
+        # No saved restriction → every button pre-selected.
+        self.assertEqual(ac._get_ma_sess(ctx).cust_selected, set(common._MENU_CATEGORIES[cat]["buttons"]))
+
+
+class TestRecvMaButton(unittest.TestCase):
+    def _sess(self, cat, selected):
+        return ac.MASession(target_user_id=2, selected={cat}, cust_category=cat, cust_selected=set(selected))
+
+    def test_toggle_removes_a_button(self):
+        cat = common.BTN_CAT_ASSIGNMENTS
+        buttons = common._MENU_CATEGORIES[cat]["buttons"]
+        update = _make_update_with_callback("ma_btn:0", user_id=1)
+        ctx = MagicMock()
+        ctx.user_data = {"ma_session": self._sess(cat, buttons)}
+        with patch.object(ac, "is_admin", return_value=True):
+            result = _run(ac.recv_ma_button(update, ctx))
+        self.assertEqual(result, ac.MA.PICK_BUTTONS)
+        self.assertNotIn(buttons[0], ac._get_ma_sess(ctx).cust_selected)
+
+    def test_done_stores_partial_allow_list(self):
+        cat = common.BTN_CAT_ASSIGNMENTS
+        buttons = common._MENU_CATEGORIES[cat]["buttons"]
+        partial = buttons[:1]
+        update = _make_update_with_callback("ma_btn:done", user_id=1)
+        ctx = MagicMock()
+        ctx.user_data = {"ma_session": self._sess(cat, partial)}
+        with patch.object(ac, "is_admin", return_value=True), \
+             patch.object(ac, "load_button_access", return_value={}), \
+             patch.object(ac, "load_user_names", return_value={}), \
+             patch.object(ac, "save_button_access") as mock_save:
+            result = _run(ac.recv_ma_button(update, ctx))
+        self.assertEqual(result, ac.MA.PICK_CUST_CAT)
+        mock_save.assert_called_once_with({"2": {cat: sorted(partial)}})
+
+    def test_done_with_all_buttons_drops_restriction(self):
+        cat = common.BTN_CAT_ASSIGNMENTS
+        buttons = common._MENU_CATEGORIES[cat]["buttons"]
+        update = _make_update_with_callback("ma_btn:done", user_id=1)
+        ctx = MagicMock()
+        ctx.user_data = {"ma_session": self._sess(cat, buttons)}
+        with patch.object(ac, "is_admin", return_value=True), \
+             patch.object(ac, "load_button_access", return_value={"2": {cat: buttons[:1]}}), \
+             patch.object(ac, "load_user_names", return_value={}), \
+             patch.object(ac, "save_button_access") as mock_save:
+            _run(ac.recv_ma_button(update, ctx))
+        # All checked == no restriction → the whole user entry is dropped.
+        mock_save.assert_called_once_with({})
 
 
 if __name__ == "__main__":

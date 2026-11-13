@@ -20,11 +20,17 @@ categories would be a no-op.
 
 🔐 Manage Access isn't a member of any category's static button list in
 common._MENU_CATEGORIES — common.py's recv_menu_category appends it to
-⚙️ Bot Settings' submenu dynamically, only when the requesting user is an
-admin, so a non-admin who's been granted Bot Settings access (e.g. just
-to use Refresh Auth) never sees it there. cmd_manage_access still
-re-checks admin status itself regardless, since /manageaccess and the
-exact button text both work independently of which menu got them there.
+👥 Valuers & Access' submenu dynamically, only when the requesting user is
+an admin, so a non-admin who's been granted Valuers & Access never sees it
+there. cmd_manage_access still re-checks admin status itself regardless,
+since /manageaccess and the exact button text both work independently of
+which menu got them there.
+
+Beyond toggling whole categories, this flow also lets the admin restrict
+which individual buttons a user sees *within* a granted category (the
+MA.PICK_CUST_CAT → MA.PICK_BUTTONS steps), persisted to
+common.saved_button_access.json and enforced display-only by
+common.get_user_category_buttons (see recv_menu_category).
 
 Users are shown by their cached Telegram display name (common.py's
 load_user_names/_record_user_name — first + last name, or @username,
@@ -66,9 +72,11 @@ from common import (
     deny,
     fallback,
     is_admin,
+    load_button_access,
     load_category_access,
     load_user_names,
     md_escape,
+    save_button_access,
     save_category_access,
 )
 
@@ -77,14 +85,18 @@ from common import (
 # States — Manage Access conversation
 # ──────────────────────────────────────────────────────────
 class MA(Enum):
-    PICK_USER       = auto()   # choose which non-admin user to manage
-    PICK_CATEGORIES = auto()   # toggle their category grants, then Done
+    PICK_USER        = auto()   # choose which non-admin user to manage
+    PICK_CATEGORIES  = auto()   # toggle their category grants, then Done
+    PICK_CUST_CAT    = auto()   # optionally pick a category to restrict its buttons
+    PICK_BUTTONS     = auto()   # toggle which buttons within that category are visible
 
 
 @dataclass
 class MASession:
     target_user_id: int = 0
     selected: Set[str] = field(default_factory=set)   # in-progress category picks
+    cust_category: str = ""                            # category whose buttons are being edited
+    cust_selected: Set[str] = field(default_factory=set)  # in-progress button picks
 
 
 def _get_ma_sess(ctx: ContextTypes.DEFAULT_TYPE) -> MASession:
@@ -139,6 +151,38 @@ def _ma_category_keyboard(selected: Set[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _ma_customize_keyboard(selected_categories: Set[str], user_button_access: Dict[str, List[str]]) -> InlineKeyboardMarkup:
+    """One button per granted category — tapping it drills into a per-button
+    allow-list for that category. A 🔧 marker flags categories that already
+    have a button restriction (others show every button by default). Plus a
+    trailing ✅ Finish. Shown in _MENU_CATEGORIES order, admin-only categories
+    excluded (they can't be granted anyway)."""
+    rows = []
+    for label in _MENU_CATEGORIES:
+        if label in _ADMIN_ONLY_CATEGORIES or label not in selected_categories:
+            continue
+        marker = "🔧 " if label in user_button_access else "• "
+        rows.append([InlineKeyboardButton(f"{marker}{label}", callback_data=f"ma_bcat:{label}")])
+    rows.append([InlineKeyboardButton("✅ Finish", callback_data="ma_bcat:done")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _ma_button_keyboard(category: str, selected_buttons: Set[str]) -> InlineKeyboardMarkup:
+    """☑/☐ toggle per workflow button in `category` (by index, so long/emoji
+    labels never blow the 64-byte callback_data limit), plus a trailing Done.
+    A checked button is one the target user will see in that category."""
+    buttons = list(_MENU_CATEGORIES.get(category, {}).get("buttons", []))
+    rows = [
+        [InlineKeyboardButton(
+            f"{'☑' if b in selected_buttons else '☐'} {b}",
+            callback_data=f"ma_btn:{i}",
+        )]
+        for i, b in enumerate(buttons)
+    ]
+    rows.append([InlineKeyboardButton("✅ Done", callback_data="ma_btn:done")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def cmd_manage_access(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Entry point (/manageaccess or the 🔐 Manage Access button) — admin
     # check independent of how this was reached, since the button is only
@@ -162,7 +206,8 @@ async def cmd_manage_access(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🔐 *Manage Access*\n\n"
-        "Grant or revoke which menu categories a user can see and open.\n\n"
+        "Grant or revoke which menu categories a user can see and open — and, "
+        "within a category, optionally which individual buttons they see.\n\n"
         "Select a user (shown by name if they've messaged the bot before, "
         "otherwise their Telegram ID):",
         parse_mode="Markdown",
@@ -209,17 +254,43 @@ async def recv_ma_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess = _get_ma_sess(ctx)
 
     if data == "done":
+        uid = str(sess.target_user_id)
         access = load_category_access()
-        access[str(sess.target_user_id)] = sorted(sess.selected)
+        access[uid] = sorted(sess.selected)
         save_category_access(access)
-        summary = ", ".join(sorted(sess.selected)) if sess.selected else "_none_"
+
+        # Drop any per-button restrictions for categories the user no longer
+        # has — a button allow-list only means anything inside a granted
+        # category.
+        button_access = load_button_access()
+        user_ba = button_access.get(uid, {})
+        pruned = {c: b for c, b in user_ba.items() if c in sess.selected}
+        if pruned != user_ba:
+            if pruned:
+                button_access[uid] = pruned
+            else:
+                button_access.pop(uid, None)
+            save_button_access(button_access)
+
+        if not sess.selected:
+            # No categories → nothing to fine-tune; end here.
+            label = _ma_display_label(sess.target_user_id, load_user_names())
+            await query.edit_message_text(
+                f"✅ Saved — *{md_escape(label)}* can now access: _none_",
+                parse_mode="Markdown",
+            )
+            await query.message.reply_text("Main menu.", reply_markup=_main_menu_for(query.from_user.id))
+            return ConversationHandler.END
+
         label = _ma_display_label(sess.target_user_id, load_user_names())
         await query.edit_message_text(
-            f"✅ Saved — *{md_escape(label)}* can now access: {summary}",
+            f"✅ Categories saved for *{md_escape(label)}*.\n\n"
+            "Optionally restrict which buttons they see *within* a category "
+            "(default is all). Tap a category to fine-tune, or ✅ Finish:",
             parse_mode="Markdown",
+            reply_markup=_ma_customize_keyboard(sess.selected, pruned),
         )
-        await query.message.reply_text("Main menu.", reply_markup=_main_menu_for(query.from_user.id))
-        return ConversationHandler.END
+        return MA.PICK_CUST_CAT
 
     if data in _MENU_CATEGORIES and data not in _ADMIN_ONLY_CATEGORIES:
         if data in sess.selected:
@@ -229,6 +300,118 @@ async def recv_ma_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_reply_markup(reply_markup=_ma_category_keyboard(sess.selected))
     return MA.PICK_CATEGORIES
+
+
+async def recv_ma_customize_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # The per-category button-customization menu — pick a category to drill
+    # into its button allow-list, or Finish to end with a summary.
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return ConversationHandler.END
+    data = query.data.split(":", 1)[1]
+    sess = _get_ma_sess(ctx)
+
+    if data == "done":
+        label = _ma_display_label(sess.target_user_id, load_user_names())
+        await query.edit_message_text(
+            f"✅ Saved access for *{md_escape(label)}*.\n\n{_ma_access_summary(sess.target_user_id)}",
+            parse_mode="Markdown",
+        )
+        await query.message.reply_text("Main menu.", reply_markup=_main_menu_for(query.from_user.id))
+        return ConversationHandler.END
+
+    if data not in sess.selected:
+        # Stale/unknown category tap — just re-render the menu.
+        button_access = load_button_access().get(str(sess.target_user_id), {})
+        await query.edit_message_reply_markup(reply_markup=_ma_customize_keyboard(sess.selected, button_access))
+        return MA.PICK_CUST_CAT
+
+    sess.cust_category = data
+    all_buttons = list(_MENU_CATEGORIES.get(data, {}).get("buttons", []))
+    allowed_now = load_button_access().get(str(sess.target_user_id), {}).get(data)
+    # Default (no restriction) → every button pre-checked.
+    sess.cust_selected = set(allowed_now) if allowed_now is not None else set(all_buttons)
+    sess.cust_selected &= set(all_buttons)
+
+    await query.edit_message_text(
+        f"🔧 *{md_escape(data)}* — toggle which buttons this user sees, then ✅ Done "
+        "(all checked = no restriction):",
+        parse_mode="Markdown",
+        reply_markup=_ma_button_keyboard(data, sess.cust_selected),
+    )
+    return MA.PICK_BUTTONS
+
+
+async def recv_ma_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Toggle one button on/off within the chosen category, or persist the
+    # allow-list on Done and return to the category-customization menu.
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return ConversationHandler.END
+    data = query.data.split(":", 1)[1]
+    sess = _get_ma_sess(ctx)
+    all_buttons = list(_MENU_CATEGORIES.get(sess.cust_category, {}).get("buttons", []))
+
+    if data == "done":
+        uid = str(sess.target_user_id)
+        button_access = load_button_access()
+        user_ba = dict(button_access.get(uid, {}))
+        chosen = sess.cust_selected & set(all_buttons)
+        if chosen == set(all_buttons):
+            # All buttons visible == no restriction → drop any existing entry.
+            user_ba.pop(sess.cust_category, None)
+        else:
+            user_ba[sess.cust_category] = sorted(chosen)
+        if user_ba:
+            button_access[uid] = user_ba
+        else:
+            button_access.pop(uid, None)
+        save_button_access(button_access)
+
+        await query.edit_message_text(
+            f"✅ Buttons saved for *{md_escape(sess.cust_category)}*.",
+            parse_mode="Markdown",
+        )
+        await query.message.reply_text(
+            "Fine-tune another category, or ✅ Finish:",
+            reply_markup=_ma_customize_keyboard(sess.selected, button_access.get(uid, {})),
+        )
+        return MA.PICK_CUST_CAT
+
+    # Toggle by index
+    try:
+        idx = int(data)
+    except ValueError:
+        return MA.PICK_BUTTONS
+    if 0 <= idx < len(all_buttons):
+        btn = all_buttons[idx]
+        if btn in sess.cust_selected:
+            sess.cust_selected.discard(btn)
+        else:
+            sess.cust_selected.add(btn)
+
+    await query.edit_message_reply_markup(reply_markup=_ma_button_keyboard(sess.cust_category, sess.cust_selected))
+    return MA.PICK_BUTTONS
+
+
+def _ma_access_summary(target_user_id: int) -> str:
+    """Human-readable summary of a user's current category + per-button
+    access, for the Finish confirmation. Lists each granted category and, if
+    its buttons are restricted, which ones remain visible."""
+    cats = sorted(load_category_access().get(str(target_user_id), []))
+    if not cats:
+        return "Access: _none_"
+    button_access = load_button_access().get(str(target_user_id), {})
+    lines = ["Access:"]
+    for c in cats:
+        if c in button_access:
+            visible = ", ".join(button_access[c]) if button_access[c] else "_none_"
+            lines.append(f"• {c} — only: {visible}")
+        else:
+            lines.append(f"• {c} — all buttons")
+    return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────────────────
@@ -243,8 +426,10 @@ def register(app: Application) -> None:
             MessageHandler(filters.Regex(f"^{re.escape(BTN_MANAGE_ACCESS)}$"), cmd_manage_access),
         ],
         states={
-            MA.PICK_USER:       [CallbackQueryHandler(recv_ma_user,     pattern=r"^ma_user:")],
-            MA.PICK_CATEGORIES: [CallbackQueryHandler(recv_ma_category, pattern=r"^ma_cat:")],
+            MA.PICK_USER:       [CallbackQueryHandler(recv_ma_user,          pattern=r"^ma_user:")],
+            MA.PICK_CATEGORIES: [CallbackQueryHandler(recv_ma_category,      pattern=r"^ma_cat:")],
+            MA.PICK_CUST_CAT:   [CallbackQueryHandler(recv_ma_customize_pick, pattern=r"^ma_bcat:")],
+            MA.PICK_BUTTONS:    [CallbackQueryHandler(recv_ma_button,        pattern=r"^ma_btn:")],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),

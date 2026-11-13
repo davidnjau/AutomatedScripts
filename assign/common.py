@@ -108,6 +108,7 @@ SAVED_SECTIONAL_CONFIG_FILE = os.path.join(DATA_DIR, "saved_sectional_config.jso
 SAVED_APARTMENTS_CONFIG_FILE = os.path.join(DATA_DIR, "saved_apartments_config.json")
 SAVED_CUSTOM_EXCLUSIONS_FILE = os.path.join(DATA_DIR, "saved_custom_exclusions.json")
 SAVED_CATEGORY_ACCESS_FILE  = os.path.join(DATA_DIR, "saved_category_access.json")
+SAVED_BUTTON_ACCESS_FILE    = os.path.join(DATA_DIR, "saved_button_access.json")
 SAVED_USER_NAMES_FILE       = os.path.join(DATA_DIR, "saved_user_names.json")
 SAVED_CHAT_MESSAGES_FILE    = os.path.join(DATA_DIR, "saved_chat_messages.json")
 
@@ -430,6 +431,57 @@ def get_user_categories(user_id: int) -> List[str]:
 def category_allowed(user_id: int, category: str) -> bool:
     """True if user_id may open the given category label."""
     return category in get_user_categories(user_id)
+
+
+# ── Per-user, per-button access (finer than category — Manage Access) ─
+#
+# saved_button_access.json: {str(user_id): {category_label: [button_label, ...]}}
+# A category key present here is an explicit allow-list — the user sees ONLY
+# those buttons within that category. A category key ABSENT means no button
+# restriction → the user sees every button in that category (the default, so
+# existing users and un-customized categories are unaffected). This is a
+# refinement *within* a category the user already has (get_user_categories);
+# it never grants a category they don't have.
+
+def load_button_access() -> Dict[str, Dict[str, List[str]]]:
+    """{str(user_id): {category_label: [button_label, ...]}} — per-user
+    button allow-lists within a category. Absent category = all buttons."""
+    try:
+        with open(SAVED_BUTTON_ACCESS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_button_access(data: Dict[str, Dict[str, List[str]]]) -> None:
+    """Persist the per-user button allow-list map."""
+    _atomic_json_write(SAVED_BUTTON_ACCESS_FILE, data, indent=2)
+
+
+def get_user_category_buttons(user_id: int, category: str) -> List[str]:
+    """The workflow buttons user_id may see within `category`, in display
+    order. Admins (and the no-admin-configured fallback inside
+    get_user_categories) always see every button. A non-admin sees every
+    button too unless an explicit allow-list exists for this (user, category)
+    in saved_button_access.json, in which case only the allow-listed buttons
+    that still belong to the category are shown. Does not check whether the
+    user has the category at all — callers gate that with category_allowed
+    first (recv_menu_category does)."""
+    all_buttons = list(_MENU_CATEGORIES.get(category, {}).get("buttons", []))
+    if not ADMIN_IDS or user_id in ADMIN_IDS:
+        return all_buttons
+    allowed_for_cat = load_button_access().get(str(user_id), {}).get(category)
+    if allowed_for_cat is None:
+        return all_buttons
+    allow = set(allowed_for_cat)
+    return [b for b in all_buttons if b in allow]
+
+
+def button_allowed(user_id: int, category: str, button: str) -> bool:
+    """True if user_id may see `button` within `category` — menu-hiding
+    symmetry with category_allowed (enforcement is display-level, same as
+    categories)."""
+    return button in get_user_category_buttons(user_id, category)
 
 
 # ── Tokens ────────────────────────────────────────────────
@@ -1118,9 +1170,19 @@ async def recv_menu_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=_main_menu_for(user_id),
         )
         return
-    buttons = list(category["buttons"])
+    # Filter to the buttons this user may see within the category (admins see
+    # all; a non-admin sees all unless an explicit per-button allow-list was
+    # set for them via Manage Access).
+    buttons = get_user_category_buttons(user_id, text)
     if text == BTN_CAT_VALUERS and is_admin(user_id):
-        buttons.append(BTN_MANAGE_ACCESS)
+        buttons = buttons + [BTN_MANAGE_ACCESS]
+    if not buttons:
+        await update.message.reply_text(
+            "ℹ️ You don't have access to any items in this category yet. "
+            "Ask an admin to grant some via 🔐 Manage Access.",
+            reply_markup=_main_menu_for(user_id),
+        )
+        return
     await update.message.reply_text(
         category["description"],
         parse_mode="Markdown",
