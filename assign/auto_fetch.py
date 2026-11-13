@@ -142,8 +142,9 @@ SAVED_AF_TELEGRAM_STATE_FILE = os.path.join(DATA_DIR, "saved_af_telegram_state.j
 # States — Auto Fetch schedule conversation
 # ──────────────────────────────────────────────────────────
 class AF(Enum):
-    MENU        = auto()   # list existing schedules; choose Add / Remove
+    MENU        = auto()   # list existing schedules; choose Add / Remove / Run Now
     REMOVE_PICK = auto()   # pick which schedule to remove
+    RUNNOW_PICK = auto()   # pick which schedule to run immediately (▶️ Run Now)
     INTERVAL    = auto()   # choose how often to run
     DAYS_BACK   = auto()   # choose days back
     COUNTY      = auto()   # county filter
@@ -447,6 +448,7 @@ def _af_interval_keyboard() -> InlineKeyboardMarkup:
 def _af_menu_keyboard(has_schedules: bool) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("➕ Add Schedule", callback_data="af_menu:add")]]
     if has_schedules:
+        rows.append([InlineKeyboardButton("▶️ Run Now (view in Telegram)", callback_data="af_menu:runnow")])
         rows.append([InlineKeyboardButton("🗑 Remove Schedule", callback_data="af_menu:remove")])
     rows.append([InlineKeyboardButton("🛑 Close", callback_data="af_menu:close")])
     return InlineKeyboardMarkup(rows)
@@ -461,6 +463,22 @@ def _af_remove_keyboard(schedules: List[Dict]) -> InlineKeyboardMarkup:
         for cfg in schedules
     ]
     rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="af_remove:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _af_runnow_keyboard(schedules: List[Dict]) -> InlineKeyboardMarkup:
+    """Picker for ▶️ Run Now — one button per schedule, labelled the same way
+    as the Remove picker, plus a Cancel. Picking one runs that schedule's
+    fetch+filter immediately and posts the matching tasks to the requester's
+    chat (read-only — no queue/email/auto-route)."""
+    rows = [
+        [InlineKeyboardButton(
+            f"▶️ {cfg.get('email') or 'Telegram only'} (every {cfg.get('interval_minutes', '?')} min)",
+            callback_data=f"af_runnow:{cfg['id']}",
+        )]
+        for cfg in schedules
+    ]
+    rows.append([InlineKeyboardButton("🛑 Cancel", callback_data="af_runnow:cancel")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -493,11 +511,25 @@ async def cmd_auto_fetch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def recv_af_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    action = query.data.split(":")[1]   # "add" | "remove" | "close"
+    action = query.data.split(":")[1]   # "add" | "remove" | "runnow" | "close"
 
     if action == "close":
         await query.edit_message_reply_markup(reply_markup=None)
         return ConversationHandler.END
+
+    if action == "runnow":
+        schedules = load_auto_fetch_schedules()
+        if not schedules:
+            await query.edit_message_text("ℹ️ No schedules to run.")
+            await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
+            return ConversationHandler.END
+        await query.edit_message_text(
+            "▶️ *Run which schedule now?*\n\nIts filters are applied and the matching "
+            "tasks are shown here — nothing is queued, emailed, or auto-assigned.",
+            parse_mode="Markdown",
+            reply_markup=_af_runnow_keyboard(schedules),
+        )
+        return AF.RUNNOW_PICK
 
     if action == "remove":
         schedules = load_auto_fetch_schedules()
@@ -549,6 +581,104 @@ async def recv_af_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(msg, parse_mode="Markdown")
     await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
     return ConversationHandler.END
+
+
+async def recv_af_runnow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle the ▶️ Run Now schedule picker — schedule a one-shot background
+    job (_af_run_now_job) that runs the chosen schedule's fetch+filter right
+    away and posts the matching tasks to this chat only. Read-only: nothing is
+    queued, emailed, auto-assigned, or marked as sent."""
+    query = update.callback_query
+    await query.answer()
+    schedule_id = query.data.split(":", 1)[1]
+
+    if schedule_id == "cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
+        return ConversationHandler.END
+
+    cfg = get_auto_fetch_schedule(schedule_id)
+    if not cfg:
+        await query.edit_message_text("⚠️ That schedule no longer exists.")
+        await query.message.reply_text("Main menu:", reply_markup=_main_menu_for(update.effective_user.id))
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        "▶️ Running now — fetching tasks… results will appear here shortly.",
+    )
+    ctx.job_queue.run_once(
+        _af_run_now_job,
+        when=0,
+        name=f"af_run_now:{schedule_id}:{query.message.chat_id}",
+        data={"schedule_id": schedule_id, "chat_id": query.message.chat_id},
+    )
+    return ConversationHandler.END
+
+
+async def _af_run_now_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """One-shot ▶️ Run Now job: fetch + filter the chosen schedule's tasks and
+    post them to the requesting chat only. A read-only preview — unlike
+    _auto_fetch_job it does not queue, email, auto-route, or touch any dedup
+    state, so it never changes what the scheduled run will later deliver."""
+    data        = context.job.data
+    schedule_id = data["schedule_id"]
+    chat_id     = data["chat_id"]
+
+    cfg = get_auto_fetch_schedule(schedule_id)
+    if not cfg:
+        await context.bot.send_message(chat_id, "⚠️ That schedule no longer exists.")
+        return
+
+    tokens = get_valid_tokens(_AF_CRED_TYPE)
+    if not tokens:
+        await context.bot.send_message(
+            chat_id,
+            f"⚠️ No valid {CRED_LABELS[_AF_CRED_TYPE]} tokens cached — can't fetch right now. "
+            "Refresh Auth and try again.",
+        )
+        return
+
+    try:
+        tasks = _af_fetch_filtered(cfg, tokens)
+    except Exception as e:
+        logger.warning("Auto Fetch Run Now: fetch failed: %s", e)
+        await context.bot.send_message(chat_id, f"⚠️ Fetch failed: `{md_escape(str(e))}`", parse_mode="Markdown")
+        return
+
+    days_back       = cfg.get("days_back", 2)
+    county_filter   = cfg.get("county_filter", "")
+    registry_filter = cfg.get("registry_filter", "")
+    amount_min      = cfg.get("amount_min")
+    amount_max      = cfg.get("amount_max")
+    lo_s     = f"KES {int(amount_min):,}" if amount_min is not None else "0"
+    hi_s     = f"KES {int(amount_max):,}" if amount_max is not None else "∞"
+    co_label = county_filter.title() or "All"
+    re_label = registry_filter.title() or "All"
+    excl_label = _af_exclusion_label(_af_get_excluded_keywords(cfg))
+
+    if not tasks:
+        await context.bot.send_message(
+            chat_id,
+            f"▶️ *Run Now* — no matching tasks.\n"
+            f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | {excl_label}",
+            parse_mode="Markdown",
+        )
+        return
+
+    header = (
+        f"▶️ *Run Now — {len(tasks)} task(s)*\n"
+        f"Days: {days_back} | County: {co_label} | Registry: {re_label} | Amount: {lo_s}–{hi_s} | "
+        f"{excl_label}\n\n"
+    )
+    lines = [_ft_format_task_block(i, t, markdown=True) for i, t in enumerate(tasks, 1)]
+
+    async def _send(text, reply_markup):
+        try:
+            await context.bot.send_message(chat_id, text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("Auto Fetch Run Now notify error for %s: %s", chat_id, e)
+
+    await _send_chunked_report(_send, [header] + lines, join="\n\n")
 
 
 async def recv_af_interval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -918,39 +1048,21 @@ def _af_build_excel(tasks: List[Dict]) -> bytes:
     return buf.getvalue()
 
 
-async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Background job for one schedule: fetch tasks with that schedule's
-    settings and notify. Each schedule gets its own repeating job, tagged
-    with its id via job_queue's `data` param (see recv_af_email/register);
-    re-reading the schedule fresh each cycle (rather than closing over it)
-    means an edit or removal takes effect on the very next run — if this
-    schedule was removed since the job last fired, cancel the job itself
-    instead of just skipping the cycle."""
-    schedule_id = context.job.data
-    cfg = get_auto_fetch_schedule(schedule_id)
-    if not cfg:
-        context.job.schedule_removal()
-        return
-
-    tokens = get_valid_tokens(_AF_CRED_TYPE)
-    if not tokens:
-        logger.warning(
-            "Auto Fetch job: no valid %s tokens cached — skipping cycle.",
-            CRED_LABELS[_AF_CRED_TYPE],
-        )
-        return
-
+def _af_fetch_filtered(cfg: Dict, tokens) -> List[Dict]:
+    """Fetch assessor tasks for one schedule's settings and apply all of its
+    read-only filters — county, registry, amount range, exclusion keywords,
+    and already-queued refs — returning the matching task list. Shared by the
+    scheduled _auto_fetch_job and the on-demand ▶️ Run Now preview so both
+    filter identically. Raises on fetch failure; the caller decides how to
+    report it. Does NOT queue, email, auto-route, or touch any dedup state —
+    purely fetch + filter."""
     days_back       = cfg.get("days_back", 2)
     county_filter   = cfg.get("county_filter", "")
     registry_filter = cfg.get("registry_filter", "")
     amount_min      = cfg.get("amount_min")
     amount_max      = cfg.get("amount_max")
 
-    try:
-        tasks, stats = _load_fetch_tasks(tokens, days_back)
-    except Exception as e:
-        logger.warning("Auto Fetch job: fetch failed: %s", e)
-        return
+    tasks, _stats = _load_fetch_tasks(tokens, days_back)
 
     # County filter
     if county_filter:
@@ -987,6 +1099,47 @@ async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Exclude already-queued refs
     queued_refs = {item.get("ref", "") for item in load_dlv_batch()}
     tasks = [t for t in tasks if t.get("reference_number", "") not in queued_refs]
+
+    return tasks
+
+
+async def _auto_fetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Background job for one schedule: fetch tasks with that schedule's
+    settings and notify. Each schedule gets its own repeating job, tagged
+    with its id via job_queue's `data` param (see recv_af_email/register);
+    re-reading the schedule fresh each cycle (rather than closing over it)
+    means an edit or removal takes effect on the very next run — if this
+    schedule was removed since the job last fired, cancel the job itself
+    instead of just skipping the cycle."""
+    schedule_id = context.job.data
+    cfg = get_auto_fetch_schedule(schedule_id)
+    if not cfg:
+        context.job.schedule_removal()
+        return
+
+    tokens = get_valid_tokens(_AF_CRED_TYPE)
+    if not tokens:
+        logger.warning(
+            "Auto Fetch job: no valid %s tokens cached — skipping cycle.",
+            CRED_LABELS[_AF_CRED_TYPE],
+        )
+        return
+
+    days_back       = cfg.get("days_back", 2)
+    county_filter   = cfg.get("county_filter", "")
+    registry_filter = cfg.get("registry_filter", "")
+    amount_min      = cfg.get("amount_min")
+    amount_max      = cfg.get("amount_max")
+
+    try:
+        tasks = _af_fetch_filtered(cfg, tokens)
+    except Exception as e:
+        logger.warning("Auto Fetch job: fetch failed: %s", e)
+        return
+
+    # Re-derive the exclusion set for the notification labels below
+    # (the filtering itself already happened inside _af_fetch_filtered).
+    excluded_keywords = _af_get_excluded_keywords(cfg)
 
     # Sectional auto-routing: if a specialist is configured, auto-assign sectional tasks
     sc_cfg = load_sectional_config()
@@ -1328,6 +1481,7 @@ def register(app: Application) -> None:
         states={
             AF.MENU:        [CallbackQueryHandler(recv_af_menu,         pattern=r"^af_menu:")],
             AF.REMOVE_PICK: [CallbackQueryHandler(recv_af_remove,       pattern=r"^af_remove:")],
+            AF.RUNNOW_PICK: [CallbackQueryHandler(recv_af_runnow,       pattern=r"^af_runnow:")],
             AF.INTERVAL:    [CallbackQueryHandler(recv_af_interval,     pattern=r"^af:")],
             AF.DAYS_BACK:   [CallbackQueryHandler(recv_af_days,         pattern=r"^af_days:")],
             AF.COUNTY:      [CallbackQueryHandler(recv_af_county,       pattern=r"^ft_county:")],

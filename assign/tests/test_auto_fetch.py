@@ -1671,5 +1671,181 @@ class TestRecvAfRemove(unittest.TestCase):
         self.assertIn("already removed", update.callback_query.edit_message_text.call_args[0][0])
 
 
+class TestAfFetchFiltered(unittest.TestCase):
+    """_af_fetch_filtered — the fetch+filter helper shared by the scheduled
+    job and ▶️ Run Now. Applies county/registry/amount/exclusion/queued
+    filters and nothing else (no side effects)."""
+
+    def test_county_registry_amount_filters_applied(self):
+        cfg = {"days_back": 2, "county_filter": "nairobi", "amount_min": 1_000_000}
+        tasks = [_task(county="Nairobi", consideration="2000000"),
+                 _task(ref="R2", county="Mombasa", consideration="5000000"),
+                 _task(ref="R3", county="Nairobi", consideration="500000")]
+        with patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[]):
+            out = af._af_fetch_filtered(cfg, TOKENS)
+        refs = [t["reference_number"] for t in out]
+        self.assertEqual(refs, ["REG/TSFR/ABC123"])   # Nairobi + >= 1M only
+
+    def test_already_queued_refs_dropped(self):
+        cfg = {"days_back": 2}
+        tasks = [_task(ref="REG/TSFR/ABC123"), _task(ref="R2")]
+        with patch.object(af, "_load_fetch_tasks", return_value=(tasks, {})), \
+             patch.object(af, "load_dlv_batch", return_value=[{"ref": "REG/TSFR/ABC123"}]):
+            out = af._af_fetch_filtered(cfg, TOKENS)
+        self.assertEqual([t["reference_number"] for t in out], ["R2"])
+
+    def test_fetch_exception_propagates_to_caller(self):
+        with patch.object(af, "_load_fetch_tasks", side_effect=RuntimeError("down")), \
+             patch.object(af, "load_dlv_batch", return_value=[]):
+            with self.assertRaises(RuntimeError):
+                af._af_fetch_filtered({"days_back": 2}, TOKENS)
+
+
+class TestAfMenuKeyboardRunNow(unittest.TestCase):
+    """_af_menu_keyboard — the ▶️ Run Now button only appears when at least
+    one schedule exists."""
+
+    def _texts(self, kb):
+        return [b.text for row in kb.inline_keyboard for b in row]
+
+    def test_run_now_shown_when_schedules_exist(self):
+        texts = self._texts(af._af_menu_keyboard(True))
+        self.assertTrue(any("Run Now" in t for t in texts))
+
+    def test_run_now_hidden_when_no_schedules(self):
+        texts = self._texts(af._af_menu_keyboard(False))
+        self.assertFalse(any("Run Now" in t for t in texts))
+
+
+class TestRecvAfMenuRunNow(unittest.TestCase):
+    """recv_af_menu — the runnow branch opens the schedule picker (or ends if
+    there are no schedules)."""
+
+    def _make_query(self, data):
+        update = MagicMock()
+        query = update.callback_query
+        query.data = data
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        query.edit_message_reply_markup = AsyncMock()
+        query.message.reply_text = AsyncMock()
+        return update
+
+    def test_runnow_with_schedules_shows_picker(self):
+        update = self._make_query("af_menu:runnow")
+        schedules = [{"id": "sched-1", "email": "abc@gmail.com", "interval_minutes": 60}]
+        with patch.object(af, "load_auto_fetch_schedules", return_value=schedules):
+            result = _run(af.recv_af_menu(update, MagicMock()))
+        self.assertEqual(result, af.AF.RUNNOW_PICK)
+
+    def test_runnow_with_no_schedules_ends(self):
+        update = self._make_query("af_menu:runnow")
+        with patch.object(af, "load_auto_fetch_schedules", return_value=[]):
+            result = _run(af.recv_af_menu(update, MagicMock()))
+        self.assertEqual(result, af.ConversationHandler.END)
+
+
+class TestRecvAfRunnow(unittest.TestCase):
+    """recv_af_runnow — cancel ends; a pick schedules a one-shot run_once job
+    carrying the schedule id + requester's chat id."""
+
+    def _make_query(self, data, chat_id=123):
+        update = MagicMock()
+        query = update.callback_query
+        query.data = data
+        query.message.chat_id = chat_id
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        query.message.reply_text = AsyncMock()
+        return update
+
+    def test_cancel_ends_without_scheduling(self):
+        update = self._make_query("af_runnow:cancel")
+        ctx = MagicMock()
+        result = _run(af.recv_af_runnow(update, ctx))
+        self.assertEqual(result, af.ConversationHandler.END)
+        ctx.job_queue.run_once.assert_not_called()
+
+    def test_missing_schedule_warns_and_does_not_schedule(self):
+        update = self._make_query("af_runnow:gone")
+        ctx = MagicMock()
+        with patch.object(af, "get_auto_fetch_schedule", return_value=None):
+            result = _run(af.recv_af_runnow(update, ctx))
+        self.assertEqual(result, af.ConversationHandler.END)
+        ctx.job_queue.run_once.assert_not_called()
+
+    def test_pick_schedules_run_once_with_chat_and_schedule(self):
+        update = self._make_query("af_runnow:sched-1", chat_id=777)
+        ctx = MagicMock()
+        with patch.object(af, "get_auto_fetch_schedule", return_value={"id": "sched-1"}):
+            result = _run(af.recv_af_runnow(update, ctx))
+        self.assertEqual(result, af.ConversationHandler.END)
+        ctx.job_queue.run_once.assert_called_once()
+        kwargs = ctx.job_queue.run_once.call_args.kwargs
+        self.assertEqual(kwargs["data"], {"schedule_id": "sched-1", "chat_id": 777})
+
+
+class TestAfRunNowJob(unittest.TestCase):
+    """_af_run_now_job — read-only preview: posts matching tasks to the
+    requesting chat, and never queues, emails, auto-routes, persists, or
+    touches dedup state."""
+
+    def _ctx(self, schedule_id="sched-1", chat_id=123):
+        ctx = MagicMock()
+        ctx.bot.send_message = AsyncMock()
+        ctx.job.data = {"schedule_id": schedule_id, "chat_id": chat_id}
+        return ctx
+
+    def test_posts_tasks_to_requesting_chat_only(self):
+        ctx = self._ctx(chat_id=555)
+        tasks = [_task(ref="R1"), _task(ref="R2")]
+        with patch.object(af, "get_auto_fetch_schedule", return_value={"id": "sched-1", "days_back": 2}), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_af_fetch_filtered", return_value=tasks), \
+             patch.object(af, "_send_chunked_report", new_callable=AsyncMock) as mock_send, \
+             patch.object(af, "persist_af_result") as mock_persist, \
+             patch.object(af, "_send_auto_fetch_email") as mock_email:
+            _run(af._af_run_now_job(ctx))
+        mock_send.assert_called_once()
+        mock_persist.assert_not_called()
+        mock_email.assert_not_called()
+
+    def test_no_matching_tasks_sends_a_none_message(self):
+        ctx = self._ctx()
+        with patch.object(af, "get_auto_fetch_schedule", return_value={"id": "sched-1", "days_back": 2}), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_af_fetch_filtered", return_value=[]), \
+             patch.object(af, "_send_chunked_report", new_callable=AsyncMock) as mock_send:
+            _run(af._af_run_now_job(ctx))
+        mock_send.assert_not_called()
+        self.assertIn("no matching tasks", ctx.bot.send_message.call_args[0][1].lower())
+
+    def test_no_tokens_warns(self):
+        ctx = self._ctx()
+        with patch.object(af, "get_auto_fetch_schedule", return_value={"id": "sched-1"}), \
+             patch.object(af, "get_valid_tokens", return_value=None), \
+             patch.object(af, "_af_fetch_filtered") as mock_fetch:
+            _run(af._af_run_now_job(ctx))
+        mock_fetch.assert_not_called()
+        self.assertIn("token", ctx.bot.send_message.call_args[0][1].lower())
+
+    def test_fetch_failure_reports_error(self):
+        ctx = self._ctx()
+        with patch.object(af, "get_auto_fetch_schedule", return_value={"id": "sched-1"}), \
+             patch.object(af, "get_valid_tokens", return_value=TOKENS), \
+             patch.object(af, "_af_fetch_filtered", side_effect=RuntimeError("boom")):
+            _run(af._af_run_now_job(ctx))
+        self.assertIn("failed", ctx.bot.send_message.call_args[0][1].lower())
+
+    def test_missing_schedule_warns(self):
+        ctx = self._ctx()
+        with patch.object(af, "get_auto_fetch_schedule", return_value=None), \
+             patch.object(af, "get_valid_tokens") as mock_tokens:
+            _run(af._af_run_now_job(ctx))
+        mock_tokens.assert_not_called()
+        self.assertIn("no longer exists", ctx.bot.send_message.call_args[0][1].lower())
+
+
 if __name__ == "__main__":
     unittest.main()
