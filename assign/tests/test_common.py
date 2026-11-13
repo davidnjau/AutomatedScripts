@@ -210,6 +210,20 @@ class TestReportRecipients(unittest.TestCase):
             self.assertEqual(set(common.report_recipients()), {111, 222})
 
 
+class TestHiddenPostBoard(unittest.TestCase):
+    def test_post_board_not_shown_in_main_menu(self):
+        with patch.object(common, "ADMIN_IDS", {5}):   # admin → all categories granted
+            kb = common._main_menu_for(5)
+        texts = {b.text for row in kb.keyboard for b in row}
+        self.assertNotIn(common.BTN_CAT_POST_BOARD, texts)   # hidden
+        self.assertIn(common.BTN_CAT_ASSIGNMENTS, texts)     # others still shown
+
+    def test_post_board_kept_in_permission_model(self):
+        # Still a real category so category_allowed / Post Board's push work.
+        self.assertIn(common.BTN_CAT_POST_BOARD, common._MENU_CATEGORIES)
+        self.assertIn(common.BTN_CAT_POST_BOARD, common._MENU_HIDDEN_CATEGORIES)
+
+
 class TestInquiryCategory(unittest.TestCase):
     def test_inquiry_holds_lookup_and_parcel_watch(self):
         self.assertIn(common.BTN_CAT_INQUIRY, common._MENU_CATEGORIES)
@@ -701,9 +715,11 @@ class TestMainMenu(unittest.TestCase):
     def _all_texts(self):
         return [b.text for row in self._rows() for b in row]
 
-    def test_shows_exactly_every_category_plus_cancel(self):
+    def test_shows_exactly_every_visible_category_plus_cancel(self):
+        # Hidden categories (e.g. Post Board) are in the model but off the menu.
         texts = self._all_texts()
-        self.assertEqual(set(texts), set(common._MENU_CATEGORIES) | {common.BTN_CANCEL})
+        visible = set(common._MENU_CATEGORIES) - common._MENU_HIDDEN_CATEGORIES
+        self.assertEqual(set(texts), visible | {common.BTN_CANCEL})
 
     def test_workflow_buttons_are_not_on_the_top_level_menu(self):
         texts = self._all_texts()

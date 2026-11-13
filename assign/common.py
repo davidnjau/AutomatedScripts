@@ -812,17 +812,24 @@ def _category_row_keyboard(categories: List[str]) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 
+# Categories kept in the permission model (so category_allowed/Manage Access
+# and any category-gated behaviour like Post Board's push still work) but NOT
+# shown in the top-level menu — reachable by command/exact-text only.
+_MENU_HIDDEN_CATEGORIES = {BTN_CAT_POST_BOARD}
+
+
 def _main_menu_for(user_id: int) -> ReplyKeyboardMarkup:
     """Top-level menu filtered to whichever categories user_id may open
-    (get_user_categories) — only that user's permitted category buttons.
-    This is the only top-level-menu builder in the bot: every feature
-    module's "flow finished" message, every /start, ⬅ Back, 🛑 Cancel, and
-    the generic "I didn't understand" fallback all call this (with
-    whichever chat/user identifier is in scope at that call site — this
-    bot is private/1:1-DM-only, so chat_id == user_id always). A
-    restricted user therefore never sees a category button they aren't
-    granted, at any point in the bot."""
-    return _category_row_keyboard(get_user_categories(user_id))
+    (get_user_categories) minus any in _MENU_HIDDEN_CATEGORIES — only that
+    user's permitted, non-hidden category buttons. This is the only
+    top-level-menu builder in the bot: every feature module's "flow finished"
+    message, every /start, ⬅ Back, 🛑 Cancel, and the generic "I didn't
+    understand" fallback all call this (with whichever chat/user identifier is
+    in scope at that call site — this bot is private/1:1-DM-only, so chat_id ==
+    user_id always). A restricted user therefore never sees a category button
+    they aren't granted, at any point in the bot."""
+    cats = [c for c in get_user_categories(user_id) if c not in _MENU_HIDDEN_CATEGORIES]
+    return _category_row_keyboard(cats)
 
 
 # ──────────────────────────────────────────────────────────

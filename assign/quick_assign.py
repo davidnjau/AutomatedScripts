@@ -147,23 +147,34 @@ async def cmd_qa_lrent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def recv_qa_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Store the photo bytes, then ask for the valuer name.
+    # Store the photo bytes. If the photo's caption already names the valuer,
+    # use it straight away — no need to ask again; otherwise prompt for a name.
     if not update.message.photo:
         await update.message.reply_text("⚠️ Please send a *photo* of the reference(s).", parse_mode="Markdown")
         return QA.PHOTO
     tgfile = await update.message.photo[-1].get_file()
     _get_qa_sess(ctx).photo_bytes = bytes(await tgfile.download_as_bytearray())
+
+    caption = (update.message.caption or "").strip()
+    if caption:
+        return await _qa_resolve_name(update, ctx, caption)
+
     await update.message.reply_text(
-        "📷 Got it. *Who should I assign to?* Type a valuer name (e.g. `Godwill`):",
+        "📷 Got it. *Who should I assign to?* Type the valuer name:",
         parse_mode="Markdown",
     )
     return QA.NAME
 
 
 async def recv_qa_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Resolve the typed name to a saved valuer. 0 → re-ask; 1 → go; 2+ → pick.
+    # The typed name (used when no caption was supplied with the photo).
+    return await _qa_resolve_name(update, ctx, (update.message.text or "").strip())
+
+
+async def _qa_resolve_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE, name: str) -> int:
+    # Resolve a name (typed or from the photo caption) to a saved valuer:
+    # 0 → re-ask; 1 → launch; 2+ → disambiguation picker.
     sess = _get_qa_sess(ctx)
-    name = (update.message.text or "").strip()
     matches = _qa_match_valuers(name)
 
     if not matches:
