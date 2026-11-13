@@ -155,6 +155,42 @@ class TestRecvName(unittest.TestCase):
         self.assertEqual(len(ctx.user_data["qa_session"].matches), 2)
 
 
+class TestRecvPhoto(unittest.TestCase):
+    def _photo_update(self, caption=None):
+        u = MagicMock()
+        u.message.caption = caption
+        f = MagicMock(); f.download_as_bytearray = AsyncMock(return_value=b"img")
+        photo = MagicMock(); photo.get_file = AsyncMock(return_value=f)
+        u.message.photo = [photo]
+        u.message.reply_text = AsyncMock()
+        u.message.chat_id = 555
+        u.effective_user.id = 111
+        return u
+
+    def test_caption_name_skips_the_name_prompt(self):
+        u = self._photo_update(caption="Godwill")
+        ctx = MagicMock(); ctx.user_data = {"qa_session": qa.QASession()}
+        with patch.object(qa, "_qa_match_valuers", return_value=[_V[0]]), \
+             patch.object(qa, "_qa_launch", new=AsyncMock(return_value=qa.ConversationHandler.END)) as mock_launch:
+            result = _run(qa.recv_qa_photo(u, ctx))
+        self.assertEqual(result, qa.ConversationHandler.END)
+        mock_launch.assert_awaited_once()
+
+    def test_no_caption_asks_for_name(self):
+        u = self._photo_update(caption=None)
+        ctx = MagicMock(); ctx.user_data = {"qa_session": qa.QASession()}
+        result = _run(qa.recv_qa_photo(u, ctx))
+        self.assertEqual(result, qa.QA.NAME)
+        self.assertIn("valuer name", u.message.reply_text.call_args[0][0].lower())
+
+    def test_caption_with_multiple_matches_asks_which(self):
+        u = self._photo_update(caption="godwi")
+        ctx = MagicMock(); ctx.user_data = {"qa_session": qa.QASession()}
+        with patch.object(qa, "_qa_match_valuers", return_value=[_V[0], _V[2]]):
+            result = _run(qa.recv_qa_photo(u, ctx))
+        self.assertEqual(result, qa.QA.PICK_VALUER)
+
+
 class TestProcessJob(unittest.TestCase):
     def _ctx(self, workflow="stamp_duty"):
         ctx = MagicMock()
