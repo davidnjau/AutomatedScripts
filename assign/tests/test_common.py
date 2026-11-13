@@ -303,6 +303,69 @@ class TestCategoryLabelMigration(unittest.TestCase):
         )
 
 
+class TestButtonAccess(unittest.TestCase):
+    """get_user_category_buttons / button_allowed — per-button visibility
+    within a category. Default (no entry) = all buttons; an explicit entry is
+    an allow-list."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.data_file = os.path.join(self.tmpdir.name, "saved_button_access.json")
+        self._patch = patch.object(common, "SAVED_BUTTON_ACCESS_FILE", self.data_file)
+        self._patch.start()
+        self.cat = common.BTN_CAT_ASSIGNMENTS
+        self.all_buttons = common._MENU_CATEGORIES[self.cat]["buttons"]
+
+    def tearDown(self):
+        self._patch.stop()
+        self.tmpdir.cleanup()
+
+    def _write(self, data):
+        with open(self.data_file, "w") as f:
+            json.dump(data, f)
+
+    def test_admin_always_sees_all_buttons(self):
+        self._write({"7": {self.cat: [self.all_buttons[0]]}})
+        with patch.object(common, "ADMIN_IDS", {7}):
+            self.assertEqual(common.get_user_category_buttons(7, self.cat), list(self.all_buttons))
+
+    def test_no_entry_defaults_to_all_buttons(self):
+        with patch.object(common, "ADMIN_IDS", {5}):
+            self.assertEqual(common.get_user_category_buttons(7, self.cat), list(self.all_buttons))
+
+    def test_allow_list_restricts_to_those_buttons_in_order(self):
+        keep = [self.all_buttons[2], self.all_buttons[0]]   # out of order in the file
+        self._write({"7": {self.cat: keep}})
+        with patch.object(common, "ADMIN_IDS", {5}):
+            out = common.get_user_category_buttons(7, self.cat)
+        # Preserves the category's display order, not the file's order.
+        self.assertEqual(out, [self.all_buttons[0], self.all_buttons[2]])
+
+    def test_empty_allow_list_hides_everything(self):
+        self._write({"7": {self.cat: []}})
+        with patch.object(common, "ADMIN_IDS", {5}):
+            self.assertEqual(common.get_user_category_buttons(7, self.cat), [])
+
+    def test_button_allowed_reflects_the_allow_list(self):
+        self._write({"7": {self.cat: [self.all_buttons[0]]}})
+        with patch.object(common, "ADMIN_IDS", {5}):
+            self.assertTrue(common.button_allowed(7, self.cat, self.all_buttons[0]))
+            self.assertFalse(common.button_allowed(7, self.cat, self.all_buttons[1]))
+
+    def test_other_category_unaffected_by_a_restriction(self):
+        self._write({"7": {self.cat: []}})
+        other = common.BTN_CAT_LOOKUPS
+        with patch.object(common, "ADMIN_IDS", {5}):
+            self.assertEqual(
+                common.get_user_category_buttons(7, other),
+                list(common._MENU_CATEGORIES[other]["buttons"]),
+            )
+
+    def test_roundtrip_persistence(self):
+        common.save_button_access({"7": {self.cat: [self.all_buttons[0]]}})
+        self.assertEqual(common.load_button_access(), {"7": {self.cat: [self.all_buttons[0]]}})
+
+
 class TestUserNamesPersistence(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -911,6 +974,29 @@ class TestRecvMenuCategory(unittest.TestCase):
         _, kwargs = update.message.reply_text.call_args
         texts = [b.text for row in kwargs["reply_markup"].keyboard for b in row]
         self.assertIn(common.BTN_MANAGE_ACCESS, texts)
+
+    def test_submenu_filtered_to_user_visible_buttons(self):
+        update = self._make_update(common.BTN_CAT_ASSIGNMENTS)
+        only = common._MENU_CATEGORIES[common.BTN_CAT_ASSIGNMENTS]["buttons"][:1]
+        with patch.object(common, "allowed", return_value=True), \
+             patch.object(common, "category_allowed", return_value=True), \
+             patch.object(common, "get_user_category_buttons", return_value=list(only)):
+            asyncio.run(common.recv_menu_category(update, MagicMock()))
+        _, kwargs = update.message.reply_text.call_args
+        texts = [b.text for row in kwargs["reply_markup"].keyboard for b in row]
+        self.assertIn(only[0], texts)
+        # A sibling button the user wasn't granted is absent.
+        hidden = common._MENU_CATEGORIES[common.BTN_CAT_ASSIGNMENTS]["buttons"][-1]
+        self.assertNotIn(hidden, texts)
+
+    def test_no_visible_buttons_shows_info_message(self):
+        update = self._make_update(common.BTN_CAT_ASSIGNMENTS)
+        with patch.object(common, "allowed", return_value=True), \
+             patch.object(common, "category_allowed", return_value=True), \
+             patch.object(common, "get_user_category_buttons", return_value=[]):
+            asyncio.run(common.recv_menu_category(update, MagicMock()))
+        sent_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("don't have access to any items", sent_text)
 
     def test_non_admin_does_not_get_manage_access(self):
         update = self._make_update(common.BTN_CAT_VALUERS)
