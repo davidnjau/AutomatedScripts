@@ -41,6 +41,7 @@ COPY new_assignment.py .
 COPY bulk_export.py .
 COPY task_analytics.py .
 COPY access_control.py .
+COPY ocr_stats.py .
 COPY post_board.py .
 COPY quick_assign.py .
 COPY clear_chat.py .

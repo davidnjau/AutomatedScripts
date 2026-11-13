@@ -110,6 +110,7 @@ from lookup_reference import (
     _lu_search_ref_lrd,
 )
 from telegram_report import _send_chunked_report
+import ocr_stats
 
 # Human-facing labels for Session.workflow's two values, shared by the
 # workflow-type picker and the /assignments history viewer.
@@ -279,6 +280,19 @@ def _ocr_via_glm_service(photo_bytes: bytes) -> str:
 
 
 async def ocr_extract_refs(photo_bytes: bytes) -> Tuple[List[str], str]:
+    """Public OCR entry point — runs the real pipeline, then records the
+    outcome once in the OCR usage counter (ocr_stats) so the admin's
+    /ocrstats spend/remaining estimate stays current. A counter failure is
+    logged and swallowed, never breaking the actual OCR/assignment."""
+    refs, source = await _ocr_extract_refs_impl(photo_bytes)
+    try:
+        ocr_stats.record_extraction(source)
+    except Exception as e:
+        logger.warning("OCR usage counter bump failed: %s", e)
+    return refs, source
+
+
+async def _ocr_extract_refs_impl(photo_bytes: bytes) -> Tuple[List[str], str]:
     """
     Tesseract first, then the self-hosted GLM-OCR service (OCR_SERVICE_URL),
     then Claude Vision as a key-gated last resort. Returns (refs, source) where

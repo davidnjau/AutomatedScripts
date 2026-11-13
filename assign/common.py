@@ -732,6 +732,7 @@ BTN_DLV_REF_CHECK = "🕓 DLV Ref Check"
 BTN_VALUER_TASKS  = "👤 Valuer Tasks"
 BTN_HELP          = "❓ Help"
 BTN_RESTART       = "🔁 Restart Bot"
+BTN_OCR_STATS     = "🧮 OCR Usage"
 BTN_CANCEL        = "🛑 Cancel"
 BTN_BRIEFING      = "🌅 Morning Briefing"
 BTN_SECTIONAL     = "🔲 Sectional"
@@ -798,6 +799,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_HOLD_TASKS)}|{re.escape(BTN_INCREMENTAL)}|{re.escape(BTN_DLV_REPORT_SCHEDULE)}"
     f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}|{re.escape(BTN_TASK_ANALYTICS)}|{re.escape(BTN_CLEAR_CHAT)}"
     f"|{re.escape(BTN_QUEUE_INTERVAL)}|{re.escape(BTN_STALE_THRESHOLD)}|{re.escape(BTN_SMS_SENDER)}"
+    f"|{re.escape(BTN_OCR_STATS)}"
     f"|{re.escape(BTN_CAT_ASSIGNMENTS)}|{re.escape(BTN_CAT_BULK)}|{re.escape(BTN_CAT_AUTOMATION)}"
     f"|{re.escape(BTN_CAT_ANALYTICS)}|{re.escape(BTN_CAT_LOOKUPS)}|{re.escape(BTN_CAT_VALUERS)}"
     f"|{re.escape(BTN_CAT_COMM)}|{re.escape(BTN_CAT_SETTINGS)}|{re.escape(BTN_CAT_GENERAL)}"
@@ -886,7 +888,7 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
             "Manage login sessions, the token refresh daemon, and the bot process "
             "itself. Admin-only."
         ),
-        "buttons": [BTN_AUTH, BTN_TOKEN_STATUS, BTN_DAEMON, BTN_RESTART],
+        "buttons": [BTN_AUTH, BTN_TOKEN_STATUS, BTN_DAEMON, BTN_RESTART, BTN_OCR_STATS],
     },
     BTN_CAT_GENERAL: {
         "description": (
