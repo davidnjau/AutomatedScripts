@@ -330,17 +330,57 @@ def save_custom_exclusions(keywords: List[str]) -> None:
 
 # ── Per-user category access (Manage Access, access_control.py) ───────
 
+# Old category labels → their new label after the menu reorg. Saved grants
+# reference a category by its label string, so a renamed/folded category (e.g.
+# "🧭 Inquiry" folded into Search & Lookup) would silently drop from a user's
+# grants unless migrated. Applied once on first load, then persisted back.
+# Unchanged labels (🤖 Automation, 📥 Post Board) need no entry.
+_CATEGORY_LABEL_MIGRATIONS = {
+    "📋 Assignments":  "📋 Tasks & Assignment",
+    "📈 Analytics":    "📈 Reports & Analytics",
+    "🔎 Look Ups":     "🔎 Search & Lookup",
+    "🧭 Inquiry":      "🔎 Search & Lookup",
+    "👥 Valuers":      "👥 Valuers & Access",
+    "⚙️ Bot Settings": "📘 General",
+}
+
+
+def _migrate_category_labels(data: Dict[str, List[str]]):
+    """Remap each user's saved category labels through
+    _CATEGORY_LABEL_MIGRATIONS, de-duplicating while preserving order.
+    Returns (migrated_data, changed) — changed is True if any label moved,
+    so the caller can persist the migration once."""
+    changed = False
+    out: Dict[str, List[str]] = {}
+    for uid, labels in data.items():
+        seen: List[str] = []
+        for label in labels:
+            new = _CATEGORY_LABEL_MIGRATIONS.get(label, label)
+            if new != label:
+                changed = True
+            if new not in seen:
+                seen.append(new)
+        out[uid] = seen
+    return out, changed
+
+
 def load_category_access() -> Dict[str, List[str]]:
     """{str(user_id): [category_label, ...]} — every non-admin user's
     explicitly granted menu categories. A user with no entry here has
     zero categories — locked out by default until an admin grants some
     (see get_user_categories's admin bypass and its no-admin-configured
-    safety fallback below)."""
+    safety fallback below). Old category labels are migrated to their new
+    names (and persisted once) on load, so a menu reorg never silently
+    revokes a grant."""
     try:
         with open(SAVED_CATEGORY_ACCESS_FILE) as f:
-            return json.load(f)
+            data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+    migrated, changed = _migrate_category_labels(data)
+    if changed:
+        save_category_access(migrated)
+    return migrated
 
 
 def save_category_access(data: Dict[str, List[str]]) -> None:
@@ -378,10 +418,13 @@ def get_user_categories(user_id: int) -> List[str]:
     there would be nobody able to grant access to anyone, ever — so in
     that case every user gets every category too, exactly like the
     pre-Manage-Access behavior. The empty-by-default restriction only
-    actually applies once at least one admin exists to lift it."""
+    actually applies once at least one admin exists to lift it.
+    Admin-only categories (_ADMIN_ONLY_CATEGORIES, e.g. 🛠 System) are never
+    returned for a non-admin even if somehow granted."""
     if not ADMIN_IDS or user_id in ADMIN_IDS:
         return list(_MENU_CATEGORIES.keys())
-    return load_category_access().get(str(user_id), [])
+    granted = load_category_access().get(str(user_id), [])
+    return [c for c in granted if c not in _ADMIN_ONLY_CATEGORIES]
 
 
 def category_allowed(user_id: int, category: str) -> bool:
@@ -660,17 +703,23 @@ BTN_VIEW_REFS     = "📑 View References"
 # tapping one opens that category's own submenu of workflow buttons (see
 # _MENU_CATEGORIES/_category_menu/_main_menu_for below). BTN_BACK returns
 # from a submenu to the main category menu.
-BTN_CAT_ASSIGNMENTS = "📋 Assignments"
+# (Constant names are kept stable across the menu reorg even where a label
+# changed — e.g. BTN_CAT_SETTINGS now reads "🛠 System" — so existing imports
+# keep working; saved grants of the old labels are migrated on load, see
+# _migrate_category_labels.)
+BTN_CAT_ASSIGNMENTS = "📋 Tasks & Assignment"
+BTN_CAT_BULK        = "📦 Bulk Operations"
+BTN_CAT_LOOKUPS     = "🔎 Search & Lookup"
 BTN_CAT_AUTOMATION  = "🤖 Automation"
-BTN_CAT_ANALYTICS   = "📈 Analytics"
-BTN_CAT_LOOKUPS     = "🔎 Look Ups"
-BTN_CAT_INQUIRY     = "🧭 Inquiry"
-BTN_CAT_VALUERS     = "👥 Valuers"
-BTN_CAT_SETTINGS    = "⚙️ Bot Settings"
-BTN_CAT_POST_BOARD  = "📥 Post Board"
+BTN_CAT_ANALYTICS   = "📈 Reports & Analytics"
+BTN_CAT_VALUERS     = "👥 Valuers & Access"
+BTN_CAT_COMM        = "💬 Communication"
+BTN_CAT_SETTINGS    = "🛠 System"          # admin-only (see _ADMIN_ONLY_CATEGORIES)
+BTN_CAT_GENERAL     = "📘 General"
+BTN_CAT_POST_BOARD  = "📥 Post Board"      # hidden (see _MENU_HIDDEN_CATEGORIES)
 BTN_BACK            = "⬅ Back"
 
-# Admin-only action appended to ⚙️ Bot Settings' submenu (only for admins,
+# Admin-only action appended to 👥 Valuers & Access' submenu (only for admins,
 # see recv_menu_category) — manages other users' category access
 # (access_control.py).
 BTN_MANAGE_ACCESS = "🔐 Manage Access"
@@ -697,8 +746,9 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_HOLD_TASKS)}|{re.escape(BTN_INCREMENTAL)}|{re.escape(BTN_DLV_REPORT_SCHEDULE)}"
     f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}|{re.escape(BTN_TASK_ANALYTICS)}|{re.escape(BTN_CLEAR_CHAT)}"
     f"|{re.escape(BTN_QUEUE_INTERVAL)}|{re.escape(BTN_STALE_THRESHOLD)}|{re.escape(BTN_SMS_SENDER)}"
-    f"|{re.escape(BTN_CAT_ASSIGNMENTS)}|{re.escape(BTN_CAT_AUTOMATION)}|{re.escape(BTN_CAT_ANALYTICS)}"
-    f"|{re.escape(BTN_CAT_LOOKUPS)}|{re.escape(BTN_CAT_INQUIRY)}|{re.escape(BTN_CAT_VALUERS)}|{re.escape(BTN_CAT_SETTINGS)}"
+    f"|{re.escape(BTN_CAT_ASSIGNMENTS)}|{re.escape(BTN_CAT_BULK)}|{re.escape(BTN_CAT_AUTOMATION)}"
+    f"|{re.escape(BTN_CAT_ANALYTICS)}|{re.escape(BTN_CAT_LOOKUPS)}|{re.escape(BTN_CAT_VALUERS)}"
+    f"|{re.escape(BTN_CAT_COMM)}|{re.escape(BTN_CAT_SETTINGS)}|{re.escape(BTN_CAT_GENERAL)}"
     f"|{re.escape(BTN_CAT_POST_BOARD)}|{re.escape(BTN_PB_POST)}|{re.escape(BTN_PB_VIEW)}"
     f"|{re.escape(BTN_BACK)}|{re.escape(BTN_MANAGE_ACCESS)}"
     f"|{re.escape(BTN_RESTART)}|{re.escape(BTN_HELP)}|{re.escape(BTN_CANCEL)})$"
@@ -708,69 +758,90 @@ not_cancel = filters.TEXT & ~filters.COMMAND & ~_CANCEL_FILTER
 
 # Each category: a short description shown when the category button is
 # tapped, plus the list of workflow buttons its submenu shows (in
-# display order). Apartments, Sectional, AF Results, Valuer Tasks, and
-# Assignments are intentionally left out of every category — hidden from
-# the menu exactly as before this reorganization, but each still has its
-# own working /command entry point and MessageHandler.
+# display order). Apartments, Sectional, AF Results, Valuer Tasks,
+# Fetch Tasks, and the Assignments history are intentionally left out of
+# every category — hidden from the menu, but each still has its own working
+# /command entry point and MessageHandler. 🛠 System is admin-only
+# (_ADMIN_ONLY_CATEGORIES); 📥 Post Board is grantable but hidden from the
+# displayed menu (_MENU_HIDDEN_CATEGORIES).
 _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
     BTN_CAT_ASSIGNMENTS: {
         "description": (
-            "📋 *Assignments*\n\n"
-            "Assign, queue, and distribute stamp-duty valuation tasks to valuers."
+            "📋 *Tasks & Assignment*\n\n"
+            "Assign and queue stamp-duty / land-rent valuation tasks to valuers, "
+            "and guard assigned tasks against takeover."
         ),
         "buttons": [
-            BTN_QA_SD, BTN_QA_LRENT, BTN_ASSIGN, BTN_DLV_BATCH, BTN_DLV_TASKS, BTN_HOLD_TASKS,
-            BTN_JOB_DIST, BTN_BULK_FIELD_UPDATE, BTN_BULK_FIELD_UPDATE_HISTORY,
+            BTN_QA_SD, BTN_QA_LRENT, BTN_ASSIGN, BTN_DLV_BATCH, BTN_HOLD_TASKS,
         ],
+    },
+    BTN_CAT_BULK: {
+        "description": (
+            "📦 *Bulk Operations*\n\n"
+            "Run bulk field updates across many records, and review their history."
+        ),
+        "buttons": [BTN_BULK_FIELD_UPDATE, BTN_BULK_FIELD_UPDATE_HISTORY],
+    },
+    BTN_CAT_LOOKUPS: {
+        "description": (
+            "🔎 *Search & Lookup*\n\n"
+            "Look up a reference number's status on demand, check a parcel "
+            "number, or set a standing watch on a parcel."
+        ),
+        "buttons": [BTN_LOOKUP, BTN_PARCEL_LOOKUP, BTN_PARCEL_WATCH],
     },
     BTN_CAT_AUTOMATION: {
         "description": (
             "🤖 *Automation*\n\n"
-            "Schedule recurring fetches, briefings, and reports so tasks and "
-            "DLV updates come to you automatically."
+            "Schedule recurring auto-fetches and tune the background queue checks "
+            "so tasks come to you automatically."
         ),
         "buttons": [
-            BTN_FETCH_TASKS, BTN_AUTO_FETCH, BTN_BRIEFING,
-            BTN_DLV_REPORT_SCHEDULE, BTN_INCREMENTAL, BTN_CUSTOM_EXCLUSIONS,
+            BTN_AUTO_FETCH, BTN_INCREMENTAL, BTN_CUSTOM_EXCLUSIONS,
+            BTN_QUEUE_INTERVAL, BTN_STALE_THRESHOLD,
         ],
     },
     BTN_CAT_ANALYTICS: {
         "description": (
-            "📈 *Analytics*\n\n"
-            "Export valuation reports and monitor background job progress."
+            "📈 *Reports & Analytics*\n\n"
+            "Export valuation reports, review DLV task reports, distribute jobs, "
+            "and monitor background job progress."
         ),
-        "buttons": [BTN_TASK_ANALYTICS, BTN_VIEW_REFS, BTN_BULK_EXPORT, BTN_EXPORT_STATUS, BTN_ERROR_REPORT],
-    },
-    BTN_CAT_LOOKUPS: {
-        "description": (
-            "🔎 *Look Ups*\n\n"
-            "Check a parcel number's status or a DLV reference, on demand."
-        ),
-        "buttons": [BTN_PARCEL_LOOKUP, BTN_DLV_REF_CHECK],
-    },
-    BTN_CAT_INQUIRY: {
-        "description": (
-            "🧭 *Inquiry*\n\n"
-            "Look up a reference number's status on demand, or set a standing "
-            "watch on a parcel number."
-        ),
-        "buttons": [BTN_LOOKUP, BTN_PARCEL_WATCH],
+        "buttons": [
+            BTN_TASK_ANALYTICS, BTN_VIEW_REFS, BTN_BULK_EXPORT, BTN_EXPORT_STATUS,
+            BTN_ERROR_REPORT, BTN_BRIEFING, BTN_DLV_REPORT_SCHEDULE, BTN_JOB_DIST,
+            BTN_DLV_TASKS, BTN_DLV_REF_CHECK,
+        ],
     },
     BTN_CAT_VALUERS: {
         "description": (
-            "👥 *Valuers*\n\n"
-            "Manage the saved valuer list used across New Assignment, Receive "
-            "Tasks, and Job Distribution."
+            "👥 *Valuers & Access*\n\n"
+            "Manage the saved valuer list used across the bot (and, for admins, "
+            "other users' menu access)."
         ),
         "buttons": [BTN_VALUERS, BTN_DELETE],
     },
+    BTN_CAT_COMM: {
+        "description": (
+            "💬 *Communication*\n\n"
+            "Send messages through the bot."
+        ),
+        "buttons": [BTN_SMS_SENDER],
+    },
     BTN_CAT_SETTINGS: {
         "description": (
-            "⚙️ *Bot Settings*\n\n"
-            "Manage login sessions, the token refresh daemon, and the bot process itself."
+            "🛠 *System*\n\n"
+            "Manage login sessions, the token refresh daemon, and the bot process "
+            "itself. Admin-only."
         ),
-        "buttons": [BTN_AUTH, BTN_TOKEN_STATUS, BTN_DAEMON, BTN_RESTART, BTN_HELP, BTN_CLEAR_CHAT,
-                    BTN_QUEUE_INTERVAL, BTN_STALE_THRESHOLD, BTN_SMS_SENDER],
+        "buttons": [BTN_AUTH, BTN_TOKEN_STATUS, BTN_DAEMON, BTN_RESTART],
+    },
+    BTN_CAT_GENERAL: {
+        "description": (
+            "📘 *General*\n\n"
+            "Help and chat housekeeping."
+        ),
+        "buttons": [BTN_HELP, BTN_CLEAR_CHAT],
     },
     BTN_CAT_POST_BOARD: {
         "description": (
@@ -816,6 +887,12 @@ def _category_row_keyboard(categories: List[str]) -> ReplyKeyboardMarkup:
 # and any category-gated behaviour like Post Board's push still work) but NOT
 # shown in the top-level menu — reachable by command/exact-text only.
 _MENU_HIDDEN_CATEGORIES = {BTN_CAT_POST_BOARD}
+
+# Categories only admins may ever open. Non-admins never see them in the menu
+# (get_user_categories strips them) and they're not offered in Manage Access'
+# grantable list (access_control._ma_category_keyboard). Admins still get them
+# via the admin bypass in get_user_categories.
+_ADMIN_ONLY_CATEGORIES = {BTN_CAT_SETTINGS}
 
 
 def _main_menu_for(user_id: int) -> ReplyKeyboardMarkup:
@@ -1026,7 +1103,7 @@ async def recv_menu_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # only if this user is actually permitted to open it (category_allowed);
     # this is the one enforcement point a restricted user can't bypass by
     # tapping a category button directly, even if it were somehow shown to
-    # them. ⚙️ Bot Settings' submenu additionally gets 🔐 Manage Access
+    # them. 👥 Valuers & Access' submenu additionally gets 🔐 Manage Access
     # appended, but only for admins.
     if not allowed(update): return await deny(update)
     text = update.message.text
@@ -1042,7 +1119,7 @@ async def recv_menu_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
     buttons = list(category["buttons"])
-    if text == BTN_CAT_SETTINGS and is_admin(user_id):
+    if text == BTN_CAT_VALUERS and is_admin(user_id):
         buttons.append(BTN_MANAGE_ACCESS)
     await update.message.reply_text(
         category["description"],

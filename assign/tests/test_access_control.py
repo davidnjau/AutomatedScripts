@@ -92,6 +92,12 @@ class TestMaCategoryKeyboard(unittest.TestCase):
         texts = [btn.text for row in kb.inline_keyboard for btn in row]
         self.assertIn("✅ Done", texts)
 
+    def test_admin_only_categories_are_not_offered(self):
+        # 🛠 System is admin-only and must never appear in the grantable list.
+        kb = ac._ma_category_keyboard(set())
+        texts = [row[0].text for row in kb.inline_keyboard if row[0].text != "✅ Done"]
+        self.assertFalse(any(common.BTN_CAT_SETTINGS in t for t in texts))
+
 
 class TestCmdManageAccess(unittest.TestCase):
     def test_non_admin_is_denied(self):
