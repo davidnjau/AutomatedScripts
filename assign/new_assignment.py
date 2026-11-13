@@ -42,6 +42,7 @@ import base64
 import io
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed as _futures_as_completed
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -115,6 +116,16 @@ from telegram_report import _send_chunked_report
 _WORKFLOW_LABELS = {"stamp_duty": "📋 Stamp Duty", "land_rent": "🏘 Land Rent"}
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# Self-hosted GLM-OCR endpoint (a RunPod serverless endpoint wrapping the
+# Digitization Platform's GLM-OCR — see that repo's serverless/ handler). When
+# OCR_SERVICE_URL is set it becomes the primary photo-OCR path, so the bot
+# needs no ANTHROPIC_API_KEY; Claude Vision stays only as a key-gated last
+# resort. OCR_SERVICE_URL is the RunPod endpoint base
+# (https://api.runpod.ai/v2/<endpoint_id>); OCR_SERVICE_TOKEN is the RunPod API key.
+OCR_SERVICE_URL     = os.getenv("OCR_SERVICE_URL", "").strip().rstrip("/")
+OCR_SERVICE_TOKEN   = os.getenv("OCR_SERVICE_TOKEN", "").strip()
+_OCR_SERVICE_TIMEOUT = 180   # seconds; generous for a scaled-to-zero cold start
 
 
 # ──────────────────────────────────────────────────────────
@@ -231,10 +242,47 @@ def _extract_refs_from_text(text: str) -> List[str]:
     return list(dict.fromkeys(_REF_RE.findall(text.upper())))  # dedup, preserve order
 
 
+def _ocr_via_glm_service(photo_bytes: bytes) -> str:
+    """Read an image via the self-hosted GLM-OCR RunPod serverless endpoint and
+    return its raw OCR text (the caller runs _REF_RE over it). Blocking — call
+    via asyncio.to_thread. Uses RunPod's /runsync, falling back to polling
+    /status/<id> for a cold-start job that outlives the sync window. Raises on
+    any failure so ocr_extract_refs can fall through."""
+    b64     = base64.standard_b64encode(photo_bytes).decode()
+    headers = {"Content-Type": "application/json"}
+    if OCR_SERVICE_TOKEN:
+        headers["Authorization"] = f"Bearer {OCR_SERVICE_TOKEN}"
+    payload = {"input": {"image_b64": b64}}
+
+    resp = requests.post(f"{OCR_SERVICE_URL}/runsync", json=payload, headers=headers, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") == "COMPLETED":
+        return (data.get("output") or {}).get("text", "")
+
+    # Cold start outlived runsync — poll the job to completion.
+    job_id = data.get("id")
+    if not job_id:
+        raise RuntimeError(f"OCR service returned no job id: {data}")
+    deadline = time.monotonic() + _OCR_SERVICE_TIMEOUT
+    while time.monotonic() < deadline:
+        time.sleep(3)
+        s  = requests.get(f"{OCR_SERVICE_URL}/status/{job_id}", headers=headers, timeout=30)
+        s.raise_for_status()
+        sd = s.json()
+        status = sd.get("status")
+        if status == "COMPLETED":
+            return (sd.get("output") or {}).get("text", "")
+        if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+            raise RuntimeError(f"OCR job {status}: {sd}")
+    raise TimeoutError("OCR service timed out")
+
+
 async def ocr_extract_refs(photo_bytes: bytes) -> Tuple[List[str], str]:
     """
-    Try Tesseract first; fall back to Claude Vision if nothing found.
-    Returns (refs, source) where source is "tesseract" or "claude".
+    Tesseract first, then the self-hosted GLM-OCR service (OCR_SERVICE_URL),
+    then Claude Vision as a key-gated last resort. Returns (refs, source) where
+    source is "tesseract", "glm-ocr", "claude", or "none".
     """
     # ── Tesseract ─────────────────────────────────────────
     try:
@@ -246,7 +294,17 @@ async def ocr_extract_refs(photo_bytes: bytes) -> Tuple[List[str], str]:
     except Exception as e:
         logger.warning("Tesseract failed: %s", e)
 
-    # ── Claude Vision fallback ────────────────────────────
+    # ── Self-hosted GLM-OCR service (primary once configured) ──
+    if OCR_SERVICE_URL:
+        try:
+            text = await asyncio.to_thread(_ocr_via_glm_service, photo_bytes)
+            refs = _extract_refs_from_text(text)
+            if refs:
+                return refs, "glm-ocr"
+        except Exception as e:
+            logger.warning("GLM-OCR service failed: %s", e)
+
+    # ── Claude Vision fallback (only if a key is still set) ────
     if not ANTHROPIC_API_KEY:
         return [], "none"
     try:
