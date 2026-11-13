@@ -224,25 +224,83 @@ class TestHiddenPostBoard(unittest.TestCase):
         self.assertIn(common.BTN_CAT_POST_BOARD, common._MENU_HIDDEN_CATEGORIES)
 
 
-class TestInquiryCategory(unittest.TestCase):
-    def test_inquiry_holds_lookup_and_parcel_watch(self):
-        self.assertIn(common.BTN_CAT_INQUIRY, common._MENU_CATEGORIES)
+class TestSearchAndLookupCategory(unittest.TestCase):
+    def test_search_lookup_holds_all_three_lookups(self):
+        # The old 🧭 Inquiry category was folded into 🔎 Search & Lookup,
+        # which now holds all three on-demand lookups.
+        lookups = common._MENU_CATEGORIES[common.BTN_CAT_LOOKUPS]["buttons"]
         self.assertEqual(
-            common._MENU_CATEGORIES[common.BTN_CAT_INQUIRY]["buttons"],
-            [common.BTN_LOOKUP, common.BTN_PARCEL_WATCH],
+            lookups,
+            [common.BTN_LOOKUP, common.BTN_PARCEL_LOOKUP, common.BTN_PARCEL_WATCH],
         )
 
-    def test_lookups_no_longer_has_those_two(self):
-        lookups = common._MENU_CATEGORIES[common.BTN_CAT_LOOKUPS]["buttons"]
-        self.assertNotIn(common.BTN_LOOKUP, lookups)
-        self.assertNotIn(common.BTN_PARCEL_WATCH, lookups)
-        self.assertIn(common.BTN_PARCEL_LOOKUP, lookups)
-        self.assertIn(common.BTN_DLV_REF_CHECK, lookups)
+    def test_inquiry_category_removed(self):
+        # The Inquiry label is no longer a live category.
+        self.assertNotIn("🧭 Inquiry", common._MENU_CATEGORIES)
 
-    def test_inquiry_is_independently_grantable_via_get_user_categories(self):
-        # An admin always has every category (incl. the new one).
+    def test_dlv_ref_check_moved_to_reports(self):
+        reports = common._MENU_CATEGORIES[common.BTN_CAT_ANALYTICS]["buttons"]
+        self.assertIn(common.BTN_DLV_REF_CHECK, reports)
+        self.assertNotIn(
+            common.BTN_DLV_REF_CHECK,
+            common._MENU_CATEGORIES[common.BTN_CAT_LOOKUPS]["buttons"],
+        )
+
+
+class TestAdminOnlyCategory(unittest.TestCase):
+    def test_system_is_admin_only(self):
+        self.assertIn(common.BTN_CAT_SETTINGS, common._ADMIN_ONLY_CATEGORIES)
+
+    def test_admin_sees_system(self):
         with patch.object(common, "ADMIN_IDS", {5}):
-            self.assertIn(common.BTN_CAT_INQUIRY, common.get_user_categories(5))
+            self.assertIn(common.BTN_CAT_SETTINGS, common.get_user_categories(5))
+
+    def test_non_admin_never_gets_system_even_if_granted(self):
+        access = {"7": [common.BTN_CAT_SETTINGS, common.BTN_CAT_GENERAL]}
+        with patch.object(common, "ADMIN_IDS", {5}), \
+             patch.object(common, "load_category_access", lambda: access):
+            cats = common.get_user_categories(7)
+        self.assertNotIn(common.BTN_CAT_SETTINGS, cats)
+        self.assertIn(common.BTN_CAT_GENERAL, cats)
+
+
+class TestCategoryLabelMigration(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.data_file = os.path.join(self.tmpdir.name, "saved_category_access.json")
+        self._patch = patch.object(common, "SAVED_CATEGORY_ACCESS_FILE", self.data_file)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self.tmpdir.cleanup()
+
+    def test_old_labels_are_migrated_on_load(self):
+        with open(self.data_file, "w") as f:
+            json.dump({"7": ["📋 Assignments", "🧭 Inquiry", "🔎 Look Ups", "⚙️ Bot Settings"]}, f)
+        migrated = common.load_category_access()
+        # Assignments → Tasks & Assignment; Inquiry + Look Ups both → Search &
+        # Lookup (de-duplicated to one); Bot Settings → General.
+        self.assertEqual(
+            migrated["7"],
+            [common.BTN_CAT_ASSIGNMENTS, common.BTN_CAT_LOOKUPS, common.BTN_CAT_GENERAL],
+        )
+
+    def test_migration_is_persisted(self):
+        with open(self.data_file, "w") as f:
+            json.dump({"7": ["📈 Analytics"]}, f)
+        common.load_category_access()
+        with open(self.data_file) as f:
+            on_disk = json.load(f)
+        self.assertEqual(on_disk["7"], [common.BTN_CAT_ANALYTICS])
+
+    def test_already_new_labels_untouched(self):
+        with open(self.data_file, "w") as f:
+            json.dump({"7": [common.BTN_CAT_AUTOMATION, common.BTN_CAT_LOOKUPS]}, f)
+        self.assertEqual(
+            common.load_category_access()["7"],
+            [common.BTN_CAT_AUTOMATION, common.BTN_CAT_LOOKUPS],
+        )
 
 
 class TestUserNamesPersistence(unittest.TestCase):
@@ -750,12 +808,13 @@ class TestMenuCategories(unittest.TestCase):
     def test_hidden_buttons_are_in_no_category(self):
         buttons = self._all_category_buttons()
         for btn in (common.BTN_APARTMENTS, common.BTN_SECTIONAL, common.BTN_AF_RESULTS,
-                    common.BTN_VALUER_TASKS, common.BTN_ASSIGNMENTS, common.BTN_DLV_QUEUE):
+                    common.BTN_VALUER_TASKS, common.BTN_ASSIGNMENTS, common.BTN_DLV_QUEUE,
+                    common.BTN_FETCH_TASKS):
             self.assertNotIn(btn, buttons)
 
     def test_every_other_button_is_in_exactly_one_category(self):
         buttons = self._all_category_buttons()
-        for btn in (common.BTN_ASSIGN, common.BTN_FETCH_TASKS, common.BTN_AUTO_FETCH,
+        for btn in (common.BTN_ASSIGN, common.BTN_AUTO_FETCH,
                     common.BTN_DLV_BATCH, common.BTN_BULK_EXPORT, common.BTN_EXPORT_STATUS,
                     common.BTN_JOB_DIST, common.BTN_DLV_TASKS, common.BTN_BRIEFING,
                     common.BTN_HOLD_TASKS, common.BTN_INCREMENTAL, common.BTN_DLV_REPORT_SCHEDULE,
@@ -826,7 +885,7 @@ class TestRecvMenuCategory(unittest.TestCase):
             asyncio.run(common.recv_menu_category(update, MagicMock()))
         update.message.reply_text.assert_awaited_once()
         args, kwargs = update.message.reply_text.call_args
-        self.assertIn("Look Ups", args[0])
+        self.assertIn("Search & Lookup", args[0])
         self.assertIn("reply_markup", kwargs)
 
     def test_unknown_text_does_nothing(self):
@@ -843,8 +902,8 @@ class TestRecvMenuCategory(unittest.TestCase):
         sent_text = update.message.reply_text.call_args[0][0]
         self.assertIn("don't have access", sent_text)
 
-    def test_admin_gets_manage_access_appended_to_bot_settings(self):
-        update = self._make_update(common.BTN_CAT_SETTINGS)
+    def test_admin_gets_manage_access_appended_to_valuers(self):
+        update = self._make_update(common.BTN_CAT_VALUERS)
         with patch.object(common, "allowed", return_value=True), \
              patch.object(common, "category_allowed", return_value=True), \
              patch.object(common, "is_admin", return_value=True):
@@ -854,7 +913,7 @@ class TestRecvMenuCategory(unittest.TestCase):
         self.assertIn(common.BTN_MANAGE_ACCESS, texts)
 
     def test_non_admin_does_not_get_manage_access(self):
-        update = self._make_update(common.BTN_CAT_SETTINGS)
+        update = self._make_update(common.BTN_CAT_VALUERS)
         with patch.object(common, "allowed", return_value=True), \
              patch.object(common, "category_allowed", return_value=True), \
              patch.object(common, "is_admin", return_value=False):

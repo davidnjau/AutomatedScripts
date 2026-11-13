@@ -57,6 +57,7 @@ from common import (
     ADMIN_IDS,
     ALLOWED_IDS,
     BTN_MANAGE_ACCESS,
+    _ADMIN_ONLY_CATEGORIES,
     _CANCEL_FILTER,
     _main_menu_for,
     _MENU_CATEGORIES,
@@ -124,13 +125,15 @@ def _ma_user_keyboard() -> InlineKeyboardMarkup:
 
 
 def _ma_category_keyboard(selected: Set[str]) -> InlineKeyboardMarkup:
-    """One toggle button per menu category (☑ granted / ☐ not granted),
-    one per row since category labels are long, plus a trailing Done
-    button — same ☑/☐ toggle-checklist convention as common.py's
-    _af_exclusion_multiselect_keyboard."""
+    """One toggle button per grantable menu category (☑ granted / ☐ not
+    granted), one per row since category labels are long, plus a trailing
+    Done button — same ☑/☐ toggle-checklist convention as common.py's
+    _af_exclusion_multiselect_keyboard. Admin-only categories
+    (_ADMIN_ONLY_CATEGORIES, e.g. 🛠 System) are never offered — admins
+    already have them and non-admins can never be granted them."""
     rows = [
         [InlineKeyboardButton(f"{'☑' if label in selected else '☐'} {label}", callback_data=f"ma_cat:{label}")]
-        for label in _MENU_CATEGORIES
+        for label in _MENU_CATEGORIES if label not in _ADMIN_ONLY_CATEGORIES
     ]
     rows.append([InlineKeyboardButton("✅ Done", callback_data="ma_cat:done")])
     return InlineKeyboardMarkup(rows)
@@ -218,7 +221,7 @@ async def recv_ma_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Main menu.", reply_markup=_main_menu_for(query.from_user.id))
         return ConversationHandler.END
 
-    if data in _MENU_CATEGORIES:
+    if data in _MENU_CATEGORIES and data not in _ADMIN_ONLY_CATEGORIES:
         if data in sess.selected:
             sess.selected.discard(data)
         else:
