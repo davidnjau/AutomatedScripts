@@ -255,6 +255,19 @@ def _project(record: Dict, extra_strip: Iterable[str] = ()) -> Dict:
     return {k: v for k, v in record.items() if k not in drop}
 
 
+def load_records_where(**match) -> List[Dict]:
+    """Every record in the consolidated store whose fields equal all the given
+    kwargs, each returned with its own `ref` key merged in. Used by Quick
+    Assign's 'View References' to pull the records it tagged
+    (channel='quick_assign') regardless of whether they ended up assigned or
+    queued."""
+    return [
+        {**rec, "ref": ref}
+        for ref, rec in _load_consolidated().items()
+        if all(rec.get(k) == v for k, v in match.items())
+    ]
+
+
 def load_dlv_batch() -> List[Dict]:
     """Every ref currently status=="queued", projected to the legacy
     saved_dlv_batch.json item shape."""

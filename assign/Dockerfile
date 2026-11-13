@@ -42,6 +42,7 @@ COPY bulk_export.py .
 COPY task_analytics.py .
 COPY access_control.py .
 COPY post_board.py .
+COPY quick_assign.py .
 COPY clear_chat.py .
 COPY bulk_field_update.py .
 COPY sms_sender.py .

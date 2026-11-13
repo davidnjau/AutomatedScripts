@@ -95,6 +95,7 @@ import new_assignment
 import parcel_lookup
 import parcel_watch
 import post_board
+import quick_assign
 import receive_tasks
 import refresh_auth
 import sectional_properties
@@ -790,6 +791,7 @@ def main():
     task_analytics.register(app)
     access_control.register(app)
     post_board.register(app)
+    quick_assign.register(app)
     clear_chat.register(app)
 
     # DLV Batch: 5-minute repeating job + DLV Queue handlers registered via
