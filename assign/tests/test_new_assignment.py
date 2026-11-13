@@ -88,6 +88,75 @@ class TestExtractRefsFromText(unittest.TestCase):
         self.assertEqual(na._extract_refs_from_text("nothing matching here"), [])
 
 
+def _rp_resp(payload):
+    r = MagicMock()
+    r.json.return_value = payload
+    r.raise_for_status = MagicMock()
+    return r
+
+
+class TestOcrViaGlmService(unittest.TestCase):
+    """_ocr_via_glm_service — RunPod serverless call: runsync fast path plus
+    the /status poll fallback for cold-start jobs."""
+
+    def test_runsync_completed_returns_text(self):
+        with patch.object(na, "OCR_SERVICE_URL", "https://api.runpod.ai/v2/ep"), \
+             patch.object(na.requests, "post",
+                          return_value=_rp_resp({"status": "COMPLETED",
+                                                 "output": {"text": "CNTYINV/IWGYH5Q9NZ"}})) as mp:
+            out = na._ocr_via_glm_service(b"img")
+        self.assertEqual(out, "CNTYINV/IWGYH5Q9NZ")
+        self.assertTrue(mp.call_args[0][0].endswith("/runsync"))   # used runsync
+
+    def test_cold_start_polls_status_to_completion(self):
+        with patch.object(na, "OCR_SERVICE_URL", "https://api.runpod.ai/v2/ep"), \
+             patch.object(na, "OCR_SERVICE_TOKEN", "key"), \
+             patch.object(na.requests, "post", return_value=_rp_resp({"status": "IN_QUEUE", "id": "job1"})), \
+             patch.object(na.requests, "get", side_effect=[
+                 _rp_resp({"status": "IN_PROGRESS"}),
+                 _rp_resp({"status": "COMPLETED", "output": {"text": "REG/TSFR/0ZB5NZK5VK"}}),
+             ]), \
+             patch.object(na.time, "sleep"):
+            out = na._ocr_via_glm_service(b"img")
+        self.assertEqual(out, "REG/TSFR/0ZB5NZK5VK")
+
+    def test_failed_job_raises(self):
+        with patch.object(na, "OCR_SERVICE_URL", "https://api.runpod.ai/v2/ep"), \
+             patch.object(na.requests, "post", return_value=_rp_resp({"status": "IN_QUEUE", "id": "j"})), \
+             patch.object(na.requests, "get", return_value=_rp_resp({"status": "FAILED"})), \
+             patch.object(na.time, "sleep"):
+            with self.assertRaises(RuntimeError):
+                na._ocr_via_glm_service(b"img")
+
+
+class TestOcrExtractRefsRouting(unittest.TestCase):
+    """ocr_extract_refs — the tesseract → GLM-OCR service → Claude routing."""
+
+    def test_uses_service_when_configured(self):
+        with patch.object(na, "OCR_SERVICE_URL", "https://api.runpod.ai/v2/ep"), \
+             patch.object(na.pytesseract, "image_to_string", return_value=""), \
+             patch.object(na.Image, "open", return_value=MagicMock()), \
+             patch.object(na, "_ocr_via_glm_service", return_value="row CNTYINV/5YCLDT7197 BLOCK46/175/89"):
+            refs, source = _run(na.ocr_extract_refs(b"img"))
+        self.assertEqual(refs, ["CNTYINV/5YCLDT7197"])   # ref kept, parcel ignored
+        self.assertEqual(source, "glm-ocr")
+
+    def test_no_service_no_key_returns_none(self):
+        with patch.object(na, "OCR_SERVICE_URL", ""), \
+             patch.object(na, "ANTHROPIC_API_KEY", ""), \
+             patch.object(na.pytesseract, "image_to_string", return_value=""), \
+             patch.object(na.Image, "open", return_value=MagicMock()):
+            self.assertEqual(_run(na.ocr_extract_refs(b"img")), ([], "none"))
+
+    def test_service_failure_falls_through_without_key(self):
+        with patch.object(na, "OCR_SERVICE_URL", "https://api.runpod.ai/v2/ep"), \
+             patch.object(na, "ANTHROPIC_API_KEY", ""), \
+             patch.object(na.pytesseract, "image_to_string", return_value=""), \
+             patch.object(na.Image, "open", return_value=MagicMock()), \
+             patch.object(na, "_ocr_via_glm_service", side_effect=RuntimeError("down")):
+            self.assertEqual(_run(na.ocr_extract_refs(b"img")), ([], "none"))
+
+
 class TestCheckAssignmentsAndProceed(unittest.TestCase):
     def test_no_existing_assignments_proceeds_to_valuer_pick(self):
         message = MagicMock()
