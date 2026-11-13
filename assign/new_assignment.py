@@ -216,8 +216,15 @@ async def _show_valuer_keyboard(message, sess: Session, results: List[Dict]) -> 
 # OCR helpers
 # ──────────────────────────────────────────────────────────
 
-# Matches patterns like LS/VAL/2024/001 — 3+ slash-separated alphanumeric segments
-_REF_RE = re.compile(r'\b[A-Z0-9]{2,}(?:/[A-Z0-9]{2,}){2,}\b')
+# Matches real Ardhisasa application references, anchored on their known
+# prefixes: CNTYINV/<code> (County Stamp Duty — one slash) or
+# REG|DLA|LAS/<TYPE>/<code> (e.g. REG/TSFR/…, REG/LOTL/…, DLA/LEASE/…,
+# LAS/ADJ/…), where <code> is a ~7–12 char uppercase-alnum string.
+# Anchoring on the prefix is deliberate: the old generic "2+ slashes" pattern
+# both MISSED every CNTYINV ref (only one slash) and FALSELY matched the
+# parcel-number column next to it (e.g. "BLOCK46/175/89"). Extend the prefix
+# group if a new reference family appears.
+_REF_RE = re.compile(r'\b(?:CNTYINV|REG|DLA|LAS)(?:/[A-Z]{2,6})?/[A-Z0-9]{7,12}\b')
 
 
 def _extract_refs_from_text(text: str) -> List[str]:
@@ -247,7 +254,7 @@ async def ocr_extract_refs(photo_bytes: bytes) -> Tuple[List[str], str]:
         b64_img = base64.standard_b64encode(photo_bytes).decode()
         resp    = client.messages.create(
             model="claude-opus-4-6",
-            max_tokens=512,
+            max_tokens=1500,   # a County application-list screenshot can hold 20+ rows
             messages=[{
                 "role": "user",
                 "content": [
@@ -258,9 +265,13 @@ async def ocr_extract_refs(photo_bytes: bytes) -> Tuple[List[str], str]:
                     {
                         "type": "text",
                         "text": (
-                            "Extract every reference number from this document image. "
-                            "Reference numbers follow a pattern like LS/VAL/2024/001 — "
-                            "alphanumeric segments separated by forward slashes. "
+                            "Extract every Ardhisasa application reference number from this image. "
+                            "They look like CNTYINV/XXXXXXXXXX or REG/TSFR/XXXXXXXXXX — a prefix "
+                            "(CNTYINV, REG/LOTL, REG/TSFR, REG/SECT, DLA/..., LAS/...) followed by a "
+                            "slash and a ~10-character code of letters and digits. If the image is a "
+                            "table, read ONLY the 'Reference Number' column. Do NOT return parcel or "
+                            "property numbers (e.g. 'MAVOKO MUNICIPALITY BLOCK46/175/89'), Ardhisasa "
+                            "IDs (e.g. PA0K17H001), dates, amounts, or application types. "
                             "Return ONLY the reference numbers, one per line, nothing else."
                         ),
                     },

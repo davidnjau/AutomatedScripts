@@ -59,13 +59,30 @@ class TestParseRefs(unittest.TestCase):
 
 
 class TestExtractRefsFromText(unittest.TestCase):
-    def test_matches_slash_separated_pattern(self):
-        refs = na._extract_refs_from_text("Doc mentions LS/VAL/2024/001 somewhere.")
-        self.assertEqual(refs, ["LS/VAL/2024/001"])
+    def test_matches_county_ref_single_slash(self):
+        # Regression: CNTYINV refs have ONE slash — the old 2+-slash regex missed them entirely.
+        refs = na._extract_refs_from_text("Land Stamp Duty: CNTYINV/IWGYH5Q9NZ")
+        self.assertEqual(refs, ["CNTYINV/IWGYH5Q9NZ"])
+
+    def test_matches_reg_typed_refs(self):
+        refs = na._extract_refs_from_text("REG/TSFR/0ZB5NZK5VK REG/LOTL/NB8JP2N6E DLA/LEASE/XXXX1234YY")
+        self.assertEqual(refs, ["REG/TSFR/0ZB5NZK5VK", "REG/LOTL/NB8JP2N6E", "DLA/LEASE/XXXX1234YY"])
+
+    def test_ignores_parcel_numbers(self):
+        # Regression: the parcel column sits next to the ref column; the old regex
+        # grabbed "BLOCK46/175/89" (2 slashes) as if it were a reference.
+        self.assertEqual(na._extract_refs_from_text("MAVOKO MUNICIPALITY BLOCK46/175/89"), [])
+
+    def test_ignores_ardhisasa_id(self):
+        self.assertEqual(na._extract_refs_from_text("Ardhisasa ID PA0K17H001"), [])
+
+    def test_table_row_picks_ref_not_parcel(self):
+        row = "1  CNTYINV/T8ER9SC7AB  MAVOKO MUNICIPALITY BLOCK46/175/89  TRANSFER  KIRINYAGA"
+        self.assertEqual(na._extract_refs_from_text(row), ["CNTYINV/T8ER9SC7AB"])
 
     def test_dedupes_preserving_order(self):
-        refs = na._extract_refs_from_text("LS/VAL/2024/001 and LS/VAL/2024/001 again, then LS/VAL/2024/002")
-        self.assertEqual(refs, ["LS/VAL/2024/001", "LS/VAL/2024/002"])
+        refs = na._extract_refs_from_text("CNTYINV/5YCLDT7197 and CNTYINV/5YCLDT7197 again, then REG/SECT/DRJ4RZ59OZ")
+        self.assertEqual(refs, ["CNTYINV/5YCLDT7197", "REG/SECT/DRJ4RZ59OZ"])
 
     def test_no_match_returns_empty(self):
         self.assertEqual(na._extract_refs_from_text("nothing matching here"), [])
