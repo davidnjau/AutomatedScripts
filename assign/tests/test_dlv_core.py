@@ -259,6 +259,23 @@ class TestFetchStampdutyDetail(unittest.TestCase):
         self.assertEqual(det, {"officers": []})
 
 
+class TestLoadRecordsWhere(unittest.TestCase):
+    def test_filters_by_field_and_merges_ref(self):
+        store = {
+            "A": {"channel": "quick_assign", "status": "assigned"},
+            "B": {"channel": "quick_assign", "status": "queued"},
+            "C": {"status": "assigned"},   # no channel → excluded
+        }
+        with patch("dlv_core._load_consolidated", return_value=store):
+            out = dlv_core.load_records_where(channel="quick_assign")
+        self.assertEqual({r["ref"] for r in out}, {"A", "B"})
+        self.assertTrue(all(r["channel"] == "quick_assign" for r in out))
+
+    def test_no_match_returns_empty(self):
+        with patch("dlv_core._load_consolidated", return_value={"A": {"status": "assigned"}}):
+            self.assertEqual(dlv_core.load_records_where(channel="quick_assign"), [])
+
+
 class TestFilterOwnRecords(unittest.TestCase):
     """filter_own_records — admin sees all; a non-admin sees only records
     whose added_by matches them."""

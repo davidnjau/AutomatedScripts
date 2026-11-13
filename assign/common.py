@@ -652,6 +652,9 @@ BTN_STALE_THRESHOLD = "⏳ Stale Pending Threshold"
 BTN_BULK_FIELD_UPDATE = "🛠 Bulk Field Update"
 BTN_BULK_FIELD_UPDATE_HISTORY = "📜 Bulk Update History"
 BTN_SMS_SENDER    = "📱 Send SMS"
+BTN_QA_SD         = "⚡ SD Assignment"
+BTN_QA_LRENT      = "⚡ LRent Assignment"
+BTN_VIEW_REFS     = "📑 View References"
 
 # Category buttons — the main menu shows only these six (plus Cancel);
 # tapping one opens that category's own submenu of workflow buttons (see
@@ -688,6 +691,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_EXPORT_STATUS)}|{re.escape(BTN_JOB_DIST)}|{re.escape(BTN_LOOKUP)}"
     f"|{re.escape(BTN_PARCEL_LOOKUP)}|{re.escape(BTN_PARCEL_WATCH)}|{re.escape(BTN_DLV_REF_CHECK)}"
     f"|{re.escape(BTN_VALUER_TASKS)}"
+    f"|{re.escape(BTN_QA_SD)}|{re.escape(BTN_QA_LRENT)}|{re.escape(BTN_VIEW_REFS)}"
     f"|{re.escape(BTN_DLV_TASKS)}|{re.escape(BTN_BRIEFING)}|{re.escape(BTN_SECTIONAL)}"
     f"|{re.escape(BTN_APARTMENTS)}"
     f"|{re.escape(BTN_HOLD_TASKS)}|{re.escape(BTN_INCREMENTAL)}|{re.escape(BTN_DLV_REPORT_SCHEDULE)}"
@@ -715,8 +719,8 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
             "Assign, queue, and distribute stamp-duty valuation tasks to valuers."
         ),
         "buttons": [
-            BTN_ASSIGN, BTN_DLV_BATCH, BTN_DLV_TASKS, BTN_HOLD_TASKS, BTN_JOB_DIST,
-            BTN_BULK_FIELD_UPDATE, BTN_BULK_FIELD_UPDATE_HISTORY,
+            BTN_QA_SD, BTN_QA_LRENT, BTN_ASSIGN, BTN_DLV_BATCH, BTN_DLV_TASKS, BTN_HOLD_TASKS,
+            BTN_JOB_DIST, BTN_BULK_FIELD_UPDATE, BTN_BULK_FIELD_UPDATE_HISTORY,
         ],
     },
     BTN_CAT_AUTOMATION: {
@@ -735,7 +739,7 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
             "📈 *Analytics*\n\n"
             "Export valuation reports and monitor background job progress."
         ),
-        "buttons": [BTN_TASK_ANALYTICS, BTN_BULK_EXPORT, BTN_EXPORT_STATUS, BTN_ERROR_REPORT],
+        "buttons": [BTN_TASK_ANALYTICS, BTN_VIEW_REFS, BTN_BULK_EXPORT, BTN_EXPORT_STATUS, BTN_ERROR_REPORT],
     },
     BTN_CAT_LOOKUPS: {
         "description": (
