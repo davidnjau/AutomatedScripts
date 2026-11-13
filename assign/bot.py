@@ -75,6 +75,7 @@ from common import (
 )
 import access_control
 import auto_fetch
+import ocr_stats
 import bulk_export
 import clear_chat
 import dlv_batch
@@ -790,6 +791,7 @@ def main():
     bulk_export.register(app)
     task_analytics.register(app)
     access_control.register(app)
+    ocr_stats.register(app)
     post_board.register(app)
     quick_assign.register(app)
     clear_chat.register(app)

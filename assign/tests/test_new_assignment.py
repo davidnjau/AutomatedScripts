@@ -132,6 +132,13 @@ class TestOcrViaGlmService(unittest.TestCase):
 class TestOcrExtractRefsRouting(unittest.TestCase):
     """ocr_extract_refs — the tesseract → GLM-OCR service → Claude routing."""
 
+    def setUp(self):
+        # The public wrapper bumps the OCR usage counter — stub it so tests
+        # don't touch the real saved_ocr_counts.json.
+        self._p = patch.object(na.ocr_stats, "record_extraction")
+        self._p.start()
+        self.addCleanup(self._p.stop)
+
     def test_uses_service_when_configured(self):
         with patch.object(na, "OCR_SERVICE_URL", "https://api.runpod.ai/v2/ep"), \
              patch.object(na.pytesseract, "image_to_string", return_value=""), \
