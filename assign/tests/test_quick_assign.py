@@ -216,6 +216,16 @@ class TestProcessJob(unittest.TestCase):
         sent = " ".join(c.args[1] for c in ctx.bot.send_message.call_args_list)
         self.assertIn("couldn't read", sent.lower())
 
+    def test_ocr_failure_is_audited_and_pushed(self):
+        # A failed OCR still records the screenshot (assignments=[]) and
+        # notifies the OCR History reviewers.
+        ctx = self._ctx()
+        with patch.object(qa, "ocr_extract_refs", new=AsyncMock(return_value=([], "none"))):
+            _run(qa._qa_process_job(ctx))
+        qa.ocr_audit.record_upload.assert_called_once()
+        self.assertEqual(qa.ocr_audit.record_upload.call_args.kwargs["assignments"], [])
+        qa.ocr_audit.notify_viewers.assert_awaited_once()
+
     def test_summary_on_success(self):
         ctx = self._ctx()
         with patch.object(qa, "ocr_extract_refs", new=AsyncMock(return_value=(["CNTYINV/ABC1234567"], "glm-ocr"))), \

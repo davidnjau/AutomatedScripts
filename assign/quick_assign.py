@@ -316,9 +316,22 @@ async def _qa_process_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Quick Assign OCR (%s): %d ref(s)", source, len(refs))
     except Exception as e:
         logger.error("Quick Assign OCR failed: %s", e)
-        refs = []
+        refs, source = [], "none"
 
     if not refs:
+        # OCR extracted nothing (e.g. the GPU wasn't funded that day). Still
+        # record the screenshot — flagged ocr_failed — and alert the OCR History
+        # reviewers in red so someone can assign it by hand and mark it resolved.
+        try:
+            _qa_rec = await asyncio.to_thread(
+                ocr_audit.record_upload, data["photo_bytes"],
+                channel="quick_assign", uploaded_by=data["user_id"], ocr_source=source,
+                valuer_name=valuer["name"], valuer_uid=valuer["uid"], assignments=[],
+            )
+            if _qa_rec:
+                await ocr_audit.notify_viewers(ctx.bot, _qa_rec, exclude_user_id=data["user_id"])
+        except Exception as e:
+            logger.warning("OCR audit record/notify failed (quick assign, OCR fail): %s", e)
         await ctx.bot.send_message(
             chat_id,
             "⚠️ *Quick Assign* — couldn't read any reference number from the photo. "

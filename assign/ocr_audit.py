@@ -57,6 +57,7 @@ from common import (
     _atomic_json_write,
     _CANCEL_FILTER,
     _main_menu_for,
+    _parse_list_input,
     allowed,
     button_allowed,
     cmd_cancel,
@@ -101,12 +102,14 @@ def record_upload(photo_bytes: bytes, *, channel: str, uploaded_by: int,
                   assignments: List[Dict]) -> Optional[Dict]:
     """Store one uploaded screenshot: store the image via blob_store and append a
     metadata record. `assignments` is [{ref, mode}] (mode: assigned/queued/
-    failed/pending). Blocking (blob write + metadata write) — call via
-    asyncio.to_thread. Returns the stored record (or None if there's nothing
-    to record). Never raises on a storage hiccup; the metadata still saves."""
+    failed/pending). An **empty** `assignments` means OCR extracted nothing
+    (e.g. the GPU wasn't funded that day) — that's still recorded, flagged
+    `ocr_failed=True`, so OCR History can surface it in red for manual handling.
+    Blocking (blob write + metadata write) — call via asyncio.to_thread. Returns
+    the stored record. Never raises on a storage hiccup; the metadata still
+    saves."""
     refs = [a["ref"] for a in assignments]
-    if not refs:
-        return None   # nothing extracted → nothing worth auditing
+    ocr_failed = len(assignments) == 0
     rec_id = uuid.uuid4().hex[:12]
     key = f"screenshots/{rec_id}.jpg"
     stored = blob_store.put_screenshot(key, photo_bytes)
@@ -121,6 +124,8 @@ def record_upload(photo_bytes: bytes, *, channel: str, uploaded_by: int,
         "blob_key": key if stored else None,
         "image_stored": bool(stored),
         "image_purged": False,
+        "ocr_failed": ocr_failed,        # True = OCR extracted no reference
+        "resolution": None,              # set when manually resolved (see mark_resolved)
         "valuer_name": valuer_name,
         "valuer_uid": valuer_uid,
         "refs": refs,
@@ -132,6 +137,30 @@ def record_upload(photo_bytes: bytes, *, channel: str, uploaded_by: int,
     return record
 
 
+def mark_resolved(rec_id: str, resolved_by: int, manual_refs: List[str]) -> Optional[Dict]:
+    """Flag a failed-OCR record as manually handled: record who resolved it,
+    when, and the ref(s) they assigned by hand (via DLV Batch / New Assignment).
+    The manual refs also become the record's `refs` so the lifecycle cleanup can
+    later purge the image once they complete. Returns the updated record, or
+    None if the id isn't found."""
+    records = load_ocr_audit()
+    names = load_user_names()
+    for rec in records:
+        if rec.get("id") == rec_id:
+            rec["resolution"] = {
+                "resolved_by": resolved_by,
+                "resolved_by_name": names.get(str(resolved_by), str(resolved_by)),
+                "resolved_at": datetime.now().isoformat(timespec="seconds"),
+                "refs": manual_refs,
+                "note": "OCR failed, manually updated",
+            }
+            if manual_refs:
+                rec["refs"] = manual_refs
+            save_ocr_audit(records)
+            return rec
+    return None
+
+
 async def notify_viewers(bot, record: Dict, exclude_user_id: Optional[int] = None) -> None:
     """Push a just-uploaded screenshot to every user who may see OCR History
     (admins + anyone granted the button), excluding the uploader. Sends the
@@ -141,7 +170,9 @@ async def notify_viewers(bot, record: Dict, exclude_user_id: Optional[int] = Non
     record_upload so the selected reviewers are alerted in real time."""
     # Plain text (no parse_mode) — _oh_caption carries raw ref numbers whose
     # underscores/slashes would break Markdown parsing, same as the viewer.
-    caption = "🖼 New OCR screenshot uploaded\n\n" + _oh_caption(record)
+    header = ("🔴 OCR FAILED — needs manual assignment\n\n" if record.get("ocr_failed")
+              else "🖼 New OCR screenshot uploaded\n\n")
+    caption = header + _oh_caption(record)
     img = (blob_store.get_screenshot(record["blob_key"])
            if record.get("blob_key") and not record.get("image_purged") else None)
     for uid in ALLOWED_IDS:
@@ -223,7 +254,8 @@ async def _ocr_audit_cleanup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # Viewer — 🖼 OCR History
 # ──────────────────────────────────────────────────────────
 class OH(Enum):
-    LIST = auto()   # browsing the history list (paginate / view a photo)
+    LIST        = auto()   # browsing the history list (paginate / view a photo)
+    RESOLVE_REF = auto()   # entering the ref(s) a failed-OCR screenshot was manually assigned to
 
 
 def _oh_can_view(user_id: int) -> bool:
@@ -233,11 +265,22 @@ def _oh_can_view(user_id: int) -> bool:
     return is_admin(user_id) or button_allowed(user_id, BTN_CAT_ANALYTICS, BTN_OCR_HISTORY)
 
 
+def _oh_status(rec: Dict) -> str:
+    """Short OCR-status marker for a record. 🔴 = OCR failed (no reference
+    extracted, e.g. GPU unfunded) and still unresolved; 🟡 = OCR failed but
+    manually updated; 🟢 = OCR succeeded. (Telegram can't render literal red
+    text, so the colour is conveyed by the emoji.)"""
+    if rec.get("ocr_failed"):
+        return "🟡 OCR FAILED → manually updated" if rec.get("resolution") else "🔴 OCR FAILED"
+    return "🟢 OCR ok"
+
+
 def _oh_row_summary(idx: int, rec: Dict) -> str:
-    """One-line summary of a history record for the list view."""
+    """One-line summary of a history record for the list view, led by its
+    OCR status marker."""
     refs = ", ".join(rec.get("refs", [])) or "—"
     img = "" if rec.get("image_stored") and not rec.get("image_purged") else " 🚫img"
-    return (f"{idx}. {rec.get('at', '?')} · {rec.get('uploaded_by_name', '?')} · "
+    return (f"{idx}. {_oh_status(rec)} · {rec.get('at', '?')} · {rec.get('uploaded_by_name', '?')} · "
             f"{refs} → {rec.get('valuer_name', '?')}{img}")
 
 
@@ -255,7 +298,12 @@ def _oh_render_page(records: List[Dict], page: int):
     rows = []
     for i, rec in enumerate(chunk, start=start + 1):
         lines.append(_oh_row_summary(i, rec))
-        rows.append([InlineKeyboardButton(f"🖼 View #{i}", callback_data=f"ocrh:view:{rec['id']}")])
+        row_btns = [InlineKeyboardButton(f"🖼 View #{i}", callback_data=f"ocrh:view:{rec['id']}")]
+        # A failed-OCR screenshot that hasn't been handled yet gets a Resolve
+        # button so the reviewer can log the ref(s) they assigned by hand.
+        if rec.get("ocr_failed") and not rec.get("resolution"):
+            row_btns.append(InlineKeyboardButton(f"✅ Resolve #{i}", callback_data=f"ocrh:resolve:{rec['id']}"))
+        rows.append(row_btns)
 
     nav = []
     if page > 0:
@@ -269,17 +317,28 @@ def _oh_render_page(records: List[Dict], page: int):
 
 
 def _oh_caption(rec: Dict) -> str:
-    """Full caption shown with a viewed screenshot: date, uploader, source,
-    valuer, and each ref's assignment mode."""
+    """Full caption shown with a viewed screenshot: OCR status, date, uploader,
+    source, valuer, each ref's assignment mode, and any manual-resolution note."""
     lines = [
+        _oh_status(rec),
         f"🖼 {rec.get('at', '?')}",
         f"Uploaded by: {rec.get('uploaded_by_name', '?')}",
         f"Source: {rec.get('ocr_source', '?')} ({rec.get('channel', '?')})",
         f"Valuer: {rec.get('valuer_name', '?')}",
-        "References:",
     ]
-    for a in rec.get("assignments", []):
-        lines.append(f"  • {a.get('ref')} — {a.get('mode')}")
+    if rec.get("ocr_failed") and not rec.get("resolution"):
+        lines.append("⚠️ No reference extracted — assign manually via 📥 DLV Batch "
+                     "or 📋 New Assignment, then tap ✅ Resolve.")
+    if rec.get("assignments"):
+        lines.append("References:")
+        for a in rec.get("assignments", []):
+            lines.append(f"  • {a.get('ref')} — {a.get('mode')}")
+    res = rec.get("resolution")
+    if res:
+        lines.append(f"🟡 Manually updated by {res.get('resolved_by_name', '?')} "
+                     f"at {res.get('resolved_at', '?')}")
+        if res.get("refs"):
+            lines.append("  refs: " + ", ".join(res["refs"]))
     return "\n".join(lines)
 
 
@@ -347,7 +406,51 @@ async def recv_oh_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"{note}\n\n{caption}", parse_mode="Markdown")
         return OH.LIST
 
+    if action == "resolve":
+        rec_id = parts[2]
+        rec = next((r for r in load_ocr_audit() if r.get("id") == rec_id), None)
+        if not rec:
+            await query.message.reply_text("⚠️ That record no longer exists.")
+            return OH.LIST
+        if rec.get("resolution"):
+            await query.message.reply_text("ℹ️ Already marked as manually updated.")
+            return OH.LIST
+        ctx.user_data["oh_resolve_id"] = rec_id
+        await query.message.reply_text(
+            "✍️ Enter the reference number(s) you assigned by hand for this "
+            "screenshot (comma / space / newline separated), or send `-` to just "
+            "mark it resolved.",
+            parse_mode="Markdown",
+        )
+        return OH.RESOLVE_REF
+
     return OH.LIST
+
+
+async def recv_oh_resolve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Record the manually-assigned ref(s) for a failed-OCR screenshot and flag
+    it 'OCR failed → manually updated'."""
+    if not _oh_can_view(update.effective_user.id):
+        return ConversationHandler.END
+    rec_id = ctx.user_data.pop("oh_resolve_id", None)
+    if not rec_id:
+        return ConversationHandler.END
+    text = update.message.text.strip()
+    manual_refs = [] if text == "-" else _parse_list_input(text)
+    rec = mark_resolved(rec_id, update.effective_user.id, manual_refs)
+    if not rec:
+        await update.message.reply_text(
+            "⚠️ That record no longer exists.",
+            reply_markup=_main_menu_for(update.effective_user.id),
+        )
+        return ConversationHandler.END
+    refs_txt = ", ".join(manual_refs) if manual_refs else "(none entered)"
+    await update.message.reply_text(
+        f"✅ Marked as *OCR failed → manually updated*.\nRefs: {refs_txt}",
+        parse_mode="Markdown",
+        reply_markup=_main_menu_for(update.effective_user.id),
+    )
+    return ConversationHandler.END
 
 
 # ──────────────────────────────────────────────────────────
@@ -363,7 +466,8 @@ def register(app: Application) -> None:
             MessageHandler(filters.Regex(f"^{re.escape(BTN_OCR_HISTORY)}$"), cmd_ocr_history),
         ],
         states={
-            OH.LIST: [CallbackQueryHandler(recv_oh_action, pattern=r"^ocrh:")],
+            OH.LIST:        [CallbackQueryHandler(recv_oh_action, pattern=r"^ocrh:")],
+            OH.RESOLVE_REF: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~_CANCEL_FILTER, recv_oh_resolve)],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
