@@ -55,7 +55,7 @@ class TestStore(_TmpStore):
 
 class TestRecordUpload(_TmpStore):
     def test_stores_image_and_metadata(self):
-        with patch.object(oa.minio_store, "put_screenshot", return_value=True), \
+        with patch.object(oa.blob_store, "put_screenshot", return_value=True), \
              patch.object(oa, "load_user_names", return_value={"7": "Jane"}):
             rec = oa.record_upload(
                 b"imgbytes", channel="quick_assign", uploaded_by=7, ocr_source="glm-ocr",
@@ -63,31 +63,31 @@ class TestRecordUpload(_TmpStore):
                 assignments=[{"ref": "R1", "mode": "assigned"}, {"ref": "R2", "mode": "queued"}],
             )
         self.assertTrue(rec["image_stored"])
-        self.assertTrue(rec["minio_key"].startswith("screenshots/"))
+        self.assertTrue(rec["blob_key"].startswith("screenshots/"))
         self.assertEqual(rec["refs"], ["R1", "R2"])
         self.assertEqual(rec["uploaded_by_name"], "Jane")
         self.assertEqual(len(oa.load_ocr_audit()), 1)
 
     def test_empty_assignments_records_nothing(self):
-        with patch.object(oa.minio_store, "put_screenshot", return_value=True):
+        with patch.object(oa.blob_store, "put_screenshot", return_value=True):
             rec = oa.record_upload(b"x", channel="new_assignment", uploaded_by=1,
                                    ocr_source="none", valuer_name="V", valuer_uid="u", assignments=[])
         self.assertIsNone(rec)
         self.assertEqual(oa.load_ocr_audit(), [])
 
-    def test_minio_failure_still_records_metadata(self):
-        with patch.object(oa.minio_store, "put_screenshot", return_value=False), \
+    def test_storage_failure_still_records_metadata(self):
+        with patch.object(oa.blob_store, "put_screenshot", return_value=False), \
              patch.object(oa, "load_user_names", return_value={}):
             rec = oa.record_upload(b"x", channel="quick_assign", uploaded_by=1, ocr_source="glm-ocr",
                                    valuer_name="V", valuer_uid="u", assignments=[{"ref": "R1", "mode": "assigned"}])
         self.assertFalse(rec["image_stored"])
-        self.assertIsNone(rec["minio_key"])
+        self.assertIsNone(rec["blob_key"])
         self.assertEqual(len(oa.load_ocr_audit()), 1)
 
 
 class TestEligibleForPurge(unittest.TestCase):
     def _rec(self, **over):
-        r = {"id": "a", "image_stored": True, "image_purged": False, "minio_key": "k",
+        r = {"id": "a", "image_stored": True, "image_purged": False, "blob_key": "k",
              "refs": ["R1", "R2"], "at": datetime.now().isoformat(timespec="seconds")}
         r.update(over)
         return r
@@ -119,11 +119,11 @@ class TestEligibleForPurge(unittest.TestCase):
 class TestCleanupJob(_TmpStore):
     def test_purges_blob_keeps_metadata(self):
         self._write([{
-            "id": "a", "image_stored": True, "image_purged": False, "minio_key": "k1",
+            "id": "a", "image_stored": True, "image_purged": False, "blob_key": "k1",
             "refs": ["R1"], "at": datetime.now().isoformat(timespec="seconds"),
         }])
         with patch.object(oa, "_ref_status_map", return_value={"R1": "completed"}), \
-             patch.object(oa.minio_store, "delete_screenshot", return_value=True) as mock_del:
+             patch.object(oa.blob_store, "delete_screenshot", return_value=True) as mock_del:
             _run(oa._ocr_audit_cleanup_job(MagicMock()))
         mock_del.assert_called_once_with("k1")
         rec = oa.load_ocr_audit()[0]
@@ -133,11 +133,11 @@ class TestCleanupJob(_TmpStore):
 
     def test_keeps_blob_when_not_done(self):
         self._write([{
-            "id": "a", "image_stored": True, "image_purged": False, "minio_key": "k1",
+            "id": "a", "image_stored": True, "image_purged": False, "blob_key": "k1",
             "refs": ["R1"], "at": datetime.now().isoformat(timespec="seconds"),
         }])
         with patch.object(oa, "_ref_status_map", return_value={"R1": "queued"}), \
-             patch.object(oa.minio_store, "delete_screenshot") as mock_del:
+             patch.object(oa.blob_store, "delete_screenshot") as mock_del:
             _run(oa._ocr_audit_cleanup_job(MagicMock()))
         mock_del.assert_not_called()
         self.assertFalse(oa.load_ocr_audit()[0]["image_purged"])
@@ -232,18 +232,18 @@ class TestRecvOhAction(_TmpStore):
         self.assertEqual(result, oa.ConversationHandler.END)
 
     def test_view_sends_photo_when_stored(self):
-        self._write([{"id": "a", "minio_key": "k", "image_stored": True, "image_purged": False,
+        self._write([{"id": "a", "blob_key": "k", "image_stored": True, "image_purged": False,
                       "at": "t", "uploaded_by_name": "U", "ocr_source": "glm-ocr", "channel": "quick_assign",
                       "valuer_name": "V", "refs": ["R1"], "assignments": [{"ref": "R1", "mode": "assigned"}]}])
         update = self._query("ocrh:view:a")
         with patch.object(oa, "_oh_can_view", return_value=True), \
-             patch.object(oa.minio_store, "get_screenshot", return_value=b"imgdata"):
+             patch.object(oa.blob_store, "get_screenshot", return_value=b"imgdata"):
             result = _run(oa.recv_oh_action(update, MagicMock()))
         self.assertEqual(result, oa.OH.LIST)
         update.callback_query.message.reply_photo.assert_awaited_once()
 
     def test_view_purged_sends_text(self):
-        self._write([{"id": "a", "minio_key": "k", "image_stored": True, "image_purged": True,
+        self._write([{"id": "a", "blob_key": "k", "image_stored": True, "image_purged": True,
                       "at": "t", "uploaded_by_name": "U", "ocr_source": "glm-ocr", "channel": "quick_assign",
                       "valuer_name": "V", "refs": ["R1"], "assignments": [{"ref": "R1", "mode": "assigned"}]}])
         update = self._query("ocrh:view:a")

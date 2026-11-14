@@ -329,7 +329,7 @@ async def _qa_process_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     result = await asyncio.to_thread(_qa_assign_or_queue, refs, valuer, workflow, data["user_id"])
 
-    # Audit the uploaded screenshot (image → MinIO, metadata → saved_ocr_audit)
+    # Audit the uploaded screenshot (image → blob_store, metadata → saved_ocr_audit)
     # — best-effort, never blocks or breaks the assignment report below.
     _qa_mode_map = [("assigned", "assigned"), ("queued", "queued"),
                     ("failed", "failed"), ("no_token", "pending")]
