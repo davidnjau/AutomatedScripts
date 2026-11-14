@@ -68,12 +68,24 @@ class TestRecordUpload(_TmpStore):
         self.assertEqual(rec["uploaded_by_name"], "Jane")
         self.assertEqual(len(oa.load_ocr_audit()), 1)
 
-    def test_empty_assignments_records_nothing(self):
-        with patch.object(oa.blob_store, "put_screenshot", return_value=True):
-            rec = oa.record_upload(b"x", channel="new_assignment", uploaded_by=1,
+    def test_empty_assignments_records_an_ocr_failure(self):
+        # OCR extracted nothing (GPU unfunded) — still recorded, flagged failed.
+        with patch.object(oa.blob_store, "put_screenshot", return_value=True), \
+             patch.object(oa, "load_user_names", return_value={}):
+            rec = oa.record_upload(b"x", channel="quick_assign", uploaded_by=1,
                                    ocr_source="none", valuer_name="V", valuer_uid="u", assignments=[])
-        self.assertIsNone(rec)
-        self.assertEqual(oa.load_ocr_audit(), [])
+        self.assertIsNotNone(rec)
+        self.assertTrue(rec["ocr_failed"])
+        self.assertIsNone(rec["resolution"])
+        self.assertEqual(rec["refs"], [])
+        self.assertEqual(len(oa.load_ocr_audit()), 1)
+
+    def test_nonempty_assignments_not_flagged_failed(self):
+        with patch.object(oa.blob_store, "put_screenshot", return_value=True), \
+             patch.object(oa, "load_user_names", return_value={}):
+            rec = oa.record_upload(b"x", channel="quick_assign", uploaded_by=1, ocr_source="glm-ocr",
+                                   valuer_name="V", valuer_uid="u", assignments=[{"ref": "R1", "mode": "assigned"}])
+        self.assertFalse(rec["ocr_failed"])
 
     def test_storage_failure_still_records_metadata(self):
         with patch.object(oa.blob_store, "put_screenshot", return_value=False), \
@@ -83,6 +95,45 @@ class TestRecordUpload(_TmpStore):
         self.assertFalse(rec["image_stored"])
         self.assertIsNone(rec["blob_key"])
         self.assertEqual(len(oa.load_ocr_audit()), 1)
+
+
+class TestMarkResolved(_TmpStore):
+    def _seed_failed(self):
+        self._write([{"id": "a", "ocr_failed": True, "resolution": None, "refs": [],
+                      "image_stored": True, "image_purged": False, "blob_key": "k",
+                      "assignments": [], "valuer_name": "V", "at": "t"}])
+
+    def test_marks_failed_record_resolved_with_refs(self):
+        self._seed_failed()
+        with patch.object(oa, "load_user_names", return_value={"9": "Checker"}):
+            rec = oa.mark_resolved("a", 9, ["CNTYINV/ABC1234567"])
+        self.assertEqual(rec["resolution"]["resolved_by"], 9)
+        self.assertEqual(rec["resolution"]["resolved_by_name"], "Checker")
+        self.assertEqual(rec["resolution"]["note"], "OCR failed, manually updated")
+        self.assertEqual(rec["refs"], ["CNTYINV/ABC1234567"])   # manual refs adopted for cleanup
+        self.assertTrue(oa.load_ocr_audit()[0]["resolution"])
+
+    def test_resolve_without_refs_keeps_empty(self):
+        self._seed_failed()
+        with patch.object(oa, "load_user_names", return_value={}):
+            rec = oa.mark_resolved("a", 9, [])
+        self.assertEqual(rec["refs"], [])
+        self.assertEqual(rec["resolution"]["refs"], [])
+
+    def test_unknown_id_returns_none(self):
+        self._seed_failed()
+        self.assertIsNone(oa.mark_resolved("nope", 9, []))
+
+
+class TestOhStatus(unittest.TestCase):
+    def test_ok(self):
+        self.assertIn("🟢", oa._oh_status({"ocr_failed": False}))
+
+    def test_failed_unresolved_is_red(self):
+        self.assertIn("🔴", oa._oh_status({"ocr_failed": True, "resolution": None}))
+
+    def test_failed_resolved_is_yellow(self):
+        self.assertIn("🟡", oa._oh_status({"ocr_failed": True, "resolution": {"resolved_by": 1}}))
 
 
 class TestNotifyViewers(unittest.TestCase):
@@ -125,6 +176,15 @@ class TestNotifyViewers(unittest.TestCase):
             _run(oa.notify_viewers(bot, self._rec(image_purged=True)))
         bot.send_message.assert_awaited_once()
         bot.send_photo.assert_not_awaited()
+
+    def test_failed_record_uses_red_header(self):
+        bot = self._bot()
+        with patch.object(oa, "ALLOWED_IDS", [2]), \
+             patch.object(oa, "_oh_can_view", return_value=True), \
+             patch.object(oa.blob_store, "get_screenshot", return_value=b"img"):
+            _run(oa.notify_viewers(bot, self._rec(ocr_failed=True, refs=[], assignments=[])))
+        caption = bot.send_photo.call_args.kwargs["caption"]
+        self.assertIn("🔴 OCR FAILED", caption)
 
     def test_per_recipient_failure_is_swallowed(self):
         bot = self._bot()
@@ -228,6 +288,22 @@ class TestRenderPage(unittest.TestCase):
         self.assertIn("ocrh:page:1", datas)
         self.assertNotIn("ocrh:page:-1", datas)
 
+    def test_failed_record_gets_resolve_button(self):
+        recs = [{"id": "f1", "at": "t", "uploaded_by_name": "U", "refs": [], "valuer_name": "V",
+                 "image_stored": True, "image_purged": False, "ocr_failed": True, "resolution": None}]
+        text, kb = oa._oh_render_page(recs, 0)
+        datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+        self.assertIn("ocrh:resolve:f1", datas)
+        self.assertIn("🔴", text)
+
+    def test_resolved_record_has_no_resolve_button(self):
+        recs = [{"id": "f1", "at": "t", "uploaded_by_name": "U", "refs": ["R1"], "valuer_name": "V",
+                 "image_stored": True, "image_purged": False, "ocr_failed": True,
+                 "resolution": {"resolved_by": 1}}]
+        text, kb = oa._oh_render_page(recs, 0)
+        datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+        self.assertFalse(any(d.startswith("ocrh:resolve:") for d in datas))
+
 
 class TestCmdOcrHistory(_TmpStore):
     def _update(self, user_id=1):
@@ -302,6 +378,60 @@ class TestRecvOhAction(_TmpStore):
             _run(oa.recv_oh_action(update, MagicMock()))
         update.callback_query.message.reply_text.assert_awaited_once()
         self.assertIn("purged", update.callback_query.message.reply_text.call_args[0][0].lower())
+
+    def test_resolve_action_prompts_for_refs(self):
+        self._write([{"id": "f1", "ocr_failed": True, "resolution": None, "refs": [],
+                      "at": "t", "uploaded_by_name": "U", "valuer_name": "V", "assignments": []}])
+        update = self._query("ocrh:resolve:f1")
+        ctx = MagicMock(); ctx.user_data = {}
+        with patch.object(oa, "_oh_can_view", return_value=True):
+            result = _run(oa.recv_oh_action(update, ctx))
+        self.assertEqual(result, oa.OH.RESOLVE_REF)
+        self.assertEqual(ctx.user_data["oh_resolve_id"], "f1")
+
+    def test_resolve_already_resolved_is_noop(self):
+        self._write([{"id": "f1", "ocr_failed": True, "resolution": {"resolved_by": 1}, "refs": [],
+                      "at": "t", "uploaded_by_name": "U", "valuer_name": "V", "assignments": []}])
+        update = self._query("ocrh:resolve:f1")
+        ctx = MagicMock(); ctx.user_data = {}
+        with patch.object(oa, "_oh_can_view", return_value=True):
+            result = _run(oa.recv_oh_action(update, ctx))
+        self.assertEqual(result, oa.OH.LIST)
+        self.assertNotIn("oh_resolve_id", ctx.user_data)
+
+
+class TestRecvOhResolve(_TmpStore):
+    def _msg(self, text, user_id=9):
+        update = MagicMock()
+        update.effective_user.id = user_id
+        update.message.text = text
+        update.message.reply_text = AsyncMock()
+        return update
+
+    def test_resolve_records_refs_and_ends(self):
+        self._write([{"id": "f1", "ocr_failed": True, "resolution": None, "refs": [],
+                      "at": "t", "uploaded_by_name": "U", "valuer_name": "V", "assignments": []}])
+        update = self._msg("CNTYINV/ABC1234567")
+        ctx = MagicMock(); ctx.user_data = {"oh_resolve_id": "f1"}
+        with patch.object(oa, "_oh_can_view", return_value=True), \
+             patch.object(oa, "load_user_names", return_value={"9": "Checker"}):
+            result = _run(oa.recv_oh_resolve(update, ctx))
+        self.assertEqual(result, oa.ConversationHandler.END)
+        rec = oa.load_ocr_audit()[0]
+        self.assertTrue(rec["resolution"])
+        self.assertEqual(rec["refs"], ["CNTYINV/ABC1234567"])
+
+    def test_dash_skips_refs(self):
+        self._write([{"id": "f1", "ocr_failed": True, "resolution": None, "refs": [],
+                      "at": "t", "uploaded_by_name": "U", "valuer_name": "V", "assignments": []}])
+        update = self._msg("-")
+        ctx = MagicMock(); ctx.user_data = {"oh_resolve_id": "f1"}
+        with patch.object(oa, "_oh_can_view", return_value=True), \
+             patch.object(oa, "load_user_names", return_value={}):
+            _run(oa.recv_oh_resolve(update, ctx))
+        rec = oa.load_ocr_audit()[0]
+        self.assertTrue(rec["resolution"])
+        self.assertEqual(rec["refs"], [])
 
 
 if __name__ == "__main__":
