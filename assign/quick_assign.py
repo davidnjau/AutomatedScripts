@@ -336,13 +336,17 @@ async def _qa_process_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     _qa_assignments = [{"ref": r, "mode": mode}
                        for key, mode in _qa_mode_map for r in result.get(key, [])]
     try:
-        await asyncio.to_thread(
+        _qa_rec = await asyncio.to_thread(
             ocr_audit.record_upload, data["photo_bytes"],
             channel="quick_assign", uploaded_by=data["user_id"], ocr_source=source,
             valuer_name=valuer["name"], valuer_uid=valuer["uid"], assignments=_qa_assignments,
         )
+        # Push the screenshot to everyone granted 🖼 OCR History (except the
+        # uploader) so the selected reviewers are alerted in real time.
+        if _qa_rec:
+            await ocr_audit.notify_viewers(ctx.bot, _qa_rec, exclude_user_id=data["user_id"])
     except Exception as e:
-        logger.warning("OCR audit record failed (quick assign): %s", e)
+        logger.warning("OCR audit record/notify failed (quick assign): %s", e)
 
     if result.get("no_token"):
         await ctx.bot.send_message(

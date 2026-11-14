@@ -85,6 +85,57 @@ class TestRecordUpload(_TmpStore):
         self.assertEqual(len(oa.load_ocr_audit()), 1)
 
 
+class TestNotifyViewers(unittest.TestCase):
+    def _bot(self):
+        bot = MagicMock()
+        bot.send_photo = AsyncMock()
+        bot.send_message = AsyncMock()
+        return bot
+
+    def _rec(self, **over):
+        r = {"id": "a", "blob_key": "screenshots/a.jpg", "image_purged": False,
+             "at": "t", "uploaded_by_name": "U", "ocr_source": "glm-ocr", "channel": "quick_assign",
+             "valuer_name": "V", "refs": ["R1"], "assignments": [{"ref": "R1", "mode": "assigned"}]}
+        r.update(over)
+        return r
+
+    def test_sends_image_to_viewers_excluding_uploader(self):
+        bot = self._bot()
+        with patch.object(oa, "ALLOWED_IDS", [1, 2, 3]), \
+             patch.object(oa, "_oh_can_view", side_effect=lambda uid: uid in (2, 3)), \
+             patch.object(oa.blob_store, "get_screenshot", return_value=b"img"):
+            _run(oa.notify_viewers(bot, self._rec(), exclude_user_id=3))
+        # Only uid 2 (viewer, not the uploader uid 3) gets it.
+        sent_to = [c.args[0] for c in bot.send_photo.call_args_list]
+        self.assertEqual(sent_to, [2])
+
+    def test_skips_non_viewers(self):
+        bot = self._bot()
+        with patch.object(oa, "ALLOWED_IDS", [1, 2]), \
+             patch.object(oa, "_oh_can_view", return_value=False), \
+             patch.object(oa.blob_store, "get_screenshot", return_value=b"img"):
+            _run(oa.notify_viewers(bot, self._rec()))
+        bot.send_photo.assert_not_awaited()
+        bot.send_message.assert_not_awaited()
+
+    def test_text_fallback_when_image_absent(self):
+        bot = self._bot()
+        with patch.object(oa, "ALLOWED_IDS", [2]), \
+             patch.object(oa, "_oh_can_view", return_value=True):
+            _run(oa.notify_viewers(bot, self._rec(image_purged=True)))
+        bot.send_message.assert_awaited_once()
+        bot.send_photo.assert_not_awaited()
+
+    def test_per_recipient_failure_is_swallowed(self):
+        bot = self._bot()
+        bot.send_photo.side_effect = RuntimeError("blocked")
+        with patch.object(oa, "ALLOWED_IDS", [2, 4]), \
+             patch.object(oa, "_oh_can_view", return_value=True), \
+             patch.object(oa.blob_store, "get_screenshot", return_value=b"img"):
+            _run(oa.notify_viewers(bot, self._rec()))   # must not raise
+        self.assertEqual(bot.send_photo.await_count, 2)   # tried both despite the first failing
+
+
 class TestEligibleForPurge(unittest.TestCase):
     def _rec(self, **over):
         r = {"id": "a", "image_stored": True, "image_purged": False, "blob_key": "k",
