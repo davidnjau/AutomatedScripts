@@ -50,6 +50,7 @@ from telegram.ext import (
 
 import blob_store
 from common import (
+    ALLOWED_IDS,
     BTN_CAT_ANALYTICS,
     BTN_OCR_HISTORY,
     DATA_DIR,
@@ -129,6 +130,31 @@ def record_upload(photo_bytes: bytes, *, channel: str, uploaded_by: int,
     records.append(record)
     save_ocr_audit(records)
     return record
+
+
+async def notify_viewers(bot, record: Dict, exclude_user_id: Optional[int] = None) -> None:
+    """Push a just-uploaded screenshot to every user who may see OCR History
+    (admins + anyone granted the button), excluding the uploader. Sends the
+    image with the standard caption, or a text-only note if the image isn't
+    stored. Per-recipient failures (user never started the bot, blocked it,
+    etc.) are logged and skipped. Called from the Quick Assign job after
+    record_upload so the selected reviewers are alerted in real time."""
+    # Plain text (no parse_mode) — _oh_caption carries raw ref numbers whose
+    # underscores/slashes would break Markdown parsing, same as the viewer.
+    caption = "🖼 New OCR screenshot uploaded\n\n" + _oh_caption(record)
+    img = (blob_store.get_screenshot(record["blob_key"])
+           if record.get("blob_key") and not record.get("image_purged") else None)
+    for uid in ALLOWED_IDS:
+        if uid == exclude_user_id or not _oh_can_view(uid):
+            continue
+        try:
+            if img:
+                import io
+                await bot.send_photo(uid, photo=io.BytesIO(img), caption=caption)
+            else:
+                await bot.send_message(uid, caption)
+        except Exception as e:
+            logger.warning("OCR History upload-notify failed for %s: %s", uid, e)
 
 
 # ──────────────────────────────────────────────────────────

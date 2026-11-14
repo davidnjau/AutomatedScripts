@@ -193,11 +193,14 @@ class TestRecvPhoto(unittest.TestCase):
 
 class TestProcessJob(unittest.TestCase):
     def setUp(self):
-        # The job audits the uploaded screenshot — stub it so tests don't
-        # touch MinIO or the real saved_ocr_audit.json.
+        # The job audits the uploaded screenshot and notifies OCR History
+        # viewers — stub both so tests don't touch the real store or send.
         self._p = patch.object(qa.ocr_audit, "record_upload")
         self._p.start()
         self.addCleanup(self._p.stop)
+        self._pn = patch.object(qa.ocr_audit, "notify_viewers", new=AsyncMock())
+        self._pn.start()
+        self.addCleanup(self._pn.stop)
 
     def _ctx(self, workflow="stamp_duty"):
         ctx = MagicMock()
