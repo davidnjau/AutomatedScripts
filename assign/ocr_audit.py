@@ -8,13 +8,13 @@ reference number(s) extracted from it, which valuer was assigned (or queued),
 and when / by whom.
 
 Design:
-- The **image** goes to MinIO (minio_store.py) under screenshots/<id>.jpg.
+- The **image** goes to local blob storage (blob_store.py) under screenshots/<id>.jpg.
 - The **metadata** goes to saved_ocr_audit.json (one record per uploaded
-  photo): id, timestamp, uploader, channel, ocr_source, the MinIO key, the
-  valuer, and per-ref assignment outcomes. MinIO holds blobs; the JSON holds
+  photo): id, timestamp, uploader, channel, ocr_source, the blob key, the
+  valuer, and per-ref assignment outcomes. blob_store holds the image bytes; the JSON holds
   the metadata + the key linking them (mirrors the codebase's JSON-store
   convention).
-- **Lifecycle:** a repeating cleanup job deletes a screenshot's MinIO blob
+- **Lifecycle:** a repeating cleanup job deletes a screenshot's stored image
   once every ref on it reaches a completed/returned status in the consolidated
   DLV store (dlv_core) — or after a hard max-age — and marks the record
   image_purged. The metadata row (who/what/when) is always kept; only the
@@ -48,7 +48,7 @@ from telegram.ext import (
     filters,
 )
 
-import minio_store
+import blob_store
 from common import (
     BTN_CAT_ANALYTICS,
     BTN_OCR_HISTORY,
@@ -98,17 +98,17 @@ def save_ocr_audit(records: List[Dict]) -> None:
 def record_upload(photo_bytes: bytes, *, channel: str, uploaded_by: int,
                   ocr_source: str, valuer_name: str, valuer_uid: str,
                   assignments: List[Dict]) -> Optional[Dict]:
-    """Store one uploaded screenshot: upload the image to MinIO and append a
+    """Store one uploaded screenshot: store the image via blob_store and append a
     metadata record. `assignments` is [{ref, mode}] (mode: assigned/queued/
-    failed/pending). Blocking (MinIO put + file write) — call via
+    failed/pending). Blocking (blob write + metadata write) — call via
     asyncio.to_thread. Returns the stored record (or None if there's nothing
-    to record). Never raises on a MinIO hiccup; the metadata still saves."""
+    to record). Never raises on a storage hiccup; the metadata still saves."""
     refs = [a["ref"] for a in assignments]
     if not refs:
         return None   # nothing extracted → nothing worth auditing
     rec_id = uuid.uuid4().hex[:12]
     key = f"screenshots/{rec_id}.jpg"
-    stored = minio_store.put_screenshot(key, photo_bytes)
+    stored = blob_store.put_screenshot(key, photo_bytes)
     names = load_user_names()
     record = {
         "id": rec_id,
@@ -117,7 +117,7 @@ def record_upload(photo_bytes: bytes, *, channel: str, uploaded_by: int,
         "uploaded_by_name": names.get(str(uploaded_by), str(uploaded_by)),
         "channel": channel,
         "ocr_source": ocr_source,
-        "minio_key": key if stored else None,
+        "blob_key": key if stored else None,
         "image_stored": bool(stored),
         "image_purged": False,
         "valuer_name": valuer_name,
@@ -159,7 +159,7 @@ def _eligible_for_purge(record: Dict, status_map: Dict[str, str], now: datetime)
     """Decide whether a record's stored image should be purged, returning a
     reason string ("completed" / "max-age") or None to keep it. All refs
     done → purge; else purge only once past the max age."""
-    if not record.get("image_stored") or record.get("image_purged") or not record.get("minio_key"):
+    if not record.get("image_stored") or record.get("image_purged") or not record.get("blob_key"):
         return None
     refs = record.get("refs", [])
     all_done = bool(refs) and all(status_map.get(r) in _DONE_STATUSES for r in refs)
@@ -171,7 +171,7 @@ def _eligible_for_purge(record: Dict, status_map: Dict[str, str], now: datetime)
 
 
 async def _ocr_audit_cleanup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Hourly sweep: purge the MinIO blob of any record whose refs are all
+    """Hourly sweep: purge the stored image of any record whose refs are all
     completed/returned (or that's past the max age), keeping the metadata."""
     records = load_ocr_audit()
     if not records:
@@ -183,7 +183,7 @@ async def _ocr_audit_cleanup_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         reason = _eligible_for_purge(rec, status_map, now)
         if not reason:
             continue
-        if minio_store.delete_screenshot(rec["minio_key"]):
+        if blob_store.delete_screenshot(rec["blob_key"]):
             rec["image_purged"] = True
             rec["purged_at"] = now.isoformat(timespec="seconds")
             rec["purge_reason"] = reason
@@ -311,13 +311,13 @@ async def recv_oh_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("⚠️ That record no longer exists.")
             return OH.LIST
         caption = _oh_caption(rec)
-        img = minio_store.get_screenshot(rec["minio_key"]) if rec.get("minio_key") and not rec.get("image_purged") else None
+        img = blob_store.get_screenshot(rec["blob_key"]) if rec.get("blob_key") and not rec.get("image_purged") else None
         if img:
             import io
             await query.message.reply_photo(photo=io.BytesIO(img), caption=caption)
         else:
             note = ("📭 _Screenshot purged (refs completed)._" if rec.get("image_purged")
-                    else "📭 _Screenshot not stored (MinIO was unavailable)._")
+                    else "📭 _Screenshot not stored (storage was unavailable)._")
             await query.message.reply_text(f"{note}\n\n{caption}", parse_mode="Markdown")
         return OH.LIST
 
@@ -329,7 +329,7 @@ async def recv_oh_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────
 
 def register(app: Application) -> None:
-    """Wire the OCR History viewer conversation and the hourly MinIO-cleanup
+    """Wire the OCR History viewer conversation and the hourly image-cleanup
     job into the given Application."""
     conv = ConversationHandler(
         entry_points=[

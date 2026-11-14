@@ -1093,7 +1093,7 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # is separate from "tag" — it's Stamp Duty vs Land Rent, not queue-vs-direct.
             persist_assignment(ref, name, uid, extra={"valuer_acct": acct, "tag": "Direct", "workflow": sess.workflow})
 
-    # Audit each uploaded screenshot (image → MinIO, metadata → saved_ocr_audit),
+    # Audit each uploaded screenshot (image → blob_store, metadata → saved_ocr_audit),
     # tagging each ref on the photo with its outcome. Best-effort — a counter/
     # store hiccup never affects the assignment just recorded above.
     for up in sess.uploads:

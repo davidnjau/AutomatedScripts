@@ -42,7 +42,7 @@ COPY bulk_export.py .
 COPY task_analytics.py .
 COPY access_control.py .
 COPY ocr_stats.py .
-COPY minio_store.py .
+COPY blob_store.py .
 COPY ocr_audit.py .
 COPY post_board.py .
 COPY quick_assign.py .

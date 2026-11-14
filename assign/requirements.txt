@@ -8,7 +8,6 @@ anthropic>=0.87.0
 apscheduler>=3.10.0
 openpyxl>=3.1.0
 matplotlib>=3.8.0
-minio>=7.2.0
 # Pinned below 2.0: numpy's 2.x manylinux wheels require an x86-64-v2 CPU
 # baseline (SSE4.2/POPCNT) at import time and crash immediately otherwise
 # ("NumPy was built with baseline optimizations... but your machine

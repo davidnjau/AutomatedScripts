@@ -5,8 +5,6 @@ services:
     restart: unless-stopped
     env_file: .env
     # No ports needed — bot uses long-polling, not webhooks
-    depends_on:
-      - minio
     volumes:
       - bot_data:/app/data
     dns:
@@ -18,28 +16,5 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # Object store for OCR screenshots (ocr_audit.py / minio_store.py). The bot
-  # reaches it at minio:9000 on the internal network; the console is on 9001.
-  # Credentials come from the same .env (MINIO_ROOT_USER / MINIO_ROOT_PASSWORD).
-  minio:
-    # Pulled from quay.io (MinIO's canonical registry) rather than Docker Hub —
-    # the Hub image pull was denied on games_server ("pull access denied for
-    # minio/minio") while quay serves it reliably without Hub rate limits.
-    image: quay.io/minio/minio
-    container_name: ardhisasa_minio
-    restart: unless-stopped
-    command: server /data --console-address ":9001"
-    env_file: .env
-    ports:
-      - "9001:9001"        # web console (API 9000 stays internal to the compose network)
-    volumes:
-      - minio_data:/data
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
 volumes:
   bot_data:
-  minio_data:
