@@ -111,6 +111,7 @@ from lookup_reference import (
 )
 from telegram_report import _send_chunked_report
 import ocr_stats
+import ocr_audit
 
 # Human-facing labels for Session.workflow's two values, shared by the
 # workflow-type picker and the /assignments history viewer.
@@ -155,6 +156,7 @@ class Session:
     workflow:         str = "stamp_duty"   # "stamp_duty" or "land_rent" — set by recv_workflow_type
     refs:             List[str] = field(default_factory=list)
     extracted_refs:   List[str] = field(default_factory=list)   # OCR-extracted refs awaiting confirmation
+    uploads:          List[Dict] = field(default_factory=list)  # [{photo_bytes, refs, source}] for OCR History audit
     already_assigned: List[Dict] = field(default_factory=list)  # [{ref, valuer_name, assigned_at}]
     valuer_name:      str = ""
     cred_type:        str = "publicuser"
@@ -490,6 +492,10 @@ async def recv_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]]) if sess.extracted_refs else None,
         )
         return S.RECV_PHOTOS
+
+    # Keep this photo's bytes + refs for the OCR History audit (recorded with
+    # the chosen valuer once the assignment is confirmed, in recv_confirm).
+    sess.uploads.append({"photo_bytes": bytes(photo_bytes), "refs": refs, "source": source})
 
     # Merge, avoiding duplicates
     new_refs = [r for r in refs if r not in sess.extracted_refs]
@@ -1086,6 +1092,23 @@ async def recv_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # Assignment always assigns immediately, never via a queue. "workflow"
             # is separate from "tag" — it's Stamp Duty vs Land Rent, not queue-vs-direct.
             persist_assignment(ref, name, uid, extra={"valuer_acct": acct, "tag": "Direct", "workflow": sess.workflow})
+
+    # Audit each uploaded screenshot (image → MinIO, metadata → saved_ocr_audit),
+    # tagging each ref on the photo with its outcome. Best-effort — a counter/
+    # store hiccup never affects the assignment just recorded above.
+    for up in sess.uploads:
+        up_assignments = [
+            {"ref": r, "mode": "assigned" if r in ok_refs else ("failed" if r in fail_refs else "pending")}
+            for r in up["refs"]
+        ]
+        try:
+            await asyncio.to_thread(
+                ocr_audit.record_upload, up["photo_bytes"],
+                channel="new_assignment", uploaded_by=update.effective_user.id, ocr_source=up["source"],
+                valuer_name=name, valuer_uid=uid, assignments=up_assignments,
+            )
+        except Exception as e:
+            logger.error("OCR audit record failed (new assignment): %s", e)
 
     header = (
         f"🏁 *Assignment Complete*\n\n"

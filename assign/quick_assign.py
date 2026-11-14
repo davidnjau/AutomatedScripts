@@ -69,6 +69,7 @@ from common import (
 from dlv_core import load_dlv_batch, load_records_where, save_dlv_batch
 from endpoints import LRD_FIX_PARCEL_NUMBER_URL, STAMP_DUTY_FIX_APPLICATION_URL
 from new_assignment import ocr_extract_refs
+import ocr_audit
 from task_block import format_labeled_block
 from telegram_report import _send_chunked_report
 
@@ -327,6 +328,21 @@ async def _qa_process_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     result = await asyncio.to_thread(_qa_assign_or_queue, refs, valuer, workflow, data["user_id"])
+
+    # Audit the uploaded screenshot (image → MinIO, metadata → saved_ocr_audit)
+    # — best-effort, never blocks or breaks the assignment report below.
+    _qa_mode_map = [("assigned", "assigned"), ("queued", "queued"),
+                    ("failed", "failed"), ("no_token", "pending")]
+    _qa_assignments = [{"ref": r, "mode": mode}
+                       for key, mode in _qa_mode_map for r in result.get(key, [])]
+    try:
+        await asyncio.to_thread(
+            ocr_audit.record_upload, data["photo_bytes"],
+            channel="quick_assign", uploaded_by=data["user_id"], ocr_source=source,
+            valuer_name=valuer["name"], valuer_uid=valuer["uid"], assignments=_qa_assignments,
+        )
+    except Exception as e:
+        logger.warning("OCR audit record failed (quick assign): %s", e)
 
     if result.get("no_token"):
         await ctx.bot.send_message(
