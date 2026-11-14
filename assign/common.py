@@ -478,10 +478,16 @@ def get_user_category_buttons(user_id: int, category: str) -> List[str]:
 
 
 def button_allowed(user_id: int, category: str, button: str) -> bool:
-    """True if user_id may see `button` within `category` — menu-hiding
-    symmetry with category_allowed (enforcement is display-level, same as
-    categories)."""
-    return button in get_user_category_buttons(user_id, category)
+    """True if user_id may see `button` within `category` — which requires
+    BOTH that they have the category at all (category_allowed) AND that the
+    button is in their visible set for it. The category check matters because
+    get_user_category_buttons returns every button when a user has no per-button
+    restriction for a category — including categories they were never granted —
+    so without this guard an ungranted category would wrongly read as "all its
+    buttons allowed". (recv_menu_category checks category_allowed separately
+    before filtering buttons, so this only bites standalone callers like
+    ocr_audit._oh_can_view.)"""
+    return category_allowed(user_id, category) and button in get_user_category_buttons(user_id, category)
 
 
 # ── Tokens ────────────────────────────────────────────────

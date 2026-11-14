@@ -348,9 +348,21 @@ class TestButtonAccess(unittest.TestCase):
 
     def test_button_allowed_reflects_the_allow_list(self):
         self._write({"7": {self.cat: [self.all_buttons[0]]}})
-        with patch.object(common, "ADMIN_IDS", {5}):
+        with patch.object(common, "ADMIN_IDS", {5}), \
+             patch.object(common, "load_category_access", return_value={"7": [self.cat]}):
             self.assertTrue(common.button_allowed(7, self.cat, self.all_buttons[0]))
             self.assertFalse(common.button_allowed(7, self.cat, self.all_buttons[1]))
+
+    def test_button_allowed_false_without_the_category(self):
+        # Regression: an unrestricted (no button-access entry) category the
+        # user wasn't granted must NOT read as "all its buttons allowed".
+        with patch.object(common, "ADMIN_IDS", {5}), \
+             patch.object(common, "load_category_access", return_value={"7": [common.BTN_CAT_LOOKUPS]}):
+            # 7 has Lookups, not Assignments → no Assignments button is allowed.
+            self.assertFalse(common.button_allowed(7, self.cat, self.all_buttons[0]))
+            # But a button in a category they DO have is allowed.
+            self.assertTrue(common.button_allowed(7, common.BTN_CAT_LOOKUPS,
+                                                  common._MENU_CATEGORIES[common.BTN_CAT_LOOKUPS]["buttons"][0]))
 
     def test_other_category_unaffected_by_a_restriction(self):
         self._write({"7": {self.cat: []}})
