@@ -733,6 +733,7 @@ BTN_VALUER_TASKS  = "👤 Valuer Tasks"
 BTN_HELP          = "❓ Help"
 BTN_RESTART       = "🔁 Restart Bot"
 BTN_OCR_STATS     = "🧮 OCR Usage"
+BTN_OCR_HISTORY   = "🖼 OCR History"
 BTN_CANCEL        = "🛑 Cancel"
 BTN_BRIEFING      = "🌅 Morning Briefing"
 BTN_SECTIONAL     = "🔲 Sectional"
@@ -799,7 +800,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"|{re.escape(BTN_HOLD_TASKS)}|{re.escape(BTN_INCREMENTAL)}|{re.escape(BTN_DLV_REPORT_SCHEDULE)}"
     f"|{re.escape(BTN_CUSTOM_EXCLUSIONS)}|{re.escape(BTN_TASK_ANALYTICS)}|{re.escape(BTN_CLEAR_CHAT)}"
     f"|{re.escape(BTN_QUEUE_INTERVAL)}|{re.escape(BTN_STALE_THRESHOLD)}|{re.escape(BTN_SMS_SENDER)}"
-    f"|{re.escape(BTN_OCR_STATS)}"
+    f"|{re.escape(BTN_OCR_STATS)}|{re.escape(BTN_OCR_HISTORY)}"
     f"|{re.escape(BTN_CAT_ASSIGNMENTS)}|{re.escape(BTN_CAT_BULK)}|{re.escape(BTN_CAT_AUTOMATION)}"
     f"|{re.escape(BTN_CAT_ANALYTICS)}|{re.escape(BTN_CAT_LOOKUPS)}|{re.escape(BTN_CAT_VALUERS)}"
     f"|{re.escape(BTN_CAT_COMM)}|{re.escape(BTN_CAT_SETTINGS)}|{re.escape(BTN_CAT_GENERAL)}"
@@ -864,7 +865,7 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
         "buttons": [
             BTN_TASK_ANALYTICS, BTN_VIEW_REFS, BTN_BULK_EXPORT, BTN_EXPORT_STATUS,
             BTN_ERROR_REPORT, BTN_BRIEFING, BTN_DLV_REPORT_SCHEDULE, BTN_JOB_DIST,
-            BTN_DLV_TASKS, BTN_DLV_REF_CHECK,
+            BTN_DLV_TASKS, BTN_DLV_REF_CHECK, BTN_OCR_HISTORY,
         ],
     },
     BTN_CAT_VALUERS: {
