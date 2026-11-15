@@ -247,21 +247,45 @@ class TestSearchAndLookupCategory(unittest.TestCase):
         )
 
 
-class TestAdminOnlyCategory(unittest.TestCase):
-    def test_system_is_admin_only(self):
-        self.assertIn(common.BTN_CAT_SETTINGS, common._ADMIN_ONLY_CATEGORIES)
+class TestSystemGrantable(unittest.TestCase):
+    """🛠 System is no longer admin-only: admins always see it, and an admin can
+    grant it (and its buttons) to any user via Manage Access."""
+
+    def test_nothing_is_admin_only(self):
+        self.assertEqual(common._ADMIN_ONLY_CATEGORIES, set())
 
     def test_admin_sees_system(self):
         with patch.object(common, "ADMIN_IDS", {5}):
             self.assertIn(common.BTN_CAT_SETTINGS, common.get_user_categories(5))
 
-    def test_non_admin_never_gets_system_even_if_granted(self):
-        access = {"7": [common.BTN_CAT_SETTINGS, common.BTN_CAT_GENERAL]}
+    def test_ungranted_user_does_not_see_system(self):
         with patch.object(common, "ADMIN_IDS", {5}), \
-             patch.object(common, "load_category_access", lambda: access):
+             patch.object(common, "load_category_access", lambda: {"7": [common.BTN_CAT_GENERAL]}), \
+             patch.object(common, "load_button_access", lambda: {}), \
+             patch.object(common, "load_roles", lambda: {}):
             cats = common.get_user_categories(7)
         self.assertNotIn(common.BTN_CAT_SETTINGS, cats)
-        self.assertIn(common.BTN_CAT_GENERAL, cats)
+
+    def test_granted_user_sees_system_and_its_buttons(self):
+        access = {"7": [common.BTN_CAT_SETTINGS, common.BTN_CAT_GENERAL]}
+        with patch.object(common, "ADMIN_IDS", {5}), \
+             patch.object(common, "load_category_access", lambda: access), \
+             patch.object(common, "load_button_access", lambda: {}), \
+             patch.object(common, "load_roles", lambda: {}):
+            cats = common.get_user_categories(7)
+            can_restart = common.button_allowed(7, common.BTN_CAT_SETTINGS, common.BTN_RESTART)
+        self.assertIn(common.BTN_CAT_SETTINGS, cats)
+        self.assertTrue(can_restart)   # granted System → sees its buttons
+
+    def test_granted_user_can_be_restricted_to_some_system_buttons(self):
+        access = {"7": [common.BTN_CAT_SETTINGS]}
+        btn = {"7": {common.BTN_CAT_SETTINGS: [common.BTN_TOKEN_STATUS]}}
+        with patch.object(common, "ADMIN_IDS", {5}), \
+             patch.object(common, "load_category_access", lambda: access), \
+             patch.object(common, "load_button_access", lambda: btn), \
+             patch.object(common, "load_roles", lambda: {}):
+            self.assertTrue(common.button_allowed(7, common.BTN_CAT_SETTINGS, common.BTN_TOKEN_STATUS))
+            self.assertFalse(common.button_allowed(7, common.BTN_CAT_SETTINGS, common.BTN_RESTART))
 
 
 class TestCategoryLabelMigration(unittest.TestCase):
@@ -315,6 +339,16 @@ class TestButtonAccess(unittest.TestCase):
         self._patch.start()
         self.cat = common.BTN_CAT_ASSIGNMENTS
         self.all_buttons = common._MENU_CATEGORIES[self.cat]["buttons"]
+        # Per-button visibility only applies within a category the user has;
+        # grant user 7 both categories these tests probe (individual tests
+        # override load_category_access where they test the no-category case).
+        self._patch_cat = patch.object(common, "load_category_access",
+                                       return_value={"7": [self.cat, common.BTN_CAT_LOOKUPS]})
+        self._patch_cat.start()
+        self.addCleanup(self._patch_cat.stop)
+        self._patch_roles = patch.object(common, "load_roles", return_value={})
+        self._patch_roles.start()
+        self.addCleanup(self._patch_roles.stop)
 
     def tearDown(self):
         self._patch.stop()
@@ -672,13 +706,79 @@ class TestGetUserCategories(unittest.TestCase):
             self.assertEqual(common.get_user_categories(111), list(common._MENU_CATEGORIES))
 
 
+class TestRoles(unittest.TestCase):
+    """Roles: admin (env), ict_admin (granted), user (implicit); a person can
+    hold several, and ict_admin's access = the monitoring bundle."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.data_file = os.path.join(self.tmpdir.name, "saved_roles.json")
+        self._p = patch.object(common, "SAVED_ROLES_FILE", self.data_file)
+        self._p.start()
+        self.addCleanup(self._p.stop)
+        self.addCleanup(self.tmpdir.cleanup)
+
+    def _write(self, data):
+        with open(self.data_file, "w") as f:
+            json.dump(data, f)
+
+    def test_roundtrip(self):
+        common.save_roles({"9": [common.ROLE_ICT_ADMIN]})
+        self.assertEqual(common.load_roles(), {"9": [common.ROLE_ICT_ADMIN]})
+
+    def test_admin_env_user_always_has_admin_and_user(self):
+        with patch.object(common, "ADMIN_IDS", {5}):
+            roles = common.get_user_roles(5)
+        self.assertIn(common.ROLE_ADMIN, roles)
+        self.assertIn(common.ROLE_USER, roles)
+
+    def test_granted_ict_plus_implicit_user(self):
+        self._write({"9": [common.ROLE_ICT_ADMIN]})
+        with patch.object(common, "ADMIN_IDS", {5}):
+            roles = common.get_user_roles(9)
+        self.assertEqual(set(roles), {common.ROLE_ICT_ADMIN, common.ROLE_USER})
+        self.assertTrue(common.is_ict_admin(9))
+        self.assertFalse(common.is_ict_admin(7))
+
+    def test_ict_admin_gets_monitoring_bundle_only(self):
+        self._write({"9": [common.ROLE_ICT_ADMIN]})
+        with patch.object(common, "ADMIN_IDS", {5}), \
+             patch.object(common, "load_category_access", return_value={}), \
+             patch.object(common, "load_button_access", return_value={}):
+            cats = common.get_user_categories(9)
+            sys_btns = common.get_user_category_buttons(9, common.BTN_CAT_SETTINGS)
+            ana_btns = common.get_user_category_buttons(9, common.BTN_CAT_ANALYTICS)
+            # Keep the membership check INSIDE the with-block, so ADMIN_IDS is
+            # the patched {5} (not the real/empty env value, which would wrongly
+            # trigger the no-admin-configured admin bypass).
+            restart_allowed = common.button_allowed(9, common.BTN_CAT_SETTINGS, common.BTN_RESTART)
+        self.assertEqual(set(cats), {common.BTN_CAT_ANALYTICS, common.BTN_CAT_SETTINGS})
+        self.assertEqual(set(sys_btns), {common.BTN_TOKEN_STATUS, common.BTN_OCR_STATS})
+        self.assertEqual(set(ana_btns), {common.BTN_OCR_HISTORY, common.BTN_ERROR_REPORT})
+        # ICT admin cannot reach Restart (a real System button not in the bundle)
+        self.assertFalse(restart_allowed)
+
+    def test_multiple_roles_union(self):
+        # ict_admin (monitoring) + a personal grant of Tasks & Assignment.
+        self._write({"9": [common.ROLE_ICT_ADMIN]})
+        with patch.object(common, "ADMIN_IDS", {5}), \
+             patch.object(common, "load_category_access", return_value={"9": [common.BTN_CAT_ASSIGNMENTS]}), \
+             patch.object(common, "load_button_access", return_value={}):
+            cats = set(common.get_user_categories(9))
+        self.assertIn(common.BTN_CAT_ASSIGNMENTS, cats)   # personal grant
+        self.assertIn(common.BTN_CAT_ANALYTICS, cats)     # role
+        self.assertIn(common.BTN_CAT_SETTINGS, cats)      # role
+
+
 class TestCategoryAllowed(unittest.TestCase):
-    def test_true_when_category_in_users_list(self):
-        with patch.object(common, "get_user_categories", return_value=[common.BTN_CAT_LOOKUPS]):
+    def test_true_when_category_in_effective_access(self):
+        with patch.object(common, "_effective_access",
+                          return_value={common.BTN_CAT_LOOKUPS: {"x"}}):
             self.assertTrue(common.category_allowed(111, common.BTN_CAT_LOOKUPS))
 
-    def test_false_when_category_not_in_users_list(self):
-        with patch.object(common, "get_user_categories", return_value=[common.BTN_CAT_LOOKUPS]):
+    def test_false_when_category_not_in_effective_access(self):
+        with patch.object(common, "_effective_access",
+                          return_value={common.BTN_CAT_LOOKUPS: {"x"}}):
             self.assertFalse(common.category_allowed(111, common.BTN_CAT_VALUERS))
 
 
@@ -955,8 +1055,10 @@ class TestRecvMenuCategory(unittest.TestCase):
 
     def test_known_category_shows_description_and_submenu(self):
         update = self._make_update(common.BTN_CAT_LOOKUPS)
+        buttons = common._MENU_CATEGORIES[common.BTN_CAT_LOOKUPS]["buttons"]
         with patch.object(common, "allowed", return_value=True), \
-             patch.object(common, "category_allowed", return_value=True):
+             patch.object(common, "category_allowed", return_value=True), \
+             patch.object(common, "get_user_category_buttons", return_value=list(buttons)):
             asyncio.run(common.recv_menu_category(update, MagicMock()))
         update.message.reply_text.assert_awaited_once()
         args, kwargs = update.message.reply_text.call_args

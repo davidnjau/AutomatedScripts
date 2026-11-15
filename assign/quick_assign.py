@@ -66,7 +66,7 @@ from common import (
     persist_assignment,
     persist_valuer,
 )
-from dlv_core import load_dlv_batch, load_records_where, save_dlv_batch
+from dlv_core import filter_own_records, load_dlv_batch, load_records_where, save_dlv_batch
 from endpoints import LRD_FIX_PARCEL_NUMBER_URL, STAMP_DUTY_FIX_APPLICATION_URL
 from new_assignment import ocr_extract_refs
 import ocr_audit
@@ -412,7 +412,8 @@ async def cmd_view_references(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # 📑 View References — every ref processed via Quick Assign, newest first,
     # with its valuer, mode (assigned vs queued), node and status for review.
     if not allowed(update): return await deny(update)
-    recs = load_records_where(channel="quick_assign")
+    # Own-data scope: a plain user sees only refs they added; admin sees all.
+    recs = filter_own_records(load_records_where(channel="quick_assign"), update.effective_user.id)
     if not recs:
         await update.message.reply_text(
             "📑 *View References* — nothing processed via Quick Assign yet.",
