@@ -247,21 +247,45 @@ class TestSearchAndLookupCategory(unittest.TestCase):
         )
 
 
-class TestAdminOnlyCategory(unittest.TestCase):
-    def test_system_is_admin_only(self):
-        self.assertIn(common.BTN_CAT_SETTINGS, common._ADMIN_ONLY_CATEGORIES)
+class TestSystemGrantable(unittest.TestCase):
+    """🛠 System is no longer admin-only: admins always see it, and an admin can
+    grant it (and its buttons) to any user via Manage Access."""
+
+    def test_nothing_is_admin_only(self):
+        self.assertEqual(common._ADMIN_ONLY_CATEGORIES, set())
 
     def test_admin_sees_system(self):
         with patch.object(common, "ADMIN_IDS", {5}):
             self.assertIn(common.BTN_CAT_SETTINGS, common.get_user_categories(5))
 
-    def test_non_admin_never_gets_system_even_if_granted(self):
-        access = {"7": [common.BTN_CAT_SETTINGS, common.BTN_CAT_GENERAL]}
+    def test_ungranted_user_does_not_see_system(self):
         with patch.object(common, "ADMIN_IDS", {5}), \
-             patch.object(common, "load_category_access", lambda: access):
+             patch.object(common, "load_category_access", lambda: {"7": [common.BTN_CAT_GENERAL]}), \
+             patch.object(common, "load_button_access", lambda: {}), \
+             patch.object(common, "load_roles", lambda: {}):
             cats = common.get_user_categories(7)
         self.assertNotIn(common.BTN_CAT_SETTINGS, cats)
-        self.assertIn(common.BTN_CAT_GENERAL, cats)
+
+    def test_granted_user_sees_system_and_its_buttons(self):
+        access = {"7": [common.BTN_CAT_SETTINGS, common.BTN_CAT_GENERAL]}
+        with patch.object(common, "ADMIN_IDS", {5}), \
+             patch.object(common, "load_category_access", lambda: access), \
+             patch.object(common, "load_button_access", lambda: {}), \
+             patch.object(common, "load_roles", lambda: {}):
+            cats = common.get_user_categories(7)
+            can_restart = common.button_allowed(7, common.BTN_CAT_SETTINGS, common.BTN_RESTART)
+        self.assertIn(common.BTN_CAT_SETTINGS, cats)
+        self.assertTrue(can_restart)   # granted System → sees its buttons
+
+    def test_granted_user_can_be_restricted_to_some_system_buttons(self):
+        access = {"7": [common.BTN_CAT_SETTINGS]}
+        btn = {"7": {common.BTN_CAT_SETTINGS: [common.BTN_TOKEN_STATUS]}}
+        with patch.object(common, "ADMIN_IDS", {5}), \
+             patch.object(common, "load_category_access", lambda: access), \
+             patch.object(common, "load_button_access", lambda: btn), \
+             patch.object(common, "load_roles", lambda: {}):
+            self.assertTrue(common.button_allowed(7, common.BTN_CAT_SETTINGS, common.BTN_TOKEN_STATUS))
+            self.assertFalse(common.button_allowed(7, common.BTN_CAT_SETTINGS, common.BTN_RESTART))
 
 
 class TestCategoryLabelMigration(unittest.TestCase):
@@ -724,11 +748,15 @@ class TestRoles(unittest.TestCase):
             cats = common.get_user_categories(9)
             sys_btns = common.get_user_category_buttons(9, common.BTN_CAT_SETTINGS)
             ana_btns = common.get_user_category_buttons(9, common.BTN_CAT_ANALYTICS)
+            # Keep the membership check INSIDE the with-block, so ADMIN_IDS is
+            # the patched {5} (not the real/empty env value, which would wrongly
+            # trigger the no-admin-configured admin bypass).
+            restart_allowed = common.button_allowed(9, common.BTN_CAT_SETTINGS, common.BTN_RESTART)
         self.assertEqual(set(cats), {common.BTN_CAT_ANALYTICS, common.BTN_CAT_SETTINGS})
         self.assertEqual(set(sys_btns), {common.BTN_TOKEN_STATUS, common.BTN_OCR_STATS})
         self.assertEqual(set(ana_btns), {common.BTN_OCR_HISTORY, common.BTN_ERROR_REPORT})
         # ICT admin cannot reach Restart (a real System button not in the bundle)
-        self.assertFalse(common.button_allowed(9, common.BTN_CAT_SETTINGS, common.BTN_RESTART))
+        self.assertFalse(restart_allowed)
 
     def test_multiple_roles_union(self):
         # ict_admin (monitoring) + a personal grant of Tasks & Assignment.

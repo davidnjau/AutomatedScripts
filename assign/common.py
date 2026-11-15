@@ -852,7 +852,7 @@ BTN_CAT_AUTOMATION  = "🤖 Automation"
 BTN_CAT_ANALYTICS   = "📈 Reports & Analytics"
 BTN_CAT_VALUERS     = "👥 Valuers & Access"
 BTN_CAT_COMM        = "💬 Communication"
-BTN_CAT_SETTINGS    = "🛠 System"          # admin-only (see _ADMIN_ONLY_CATEGORIES)
+BTN_CAT_SETTINGS    = "🛠 System"          # admins always; grantable to others via Manage Access
 BTN_CAT_GENERAL     = "📘 General"
 BTN_CAT_POST_BOARD  = "📥 Post Board"      # hidden (see _MENU_HIDDEN_CATEGORIES)
 BTN_BACK            = "⬅ Back"
@@ -971,7 +971,7 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
         "description": (
             "🛠 *System*\n\n"
             "Manage login sessions, the token refresh daemon, and the bot process "
-            "itself. Admin-only."
+            "itself. Admins always; others only if an admin grants it."
         ),
         "buttons": [BTN_AUTH, BTN_TOKEN_STATUS, BTN_DAEMON, BTN_RESTART, BTN_OCR_STATS],
     },
@@ -1027,11 +1027,13 @@ def _category_row_keyboard(categories: List[str]) -> ReplyKeyboardMarkup:
 # shown in the top-level menu — reachable by command/exact-text only.
 _MENU_HIDDEN_CATEGORIES = {BTN_CAT_POST_BOARD}
 
-# Categories only admins may ever open. Non-admins never see them in the menu
-# (get_user_categories strips them) and they're not offered in Manage Access'
-# grantable list (access_control._ma_category_keyboard). Admins still get them
-# via the admin bypass in get_user_categories.
-_ADMIN_ONLY_CATEGORIES = {BTN_CAT_SETTINGS}
+# Categories NO non-admin may ever be granted — excluded from Manage Access'
+# grantable list and skipped by _effective_access's per-user path. Currently
+# empty: 🛠 System is now grantable (an admin can delegate specific System
+# buttons — Token Status, Refresh Auth, Restart, etc. — to a user via Manage
+# Access), and the ICT Admin role grants a System subset too. System is still
+# hidden from a user who hasn't been granted it; admins always see it (bypass).
+_ADMIN_ONLY_CATEGORIES: set = set()
 
 # Role → {category: [buttons]} the role grants, merged into _effective_access.
 # ICT Admin ("logs only") gets the monitoring bundle: OCR History + Error
