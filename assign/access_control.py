@@ -65,8 +65,10 @@ from common import (
     BTN_MANAGE_ACCESS,
     _ADMIN_ONLY_CATEGORIES,
     _CANCEL_FILTER,
+    _GRANTABLE_ROLES,
     _main_menu_for,
     _MENU_CATEGORIES,
+    _ROLE_LABELS,
     allowed,
     cmd_cancel,
     deny,
@@ -74,10 +76,12 @@ from common import (
     is_admin,
     load_button_access,
     load_category_access,
+    load_roles,
     load_user_names,
     md_escape,
     save_button_access,
     save_category_access,
+    save_roles,
 )
 
 
@@ -86,6 +90,7 @@ from common import (
 # ──────────────────────────────────────────────────────────
 class MA(Enum):
     PICK_USER        = auto()   # choose which non-admin user to manage
+    PICK_ROLES       = auto()   # toggle their roles (e.g. ICT Admin), then continue
     PICK_CATEGORIES  = auto()   # toggle their category grants, then Done
     PICK_CUST_CAT    = auto()   # optionally pick a category to restrict its buttons
     PICK_BUTTONS     = auto()   # toggle which buttons within that category are visible
@@ -94,6 +99,7 @@ class MA(Enum):
 @dataclass
 class MASession:
     target_user_id: int = 0
+    roles: Set[str] = field(default_factory=set)      # in-progress role picks (e.g. ict_admin)
     selected: Set[str] = field(default_factory=set)   # in-progress category picks
     cust_category: str = ""                            # category whose buttons are being edited
     cust_selected: Set[str] = field(default_factory=set)  # in-progress button picks
@@ -216,6 +222,67 @@ async def cmd_manage_access(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return MA.PICK_USER
 
 
+def _ma_roles_keyboard(selected: Set[str]) -> InlineKeyboardMarkup:
+    """One toggle per grantable role (☑ granted / ☐ not), plus ➡️ Next
+    (continue to category access) and ✅ Save Roles & Finish."""
+    rows = [
+        [InlineKeyboardButton(f"{'☑' if role in selected else '☐'} {_ROLE_LABELS.get(role, role)}",
+                              callback_data=f"ma_role:{role}")]
+        for role in _GRANTABLE_ROLES
+    ]
+    rows.append([InlineKeyboardButton("➡️ Next: Categories", callback_data="ma_role:next")])
+    rows.append([InlineKeyboardButton("✅ Save Roles & Finish", callback_data="ma_role:done")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _ma_persist_roles(sess: MASession) -> None:
+    """Save the session's role selection for the target user (dropping an empty
+    entry so the file stays clean)."""
+    roles = load_roles()
+    if sess.roles:
+        roles[str(sess.target_user_id)] = sorted(sess.roles)
+    else:
+        roles.pop(str(sess.target_user_id), None)
+    save_roles(roles)
+
+
+async def recv_ma_roles(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Toggle a role, or persist roles and either continue to categories or end.
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return ConversationHandler.END
+    data = query.data.split(":", 1)[1]
+    sess = _get_ma_sess(ctx)
+
+    if data in (_GRANTABLE_ROLES):
+        if data in sess.roles:
+            sess.roles.discard(data)
+        else:
+            sess.roles.add(data)
+        await query.edit_message_reply_markup(reply_markup=_ma_roles_keyboard(sess.roles))
+        return MA.PICK_ROLES
+
+    _ma_persist_roles(sess)
+
+    if data == "done":
+        label = _ma_display_label(sess.target_user_id, load_user_names())
+        await query.edit_message_text(
+            f"✅ Saved roles for *{md_escape(label)}*.\n\n{_ma_access_summary(sess.target_user_id)}",
+            parse_mode="Markdown",
+        )
+        await query.message.reply_text("Main menu.", reply_markup=_main_menu_for(query.from_user.id))
+        return ConversationHandler.END
+
+    # data == "next" → continue to the category-grant step
+    await query.edit_message_text(
+        "🗂 Now toggle their *category* access, then tap ✅ Done:",
+        parse_mode="Markdown",
+        reply_markup=_ma_category_keyboard(sess.selected),
+    )
+    return MA.PICK_CATEGORIES
+
+
 async def recv_ma_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Handle the user picker — Cancel, or a specific target user id whose
     # current grants get preloaded as the starting selection.
@@ -234,14 +301,18 @@ async def recv_ma_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sess = _get_ma_sess(ctx)
     sess.target_user_id = target_id
     sess.selected = set(load_category_access().get(str(target_id), []))
+    sess.roles = set(load_roles().get(str(target_id), []))
 
     label = _ma_display_label(target_id, load_user_names())
     await query.edit_message_text(
-        f"✅ Managing *{md_escape(label)}*.\n\nToggle their categories, then tap ✅ Done:",
+        f"✅ Managing *{md_escape(label)}*.\n\nFirst, their *roles* — a role grants a "
+        "fixed set of screens (ICT Admin = the logs/monitoring views, sees all "
+        "logs). A user can hold several. Toggle, then ➡️ Next for category "
+        "access, or ✅ Save Roles & Finish:",
         parse_mode="Markdown",
-        reply_markup=_ma_category_keyboard(sess.selected),
+        reply_markup=_ma_roles_keyboard(sess.roles),
     )
-    return MA.PICK_CATEGORIES
+    return MA.PICK_ROLES
 
 
 async def recv_ma_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -397,14 +468,17 @@ async def recv_ma_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def _ma_access_summary(target_user_id: int) -> str:
-    """Human-readable summary of a user's current category + per-button
-    access, for the Finish confirmation. Lists each granted category and, if
-    its buttons are restricted, which ones remain visible."""
+    """Human-readable summary of a user's current roles + category + per-button
+    access, for the Finish confirmation."""
+    roles = load_roles().get(str(target_user_id), [])
+    role_txt = ", ".join(_ROLE_LABELS.get(r, r) for r in roles) if roles else "_none_"
+    lines = [f"Roles: {role_txt}"]
     cats = sorted(load_category_access().get(str(target_user_id), []))
     if not cats:
-        return "Access: _none_"
+        lines.append("Category access: _none_")
+        return "\n".join(lines)
     button_access = load_button_access().get(str(target_user_id), {})
-    lines = ["Access:"]
+    lines.append("Category access:")
     for c in cats:
         if c in button_access:
             visible = ", ".join(button_access[c]) if button_access[c] else "_none_"
@@ -427,6 +501,7 @@ def register(app: Application) -> None:
         ],
         states={
             MA.PICK_USER:       [CallbackQueryHandler(recv_ma_user,          pattern=r"^ma_user:")],
+            MA.PICK_ROLES:      [CallbackQueryHandler(recv_ma_roles,         pattern=r"^ma_role:")],
             MA.PICK_CATEGORIES: [CallbackQueryHandler(recv_ma_category,      pattern=r"^ma_cat:")],
             MA.PICK_CUST_CAT:   [CallbackQueryHandler(recv_ma_customize_pick, pattern=r"^ma_bcat:")],
             MA.PICK_BUTTONS:    [CallbackQueryHandler(recv_ma_button,        pattern=r"^ma_btn:")],

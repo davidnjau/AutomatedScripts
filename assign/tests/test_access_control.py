@@ -153,12 +153,15 @@ class TestRecvMaUser(unittest.TestCase):
         existing = {"2": [common.BTN_CAT_LOOKUPS]}
         with patch.object(ac, "is_admin", return_value=True), \
              patch.object(ac, "load_category_access", return_value=existing), \
+             patch.object(ac, "load_roles", return_value={"2": [common.ROLE_ICT_ADMIN]}), \
              patch.object(ac, "load_user_names", return_value={}):
             result = _run(ac.recv_ma_user(update, ctx))
-        self.assertEqual(result, ac.MA.PICK_CATEGORIES)
+        # The user picker now opens the roles step first.
+        self.assertEqual(result, ac.MA.PICK_ROLES)
         sess = ac._get_ma_sess(ctx)
         self.assertEqual(sess.target_user_id, 2)
-        self.assertEqual(sess.selected, {common.BTN_CAT_LOOKUPS})
+        self.assertEqual(sess.selected, {common.BTN_CAT_LOOKUPS})     # categories preloaded
+        self.assertEqual(sess.roles, {common.ROLE_ICT_ADMIN})         # roles preloaded
 
     def test_confirmation_shows_cached_name(self):
         update = _make_update_with_callback("ma_user:2", user_id=1)
@@ -258,6 +261,53 @@ class TestRecvMaCategory(unittest.TestCase):
             _run(ac.recv_ma_category(update, ctx))
         sent_text = update.callback_query.edit_message_text.call_args[0][0]
         self.assertIn("Jane Doe", sent_text)
+
+
+class TestMaRolesKeyboard(unittest.TestCase):
+    def test_toggle_and_controls_present(self):
+        kb = ac._ma_roles_keyboard({common.ROLE_ICT_ADMIN})
+        datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+        self.assertIn(f"ma_role:{common.ROLE_ICT_ADMIN}", datas)
+        self.assertIn("ma_role:next", datas)
+        self.assertIn("ma_role:done", datas)
+        checked = [b.text for row in kb.inline_keyboard for b in row if b.text.startswith("☑")]
+        self.assertTrue(checked)   # ict_admin shown as granted
+
+
+class TestRecvMaRoles(unittest.TestCase):
+    def test_toggle_adds_role(self):
+        update = _make_update_with_callback(f"ma_role:{common.ROLE_ICT_ADMIN}", user_id=1)
+        ctx = MagicMock()
+        ctx.user_data = {"ma_session": ac.MASession(target_user_id=2, roles=set())}
+        with patch.object(ac, "is_admin", return_value=True):
+            result = _run(ac.recv_ma_roles(update, ctx))
+        self.assertEqual(result, ac.MA.PICK_ROLES)
+        self.assertEqual(ac._get_ma_sess(ctx).roles, {common.ROLE_ICT_ADMIN})
+
+    def test_next_persists_roles_and_opens_categories(self):
+        update = _make_update_with_callback("ma_role:next", user_id=1)
+        ctx = MagicMock()
+        ctx.user_data = {"ma_session": ac.MASession(target_user_id=2, roles={common.ROLE_ICT_ADMIN})}
+        with patch.object(ac, "is_admin", return_value=True), \
+             patch.object(ac, "load_roles", return_value={}), \
+             patch.object(ac, "save_roles") as mock_save:
+            result = _run(ac.recv_ma_roles(update, ctx))
+        self.assertEqual(result, ac.MA.PICK_CATEGORIES)
+        mock_save.assert_called_once_with({"2": [common.ROLE_ICT_ADMIN]})
+
+    def test_done_persists_and_ends(self):
+        update = _make_update_with_callback("ma_role:done", user_id=1)
+        ctx = MagicMock()
+        ctx.user_data = {"ma_session": ac.MASession(target_user_id=2, roles=set())}
+        with patch.object(ac, "is_admin", return_value=True), \
+             patch.object(ac, "load_roles", return_value={"2": [common.ROLE_ICT_ADMIN]}), \
+             patch.object(ac, "load_category_access", return_value={}), \
+             patch.object(ac, "load_button_access", return_value={}), \
+             patch.object(ac, "load_user_names", return_value={}), \
+             patch.object(ac, "save_roles") as mock_save:
+            result = _run(ac.recv_ma_roles(update, ctx))
+        self.assertEqual(result, ac.ConversationHandler.END)
+        mock_save.assert_called_once_with({})   # empty selection drops the entry
 
 
 class TestMaButtonKeyboard(unittest.TestCase):

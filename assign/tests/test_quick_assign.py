@@ -265,6 +265,7 @@ class TestViewReferences(unittest.TestCase):
         ]
         u = _msg_update()
         with patch.object(qa, "allowed", return_value=True), \
+             patch.object(qa, "filter_own_records", side_effect=lambda r, uid: r), \
              patch.object(qa, "load_records_where", return_value=recs):
             _run(qa.cmd_view_references(u, MagicMock()))
         sent = " ".join(c.args[0] for c in u.message.reply_text.call_args_list)

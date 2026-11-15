@@ -136,6 +136,33 @@ class TestOhStatus(unittest.TestCase):
         self.assertIn("🟡", oa._oh_status({"ocr_failed": True, "resolution": {"resolved_by": 1}}))
 
 
+class TestOwnDataScope(_TmpStore):
+    """_oh_sees_all / _oh_visible_records — log viewers (admin/ict) see every
+    screenshot; a plain user sees only their own uploads."""
+
+    def test_sees_all_for_admin_or_ict(self):
+        with patch.object(oa, "is_admin", return_value=True):
+            self.assertTrue(oa._oh_sees_all(1))
+        with patch.object(oa, "is_admin", return_value=False), \
+             patch.object(oa, "is_ict_admin", return_value=True):
+            self.assertTrue(oa._oh_sees_all(2))
+        with patch.object(oa, "is_admin", return_value=False), \
+             patch.object(oa, "is_ict_admin", return_value=False):
+            self.assertFalse(oa._oh_sees_all(3))
+
+    def test_plain_user_sees_only_own_uploads(self):
+        self._write([{"id": "a", "uploaded_by": 7}, {"id": "b", "uploaded_by": 9}])
+        with patch.object(oa, "_oh_sees_all", return_value=False):
+            ids = [r["id"] for r in oa._oh_visible_records(7)]
+        self.assertEqual(ids, ["a"])
+
+    def test_log_viewer_sees_everything(self):
+        self._write([{"id": "a", "uploaded_by": 7}, {"id": "b", "uploaded_by": 9}])
+        with patch.object(oa, "_oh_sees_all", return_value=True):
+            ids = [r["id"] for r in oa._oh_visible_records(7)]
+        self.assertEqual(ids, ["a", "b"])
+
+
 class TestNotifyViewers(unittest.TestCase):
     def _bot(self):
         bot = MagicMock()
@@ -153,7 +180,7 @@ class TestNotifyViewers(unittest.TestCase):
     def test_sends_image_to_viewers_excluding_uploader(self):
         bot = self._bot()
         with patch.object(oa, "ALLOWED_IDS", [1, 2, 3]), \
-             patch.object(oa, "_oh_can_view", side_effect=lambda uid: uid in (2, 3)), \
+             patch.object(oa, "_oh_sees_all", side_effect=lambda uid: uid in (2, 3)), \
              patch.object(oa.blob_store, "get_screenshot", return_value=b"img"):
             _run(oa.notify_viewers(bot, self._rec(), exclude_user_id=3))
         # Only uid 2 (viewer, not the uploader uid 3) gets it.
@@ -163,7 +190,7 @@ class TestNotifyViewers(unittest.TestCase):
     def test_skips_non_viewers(self):
         bot = self._bot()
         with patch.object(oa, "ALLOWED_IDS", [1, 2]), \
-             patch.object(oa, "_oh_can_view", return_value=False), \
+             patch.object(oa, "_oh_sees_all", return_value=False), \
              patch.object(oa.blob_store, "get_screenshot", return_value=b"img"):
             _run(oa.notify_viewers(bot, self._rec()))
         bot.send_photo.assert_not_awaited()
@@ -172,7 +199,7 @@ class TestNotifyViewers(unittest.TestCase):
     def test_text_fallback_when_image_absent(self):
         bot = self._bot()
         with patch.object(oa, "ALLOWED_IDS", [2]), \
-             patch.object(oa, "_oh_can_view", return_value=True):
+             patch.object(oa, "_oh_sees_all", return_value=True):
             _run(oa.notify_viewers(bot, self._rec(image_purged=True)))
         bot.send_message.assert_awaited_once()
         bot.send_photo.assert_not_awaited()
@@ -180,7 +207,7 @@ class TestNotifyViewers(unittest.TestCase):
     def test_failed_record_uses_red_header(self):
         bot = self._bot()
         with patch.object(oa, "ALLOWED_IDS", [2]), \
-             patch.object(oa, "_oh_can_view", return_value=True), \
+             patch.object(oa, "_oh_sees_all", return_value=True), \
              patch.object(oa.blob_store, "get_screenshot", return_value=b"img"):
             _run(oa.notify_viewers(bot, self._rec(ocr_failed=True, refs=[], assignments=[])))
         caption = bot.send_photo.call_args.kwargs["caption"]
@@ -190,7 +217,7 @@ class TestNotifyViewers(unittest.TestCase):
         bot = self._bot()
         bot.send_photo.side_effect = RuntimeError("blocked")
         with patch.object(oa, "ALLOWED_IDS", [2, 4]), \
-             patch.object(oa, "_oh_can_view", return_value=True), \
+             patch.object(oa, "_oh_sees_all", return_value=True), \
              patch.object(oa.blob_store, "get_screenshot", return_value=b"img"):
             _run(oa.notify_viewers(bot, self._rec()))   # must not raise
         self.assertEqual(bot.send_photo.await_count, 2)   # tried both despite the first failing
@@ -334,12 +361,21 @@ class TestCmdOcrHistory(_TmpStore):
         update = self._update()
         ctx = MagicMock(); ctx.user_data = {}
         with patch.object(oa, "allowed", return_value=True), \
-             patch.object(oa, "_oh_can_view", return_value=True):
+             patch.object(oa, "_oh_can_view", return_value=True), \
+             patch.object(oa, "_oh_sees_all", return_value=True):
             result = _run(oa.cmd_ocr_history(update, ctx))
         self.assertEqual(result, oa.OH.LIST)
 
 
 class TestRecvOhAction(_TmpStore):
+    def setUp(self):
+        super().setUp()
+        # These tests exercise viewing/resolving specific records; treat the
+        # actor as a log viewer so own-data filtering doesn't hide the seed.
+        self._pall = patch.object(oa, "_oh_sees_all", return_value=True)
+        self._pall.start()
+        self.addCleanup(self._pall.stop)
+
     def _query(self, data):
         update = MagicMock()
         q = update.callback_query

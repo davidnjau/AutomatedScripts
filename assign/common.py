@@ -109,6 +109,7 @@ SAVED_APARTMENTS_CONFIG_FILE = os.path.join(DATA_DIR, "saved_apartments_config.j
 SAVED_CUSTOM_EXCLUSIONS_FILE = os.path.join(DATA_DIR, "saved_custom_exclusions.json")
 SAVED_CATEGORY_ACCESS_FILE  = os.path.join(DATA_DIR, "saved_category_access.json")
 SAVED_BUTTON_ACCESS_FILE    = os.path.join(DATA_DIR, "saved_button_access.json")
+SAVED_ROLES_FILE            = os.path.join(DATA_DIR, "saved_roles.json")
 SAVED_USER_NAMES_FILE       = os.path.join(DATA_DIR, "saved_user_names.json")
 SAVED_CHAT_MESSAGES_FILE    = os.path.join(DATA_DIR, "saved_chat_messages.json")
 
@@ -412,25 +413,117 @@ def report_recipients() -> List[int]:
     return [uid for uid in ALLOWED_IDS if uid not in NO_REPORT_IDS]
 
 
-def get_user_categories(user_id: int) -> List[str]:
-    """Every menu category label user_id may open. Admins always get
-    every category, regardless of what's explicitly granted to them.
-    Safety fallback: if no admin is configured at all (ADMIN_IDS empty),
-    there would be nobody able to grant access to anyone, ever — so in
-    that case every user gets every category too, exactly like the
-    pre-Manage-Access behavior. The empty-by-default restriction only
-    actually applies once at least one admin exists to lift it.
-    Admin-only categories (_ADMIN_ONLY_CATEGORIES, e.g. 🛠 System) are never
-    returned for a non-admin even if somehow granted."""
+# ── Roles ────────────────────────────────────────────────────────────
+#
+# Three roles; a person can hold several (effective access = the union):
+#   ROLE_ADMIN     — sees/does everything. Bootstrapped from ADMIN_TELEGRAM_IDS
+#                    (env), so a config mistake in the UI can never lock every
+#                    admin out. Not UI-grantable.
+#   ROLE_ICT_ADMIN — "logs only": the monitoring bundle in _ROLE_ACCESS
+#                    (OCR History, Error Report, Token Status, OCR Usage), and
+#                    sees ALL records in those log views, not just their own.
+#                    UI-grantable via Manage Access (saved_roles.json).
+#   ROLE_USER      — the implicit baseline for every allowed user: menu access
+#                    from their per-category/per-button grants, and record-level
+#                    views (OCR History, View References) filtered to their own
+#                    added_by/uploaded_by. Not stored; it's just "no special role".
+
+ROLE_ADMIN     = "admin"
+ROLE_ICT_ADMIN = "ict_admin"
+ROLE_USER      = "user"
+_ROLE_LABELS = {ROLE_ADMIN: "👑 Admin", ROLE_ICT_ADMIN: "🛠 ICT Admin", ROLE_USER: "👤 User"}
+# Roles an admin may grant through Manage Access (admin itself stays env-only).
+_GRANTABLE_ROLES = [ROLE_ICT_ADMIN]
+
+
+def load_roles() -> Dict[str, List[str]]:
+    """{str(user_id): [role, ...]} — UI-granted roles (currently just
+    ict_admin). Admin comes from env, not here."""
+    try:
+        with open(SAVED_ROLES_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_roles(data: Dict[str, List[str]]) -> None:
+    """Persist the per-user role map."""
+    _atomic_json_write(SAVED_ROLES_FILE, data, indent=2)
+
+
+def get_user_roles(user_id: int) -> List[str]:
+    """Every role user_id holds: admin (if in ADMIN_IDS), any stored roles
+    (ict_admin), and always the implicit user baseline."""
+    roles = list(load_roles().get(str(user_id), []))
+    if is_admin(user_id) and ROLE_ADMIN not in roles:
+        roles.insert(0, ROLE_ADMIN)
+    if ROLE_USER not in roles:
+        roles.append(ROLE_USER)
+    return roles
+
+
+def has_role(user_id: int, role: str) -> bool:
+    """True if user_id holds the given role."""
+    return role in get_user_roles(user_id)
+
+
+def is_ict_admin(user_id: int) -> bool:
+    """True if user_id holds the ICT Admin (logs) role."""
+    return has_role(user_id, ROLE_ICT_ADMIN)
+
+
+def _role_access_map(user_id: int) -> Dict[str, set]:
+    """Merge the {category: {buttons}} access granted by each of the user's
+    roles (see _ROLE_ACCESS). Role access can include admin-only categories
+    (e.g. ICT Admin reaching Token Status under 🛠 System)."""
+    out: Dict[str, set] = {}
+    for role in get_user_roles(user_id):
+        for cat, btns in _ROLE_ACCESS.get(role, {}).items():
+            out.setdefault(cat, set()).update(btns)
+    return out
+
+
+def _effective_access(user_id: int) -> Dict[str, set]:
+    """{category: {buttons}} this user may see — the single source of truth for
+    every menu/permission check, merging per-user category+button grants with
+    role-based access. Admins (and the no-admin-configured fallback) get
+    everything."""
     if not ADMIN_IDS or user_id in ADMIN_IDS:
-        return list(_MENU_CATEGORIES.keys())
+        return {c: set(d["buttons"]) for c, d in _MENU_CATEGORIES.items()}
+    access: Dict[str, set] = {}
+    # Per-user grants (Manage Access): a granted, non-admin-only category
+    # contributes its visible buttons (all, unless a per-button allow-list
+    # narrows it).
     granted = load_category_access().get(str(user_id), [])
-    return [c for c in granted if c not in _ADMIN_ONLY_CATEGORIES]
+    ba = load_button_access().get(str(user_id), {})
+    for cat in granted:
+        if cat in _ADMIN_ONLY_CATEGORIES:
+            continue
+        all_b = set(_MENU_CATEGORIES.get(cat, {}).get("buttons", []))
+        allow = ba.get(cat)
+        visible = all_b if allow is None else (set(allow) & all_b)
+        if visible:
+            access.setdefault(cat, set()).update(visible)
+    # Role-based access (e.g. ICT Admin's monitoring bundle), filtered to
+    # buttons that actually exist in the category.
+    for cat, btns in _role_access_map(user_id).items():
+        valid = set(btns) & set(_MENU_CATEGORIES.get(cat, {}).get("buttons", []))
+        if valid:
+            access.setdefault(cat, set()).update(valid)
+    return access
+
+
+def get_user_categories(user_id: int) -> List[str]:
+    """Every menu category label user_id may open (in display order), from the
+    union of their per-user grants and role access. Admins get all. A category
+    with no visible buttons isn't returned."""
+    acc = _effective_access(user_id)
+    return [c for c in _MENU_CATEGORIES if acc.get(c)]
 
 
 def category_allowed(user_id: int, category: str) -> bool:
     """True if user_id may open the given category label."""
-    return category in get_user_categories(user_id)
+    return bool(_effective_access(user_id).get(category))
 
 
 # ── Per-user, per-button access (finer than category — Manage Access) ─
@@ -460,34 +553,19 @@ def save_button_access(data: Dict[str, Dict[str, List[str]]]) -> None:
 
 def get_user_category_buttons(user_id: int, category: str) -> List[str]:
     """The workflow buttons user_id may see within `category`, in display
-    order. Admins (and the no-admin-configured fallback inside
-    get_user_categories) always see every button. A non-admin sees every
-    button too unless an explicit allow-list exists for this (user, category)
-    in saved_button_access.json, in which case only the allow-listed buttons
-    that still belong to the category are shown. Does not check whether the
-    user has the category at all — callers gate that with category_allowed
-    first (recv_menu_category does)."""
-    all_buttons = list(_MENU_CATEGORIES.get(category, {}).get("buttons", []))
-    if not ADMIN_IDS or user_id in ADMIN_IDS:
-        return all_buttons
-    allowed_for_cat = load_button_access().get(str(user_id), {}).get(category)
-    if allowed_for_cat is None:
-        return all_buttons
-    allow = set(allowed_for_cat)
-    return [b for b in all_buttons if b in allow]
+    order — read straight from _effective_access (per-user grants ∪ role
+    access). Admins see every button. A category the user can't reach yields
+    an empty list."""
+    visible = _effective_access(user_id).get(category, set())
+    return [b for b in _MENU_CATEGORIES.get(category, {}).get("buttons", []) if b in visible]
 
 
 def button_allowed(user_id: int, category: str, button: str) -> bool:
-    """True if user_id may see `button` within `category` — which requires
-    BOTH that they have the category at all (category_allowed) AND that the
-    button is in their visible set for it. The category check matters because
-    get_user_category_buttons returns every button when a user has no per-button
-    restriction for a category — including categories they were never granted —
-    so without this guard an ungranted category would wrongly read as "all its
-    buttons allowed". (recv_menu_category checks category_allowed separately
-    before filtering buttons, so this only bites standalone callers like
-    ocr_audit._oh_can_view.)"""
-    return category_allowed(user_id, category) and button in get_user_category_buttons(user_id, category)
+    """True if user_id may see `button` within `category`. Reads the unified
+    _effective_access map, so it already requires the user to actually reach
+    the category (an ungranted category contributes nothing) — the standalone
+    gate ocr_audit._oh_can_view relies on this."""
+    return button in _effective_access(user_id).get(category, set())
 
 
 # ── Tokens ────────────────────────────────────────────────
@@ -954,6 +1032,18 @@ _MENU_HIDDEN_CATEGORIES = {BTN_CAT_POST_BOARD}
 # grantable list (access_control._ma_category_keyboard). Admins still get them
 # via the admin bypass in get_user_categories.
 _ADMIN_ONLY_CATEGORIES = {BTN_CAT_SETTINGS}
+
+# Role → {category: [buttons]} the role grants, merged into _effective_access.
+# ICT Admin ("logs only") gets the monitoring bundle: OCR History + Error
+# Report (under 📈 Reports & Analytics) and Token Status + OCR Usage (under
+# 🛠 System — role access reaches it even though System is admin-only for
+# per-user grants). Admin needs no entry here (it bypasses to everything).
+_ROLE_ACCESS = {
+    ROLE_ICT_ADMIN: {
+        BTN_CAT_ANALYTICS: [BTN_OCR_HISTORY, BTN_ERROR_REPORT],
+        BTN_CAT_SETTINGS:  [BTN_TOKEN_STATUS, BTN_OCR_STATS],
+    },
+}
 
 
 def _main_menu_for(user_id: int) -> ReplyKeyboardMarkup:

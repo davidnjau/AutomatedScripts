@@ -64,6 +64,7 @@ from common import (
     deny,
     fallback,
     is_admin,
+    is_ict_admin,
     load_user_names,
     logger,
 )
@@ -175,8 +176,11 @@ async def notify_viewers(bot, record: Dict, exclude_user_id: Optional[int] = Non
     caption = header + _oh_caption(record)
     img = (blob_store.get_screenshot(record["blob_key"])
            if record.get("blob_key") and not record.get("image_purged") else None)
+    # Only push to users who see ALL logs (admins + ICT admins); a plain user
+    # granted OCR History sees only their own uploads, so there's nothing to
+    # alert them about here.
     for uid in ALLOWED_IDS:
-        if uid == exclude_user_id or not _oh_can_view(uid):
+        if uid == exclude_user_id or not _oh_sees_all(uid):
             continue
         try:
             if img:
@@ -259,10 +263,25 @@ class OH(Enum):
 
 
 def _oh_can_view(user_id: int) -> bool:
-    """True if user_id may open OCR History — admins always, otherwise only if
-    granted the specific button (per-button access). PII, so this is enforced
-    here, not just hidden from the menu."""
+    """True if user_id may open OCR History at all — admins and ICT admins
+    always (via role access), or any user granted the specific button. PII, so
+    enforced here, not just hidden from the menu."""
     return is_admin(user_id) or button_allowed(user_id, BTN_CAT_ANALYTICS, BTN_OCR_HISTORY)
+
+
+def _oh_sees_all(user_id: int) -> bool:
+    """True if user_id sees EVERY screenshot (a log viewer: admin or ICT admin).
+    A plain user granted the button sees only their own uploads."""
+    return is_admin(user_id) or is_ict_admin(user_id)
+
+
+def _oh_visible_records(user_id: int) -> List[Dict]:
+    """The audit records user_id may see: all of them for a log viewer, else
+    only the ones they uploaded."""
+    records = load_ocr_audit()
+    if _oh_sees_all(user_id):
+        return records
+    return [r for r in records if r.get("uploaded_by") == user_id]
 
 
 def _oh_status(rec: Dict) -> str:
@@ -354,7 +373,7 @@ async def cmd_ocr_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=_main_menu_for(update.effective_user.id),
         )
         return ConversationHandler.END
-    records = load_ocr_audit()
+    records = _oh_visible_records(update.effective_user.id)
     if not records:
         await update.message.reply_text(
             "🖼 *OCR History*\n\nNo screenshots logged yet. They appear here once "
@@ -382,16 +401,20 @@ async def recv_oh_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=None)
         return ConversationHandler.END
 
+    # Scope every record lookup to what this user may see — a plain user only
+    # gets their own uploads, so they can't page to or view/resolve others' by id.
+    visible = _oh_visible_records(query.from_user.id)
+
     if action == "page":
         page = int(parts[2])
         ctx.user_data["oh_page"] = page
-        text, kb = _oh_render_page(load_ocr_audit(), page)
+        text, kb = _oh_render_page(visible, page)
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
         return OH.LIST
 
     if action == "view":
         rec_id = parts[2]
-        rec = next((r for r in load_ocr_audit() if r.get("id") == rec_id), None)
+        rec = next((r for r in visible if r.get("id") == rec_id), None)
         if not rec:
             await query.message.reply_text("⚠️ That record no longer exists.")
             return OH.LIST
@@ -408,7 +431,7 @@ async def recv_oh_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "resolve":
         rec_id = parts[2]
-        rec = next((r for r in load_ocr_audit() if r.get("id") == rec_id), None)
+        rec = next((r for r in visible if r.get("id") == rec_id), None)
         if not rec:
             await query.message.reply_text("⚠️ That record no longer exists.")
             return OH.LIST
