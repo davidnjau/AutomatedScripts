@@ -358,12 +358,54 @@ def _oh_render_page(records: List[Dict], page: int):
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
+def _relative_age(iso_ts) -> str:
+    """'today' / 'N day(s) ago' for an ISO timestamp; '' if unparseable."""
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+    except (ValueError, TypeError):
+        return ""
+    days = (datetime.now() - dt).days
+    if days <= 0:
+        return "today"
+    return f"{days} day{'s' if days != 1 else ''} ago"
+
+
+def _oh_assigned_age(rec: Dict) -> str:
+    """Relative age of when the record's ref(s) were assigned — looked up in
+    the consolidated DLV store (which holds `assigned_at`), falling back to the
+    record's own creation time for a directly-assigned ref. '' if the ref is
+    still queued/unassigned or nothing is found."""
+    ts = None
+    try:
+        import dlv_core
+        store = {r.get("ref"): r for r in dlv_core.load_records_where()}
+        for ref in rec.get("refs", []):
+            r = store.get(ref)
+            if r and r.get("assigned_at"):
+                ts = r["assigned_at"]
+                break
+    except Exception as e:
+        logger.warning("OCR History: assigned-age lookup failed: %s", e)
+    if not ts and any(a.get("mode") == "assigned" for a in rec.get("assignments", [])):
+        ts = rec.get("at")   # direct assignment: assigned == created
+    return _relative_age(ts) if ts else ""
+
+
 def _oh_caption(rec: Dict) -> str:
-    """Full caption shown with a viewed screenshot: OCR status, date, uploader,
-    source, valuer, each ref's assignment mode, and any manual-resolution note."""
+    """Full caption shown with a viewed screenshot: OCR status, created/assigned
+    ages, uploader, source, valuer, each ref's assignment mode, and any
+    manual-resolution note."""
+    created_age = _relative_age(rec.get("at"))
+    assigned_age = _oh_assigned_age(rec)
     lines = [
         _oh_status(rec),
         f"🖼 {rec.get('at', '?')}",
+    ]
+    if created_age:
+        lines.append(f"Created {created_age}")
+    if assigned_age:
+        lines.append(f"Assigned {assigned_age}")
+    lines += [
         f"Uploaded by: {rec.get('uploaded_by_name', '?')}",
         f"Source: {rec.get('ocr_source', '?')} ({rec.get('channel', '?')})",
         f"Valuer: {rec.get('valuer_name', '?')}",

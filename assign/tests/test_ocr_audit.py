@@ -297,6 +297,47 @@ class TestAccess(unittest.TestCase):
             self.assertFalse(oa._oh_can_view(2))
 
 
+class TestRelativeAges(unittest.TestCase):
+    def test_today(self):
+        now = datetime.now().isoformat(timespec="seconds")
+        self.assertEqual(oa._relative_age(now), "today")
+
+    def test_days_ago_singular_and_plural(self):
+        one = (datetime.now() - timedelta(days=1, hours=1)).isoformat(timespec="seconds")
+        three = (datetime.now() - timedelta(days=3, hours=1)).isoformat(timespec="seconds")
+        self.assertEqual(oa._relative_age(one), "1 day ago")
+        self.assertEqual(oa._relative_age(three), "3 days ago")
+
+    def test_unparseable_is_empty(self):
+        self.assertEqual(oa._relative_age("not-a-date"), "")
+        self.assertEqual(oa._relative_age(None), "")
+
+    def test_assigned_age_falls_back_to_created_for_direct_assign(self):
+        at = (datetime.now() - timedelta(days=2, hours=1)).isoformat(timespec="seconds")
+        rec = {"at": at, "refs": ["R1"], "assignments": [{"ref": "R1", "mode": "assigned"}]}
+        import dlv_core
+        with patch.object(dlv_core, "load_records_where", return_value=[]):
+            self.assertEqual(oa._oh_assigned_age(rec), "2 days ago")
+
+    def test_assigned_age_uses_store_assigned_at(self):
+        assigned = (datetime.now() - timedelta(days=5, hours=1)).isoformat(timespec="seconds")
+        rec = {"at": "2026-01-01T00:00:00", "refs": ["R1"], "assignments": [{"ref": "R1", "mode": "queued"}]}
+        import dlv_core
+        with patch.object(dlv_core, "load_records_where",
+                          return_value=[{"ref": "R1", "assigned_at": assigned}]):
+            self.assertEqual(oa._oh_assigned_age(rec), "5 days ago")
+
+    def test_caption_includes_created_and_assigned(self):
+        at = (datetime.now() - timedelta(days=1, hours=1)).isoformat(timespec="seconds")
+        rec = {"at": at, "refs": ["R1"], "valuer_name": "Jane",
+               "assignments": [{"ref": "R1", "mode": "assigned"}]}
+        import dlv_core
+        with patch.object(dlv_core, "load_records_where", return_value=[]):
+            cap = oa._oh_caption(rec)
+        self.assertIn("Created 1 day ago", cap)
+        self.assertIn("Assigned 1 day ago", cap)
+
+
 class TestViewLabel(unittest.TestCase):
     def test_valuer_short_first_name_titlecased(self):
         self.assertEqual(oa._oh_valuer_short({"valuer_name": "BYRON MARCEL ONDITI"}), "Byron")
