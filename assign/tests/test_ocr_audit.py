@@ -297,6 +297,21 @@ class TestAccess(unittest.TestCase):
             self.assertFalse(oa._oh_can_view(2))
 
 
+class TestViewLabel(unittest.TestCase):
+    def test_valuer_short_first_name_titlecased(self):
+        self.assertEqual(oa._oh_valuer_short({"valuer_name": "BYRON MARCEL ONDITI"}), "Byron")
+        self.assertEqual(oa._oh_valuer_short({"valuer_name": ""}), "?")
+
+    def test_label_has_ref_and_valuer(self):
+        label = oa._oh_view_label(1, {"refs": ["REG/TSFR/ABC"], "valuer_name": "Jane Doe"})
+        self.assertIn("REG/TSFR/ABC", label)
+        self.assertIn("Jane", label)
+
+    def test_failed_record_label_says_ocr_failed(self):
+        label = oa._oh_view_label(2, {"refs": [], "ocr_failed": True, "valuer_name": "Jane Doe"})
+        self.assertIn("OCR FAILED", label)
+
+
 class TestRenderPage(unittest.TestCase):
     def _recs(self, n):
         return [{"id": f"id{i}", "at": "2026-11-14 10:00:00", "uploaded_by_name": "U",
@@ -308,6 +323,16 @@ class TestRenderPage(unittest.TestCase):
         datas = [b.callback_data for row in kb.inline_keyboard for b in row]
         self.assertTrue(any(d.startswith("ocrh:view:") for d in datas))
         self.assertIn("ocrh:close", datas)
+
+    def test_view_button_named_by_ref_and_valuer(self):
+        rec = {"id": "id0", "at": "t", "uploaded_by_name": "U", "refs": ["REG/TSFR/5UVO3L7OEY"],
+               "valuer_name": "BYRON MARCEL ONDITI", "image_stored": True, "image_purged": False}
+        text, kb = oa._oh_render_page([rec], 0)
+        view_btn = [b for row in kb.inline_keyboard for b in row
+                    if b.callback_data == "ocrh:view:id0"][0]
+        self.assertIn("REG/TSFR/5UVO3L7OEY", view_btn.text)
+        self.assertIn("Byron", view_btn.text)        # first name, title-cased
+        self.assertNotIn("View #", view_btn.text)
 
     def test_pagination_next_on_first_page(self):
         text, kb = oa._oh_render_page(self._recs(oa._OH_PAGE_SIZE + 2), 0)

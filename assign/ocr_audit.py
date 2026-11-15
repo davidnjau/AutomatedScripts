@@ -294,6 +294,27 @@ def _oh_status(rec: Dict) -> str:
     return "🟢 OCR ok"
 
 
+def _oh_valuer_short(rec: Dict) -> str:
+    """The assigned valuer's first name, title-cased (e.g. 'BYRON MARCEL
+    ONDITI' → 'Byron') — used to keep the inline-button labels compact."""
+    name = (rec.get("valuer_name") or "").strip()
+    return name.split()[0].title() if name else "?"
+
+
+def _oh_view_label(idx: int, rec: Dict) -> str:
+    """Inline-button label for a history row — the reference number(s) and the
+    assigned valuer (e.g. '🖼 1. REG/TSFR/5UVO3L7OEY — Byron'), instead of a
+    bare 'View #n'. Capped so the button text stays readable."""
+    refs = rec.get("refs") or []
+    if refs:
+        ref_part = ", ".join(refs)
+    elif rec.get("ocr_failed"):
+        ref_part = "OCR FAILED"
+    else:
+        ref_part = "(no ref)"
+    return f"🖼 {idx}. {ref_part} — {_oh_valuer_short(rec)}"[:60]
+
+
 def _oh_row_summary(idx: int, rec: Dict) -> str:
     """One-line summary of a history record for the list view, led by its
     OCR status marker."""
@@ -317,11 +338,13 @@ def _oh_render_page(records: List[Dict], page: int):
     rows = []
     for i, rec in enumerate(chunk, start=start + 1):
         lines.append(_oh_row_summary(i, rec))
-        row_btns = [InlineKeyboardButton(f"🖼 View #{i}", callback_data=f"ocrh:view:{rec['id']}")]
+        # Button named by the image's content — reference number(s) + valuer —
+        # rather than a bare "View #n".
+        row_btns = [InlineKeyboardButton(_oh_view_label(i, rec), callback_data=f"ocrh:view:{rec['id']}")]
         # A failed-OCR screenshot that hasn't been handled yet gets a Resolve
         # button so the reviewer can log the ref(s) they assigned by hand.
         if rec.get("ocr_failed") and not rec.get("resolution"):
-            row_btns.append(InlineKeyboardButton(f"✅ Resolve #{i}", callback_data=f"ocrh:resolve:{rec['id']}"))
+            row_btns.append(InlineKeyboardButton(f"✅ Resolve {i}", callback_data=f"ocrh:resolve:{rec['id']}"))
         rows.append(row_btns)
 
     nav = []
