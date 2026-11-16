@@ -191,6 +191,39 @@ class TestRecvPhoto(unittest.TestCase):
         self.assertEqual(result, qa.QA.PICK_VALUER)
 
 
+class TestRecvRefs(unittest.TestCase):
+    """recv_qa_refs — the text path: type reference number(s) instead of a photo."""
+
+    def _text_update(self, text):
+        u = MagicMock()
+        u.message.text = text
+        u.message.reply_text = AsyncMock()
+        u.message.chat_id = 555
+        u.effective_user.id = 111
+        return u
+
+    def test_valid_ref_stores_and_asks_name(self):
+        u = self._text_update("CNTYINV/ABC1234567")
+        ctx = MagicMock(); ctx.user_data = {"qa_session": qa.QASession()}
+        result = _run(qa.recv_qa_refs(u, ctx))
+        self.assertEqual(result, qa.QA.NAME)
+        self.assertEqual(qa._get_qa_sess(ctx).refs, ["CNTYINV/ABC1234567"])
+        self.assertIn("who should i assign", u.message.reply_text.call_args[0][0].lower())
+
+    def test_multiple_refs(self):
+        u = self._text_update("CNTYINV/ABC1234567 REG/TSFR/XYZ9876543")
+        ctx = MagicMock(); ctx.user_data = {"qa_session": qa.QASession()}
+        _run(qa.recv_qa_refs(u, ctx))
+        self.assertEqual(len(qa._get_qa_sess(ctx).refs), 2)
+
+    def test_no_valid_ref_reprompts(self):
+        u = self._text_update("hello there")
+        ctx = MagicMock(); ctx.user_data = {"qa_session": qa.QASession()}
+        result = _run(qa.recv_qa_refs(u, ctx))
+        self.assertEqual(result, qa.QA.PHOTO)
+        self.assertIn("no valid reference", u.message.reply_text.call_args[0][0].lower())
+
+
 class TestProcessJob(unittest.TestCase):
     def setUp(self):
         # The job audits the uploaded screenshot and notifies OCR History
@@ -208,6 +241,29 @@ class TestProcessJob(unittest.TestCase):
                         "photo_bytes": b"img", "valuer": {"name": "Godwill", "uid": "u1", "account_number": "a1"}}
         ctx.bot.send_message = AsyncMock()
         return ctx
+
+    def _ctx_text(self, refs, workflow="stamp_duty"):
+        ctx = MagicMock()
+        ctx.job.data = {"chat_id": 555, "user_id": 111, "workflow": workflow,
+                        "photo_bytes": None, "refs": refs,
+                        "valuer": {"name": "Godwill", "uid": "u1", "account_number": "a1"}}
+        ctx.bot.send_message = AsyncMock()
+        return ctx
+
+    def test_text_path_assigns_without_ocr_or_audit(self):
+        # A text-typed reference skips OCR entirely and isn't logged to OCR
+        # History (no screenshot) — it just assigns/queues and reports.
+        ctx = self._ctx_text(["CNTYINV/ABC1234567"])
+        with patch.object(qa, "ocr_extract_refs", new=AsyncMock()) as mock_ocr, \
+             patch.object(qa, "_qa_assign_or_queue",
+                          return_value={"assigned": ["CNTYINV/ABC1234567"], "queued": [], "failed": [], "no_token": []}), \
+             patch.object(qa, "persist_valuer"):
+            _run(qa._qa_process_job(ctx))
+        mock_ocr.assert_not_called()
+        qa.ocr_audit.record_upload.assert_not_called()
+        qa.ocr_audit.notify_viewers.assert_not_awaited()
+        sent = " ".join(c.args[1] for c in ctx.bot.send_message.call_args_list)
+        self.assertIn("CNTYINV/ABC1234567", sent)
 
     def test_no_refs_notifies(self):
         ctx = self._ctx()

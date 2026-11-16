@@ -68,7 +68,7 @@ from common import (
 )
 from dlv_core import filter_own_records, load_dlv_batch, load_records_where, save_dlv_batch
 from endpoints import LRD_FIX_PARCEL_NUMBER_URL, STAMP_DUTY_FIX_APPLICATION_URL
-from new_assignment import ocr_extract_refs
+from new_assignment import _extract_refs_from_text, ocr_extract_refs
 import ocr_audit
 from task_block import format_labeled_block
 from telegram_report import _send_chunked_report
@@ -89,6 +89,7 @@ class QA(Enum):
 class QASession:
     workflow:    str = "stamp_duty"       # "stamp_duty" | "land_rent"
     photo_bytes: Optional[bytes] = None
+    refs:        Optional[List[str]] = None   # reference(s) typed as text (no photo)
     matches:     List[Dict] = field(default_factory=list)   # candidate valuers when ambiguous
 
 
@@ -129,9 +130,9 @@ async def _qa_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE, workflow: st
     if not allowed(update): return await deny(update)
     ctx.user_data["qa_session"] = QASession(workflow=workflow)
     await update.message.reply_text(
-        f"⚡ *Quick {_WORKFLOW_LABEL[workflow]} Assignment* — the fast path: send a photo of the "
-        "reference(s), then give me a valuer name, and I'll read it and assign (or queue) in the "
-        "background — no further steps.\n\n*Send the photo now:*",
+        f"⚡ *Quick {_WORKFLOW_LABEL[workflow]} Assignment* — the fast path: *send a photo* of the "
+        "reference(s) *or type the reference number(s)*, then give me a valuer name, and I'll assign "
+        "(or queue) in the background — no further steps.\n\n*Send a photo or type the reference(s) now:*",
         parse_mode="Markdown",
     )
     return QA.PHOTO
@@ -167,8 +168,29 @@ async def recv_qa_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return QA.NAME
 
 
+async def recv_qa_refs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Text path: the user typed the reference number(s) instead of sending a
+    # photo. Extract them with the same ref pattern OCR uses, then ask for the
+    # valuer (no OCR needed — the job assigns/queues these directly).
+    refs = _extract_refs_from_text(update.message.text or "")
+    if not refs:
+        await update.message.reply_text(
+            "⚠️ No valid reference number found. *Send a photo* or *type the reference number(s)* "
+            "(e.g. `CNTYINV/ABC1234567`).",
+            parse_mode="Markdown",
+        )
+        return QA.PHOTO
+    _get_qa_sess(ctx).refs = refs
+    await update.message.reply_text(
+        f"✍️ Got *{len(refs)}* reference(s). *Who should I assign to?* Type the valuer name:",
+        parse_mode="Markdown",
+    )
+    return QA.NAME
+
+
 async def recv_qa_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # The typed name (used when no caption was supplied with the photo).
+    # The typed name (used when no caption was supplied with the photo, or on
+    # the text-reference path).
     return await _qa_resolve_name(update, ctx, (update.message.text or "").strip())
 
 
@@ -227,12 +249,14 @@ async def _qa_launch(update_or_query, ctx: ContextTypes.DEFAULT_TYPE, valuer: Di
             "user_id":     user_id,
             "workflow":    sess.workflow,
             "photo_bytes": sess.photo_bytes,
+            "refs":        sess.refs,
             "valuer":      valuer,
         },
         name=f"quick_assign:{msg.chat_id}",
     )
+    _what = "the reference(s)" if sess.refs else "the photo"
     await msg.reply_text(
-        f"⚡ Working on it in the background — reading the photo and assigning to "
+        f"⚡ Working on it in the background — reading {_what} and assigning to "
         f"*{md_escape(valuer['name'])}*. I'll report back here when it's done.",
         parse_mode="Markdown",
         reply_markup=_main_menu_for(user_id),
@@ -311,55 +335,64 @@ async def _qa_process_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     workflow = data["workflow"]
     valuer   = data["valuer"]
 
-    try:
-        refs, source = await ocr_extract_refs(data["photo_bytes"])
-        logger.info("Quick Assign OCR (%s): %d ref(s)", source, len(refs))
-    except Exception as e:
-        logger.error("Quick Assign OCR failed: %s", e)
-        refs, source = [], "none"
-
-    if not refs:
-        # OCR extracted nothing (e.g. the GPU wasn't funded that day). Still
-        # record the screenshot — flagged ocr_failed — and alert the OCR History
-        # reviewers in red so someone can assign it by hand and mark it resolved.
+    text_refs = data.get("refs")
+    if text_refs:
+        # Text path: refs were typed directly — no OCR, no screenshot to audit.
+        refs, source = list(text_refs), "text"
+        logger.info("Quick Assign text: %d ref(s)", len(refs))
+    else:
         try:
-            _qa_rec = await asyncio.to_thread(
-                ocr_audit.record_upload, data["photo_bytes"],
-                channel="quick_assign", uploaded_by=data["user_id"], ocr_source=source,
-                valuer_name=valuer["name"], valuer_uid=valuer["uid"], assignments=[],
-            )
-            if _qa_rec:
-                await ocr_audit.notify_viewers(ctx.bot, _qa_rec, exclude_user_id=data["user_id"])
+            refs, source = await ocr_extract_refs(data["photo_bytes"])
+            logger.info("Quick Assign OCR (%s): %d ref(s)", source, len(refs))
         except Exception as e:
-            logger.warning("OCR audit record/notify failed (quick assign, OCR fail): %s", e)
-        await ctx.bot.send_message(
-            chat_id,
-            "⚠️ *Quick Assign* — couldn't read any reference number from the photo. "
-            "Try a clearer shot of the Reference Number column.",
-            parse_mode="Markdown", reply_markup=_main_menu_for(chat_id),
-        )
-        return
+            logger.error("Quick Assign OCR failed: %s", e)
+            refs, source = [], "none"
+
+        if not refs:
+            # OCR extracted nothing (e.g. the GPU wasn't funded that day). Still
+            # record the screenshot — flagged ocr_failed — and alert the OCR
+            # History reviewers in red so someone can assign it by hand and mark
+            # it resolved.
+            try:
+                _qa_rec = await asyncio.to_thread(
+                    ocr_audit.record_upload, data["photo_bytes"],
+                    channel="quick_assign", uploaded_by=data["user_id"], ocr_source=source,
+                    valuer_name=valuer["name"], valuer_uid=valuer["uid"], assignments=[],
+                )
+                if _qa_rec:
+                    await ocr_audit.notify_viewers(ctx.bot, _qa_rec, exclude_user_id=data["user_id"])
+            except Exception as e:
+                logger.warning("OCR audit record/notify failed (quick assign, OCR fail): %s", e)
+            await ctx.bot.send_message(
+                chat_id,
+                "⚠️ *Quick Assign* — couldn't read any reference number from the photo. "
+                "Try a clearer shot of the Reference Number column.",
+                parse_mode="Markdown", reply_markup=_main_menu_for(chat_id),
+            )
+            return
 
     result = await asyncio.to_thread(_qa_assign_or_queue, refs, valuer, workflow, data["user_id"])
 
     # Audit the uploaded screenshot (image → blob_store, metadata → saved_ocr_audit)
-    # — best-effort, never blocks or breaks the assignment report below.
-    _qa_mode_map = [("assigned", "assigned"), ("queued", "queued"),
-                    ("failed", "failed"), ("no_token", "pending")]
-    _qa_assignments = [{"ref": r, "mode": mode}
-                       for key, mode in _qa_mode_map for r in result.get(key, [])]
-    try:
-        _qa_rec = await asyncio.to_thread(
-            ocr_audit.record_upload, data["photo_bytes"],
-            channel="quick_assign", uploaded_by=data["user_id"], ocr_source=source,
-            valuer_name=valuer["name"], valuer_uid=valuer["uid"], assignments=_qa_assignments,
-        )
-        # Push the screenshot to everyone granted 🖼 OCR History (except the
-        # uploader) so the selected reviewers are alerted in real time.
-        if _qa_rec:
-            await ocr_audit.notify_viewers(ctx.bot, _qa_rec, exclude_user_id=data["user_id"])
-    except Exception as e:
-        logger.warning("OCR audit record/notify failed (quick assign): %s", e)
+    # — photo path only; a text-typed reference has no image to log. Best-effort,
+    # never blocks or breaks the assignment report below.
+    if not text_refs:
+        _qa_mode_map = [("assigned", "assigned"), ("queued", "queued"),
+                        ("failed", "failed"), ("no_token", "pending")]
+        _qa_assignments = [{"ref": r, "mode": mode}
+                           for key, mode in _qa_mode_map for r in result.get(key, [])]
+        try:
+            _qa_rec = await asyncio.to_thread(
+                ocr_audit.record_upload, data["photo_bytes"],
+                channel="quick_assign", uploaded_by=data["user_id"], ocr_source=source,
+                valuer_name=valuer["name"], valuer_uid=valuer["uid"], assignments=_qa_assignments,
+            )
+            # Push the screenshot to everyone granted 🖼 OCR History (except the
+            # uploader) so the selected reviewers are alerted in real time.
+            if _qa_rec:
+                await ocr_audit.notify_viewers(ctx.bot, _qa_rec, exclude_user_id=data["user_id"])
+        except Exception as e:
+            logger.warning("OCR audit record/notify failed (quick assign): %s", e)
 
     if result.get("no_token"):
         await ctx.bot.send_message(
@@ -445,7 +478,8 @@ def register(app: Application) -> None:
             MessageHandler(filters.Regex(f"^{re.escape(BTN_QA_LRENT)}$"), cmd_qa_lrent),
         ],
         states={
-            QA.PHOTO:       [MessageHandler(filters.PHOTO, recv_qa_photo)],
+            QA.PHOTO:       [MessageHandler(filters.PHOTO, recv_qa_photo),
+                             MessageHandler(not_cancel, recv_qa_refs)],
             QA.NAME:        [MessageHandler(not_cancel, recv_qa_name)],
             QA.PICK_VALUER: [CallbackQueryHandler(recv_qa_pick, pattern=r"^qa_pick:")],
         },
