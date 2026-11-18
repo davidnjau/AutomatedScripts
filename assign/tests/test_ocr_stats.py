@@ -86,6 +86,32 @@ class TestRecordExtraction(_TmpStore):
         os_mod.record_extraction("weird")
         self.assertEqual(os_mod.load_ocr_counts()["counts"]["weird"], 1)
 
+    def test_glm_none_is_billed_and_tracked_as_unfinalised(self):
+        # A GPU run that produced no ref still costs money (billed) and is
+        # additionally tallied as 'not finalised'.
+        self._write({"starting_balance_usd": 30.0, "spent_usd": 0.0, "unfinalised_usd": 0.0,
+                     "cost_per_extraction_usd": 0.02, "counts": {}})
+        os_mod.record_extraction("glm-none")
+        d = os_mod.load_ocr_counts()
+        self.assertEqual(d["counts"]["glm-none"], 1)
+        self.assertEqual(d["spent_usd"], 0.02)          # billed
+        self.assertEqual(d["unfinalised_usd"], 0.02)    # and flagged not-finalised
+        self.assertEqual(os_mod._remaining(d), 29.98)
+
+    def test_glm_ocr_bills_but_is_not_unfinalised(self):
+        self._write({"starting_balance_usd": 30.0, "spent_usd": 0.0, "unfinalised_usd": 0.0,
+                     "cost_per_extraction_usd": 0.02, "counts": {}})
+        os_mod.record_extraction("glm-ocr")
+        d = os_mod.load_ocr_counts()
+        self.assertEqual(d["spent_usd"], 0.02)
+        self.assertEqual(d["unfinalised_usd"], 0.0)     # finalised run
+
+    def test_stats_text_shows_not_finalised_line(self):
+        d = {"counts": {"glm-none": 1}, "cost_per_extraction_usd": 0.02,
+             "starting_balance_usd": 30.0, "spent_usd": 0.02, "unfinalised_usd": 0.02}
+        text = os_mod._os_stats_text(d)
+        self.assertIn("not finalised", text.lower())
+
 
 class TestDerived(_TmpStore):
     def test_total_extractions_sums_counts(self):
@@ -100,7 +126,7 @@ class TestDerived(_TmpStore):
         d = {"counts": {"glm-ocr": 3}, "cost_per_extraction_usd": 0.02,
              "starting_balance_usd": 29.87, "spent_usd": 0.06}
         text = os_mod._os_stats_text(d)
-        self.assertIn("GLM-OCR (GPU): 3", text)
+        self.assertIn("GLM-OCR (GPU, ref found): 3", text)
         self.assertIn("$29.81", text)   # remaining
 
 
