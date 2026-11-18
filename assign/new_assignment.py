@@ -240,9 +240,16 @@ async def _show_valuer_keyboard(message, sess: Session, results: List[Dict]) -> 
 # group if a new reference family appears.
 _REF_RE = re.compile(r'\b(?:CNTYINV|REG|DLA|LAS)(?:/[A-Z]{2,6})?/[A-Z0-9]{7,12}\b')
 
+# OCR frequently line-wraps a reference right after a slash (e.g. real screenshot
+# output "REG/TSFR/\nQA5RI1FGZB"), which split the ref across a newline and made
+# the contiguous _REF_RE miss a perfectly clear reference. Collapse whitespace
+# on either side of every slash before matching so a wrapped ref is rejoined.
+_SLASH_WS_RE = re.compile(r'\s*/\s*')
+
 
 def _extract_refs_from_text(text: str) -> List[str]:
-    return list(dict.fromkeys(_REF_RE.findall(text.upper())))  # dedup, preserve order
+    normalized = _SLASH_WS_RE.sub('/', text.upper())
+    return list(dict.fromkeys(_REF_RE.findall(normalized)))  # dedup, preserve order
 
 
 def _ocr_via_glm_service(photo_bytes: bytes) -> str:
@@ -298,7 +305,10 @@ async def _ocr_extract_refs_impl(photo_bytes: bytes) -> Tuple[List[str], str]:
     """
     Tesseract first, then the self-hosted GLM-OCR service (OCR_SERVICE_URL),
     then Claude Vision as a key-gated last resort. Returns (refs, source) where
-    source is "tesseract", "glm-ocr", "claude", or "none".
+    source is "tesseract", "glm-ocr", "claude", "glm-none", or "none".
+    "glm-none" means the GPU *ran* (GLM returned text) but no reference was
+    extracted — a GPU run still cost money even though it didn't finalise, so
+    it's billed (see ocr_stats._BILLABLE_SOURCES / unfinalised tracking).
     """
     # ── Tesseract ─────────────────────────────────────────
     try:
@@ -311,9 +321,11 @@ async def _ocr_extract_refs_impl(photo_bytes: bytes) -> Tuple[List[str], str]:
         logger.warning("Tesseract failed: %s", e)
 
     # ── Self-hosted GLM-OCR service (primary once configured) ──
+    glm_ran = False
     if OCR_SERVICE_URL:
         try:
             text = await asyncio.to_thread(_ocr_via_glm_service, photo_bytes)
+            glm_ran = True   # the GPU actually ran (billable) regardless of result
             refs = _extract_refs_from_text(text)
             if refs:
                 return refs, "glm-ocr"
@@ -322,7 +334,7 @@ async def _ocr_extract_refs_impl(photo_bytes: bytes) -> Tuple[List[str], str]:
 
     # ── Claude Vision fallback (only if a key is still set) ────
     if not ANTHROPIC_API_KEY:
-        return [], "none"
+        return [], ("glm-none" if glm_ran else "none")
     try:
         client  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         b64_img = base64.standard_b64encode(photo_bytes).decode()
@@ -354,10 +366,12 @@ async def _ocr_extract_refs_impl(photo_bytes: bytes) -> Tuple[List[str], str]:
         )
         text = resp.content[0].text
         refs = _extract_refs_from_text(text)
-        return refs, "claude"
+        if refs:
+            return refs, "claude"
+        return [], ("glm-none" if glm_ran else "none")
     except Exception as e:
         logger.warning("Claude Vision failed: %s", e)
-        return [], "none"
+        return [], ("glm-none" if glm_ran else "none")
 
 
 # ──────────────────────────────────────────────────────────

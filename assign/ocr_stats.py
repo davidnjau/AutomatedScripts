@@ -62,15 +62,20 @@ SAVED_OCR_COUNTS_FILE = os.path.join(DATA_DIR, "saved_ocr_counts.json")
 # Flat estimate per GPU (GLM-OCR) extraction — the measured cold-start cost of
 # one photo (~$0.02); a warm photo is far cheaper, so this is conservative.
 _DEFAULT_COST_PER_EXTRACTION = 0.02
-# Only the self-hosted GPU path spends RunPod credit; the others don't.
-_BILLABLE_SOURCES = {"glm-ocr"}
+# Any GLM run hits the self-hosted GPU and costs RunPod credit — whether or not
+# a reference came out. "glm-ocr" = ran and extracted a ref (finalised);
+# "glm-none" = ran but extracted nothing (NOT finalised, but still billed).
+_BILLABLE_SOURCES = {"glm-ocr", "glm-none"}
+# GPU runs that didn't finalise (billed but produced no reference).
+_UNFINALISED_SOURCES = {"glm-none"}
 
-# Human labels for the four source buckets, in display order.
+# Human labels for the source buckets, in display order.
 _SOURCE_LABELS = [
-    ("glm-ocr",   "GLM-OCR (GPU)"),
+    ("glm-ocr",   "GLM-OCR (GPU, ref found)"),
+    ("glm-none",  "GLM-OCR (GPU, no ref — not finalised)"),
     ("claude",    "Claude Vision"),
     ("tesseract", "Tesseract"),
-    ("none",      "No result"),
+    ("none",      "No result (no GPU)"),
 ]
 
 
@@ -86,6 +91,7 @@ def load_ocr_counts() -> Dict:
         "cost_per_extraction_usd": _DEFAULT_COST_PER_EXTRACTION,
         "starting_balance_usd": 0.0,
         "spent_usd": 0.0,
+        "unfinalised_usd": 0.0,   # portion of spend from GPU runs that produced no ref
     }
     try:
         with open(SAVED_OCR_COUNTS_FILE) as f:
@@ -103,8 +109,10 @@ def save_ocr_counts(data: Dict) -> None:
 
 
 def record_extraction(source: str) -> None:
-    """Bump the lifetime per-source counter and, for a billable (GPU) source,
-    deduct the estimated cost from spend. Called once per photo from
+    """Bump the lifetime per-source counter and, for ANY billable (GPU) source,
+    deduct the estimated cost from spend — including a GPU run that produced no
+    reference ("glm-none"), whose cost is additionally tallied as
+    unfinalised_usd ("calculated but not finalised"). Called once per photo from
     new_assignment.ocr_extract_refs; the caller wraps it so a counter failure
     never breaks an actual OCR/assignment."""
     data = load_ocr_counts()
@@ -113,6 +121,8 @@ def record_extraction(source: str) -> None:
     if source in _BILLABLE_SOURCES:
         cost = data.get("cost_per_extraction_usd", _DEFAULT_COST_PER_EXTRACTION)
         data["spent_usd"] = round(data.get("spent_usd", 0.0) + cost, 4)
+        if source in _UNFINALISED_SOURCES:
+            data["unfinalised_usd"] = round(data.get("unfinalised_usd", 0.0) + cost, 4)
     save_ocr_counts(data)
 
 
@@ -146,13 +156,16 @@ def _os_stats_text(data: Dict) -> str:
     lines.append(f"Est. cost per GPU extraction: ${data.get('cost_per_extraction_usd', _DEFAULT_COST_PER_EXTRACTION):.4f}")
     lines.append(f"Balance (last set): ${data.get('starting_balance_usd', 0.0):.2f}")
     lines.append(f"Est. spent since then: ${data.get('spent_usd', 0.0):.2f}")
+    unfinalised = data.get("unfinalised_usd", 0.0)
+    if unfinalised:
+        lines.append(f"  ↳ of which not finalised (GPU ran, no ref): ${unfinalised:.2f}")
     lines.append(f"*Est. remaining: ${_remaining(data):.2f}*")
     lines.append("")
     lines.append(
-        "ℹ️ _Approximate. Only GLM-OCR (self-hosted GPU) extractions deduct "
-        "credit; Claude Vision bills Anthropic separately and Tesseract is "
-        "free. Tap 💵 Set Balance and enter your real RunPod figure to "
-        "re-baseline._"
+        "ℹ️ _Approximate. Every GLM-OCR run hits the GPU and deducts credit — "
+        "including runs that produce no reference (counted but 'not finalised'). "
+        "Claude Vision bills Anthropic separately; Tesseract is free. Tap "
+        "💵 Set Balance and enter your real RunPod figure to re-baseline._"
     )
     return "\n".join(lines)
 
@@ -230,6 +243,7 @@ async def recv_os_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         data = load_ocr_counts()
         data["counts"] = {}
         data["spent_usd"] = 0.0
+        data["unfinalised_usd"] = 0.0
         save_ocr_counts(data)
         await query.edit_message_text(
             "🔄 Counters and spend reset.\n\n" + _os_stats_text(data),
@@ -260,6 +274,7 @@ async def recv_os_set_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = load_ocr_counts()
     data["starting_balance_usd"] = round(amount, 2)
     data["spent_usd"] = 0.0
+    data["unfinalised_usd"] = 0.0
     save_ocr_counts(data)
     await update.message.reply_text(
         f"✅ Balance set to ${amount:.2f}.\n\n" + _os_stats_text(data),

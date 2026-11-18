@@ -87,6 +87,17 @@ class TestExtractRefsFromText(unittest.TestCase):
     def test_no_match_returns_empty(self):
         self.assertEqual(na._extract_refs_from_text("nothing matching here"), [])
 
+    def test_ref_wrapped_across_a_line_break_is_rejoined(self):
+        # Real GLM-OCR output: the ref wrapped right after the last slash.
+        raw = "Transfer of Interest in land: Application REG/TSFR/\nQA5RI1FGZB\nCancel Application"
+        self.assertEqual(na._extract_refs_from_text(raw), ["REG/TSFR/QA5RI1FGZB"])
+
+    def test_spaces_around_slashes_are_tolerated(self):
+        self.assertEqual(na._extract_refs_from_text("REG / TSFR / QA5RI1FGZB"), ["REG/TSFR/QA5RI1FGZB"])
+
+    def test_wrap_fix_still_rejects_parcel_numbers(self):
+        self.assertEqual(na._extract_refs_from_text("BLOCK46 / 175 / 89"), [])
+
 
 def _rp_resp(payload):
     r = MagicMock()
@@ -154,6 +165,16 @@ class TestOcrExtractRefsRouting(unittest.TestCase):
              patch.object(na.pytesseract, "image_to_string", return_value=""), \
              patch.object(na.Image, "open", return_value=MagicMock()):
             self.assertEqual(_run(na.ocr_extract_refs(b"img")), ([], "none"))
+
+    def test_glm_runs_but_no_ref_returns_glm_none(self):
+        # GPU ran (GLM returned text) but no reference matched → 'glm-none',
+        # so the cost is still billed as an unfinalised GPU run.
+        with patch.object(na, "OCR_SERVICE_URL", "https://api.runpod.ai/v2/ep"), \
+             patch.object(na, "ANTHROPIC_API_KEY", ""), \
+             patch.object(na.pytesseract, "image_to_string", return_value=""), \
+             patch.object(na.Image, "open", return_value=MagicMock()), \
+             patch.object(na, "_ocr_via_glm_service", return_value="some text with no reference"):
+            self.assertEqual(_run(na.ocr_extract_refs(b"img")), ([], "glm-none"))
 
     def test_service_failure_falls_through_without_key(self):
         with patch.object(na, "OCR_SERVICE_URL", "https://api.runpod.ai/v2/ep"), \
