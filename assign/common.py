@@ -405,6 +405,18 @@ def admin_recipients() -> List[int]:
     return list(ADMIN_IDS)
 
 
+def ops_recipients() -> List[int]:
+    """Recipients for auth/ops alerts (e.g. a token-refresh failure): admins +
+    ICT admins — the technical/monitoring audience, not every allowed user.
+    Falls back to all allowed if neither is configured (so an alert never goes
+    nowhere). The token-refresh daemon mirrors this independently since it's a
+    separate process that doesn't import common (see its _ops_recipients)."""
+    ids = set(ADMIN_IDS) | {uid for uid in ALLOWED_IDS if is_ict_admin(uid)}
+    if not ids:
+        return list(ALLOWED_IDS)
+    return sorted(ids)
+
+
 def report_recipients() -> List[int]:
     """Allowed users who should receive a broadcast report/notification —
     every allowed user except those in NO_REPORT_IDS. Used by every recurring
