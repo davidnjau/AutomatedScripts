@@ -139,6 +139,7 @@ These apply to every change in this codebase, not just new-module extractions:
 - Auto-started by `bot.py` on every boot (`_post_init` → `_daemon_start()`), so it comes back automatically after a redeploy/rebuild — no manual step needed
 - Can also be started/stopped manually via the "🔄 Token Daemon" menu button (spawns a subprocess, writes PID to `data/daemon.pid`) or run standalone: `python token_refresh_daemon.py` / `nohup python token_refresh_daemon.py &`
 - `_daemon_running()` cross-checks `/proc/<pid>/cmdline` against the daemon script (on Linux) to avoid a false-positive "already running" from a stale `daemon.pid` colliding with an unrelated PID after a container rebuild
+- **Auth-failure alert goes to admins + ICT admins only** (not every allowed user): once a credential's refresh is exhausted, the "⚠️ Token Refresh Failed" Telegram alert targets `_ops_recipients()` = `ADMIN_TELEGRAM_IDS` (env) + anyone with the `ict_admin` role in `data/saved_roles.json` (read fresh each alert), falling back to all-allowed only if neither is configured. The daemon is a separate process that doesn't import `common`, so it mirrors this independently; the bot process has the canonical `common.ops_recipients()` for any future bot-side auth/ops alert
 
 ### Assign Flow State Machine (`S` enum, in `new_assignment.py`)
 

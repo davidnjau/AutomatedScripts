@@ -26,9 +26,9 @@ Refresh strategy:
   immediately — a single transient failure must not permanently disable
   auto-refresh for a credential. Only once retries are exhausted is the
   credential marked failed (no further attempts until the bot saves fresh
-  tokens for it via OTP) and a Telegram alert sent to ALLOWED_IDS, so a
-  dead credential is surfaced immediately rather than discovered later
-  when its token has already expired.
+  tokens for it via OTP) and a Telegram alert sent to admins + ICT admins
+  only (the ops audience — see _ops_recipients), so a dead credential is
+  surfaced to whoever can fix it rather than spamming every user.
 
 Usage:
     python token_refresh_daemon.py              # foreground
@@ -97,6 +97,16 @@ NO_REPORT_IDS: set = {
     for x in os.getenv("REPORT_EXCLUDED_TELEGRAM_IDS", "").split(",")
     if x.strip()
 }
+# Auth/token-failure alerts go to admins + ICT admins only (the ops/monitoring
+# audience) — NOT every allowed user. Admins come from the env; ICT admins come
+# from saved_roles.json (same role store common.py uses), read fresh each alert
+# so a role grant takes effect without a daemon restart.
+ADMIN_IDS: set = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",")
+    if x.strip()
+}
+ROLES_FILE = os.path.join(_BASE_DIR, "data", "saved_roles.json")
 
 CRED_LABELS = {
     "publicuser":   "👤 Public User",
@@ -186,11 +196,30 @@ def _tg_send(chat_id: int, text: str) -> None:
         logger.warning("Telegram error for %s: %s", chat_id, e)
 
 
-def _tg_broadcast(text: str) -> None:
-    # Skip report-excluded users (inquiry-only), same as common.report_recipients.
-    for chat_id in ALLOWED_IDS:
-        if chat_id in NO_REPORT_IDS:
-            continue
+def _ict_admin_ids() -> set:
+    """Telegram ids granted the ICT Admin role (saved_roles.json), read fresh
+    each call so a role change takes effect without a daemon restart."""
+    try:
+        with open(ROLES_FILE) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+    return {int(uid) for uid, roles in data.items() if "ict_admin" in (roles or [])}
+
+
+def _ops_recipients() -> List[int]:
+    """Who receives auth/token-failure alerts: admins + ICT admins. Falls back
+    to all allowed (minus report-excluded) if neither is configured, so an
+    alert never silently goes nowhere."""
+    ids = set(ADMIN_IDS) | _ict_admin_ids()
+    if not ids:
+        return [c for c in ALLOWED_IDS if c not in NO_REPORT_IDS]
+    return sorted(ids)
+
+
+def _tg_alert_ops(text: str) -> None:
+    # Auth/token alerts go to admins + ICT admins only (not every allowed user).
+    for chat_id in _ops_recipients():
         _tg_send(chat_id, text)
 
 
@@ -365,7 +394,7 @@ def _refresh_job(cred_type: str) -> None:
             _failed.add(cred_type)
             _retry_count.pop(cred_type, None)
             _scheduled.pop(cred_type, None)
-            _tg_broadcast(
+            _tg_alert_ops(
                 f"⚠️ *Token Refresh Failed*\n\n"
                 f"*{label}* (`{cred_type}`) could not be auto-refreshed after {RETRY_MAX} attempts.\n"
                 f"Please re-authenticate it manually via *🔑 Refresh Auth* before its token expires."

@@ -198,6 +198,20 @@ class TestAdminRecipients(unittest.TestCase):
             self.assertEqual(set(common.admin_recipients()), {333, 444})
 
 
+class TestOpsRecipients(unittest.TestCase):
+    def test_admins_plus_ict_admins(self):
+        with patch.object(common, "ADMIN_IDS", {5}), \
+             patch.object(common, "ALLOWED_IDS", {5, 7, 9}), \
+             patch.object(common, "is_ict_admin", side_effect=lambda uid: uid == 9):
+            self.assertEqual(common.ops_recipients(), [5, 9])
+
+    def test_falls_back_to_all_allowed_when_none(self):
+        with patch.object(common, "ADMIN_IDS", set()), \
+             patch.object(common, "ALLOWED_IDS", {7, 9}), \
+             patch.object(common, "is_ict_admin", return_value=False):
+            self.assertEqual(set(common.ops_recipients()), {7, 9})
+
+
 class TestReportRecipients(unittest.TestCase):
     def test_excludes_no_report_ids(self):
         with patch.object(common, "ALLOWED_IDS", {111, 222, 333}), \
