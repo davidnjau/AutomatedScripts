@@ -51,6 +51,14 @@ AUTH_LOGIN_URL = f"{AUTH_BASE_URL}/login"
 # receive_tasks.py, refresh_auth.py.
 AUTH_OTP_VERIFY_URL = f"{AUTH_BASE_URL}/otpverify"
 
+# POST — body: {"username", "password", "usertype"} — OTP-FREE machine login
+# (OAuth2 password grant). No OTP is generated or verified; returns tokens
+# directly. Response: {"details": {"access_token", "expires_in", "token_type",
+# "refresh_token", "jwt"}} (same shape as otpverify + expires_in/token_type).
+# usertype is compared uppercased against the account's category mapping (e.g.
+# "staff"). Used by ardhisasa_auth.py's system_login() for unattended re-auth.
+AUTH_SYSTEM_LOGIN_URL = f"{AUTH_BASE_URL}/system-login"
+
 # POST — headers: current (possibly-about-to-expire) Authorization/JWTAUTH.
 # Body: {"refresh_token": "..."} if available, else {} (server still issues
 # new tokens while the current ones remain valid). Response:
