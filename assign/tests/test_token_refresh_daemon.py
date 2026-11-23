@@ -247,18 +247,48 @@ class TestReauth(unittest.TestCase):
         self.assertTrue(any("staff2" in line for line in cm.output))
 
 
-class TestRefreshJobMissingCredProfile(TokenRefreshDaemonTestCase):
-    def test_unknown_cred_type_is_a_no_op_not_a_failure(self):
-        # The daemon now renews via system-login using CRED_MAP (not the cached
-        # token), so a cred_type with no credential profile is the skip case —
-        # not an empty cache (which it now re-auths from scratch).
-        with patch.object(trd, "_tg_alert_ops") as mock_broadcast, \
-             patch.object(trd, "_reauth") as mock_reauth:
-            trd._refresh_job("no_such_cred")
+class TestRefreshJobScoping(TokenRefreshDaemonTestCase):
+    """staff_valuer + staff2 renew via system-login (_reauth); publicuser +
+    staff (ICT) stay on the legacy refresh-token path (_try_refresh_token)."""
+
+    def test_scoped_cred_uses_system_login(self):
+        cache = {"staff_valuer": {"access_token": "at", "jwt": "j", "refresh_token": "rt"}}
+        with patch.object(trd, "_load_cache", return_value=cache), \
+             patch.object(trd, "_save_cache"), \
+             patch.object(trd, "_reauth", return_value=("AT", "JWT", "RT")) as mock_reauth, \
+             patch.object(trd, "_try_refresh_token") as mock_legacy, \
+             patch.object(trd, "_decode_exp", return_value=None):
+            trd._refresh_job("staff_valuer")
+        mock_reauth.assert_called_once()
+        mock_legacy.assert_not_called()
+
+    def test_non_scoped_cred_uses_refresh_token(self):
+        cache = {"publicuser": {"access_token": "at", "jwt": "j", "refresh_token": "rt"}}
+        with patch.object(trd, "_load_cache", return_value=cache), \
+             patch.object(trd, "_save_cache"), \
+             patch.object(trd, "_reauth") as mock_reauth, \
+             patch.object(trd, "_try_refresh_token", return_value=("AT", "JWT", "RT")) as mock_legacy, \
+             patch.object(trd, "_decode_exp", return_value=None):
+            trd._refresh_job("publicuser")
+        mock_legacy.assert_called_once_with("at", "j", "rt")
         mock_reauth.assert_not_called()
-        self.assertNotIn("no_such_cred", trd._failed)
-        self.assertNotIn("no_such_cred", trd._retry_count)
+
+    def test_non_scoped_cred_with_no_cached_token_is_a_no_op(self):
+        with patch.object(trd, "_load_cache", return_value={}), \
+             patch.object(trd, "_tg_alert_ops") as mock_broadcast, \
+             patch.object(trd, "_try_refresh_token") as mock_legacy:
+            trd._refresh_job("publicuser")
+        mock_legacy.assert_not_called()
+        self.assertNotIn("publicuser", trd._failed)
         mock_broadcast.assert_not_called()
+
+    def test_scoped_cred_without_profile_is_a_no_op(self):
+        # Defensive: a scoped cred_type somehow missing from CRED_MAP.
+        with patch.object(trd, "CRED_MAP", {}), \
+             patch.object(trd, "_reauth") as mock_reauth:
+            trd._refresh_job("staff_valuer")
+        mock_reauth.assert_not_called()
+        self.assertNotIn("staff_valuer", trd._failed)
 
 
 if __name__ == "__main__":

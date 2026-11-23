@@ -56,6 +56,15 @@ PUBLIC_CREDENTIALS = {
     "usertype": "publicuser",
 }
 
+# Credentials whose tokens are renewed via the OTP-free system-login (both the
+# daemon's proactive renewal and common.reauth's live-403 recovery). Scoped to
+# the two credentials the bot actually depends on — 🏢 Staff Valuer (DLV/
+# valuation work) and 🏢 Support Reg (staff2, the county/assessor stage).
+# publicuser and staff (ICT) stay on the legacy refresh-token path (they're
+# rarely used and weren't affected by the rotation issue). Imported by both
+# common.py and the standalone token_refresh_daemon.py.
+SYSTEM_LOGIN_CREDS = {"staff_valuer", "staff2"}
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
