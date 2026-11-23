@@ -40,7 +40,10 @@ from ardhisasa_auth import (
     STAFF_CREDENTIALS_SUPPORT,
     STAFF_CREDENTIALS_VALUER,
     AuthTokens,
+    auth_headers,
+    build_session,
     decode_jwt_exp,
+    system_login,
 )
 
 # ──────────────────────────────────────────────────────────
@@ -630,6 +633,79 @@ def _any_valid_tokens() -> Optional[AuthTokens]:
         if t:
             return t
     return None
+
+
+# Serialize re-auth per credential so a burst of concurrent 403s (several
+# background jobs hitting a just-retired token at once) coalesces into ONE
+# system-login rather than hammering the auth endpoint; the losers of the lock
+# re-read the freshly-cached token instead of re-authing again.
+_REAUTH_LOCKS: Dict[str, threading.Lock] = {}
+_REAUTH_LOCKS_GUARD = threading.Lock()
+
+
+def _reauth_lock(cred_type: str) -> threading.Lock:
+    """Get (creating once) the per-credential re-auth lock."""
+    with _REAUTH_LOCKS_GUARD:
+        lock = _REAUTH_LOCKS.get(cred_type)
+        if lock is None:
+            lock = threading.Lock()
+            _REAUTH_LOCKS[cred_type] = lock
+        return lock
+
+
+def reauth(cred_type: str) -> Optional[AuthTokens]:
+    """Re-authenticate `cred_type` immediately via the OTP-free system-login
+    and cache the result — used when a live API call is rejected (403, token
+    retired) so the caller can retry without waiting for the daemon's next
+    renewal cycle. Serialized per credential: if the token was already
+    refreshed by another thread while waiting for the lock, that fresh token
+    is returned instead of logging in again. Returns the new AuthTokens, or
+    None if system-login fails (logged, not raised)."""
+    creds = CRED_MAP.get(cred_type)
+    if not creds:
+        logger.warning("reauth: no credential profile for %s", cred_type)
+        return None
+    lock = _reauth_lock(cred_type)
+    with lock:
+        # Another thread may have just re-authed while we waited for the lock.
+        fresh = get_valid_tokens(cred_type)
+        if fresh:
+            return fresh
+        try:
+            tokens, refresh_token = system_login(build_session(), creds)
+        except Exception as e:
+            logger.warning("reauth: system-login failed for %s: %s", cred_type, _safe_err(e))
+            return None
+        persist_tokens(cred_type, tokens.access_token, tokens.jwt, refresh_token)
+        logger.info("reauth: re-authenticated %s via system-login after a live failure.", cred_type)
+        return tokens
+
+
+def request_with_reauth(cred_type: str, method: str, url: str, *,
+                        headers_fn=auth_headers, session=None, **kwargs):
+    """Make an HTTP request for `cred_type`, re-authenticating once and retrying
+    if the call is rejected with 403 (a retired/revoked token). Acquires the
+    cached token (re-authing first if none is valid), sends the request, and on
+    a 403 calls reauth(cred_type) and retries exactly once with the fresh token.
+    Returns the final requests.Response (the caller still checks status /
+    raise_for_status). Raises RuntimeError only if no token can be obtained at
+    all. `headers_fn(tokens)` builds the auth headers (defaults to
+    ardhisasa_auth.auth_headers — pass a custom one that adds cparams if the
+    endpoint needs it). Any caller-supplied `headers=` are merged on top of
+    headers_fn's output, on both the first attempt and the retry."""
+    sess = session or build_session()
+    extra_headers = kwargs.pop("headers", {}) or {}
+    tokens = get_valid_tokens(cred_type) or reauth(cred_type)
+    if not tokens:
+        raise RuntimeError(f"request_with_reauth: could not obtain a token for {cred_type}")
+    resp = sess.request(method, url, headers={**headers_fn(tokens), **extra_headers}, **kwargs)
+    if resp.status_code == 403:
+        logger.info("request_with_reauth: 403 for %s on %s — re-authenticating and retrying.",
+                    cred_type, url)
+        fresh = reauth(cred_type)
+        if fresh:
+            resp = sess.request(method, url, headers={**headers_fn(fresh), **extra_headers}, **kwargs)
+    return resp
 
 
 def _ft_headers(tokens: AuthTokens) -> dict:
