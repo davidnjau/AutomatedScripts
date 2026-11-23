@@ -213,6 +213,15 @@ class TestReauth(unittest.TestCase):
     def test_reauth_unknown_cred_returns_none(self):
         self.assertIsNone(common.reauth("no_such_cred"))
 
+    def test_reauth_non_scoped_cred_does_not_system_login(self):
+        # reauth is scoped to SYSTEM_LOGIN_CREDS (staff_valuer + staff2) — a
+        # credential on the legacy path (e.g. publicuser) returns None without
+        # ever calling system_login.
+        with patch.object(common, "system_login") as mock_sl:
+            self.assertIsNone(common.reauth("publicuser"))
+            self.assertIsNone(common.reauth("staff"))
+        mock_sl.assert_not_called()
+
     def test_reauth_failure_returns_none(self):
         with patch.object(common, "get_valid_tokens", return_value=None), \
              patch.object(common, "system_login", side_effect=RuntimeError("403")), \

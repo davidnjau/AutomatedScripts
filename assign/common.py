@@ -39,6 +39,7 @@ from ardhisasa_auth import (
     STAFF_CREDENTIALS_ICT,
     STAFF_CREDENTIALS_SUPPORT,
     STAFF_CREDENTIALS_VALUER,
+    SYSTEM_LOGIN_CREDS,
     AuthTokens,
     auth_headers,
     build_session,
@@ -660,7 +661,13 @@ def reauth(cred_type: str) -> Optional[AuthTokens]:
     renewal cycle. Serialized per credential: if the token was already
     refreshed by another thread while waiting for the lock, that fresh token
     is returned instead of logging in again. Returns the new AuthTokens, or
-    None if system-login fails (logged, not raised)."""
+    None if system-login fails (logged, not raised). Scoped to
+    SYSTEM_LOGIN_CREDS (staff_valuer + staff2) — returns None for any other
+    credential so its callers fall back to their prior behaviour (rotate /
+    fail) rather than system-logging a credential that stays on the legacy
+    refresh-token path."""
+    if cred_type not in SYSTEM_LOGIN_CREDS:
+        return None
     creds = CRED_MAP.get(cred_type)
     if not creds:
         logger.warning("reauth: no credential profile for %s", cred_type)

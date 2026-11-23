@@ -5,21 +5,20 @@ token_refresh_daemon.py
 Always-on daemon that monitors data/saved_tokens.json and automatically
 re-authenticates every credential profile before its token expires.
 
-Renewal strategy (changed from refresh-token to system-login):
-  POST /acl/api/v1/auth/system-login   (ardhisasa_auth.system_login)
-      Body: {"username", "password", "usertype"}
-
-  The daemon now RE-AUTHENTICATES from scratch (OTP-free, OAuth2 password
-  grant) rather than exchanging the cached refresh_token. This was switched
-  deliberately: the server rotates refresh tokens (ROTATE_REFRESH_TOKEN) and
-  allows a single access token per account (OAUTH_SINGLE_ACCESS_TOKEN), so
-  whenever an account was also used elsewhere the daemon's cached
-  refresh/access token got revoked and the refresh-token call returned 403
-  (the staff_valuer outages). A fresh username/password login is immune to
-  that — it needs no valid prior token, so an already-expired or revoked
-  credential still re-auths cleanly, and no account-sharing can lock the bot
-  out for more than one renewal cycle. (system-login itself returns a
-  refresh_token, which is cached but no longer relied on for renewal.)
+Renewal strategy (per-credential — see SYSTEM_LOGIN_CREDS in ardhisasa_auth):
+  • staff_valuer + staff2 (the credentials the bot depends on): RE-AUTHENTICATE
+    from scratch via the OTP-free system-login (POST /acl/api/v1/auth/system-login
+    with {username, password, usertype} — ardhisasa_auth.system_login). This was
+    switched deliberately: the server rotates refresh tokens (ROTATE_REFRESH_TOKEN)
+    and allows a single access token per account (OAUTH_SINGLE_ACCESS_TOKEN), so
+    whenever an account was also used elsewhere the daemon's cached refresh/access
+    token got revoked and the refresh-token call returned 403 (the staff_valuer
+    outages). A fresh username/password login is immune — it needs no valid prior
+    token, so an expired/revoked credential re-auths cleanly and no account-sharing
+    can lock the bot out for more than one renewal cycle.
+  • publicuser + staff (ICT): stay on the LEGACY refresh-token exchange
+    (POST /auth/refresh-token with the cached tokens) — rarely used, unaffected by
+    the rotation issue, so left on their prior behaviour.
 
   For each credential found in saved_tokens.json the daemon schedules an
   APScheduler one-shot job to fire REFRESH_BEFORE seconds before expiry.
@@ -76,10 +75,12 @@ from ardhisasa_auth import (
     STAFF_CREDENTIALS_ICT,
     STAFF_CREDENTIALS_SUPPORT,
     STAFF_CREDENTIALS_VALUER,
+    SYSTEM_LOGIN_CREDS,
     build_session,
     decode_jwt_exp,
     system_login,
 )
+from endpoints import AUTH_REFRESH_TOKEN_URL
 
 # cred_type → the username/password/usertype profile used for OTP-free
 # re-authentication via system_login (see _refresh_job). Keeps the daemon's
@@ -295,6 +296,48 @@ def _reauth(cred_type: str, creds: dict) -> Optional[Tuple[str, str, str]]:
         return None
 
 
+def _try_refresh_token(
+    access_token:  str,
+    jwt_token:     str,
+    refresh_token: str = "",
+) -> Optional[Tuple[str, str, str]]:
+    """
+    Legacy renewal path (refresh-token exchange) used for credentials NOT in
+    SYSTEM_LOGIN_CREDS — i.e. publicuser and staff (ICT), which are rarely used
+    and weren't affected by the rotation issue, so they stay on their prior
+    behaviour. POST /auth/refresh-token using the cached auth headers; sends
+    refresh_token in the body if available. Returns (access, jwt, refresh) or
+    None (reason logged at WARNING).
+    """
+    body = {}
+    if refresh_token:
+        body["refresh_token"] = refresh_token
+    try:
+        resp = _api_sess.post(
+            AUTH_REFRESH_TOKEN_URL,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "JWTAUTH":       f"Bearer {jwt_token}",
+            },
+            json=body,
+            timeout=30,
+        )
+        if resp.status_code not in (200, 201):
+            logger.warning("refresh-token HTTP %d: %s", resp.status_code, resp.text[:200])
+            return None
+        data    = resp.json()
+        details = data.get("details", data)
+        new_at  = details.get("access_token")
+        new_jwt = details.get("jwt")
+        new_rt  = details.get("refresh_token") or refresh_token
+        if new_at and new_jwt:
+            return new_at, new_jwt, new_rt
+        logger.warning("refresh-token response missing tokens. Keys: %s", list(data.keys()))
+    except Exception as e:
+        logger.warning("refresh-token error: %s", e)
+    return None
+
+
 # ──────────────────────────────────────────────────────────
 # Scheduler and job tracking
 # ──────────────────────────────────────────────────────────
@@ -383,18 +426,30 @@ def _refresh_job(cred_type: str) -> None:
     label = CRED_LABELS.get(cred_type, cred_type)
     logger.info("[%s] Refresh job fired.", cred_type)
 
-    creds = CRED_MAP.get(cred_type)
-    if not creds:
-        logger.warning("[%s] No credential profile — skipping (cannot system-login).", cred_type)
-        return
-
-    # Re-authenticate from scratch via the OTP-free system-login (username/
-    # password) rather than exchanging the cached refresh_token. This is
-    # immune to the server's refresh-token ROTATION (which was revoking a
-    # cached token whenever the account was used elsewhere — the staff_valuer
-    # 403 incidents), and needs no valid prior token, so an already-expired or
-    # revoked credential still re-auths cleanly.
-    result = _reauth(cred_type, creds)
+    if cred_type in SYSTEM_LOGIN_CREDS:
+        # staff_valuer + staff2: re-authenticate from scratch via the OTP-free
+        # system-login (username/password) rather than exchanging the cached
+        # refresh_token. Immune to the server's refresh-token ROTATION (which
+        # was revoking a cached token whenever the account was used elsewhere —
+        # the staff_valuer 403 incidents), and needs no valid prior token, so
+        # an already-expired or revoked credential still re-auths cleanly.
+        creds = CRED_MAP.get(cred_type)
+        if not creds:
+            logger.warning("[%s] No credential profile — skipping (cannot system-login).", cred_type)
+            return
+        result = _reauth(cred_type, creds)
+    else:
+        # publicuser + staff (ICT): stay on the legacy refresh-token exchange
+        # (rarely used, unaffected by the rotation issue). Needs a valid cached
+        # token to refresh from.
+        entry = _load_cache().get(cred_type) or {}
+        access_token  = entry.get("access_token", "")
+        jwt_token     = entry.get("jwt", "")
+        refresh_token = entry.get("refresh_token", "")
+        if not access_token or not jwt_token:
+            logger.warning("[%s] No cached tokens to refresh — skipping (legacy path needs OTP re-auth).", cred_type)
+            return
+        result = _try_refresh_token(access_token, jwt_token, refresh_token)
     if result:
         new_access, new_jwt, new_rt = result
         new_exp = _decode_exp(new_jwt) or (time.time() + 3600)
@@ -415,7 +470,8 @@ def _refresh_job(cred_type: str) -> None:
         _retry_count.pop(cred_type, None)
         _failed_since.pop(cred_type, None)
         _escalated.discard(cred_type)
-        logger.info("[%s] ✅ Token re-authenticated (system-login). New expiry: %s", cred_type, _fmt_ts(new_exp))
+        _how = "system-login" if cred_type in SYSTEM_LOGIN_CREDS else "refresh-token"
+        logger.info("[%s] ✅ Token renewed (%s). New expiry: %s", cred_type, _how, _fmt_ts(new_exp))
 
         # Schedule next refresh for the new expiry
         _schedule_refresh(cred_type, new_exp)
