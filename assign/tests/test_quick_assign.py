@@ -16,6 +16,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import quick_assign as qa
 
+# A direct assignment auto-holds the ref (see hold_tasks.auto_hold_ref) —
+# module-level patch so NO test in this file, regardless of class, ever
+# touches the real saved_dlv_records.json.
+_module_patches = []
+
+
+def setUpModule():
+    p = patch.object(qa, "auto_hold_ref")
+    p.start()
+    _module_patches.append(p)
+
+
+def tearDownModule():
+    for p in _module_patches:
+        p.stop()
+    _module_patches.clear()
+
 
 def _run(coro):
     return asyncio.run(coro)
@@ -59,6 +76,13 @@ class TestMatchValuers(unittest.TestCase):
 
 
 class TestAssignOrQueue(unittest.TestCase):
+    def setUp(self):
+        # A direct assignment auto-holds the ref — stub it so tests don't
+        # touch the real saved_dlv_records.json.
+        self._p = patch.object(qa, "auto_hold_ref")
+        self._p.start()
+        self.addCleanup(self._p.stop)
+
     def _http(self, raise_on_post=False):
         http = MagicMock()
         resp = MagicMock()
@@ -79,6 +103,7 @@ class TestAssignOrQueue(unittest.TestCase):
         mock_persist.assert_called_once()
         self.assertEqual(mock_persist.call_args.kwargs["extra"]["channel"], "quick_assign")
         mock_enqueue.assert_not_called()
+        qa.auto_hold_ref.assert_called_once_with("CNTYINV/ABC1234567", "Godwill", "u1")
 
     def test_queues_when_direct_fails(self):
         v = {"name": "Godwill", "uid": "u1", "account_number": "a1"}
@@ -92,6 +117,9 @@ class TestAssignOrQueue(unittest.TestCase):
         self.assertEqual(out["queued"], ["REG/TSFR/ABC1234567"])
         mock_enqueue.assert_called_once()
         mock_persist.assert_not_called()
+        # Queued (not directly assigned) refs are auto-held later, once
+        # DLV Batch's processing job confirms the assignment — not here.
+        qa.auto_hold_ref.assert_not_called()
 
     def test_land_rent_body_has_no_node(self):
         v = {"name": "G", "uid": "u1", "account_number": "a1"}

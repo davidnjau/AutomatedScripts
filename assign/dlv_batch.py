@@ -36,15 +36,17 @@ drops it too. This decision handler is registered globally (not part of
 the DB conversation), since the prompt can be answered long after the run
 that sent it and by any allowed user.
 
-A queue item carrying `auto_hold: true` (set by parcel_watch.py's
-_pw_check_job when it queues a found parcel's ref, tagged "Parcel Watch")
-is automatically enrolled into Hold Tasks' guard queue
-(hold_tasks.save_hold_tasks, via the local _db_maybe_auto_hold helper) the
-moment _process_dlv_batch_item confirms the ref is correctly assigned to
-the queued valuer — covering all three ways that can happen (a fresh
-assign, a forced reassign, or finding it already correctly assigned).
-This is the only way a ref starts being held without an explicit Hold
-Tasks ➕ Add Tasks to Hold step.
+EVERY queued ref, regardless of source (this module's own recv_db_confirm,
+Quick Assign's queue-fallback, Parcel Watch, etc.), is automatically
+enrolled into Hold Tasks' guard queue (hold_tasks.auto_hold_ref, via the
+local _db_maybe_auto_hold helper) the moment _process_dlv_batch_item
+confirms the ref is correctly assigned to the queued valuer — covering all
+three ways that can happen (a fresh assign, a forced reassign, or finding
+it already correctly assigned). Direct assignments (New Assignment, Quick
+Assign's direct-assign branch) are auto-held the same way, right where
+they persist_assignment — see those modules. This is what guards every
+assignment against takeover from the instant it's made, without a separate
+manual ➕ Add Tasks to Hold step.
 
 Call register(app) from bot.py's main() to wire this feature in.
 """
@@ -113,7 +115,7 @@ from dlv_core import (
 from dlv_incremental import next_incremental_assign_tag, next_incremental_tag
 from endpoints import ACCOUNTS_LIST_URL, STAMP_DUTY_FIX_APPLICATION_URL
 from fetch_tasks_cache import _fetch_tasks_log_lookup, _fetch_tasks_log_remove
-from hold_tasks import save_hold_tasks
+from hold_tasks import auto_hold_ref
 from task_block import format_labeled_block
 from telegram_report import _send_chunked_report
 
@@ -204,24 +206,14 @@ def _incremental_assign_tag_for(item: Dict) -> str:
 
 
 def _db_maybe_auto_hold(item: Dict, valuer_name: str, valuer_uid: str) -> None:
-    """If this queue item was marked auto_hold (currently only set by
-    parcel_watch.py's _pw_check_job), enroll the ref into Hold Tasks' guard
-    queue now that the assignment is confirmed — Hold Tasks can't guard a
-    ref until it's actually assigned, so this is the earliest point that
-    can happen. Called for all three "correctly assigned" outcomes
-    (Assigned/Reassigned/Already correctly assigned); logs rather than
-    raises on failure, since the assignment itself already succeeded."""
-    if not item.get("auto_hold"):
-        return
-    try:
-        save_hold_tasks([{
-            "ref":              item.get("ref", ""),
-            "held_valuer_name": valuer_name,
-            "held_valuer_uid":  valuer_uid,
-            "held_at":          datetime.now().isoformat(timespec="seconds"),
-        }])
-    except Exception as e:
-        logger.error("Auto-hold enrollment failed for %s: %s", item.get("ref", ""), e)
+    """Enroll the ref into Hold Tasks' guard queue (hold_tasks.auto_hold_ref)
+    now that the assignment is confirmed — Hold Tasks can't guard a ref until
+    it's actually assigned, so this is the earliest point that can happen.
+    Called for all three "correctly assigned" outcomes (Assigned/Reassigned/
+    Already correctly assigned), for EVERY queue item regardless of source
+    (DLV Batch's own queueing, Quick Assign's queue-fallback, Parcel Watch,
+    etc.) — every queued assignment is auto-held, not just an opt-in subset."""
+    auto_hold_ref(item.get("ref", ""), valuer_name, valuer_uid)
 
 
 def _process_dlv_batch_item(tokens: AuthTokens, http_sess, assign_url: str, auth_hdrs: dict, item: Dict) -> Dict:

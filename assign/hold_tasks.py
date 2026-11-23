@@ -34,8 +34,12 @@ it and the user adds it via Hold Tasks' Tracked Assignments source. This
 deliberately avoids Hold Tasks making an unreviewed live reassignment call
 against a ref it didn't originate the hold for.
 
-Tasks are only ever held or released by explicit user selection — via
-➕ Add Tasks to Hold and 🗑 Release Task(s) below — never automatically.
+Tasks can be held two ways: explicit user selection (➕ Add Tasks to Hold /
+🗑 Release Task(s) below), or automatically — auto_hold_ref() is called the
+moment ANY assignment succeeds, direct or via a queue (see its docstring and
+the call sites in new_assignment.py/quick_assign.py/dlv_batch.py), so every
+assignment is guarded against takeover from the instant it's made, without
+a separate manual step. Release is always automatic either way (see above).
 
 load_hold_tasks/save_hold_tasks are adapters over dlv_core's consolidated
 ref-keyed DLV-lifecycle store (Group A JSON consolidation, the last of its
@@ -177,6 +181,28 @@ def load_hold_tasks() -> List[Dict]:
         for ref, r in store.items()
         if r.get("hold") and r.get("status") != "removed"
     ]
+
+
+def auto_hold_ref(ref: str, valuer_name: str, valuer_uid: str) -> None:
+    """Enroll `ref` into the Hold Tasks guard queue immediately after ANY
+    successful assignment to valuer_name/valuer_uid — direct (New Assignment,
+    Quick Assign's direct-assign branch) or via a queue (DLV Batch's
+    processing job, for every queue source: its own recv_db_confirm, Quick
+    Assign's queue-fallback, Parcel Watch, etc.). This is what makes every
+    assignment automatically guarded against takeover until its status/node
+    moves past the valuer-report-pending stage (see this module's docstring),
+    rather than requiring the explicit ➕ Add Tasks to Hold step. Logs rather
+    than raises on failure, since the assignment itself already succeeded and
+    this is best-effort follow-up bookkeeping."""
+    try:
+        save_hold_tasks([{
+            "ref":              ref,
+            "held_valuer_name": valuer_name,
+            "held_valuer_uid":  valuer_uid,
+            "held_at":          datetime.now().isoformat(timespec="seconds"),
+        }])
+    except Exception as e:
+        logger.error("Auto-hold enrollment failed for %s: %s", ref, e)
 
 
 def save_hold_tasks(items: List[Dict]) -> None:
