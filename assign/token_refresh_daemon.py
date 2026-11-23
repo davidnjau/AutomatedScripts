@@ -3,23 +3,31 @@
 token_refresh_daemon.py
 =======================
 Always-on daemon that monitors data/saved_tokens.json and automatically
-refreshes every credential profile before its token expires.
+re-authenticates every credential profile before its token expires.
 
-Refresh strategy:
-  POST /acl/api/v1/auth/refresh-token
-      Authorization: Bearer <access_token>
-      JWTAUTH:       Bearer <jwt>
-      Body:          {"refresh_token": "<refresh_token>"}
+Renewal strategy (changed from refresh-token to system-login):
+  POST /acl/api/v1/auth/system-login   (ardhisasa_auth.system_login)
+      Body: {"username", "password", "usertype"}
+
+  The daemon now RE-AUTHENTICATES from scratch (OTP-free, OAuth2 password
+  grant) rather than exchanging the cached refresh_token. This was switched
+  deliberately: the server rotates refresh tokens (ROTATE_REFRESH_TOKEN) and
+  allows a single access token per account (OAUTH_SINGLE_ACCESS_TOKEN), so
+  whenever an account was also used elsewhere the daemon's cached
+  refresh/access token got revoked and the refresh-token call returned 403
+  (the staff_valuer outages). A fresh username/password login is immune to
+  that — it needs no valid prior token, so an already-expired or revoked
+  credential still re-auths cleanly, and no account-sharing can lock the bot
+  out for more than one renewal cycle. (system-login itself returns a
+  refresh_token, which is cached but no longer relied on for renewal.)
 
   For each credential found in saved_tokens.json the daemon schedules an
   APScheduler one-shot job to fire REFRESH_BEFORE seconds before expiry.
-  After a successful refresh the job reschedules itself for the new expiry.
-  A periodic scan runs every SCAN_INTERVAL seconds to pick up credentials
-  that were added or re-authenticated by the bot after startup.
-
-  The daemon never triggers OTP prompts — OTP is handled exclusively by the
-  bot flows (assign / receive / fetch).  Once those flows save tokens via
-  persist_tokens(), the daemon picks them up and keeps them fresh.
+  After a successful renewal the job reschedules itself for the new expiry.
+  A periodic scan runs every SCAN_INTERVAL seconds; an expired credential is
+  re-authed immediately. Renewal uses the username/password in CRED_MAP (the
+  same env credentials the bot's OTP flows use), so it needs no OTP and no
+  human step.
 
   A failed refresh (network blip, transient 5xx, etc.) is retried up to
   RETRY_MAX times, RETRY_INTERVAL seconds apart, rather than giving up
@@ -64,10 +72,25 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from ardhisasa_auth import (
+    PUBLIC_CREDENTIALS,
+    STAFF_CREDENTIALS_ICT,
+    STAFF_CREDENTIALS_SUPPORT,
+    STAFF_CREDENTIALS_VALUER,
     build_session,
     decode_jwt_exp,
+    system_login,
 )
-from endpoints import AUTH_REFRESH_TOKEN_URL
+
+# cred_type → the username/password/usertype profile used for OTP-free
+# re-authentication via system_login (see _refresh_job). Keeps the daemon's
+# renewal independent of a still-valid cached token, so an expired/revoked
+# credential is re-authed from scratch rather than failing to "refresh."
+CRED_MAP = {
+    "publicuser":   PUBLIC_CREDENTIALS,
+    "staff":        STAFF_CREDENTIALS_ICT,
+    "staff2":       STAFF_CREDENTIALS_SUPPORT,
+    "staff_valuer": STAFF_CREDENTIALS_VALUER,
+}
 
 load_dotenv()
 
@@ -248,51 +271,28 @@ def _tg_alert_ops(text: str) -> None:
 _api_sess = _api_session()
 
 
-def _try_refresh_token(
-    access_token:  str,
-    jwt_token:     str,
-    refresh_token: str = "",
-) -> Optional[Tuple[str, str, str]]:
+def _reauth(cred_type: str, creds: dict) -> Optional[Tuple[str, str, str]]:
     """
-    POST /auth/refresh-token using current valid auth headers.
-    Sends refresh_token in the body if one is available, but also works
-    without it — the server will issue new tokens while the current ones
-    are still valid (called 10 min before expiry).
-    Returns (new_access_token, new_jwt, new_refresh_token) or None.
+    Re-authenticate a credential from scratch via the OTP-free system-login
+    (ardhisasa_auth.system_login). Returns (access_token, jwt, refresh_token)
+    on success, or None on failure — logging the real reason at WARNING (the
+    logger runs at INFO, so this is the only record of WHY a renewal failed;
+    without it the "attempt N/5" lines give no clue). Unlike the old
+    refresh-token exchange this doesn't need a valid prior token and isn't
+    affected by refresh-token rotation.
     """
-    body = {}
-    if refresh_token:
-        body["refresh_token"] = refresh_token
-
     try:
-        resp = _api_sess.post(
-            AUTH_REFRESH_TOKEN_URL,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "JWTAUTH":       f"Bearer {jwt_token}",
-            },
-            json=body,
-            timeout=30,
-        )
-        if resp.status_code not in (200, 201):
-            # WARNING (not debug) — the logger runs at INFO, so this is the
-            # only place the actual reason a refresh failed ever gets
-            # persisted; without it, "attempt N/5 failed" lines give no clue
-            # why, and diagnosing a stuck credential requires exec'ing into
-            # the container to call the API by hand.
-            logger.warning("refresh-token HTTP %d: %s", resp.status_code, resp.text[:200])
-            return None
-        data    = resp.json()
-        details = data.get("details", data)
-        new_at  = details.get("access_token")
-        new_jwt = details.get("jwt")
-        new_rt  = details.get("refresh_token") or refresh_token
-        if new_at and new_jwt:
-            return new_at, new_jwt, new_rt
-        logger.warning("refresh-token response missing tokens. Keys: %s", list(data.keys()))
+        tokens, refresh = system_login(_api_sess, creds)
+        return tokens.access_token, tokens.jwt, refresh
     except Exception as e:
-        logger.warning("refresh-token error: %s", e)
-    return None
+        # HTTPError carries the status/body; everything else is a transport or
+        # parse failure. Keep it to ~200 chars so daemon.log stays readable.
+        detail = ""
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            detail = f" HTTP {resp.status_code}: {(resp.text or '')[:200]}"
+        logger.warning("[%s] system-login failed: %s%s", cred_type, type(e).__name__, detail)
+        return None
 
 
 # ──────────────────────────────────────────────────────────
@@ -383,32 +383,23 @@ def _refresh_job(cred_type: str) -> None:
     label = CRED_LABELS.get(cred_type, cred_type)
     logger.info("[%s] Refresh job fired.", cred_type)
 
-    cache = _load_cache()
-    entry = cache.get(cred_type)
-    if not entry:
-        logger.warning("[%s] No token entry in cache — skipping.", cred_type)
+    creds = CRED_MAP.get(cred_type)
+    if not creds:
+        logger.warning("[%s] No credential profile — skipping (cannot system-login).", cred_type)
         return
 
-    access_token  = entry.get("access_token", "")
-    jwt_token     = entry.get("jwt", "")
-    refresh_token = entry.get("refresh_token", "")
-
-    if not access_token or not jwt_token:
-        logger.warning("[%s] No tokens in cache — skipping.", cred_type)
-        return
-
-    if not refresh_token:
-        logger.warning(
-            "[%s] No refresh_token stored — attempting header-only refresh. "
-            "If this keeps failing the credential will need to be re-authenticated via OTP.",
-            cred_type,
-        )
-
-    result = _try_refresh_token(access_token, jwt_token, refresh_token)
+    # Re-authenticate from scratch via the OTP-free system-login (username/
+    # password) rather than exchanging the cached refresh_token. This is
+    # immune to the server's refresh-token ROTATION (which was revoking a
+    # cached token whenever the account was used elsewhere — the staff_valuer
+    # 403 incidents), and needs no valid prior token, so an already-expired or
+    # revoked credential still re-auths cleanly.
+    result = _reauth(cred_type, creds)
     if result:
         new_access, new_jwt, new_rt = result
         new_exp = _decode_exp(new_jwt) or (time.time() + 3600)
 
+        cache = _load_cache()
         cache[cred_type] = {
             "access_token":  new_access,
             "jwt":           new_jwt,
@@ -424,7 +415,7 @@ def _refresh_job(cred_type: str) -> None:
         _retry_count.pop(cred_type, None)
         _failed_since.pop(cred_type, None)
         _escalated.discard(cred_type)
-        logger.info("[%s] ✅ Token refreshed. New expiry: %s", cred_type, _fmt_ts(new_exp))
+        logger.info("[%s] ✅ Token re-authenticated (system-login). New expiry: %s", cred_type, _fmt_ts(new_exp))
 
         # Schedule next refresh for the new expiry
         _schedule_refresh(cred_type, new_exp)

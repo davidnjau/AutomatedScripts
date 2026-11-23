@@ -17,14 +17,14 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from endpoints import AUTH_LOGIN_URL, AUTH_OTP_VERIFY_URL
+from endpoints import AUTH_LOGIN_URL, AUTH_OTP_VERIFY_URL, AUTH_SYSTEM_LOGIN_URL
 
 load_dotenv()
 
@@ -202,6 +202,54 @@ def verify_otp(session: requests.Session, credentials: dict, otp_code: str) -> A
 
     logger.info("OTP verified successfully. Tokens acquired.")
     return AuthTokens(access_token=access_token, jwt=jwt)
+
+
+def system_login(session: requests.Session, credentials: dict) -> Tuple[AuthTokens, str]:
+    """
+    OTP-free machine login via /acl/api/v1/auth/system-login (OAuth2 password
+    grant). Unlike login()+verify_otp(), this authenticates with just
+    username/password/usertype and returns tokens directly — no OTP dispatch,
+    no human step — so it can be called unattended whenever a credential's
+    tokens expire or are retired (403). Because it's a fresh username/password
+    login (not a refresh_token exchange), it is immune to the refresh-token
+    rotation that can revoke a cached token when the account is used elsewhere.
+
+    Args:
+        session:     Active requests session.
+        credentials: Dict with keys: username, password, usertype.
+
+    Returns:
+        (AuthTokens, refresh_token). refresh_token may be "" if absent.
+
+    Raises:
+        requests.HTTPError: on non-2xx (e.g. 403 if the endpoint is gated, 400
+            on bad credentials/usertype).
+        RuntimeError: if the response is 2xx but tokens are missing.
+    """
+    payload = {
+        "username": credentials["username"],
+        "password": credentials["password"],
+        "usertype": credentials["usertype"],
+    }
+    logger.info("System login (usertype=%s) — OTP-free.", credentials["usertype"])
+    response = session.post(AUTH_SYSTEM_LOGIN_URL, json=payload, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    data = response.json()
+
+    details      = data.get("details", {}) if isinstance(data.get("details"), dict) else {}
+    access_token = details.get("access_token")
+    jwt          = details.get("jwt")
+    refresh      = details.get("refresh_token", "") or ""
+
+    if not access_token or not jwt:
+        logger.error("System-login response keys: %s", list(data.keys()))
+        raise RuntimeError(
+            "System login succeeded (2xx) but tokens were not found in the "
+            f"response. Available keys: {list(data.keys())}"
+        )
+
+    logger.info("System login successful — tokens acquired (no OTP).")
+    return AuthTokens(access_token=access_token, jwt=jwt), refresh
 
 
 def authenticate(

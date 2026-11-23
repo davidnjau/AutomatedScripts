@@ -90,7 +90,7 @@ class TestRefreshJobSuccess(TokenRefreshDaemonTestCase):
         cache = {"staff2": {"access_token": "old_at", "jwt": "old_jwt", "refresh_token": "old_rt"}}
         with patch.object(trd, "_load_cache", return_value=cache), \
              patch.object(trd, "_save_cache") as mock_save, \
-             patch.object(trd, "_try_refresh_token", return_value=("new_at", "new_jwt", "new_rt")), \
+             patch.object(trd, "_reauth", return_value=("new_at", "new_jwt", "new_rt")), \
              patch.object(trd, "_decode_exp", return_value=None):
             trd._refresh_job("staff2")
         self.assertNotIn("staff2", trd._retry_count)
@@ -103,7 +103,7 @@ class TestRefreshJobFailureRetries(TokenRefreshDaemonTestCase):
     def test_first_failure_schedules_a_retry_without_giving_up(self):
         cache = {"staff2": {"access_token": "at", "jwt": "jwt", "refresh_token": "rt"}}
         with patch.object(trd, "_load_cache", return_value=cache), \
-             patch.object(trd, "_try_refresh_token", return_value=None), \
+             patch.object(trd, "_reauth", return_value=None), \
              patch.object(trd, "_tg_alert_ops") as mock_broadcast:
             trd._refresh_job("staff2")
         self.assertEqual(trd._retry_count.get("staff2"), 1)
@@ -114,7 +114,7 @@ class TestRefreshJobFailureRetries(TokenRefreshDaemonTestCase):
     def test_repeated_failures_up_to_retry_max_do_not_give_up(self):
         cache = {"staff2": {"access_token": "at", "jwt": "jwt", "refresh_token": "rt"}}
         with patch.object(trd, "_load_cache", return_value=cache), \
-             patch.object(trd, "_try_refresh_token", return_value=None), \
+             patch.object(trd, "_reauth", return_value=None), \
              patch.object(trd, "_tg_alert_ops") as mock_broadcast:
             for _ in range(trd.RETRY_MAX):
                 trd._refresh_job("staff2")
@@ -125,7 +125,7 @@ class TestRefreshJobFailureRetries(TokenRefreshDaemonTestCase):
     def test_exhausting_retries_marks_failed_and_alerts(self):
         cache = {"staff2": {"access_token": "at", "jwt": "jwt", "refresh_token": "rt"}}
         with patch.object(trd, "_load_cache", return_value=cache), \
-             patch.object(trd, "_try_refresh_token", return_value=None), \
+             patch.object(trd, "_reauth", return_value=None), \
              patch.object(trd, "_tg_alert_ops") as mock_broadcast:
             for _ in range(trd.RETRY_MAX + 1):
                 trd._refresh_job("staff2")
@@ -139,14 +139,14 @@ class TestRefreshJobFailureRetries(TokenRefreshDaemonTestCase):
     def test_success_after_some_failures_resets_retry_count(self):
         cache = {"staff2": {"access_token": "at", "jwt": "jwt", "refresh_token": "rt"}}
         with patch.object(trd, "_load_cache", return_value=cache), \
-             patch.object(trd, "_try_refresh_token", return_value=None):
+             patch.object(trd, "_reauth", return_value=None):
             trd._refresh_job("staff2")
             trd._refresh_job("staff2")
         self.assertEqual(trd._retry_count.get("staff2"), 2)
 
         with patch.object(trd, "_load_cache", return_value=cache), \
              patch.object(trd, "_save_cache"), \
-             patch.object(trd, "_try_refresh_token", return_value=("new_at", "new_jwt", "new_rt")), \
+             patch.object(trd, "_reauth", return_value=("new_at", "new_jwt", "new_rt")), \
              patch.object(trd, "_decode_exp", return_value=None):
             trd._refresh_job("staff2")
         self.assertNotIn("staff2", trd._retry_count)
@@ -162,7 +162,7 @@ class TestRefreshJobCooldownAfterGiveUp(TokenRefreshDaemonTestCase):
 
     def _fail_until_given_up(self, cache):
         with patch.object(trd, "_load_cache", return_value=cache), \
-             patch.object(trd, "_try_refresh_token", return_value=None), \
+             patch.object(trd, "_reauth", return_value=None), \
              patch.object(trd, "_tg_alert_ops"):
             for _ in range(trd.RETRY_MAX + 1):
                 trd._refresh_job("staff2")
@@ -186,7 +186,7 @@ class TestRefreshJobCooldownAfterGiveUp(TokenRefreshDaemonTestCase):
         cache = {"staff2": {"access_token": "at", "jwt": "jwt", "refresh_token": "rt"}}
         self._fail_until_given_up(cache)
         with patch.object(trd, "_load_cache", return_value=cache), \
-             patch.object(trd, "_try_refresh_token", return_value=None), \
+             patch.object(trd, "_reauth", return_value=None), \
              patch.object(trd, "_tg_alert_ops") as mock_alert:
             for _ in range(10):   # many more quiet background failures
                 trd._refresh_job("staff2")
@@ -197,7 +197,7 @@ class TestRefreshJobCooldownAfterGiveUp(TokenRefreshDaemonTestCase):
         self._fail_until_given_up(cache)
         trd._failed_since["staff2"] = time.time() - trd.ESCALATION_AFTER - 1
         with patch.object(trd, "_load_cache", return_value=cache), \
-             patch.object(trd, "_try_refresh_token", return_value=None), \
+             patch.object(trd, "_reauth", return_value=None), \
              patch.object(trd, "_tg_alert_ops") as mock_alert:
             trd._refresh_job("staff2")   # crosses the threshold -> escalate
             trd._refresh_job("staff2")   # still past threshold -> no 2nd escalation
@@ -211,44 +211,53 @@ class TestRefreshJobCooldownAfterGiveUp(TokenRefreshDaemonTestCase):
         trd._failed_since["staff2"] = time.time()
         with patch.object(trd, "_load_cache", return_value=cache), \
              patch.object(trd, "_save_cache"), \
-             patch.object(trd, "_try_refresh_token", return_value=("new_at", "new_jwt", "new_rt")), \
+             patch.object(trd, "_reauth", return_value=("new_at", "new_jwt", "new_rt")), \
              patch.object(trd, "_decode_exp", return_value=None):
             trd._refresh_job("staff2")
         self.assertNotIn("staff2", trd._escalated)
         self.assertNotIn("staff2", trd._failed_since)
 
 
-class TestTryRefreshTokenLogging(unittest.TestCase):
-    """The actual HTTP/exception reason a refresh failed must land at WARNING
-    (not DEBUG, which the daemon's logger is configured above) — otherwise it
-    never reaches daemon.log and a stuck credential is undiagnosable without
-    live-exec'ing into the container."""
+class TestReauth(unittest.TestCase):
+    """_reauth — the OTP-free system-login renewal. Returns (access, jwt,
+    refresh) on success, None on failure, logging the real reason at WARNING
+    (the daemon logger runs at INFO, so this is the only record of WHY a
+    renewal failed)."""
 
-    def test_non_200_response_logs_reason_at_warning(self):
-        resp = MagicMock(status_code=401, text="Unauthorized")
-        with patch.object(trd, "_api_sess") as mock_sess:
-            mock_sess.post.return_value = resp
+    def test_success_returns_token_tuple(self):
+        from ardhisasa_auth import AuthTokens
+        with patch.object(trd, "system_login", return_value=(AuthTokens("AT", "JWT"), "RT")):
+            result = trd._reauth("staff2", {"username": "u", "password": "p", "usertype": "staff"})
+        self.assertEqual(result, ("AT", "JWT", "RT"))
+
+    def test_http_error_logs_status_and_returns_none(self):
+        err = RuntimeError("boom")
+        err.response = MagicMock(status_code=403, text="")
+        with patch.object(trd, "system_login", side_effect=err):
             with self.assertLogs("token_refresh_daemon", level="WARNING") as cm:
-                result = trd._try_refresh_token("at", "jwt", "rt")
+                result = trd._reauth("staff_valuer", {"username": "u", "password": "p", "usertype": "staff"})
         self.assertIsNone(result)
-        self.assertTrue(any("401" in line for line in cm.output))
+        self.assertTrue(any("403" in line and "staff_valuer" in line for line in cm.output))
 
-    def test_request_exception_logs_reason_at_warning(self):
-        with patch.object(trd, "_api_sess") as mock_sess:
-            mock_sess.post.side_effect = RuntimeError("connection reset")
+    def test_transport_error_logs_and_returns_none(self):
+        with patch.object(trd, "system_login", side_effect=RuntimeError("connection reset")):
             with self.assertLogs("token_refresh_daemon", level="WARNING") as cm:
-                result = trd._try_refresh_token("at", "jwt", "rt")
+                result = trd._reauth("staff2", {"username": "u", "password": "p", "usertype": "staff"})
         self.assertIsNone(result)
-        self.assertTrue(any("connection reset" in line for line in cm.output))
+        self.assertTrue(any("staff2" in line for line in cm.output))
 
 
-class TestRefreshJobMissingCache(TokenRefreshDaemonTestCase):
-    def test_no_token_entry_is_a_no_op_not_a_failure(self):
-        with patch.object(trd, "_load_cache", return_value={}), \
-             patch.object(trd, "_tg_alert_ops") as mock_broadcast:
-            trd._refresh_job("staff2")
-        self.assertNotIn("staff2", trd._failed)
-        self.assertNotIn("staff2", trd._retry_count)
+class TestRefreshJobMissingCredProfile(TokenRefreshDaemonTestCase):
+    def test_unknown_cred_type_is_a_no_op_not_a_failure(self):
+        # The daemon now renews via system-login using CRED_MAP (not the cached
+        # token), so a cred_type with no credential profile is the skip case —
+        # not an empty cache (which it now re-auths from scratch).
+        with patch.object(trd, "_tg_alert_ops") as mock_broadcast, \
+             patch.object(trd, "_reauth") as mock_reauth:
+            trd._refresh_job("no_such_cred")
+        mock_reauth.assert_not_called()
+        self.assertNotIn("no_such_cred", trd._failed)
+        self.assertNotIn("no_such_cred", trd._retry_count)
         mock_broadcast.assert_not_called()
 
 
