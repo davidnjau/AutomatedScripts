@@ -23,12 +23,20 @@ Refresh strategy:
 
   A failed refresh (network blip, transient 5xx, etc.) is retried up to
   RETRY_MAX times, RETRY_INTERVAL seconds apart, rather than giving up
-  immediately — a single transient failure must not permanently disable
-  auto-refresh for a credential. Only once retries are exhausted is the
-  credential marked failed (no further attempts until the bot saves fresh
-  tokens for it via OTP) and a Telegram alert sent to admins + ICT admins
-  only (the ops audience — see _ops_recipients), so a dead credential is
-  surfaced to whoever can fix it rather than spamming every user.
+  immediately. Once those fast retries are exhausted, a single Telegram alert
+  goes to admins + ICT admins only (the ops audience — see _ops_recipients) —
+  but the daemon keeps retrying in the background at a slower COOLDOWN_INTERVAL
+  cadence rather than stopping, since the upstream Ardhisasa auth API is
+  sometimes intermittently flaky for extended periods and recovers on its own.
+  No further alert is sent for that incident unless it's STILL failing after
+  ESCALATION_AFTER, which sends one follow-up and then goes quiet again.
+  (An earlier version of this logic incorrectly cleared its own bucket-tracking
+  state on give-up, which caused _scan_cache to misread the unchanged, still-
+  failing token as "new tokens detected" every SCAN_INTERVAL and silently
+  restart the whole retry cycle — re-sending the alert every ~10 minutes for
+  as long as a credential stayed broken. Fixed: _scheduled is no longer
+  cleared on give-up, so the background cooldown retry above is now the one
+  and only mechanism that keeps trying, and the alert fires once per incident.)
 
 Usage:
     python token_refresh_daemon.py              # foreground
@@ -43,7 +51,6 @@ import json
 import logging
 import os
 import signal
-import sys
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
@@ -77,10 +84,20 @@ REFRESH_BEFORE  = 10 * 60   # 10 minutes
 # How often to scan cache for new / changed credentials
 SCAN_INTERVAL   = 5 * 60    # 5 minutes
 
-# Bounded retry on a failed refresh — a transient network/API blip shouldn't
+# Bounded fast retry on a failed refresh — a transient network/API blip shouldn't
 # permanently disable auto-refresh for a credential.
-RETRY_MAX       = 5    # attempts after the first failure before giving up
-RETRY_INTERVAL  = 90   # seconds between retry attempts
+RETRY_MAX       = 5    # fast attempts (RETRY_INTERVAL apart) before backing off
+RETRY_INTERVAL  = 90   # seconds between fast retry attempts
+# After the fast retries are exhausted, keep retrying quietly (no repeat
+# alerts) at this slower cadence — the upstream Ardhisasa auth API is
+# sometimes intermittently flaky for extended periods and recovers on its own
+# without a human re-authenticating; see _refresh_job's give-up branch.
+COOLDOWN_INTERVAL   = 10 * 60   # 10 minutes between background retries once failed
+# If a credential is STILL failing this long after the initial alert, send one
+# follow-up escalation (and only one, until it recovers) — catches a genuinely
+# stuck credential (e.g. one that truly needs manual OTP) without re-alerting
+# on every quiet background retry in between.
+ESCALATION_AFTER    = 2 * 60 * 60   # 2 hours
 
 TELEGRAM_API = "https://api.telegram.org"
 BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -118,16 +135,18 @@ CRED_LABELS = {
 # ──────────────────────────────────────────────────────────
 # Logging — stdout + file
 # ──────────────────────────────────────────────────────────
+# Single FileHandler only — NOT also a StreamHandler to stdout. bot.py's
+# _daemon_start() launches this script as a subprocess with stdout/stderr
+# redirected into this same LOG_FILE (a crash-safety net for tracebacks
+# printed outside the logger); a StreamHandler here would duplicate every
+# log line into that same file via both paths at once.
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
 _fh  = logging.FileHandler(LOG_FILE, encoding="utf-8")
 _fh.setFormatter(_fmt)
-_sh  = logging.StreamHandler(sys.stdout)
-_sh.setFormatter(_fmt)
 logger = logging.getLogger("token_refresh_daemon")
 logger.setLevel(logging.INFO)
 logger.addHandler(_fh)
-logger.addHandler(_sh)
 
 
 # ──────────────────────────────────────────────────────────
@@ -256,7 +275,12 @@ def _try_refresh_token(
             timeout=30,
         )
         if resp.status_code not in (200, 201):
-            logger.debug("refresh-token HTTP %d: %s", resp.status_code, resp.text[:200])
+            # WARNING (not debug) — the logger runs at INFO, so this is the
+            # only place the actual reason a refresh failed ever gets
+            # persisted; without it, "attempt N/5 failed" lines give no clue
+            # why, and diagnosing a stuck credential requires exec'ing into
+            # the container to call the API by hand.
+            logger.warning("refresh-token HTTP %d: %s", resp.status_code, resp.text[:200])
             return None
         data    = resp.json()
         details = data.get("details", data)
@@ -265,9 +289,9 @@ def _try_refresh_token(
         new_rt  = details.get("refresh_token") or refresh_token
         if new_at and new_jwt:
             return new_at, new_jwt, new_rt
-        logger.debug("refresh-token response missing tokens. Keys: %s", list(data.keys()))
+        logger.warning("refresh-token response missing tokens. Keys: %s", list(data.keys()))
     except Exception as e:
-        logger.debug("refresh-token error: %s", e)
+        logger.warning("refresh-token error: %s", e)
     return None
 
 
@@ -280,11 +304,41 @@ scheduler = BackgroundScheduler(timezone="UTC")
 # so we don't double-schedule for the same expiry window.
 _scheduled: Dict[str, int] = {}   # cred_type → expiry_bucket (int(exp // 60))
 
-# Credentials that exhausted their retries — not scheduled again until new tokens are saved by the bot.
+# Credentials currently in a failed/cooldown state (fast retries exhausted at
+# least once since the last success or genuinely new tokens). While a
+# credential is in here, _refresh_job keeps retrying itself at COOLDOWN_INTERVAL
+# — it is NOT "stopped until a human intervenes" despite the historical log
+# wording; the upstream API recovers on its own often enough that requiring
+# manual re-auth for every blip would be worse than a quiet background retry.
 _failed: set = set()
 
 # In-flight retry attempt count per credential, since its first failed refresh this expiry window.
 _retry_count: Dict[str, int] = {}
+
+# When each currently-failed credential's incident started (time.time()), so
+# the escalation alert fires once if it's STILL down after ESCALATION_AFTER —
+# without this, every incident looks identical regardless of how long it's lasted.
+_failed_since: Dict[str, float] = {}
+
+# Credentials that have already received the one-time escalation alert for
+# their current incident — prevents re-sending it on every subsequent
+# cooldown-retry failure once the threshold has been crossed.
+_escalated: set = set()
+
+
+def _reschedule_in(cred_type: str, delay_seconds: int) -> None:
+    """Schedule a one-off _refresh_job retry delay_seconds from now, reusing
+    the credential's job id (replace_existing=True) so it supersedes whatever
+    was previously scheduled for it — used for both the fast RETRY_INTERVAL
+    retries and the slower COOLDOWN_INTERVAL background retries after give-up."""
+    scheduler.add_job(
+        _refresh_job,
+        trigger=DateTrigger(run_date=datetime.now(tz=timezone.utc) + timedelta(seconds=delay_seconds)),
+        id=f"refresh_{cred_type}",
+        args=[cred_type],
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
 
 
 def _schedule_refresh(cred_type: str, exp: float) -> None:
@@ -363,13 +417,40 @@ def _refresh_job(cred_type: str) -> None:
         }
         _save_cache(cache)
 
-        _scheduled.pop(cred_type, None)
+        # NOTE: _scheduled is deliberately NOT popped here — _schedule_refresh
+        # below sets it to the new bucket itself. Popping it was the root cause
+        # of a past bug (see the give-up branch's comment).
         _failed.discard(cred_type)      # clear any previous failure flag
         _retry_count.pop(cred_type, None)
+        _failed_since.pop(cred_type, None)
+        _escalated.discard(cred_type)
         logger.info("[%s] ✅ Token refreshed. New expiry: %s", cred_type, _fmt_ts(new_exp))
 
         # Schedule next refresh for the new expiry
         _schedule_refresh(cred_type, new_exp)
+    elif cred_type in _failed:
+        # Already past the fast-retry burst and in the quiet cooldown phase —
+        # this failure does NOT restart the fast-attempt counter (there is
+        # none to restart; it was popped when we first gave up). Just log and
+        # reschedule at COOLDOWN_INTERVAL, escalating once if this has dragged
+        # on long enough, but never re-sending the initial alert.
+        if (cred_type not in _escalated
+                and time.time() - _failed_since.get(cred_type, time.time()) >= ESCALATION_AFTER):
+            _escalated.add(cred_type)
+            down_for_min = int((time.time() - _failed_since[cred_type]) // 60)
+            logger.warning("[%s] Still failing after %dm — escalating.", cred_type, down_for_min)
+            _tg_alert_ops(
+                f"⚠️ *Token Still Not Refreshed*\n\n"
+                f"*{label}* (`{cred_type}`) has been failing to auto-refresh for "
+                f"over {down_for_min} minutes. Please re-authenticate manually via "
+                f"*🔑 Refresh Auth*."
+            )
+        else:
+            logger.info(
+                "[%s] Still failing (quiet retry, no alert) — next attempt in %dm.",
+                cred_type, COOLDOWN_INTERVAL // 60,
+            )
+        _reschedule_in(cred_type, COOLDOWN_INTERVAL)
     else:
         attempt = _retry_count.get(cred_type, 0) + 1
         if attempt <= RETRY_MAX:
@@ -378,27 +459,34 @@ def _refresh_job(cred_type: str) -> None:
                 "[%s] ❌ Refresh attempt %d/%d failed — retrying in %ds.",
                 cred_type, attempt, RETRY_MAX, RETRY_INTERVAL,
             )
-            scheduler.add_job(
-                _refresh_job,
-                trigger=DateTrigger(run_date=datetime.now(tz=timezone.utc) + timedelta(seconds=RETRY_INTERVAL)),
-                id=f"refresh_{cred_type}",
-                args=[cred_type],
-                replace_existing=True,
-                misfire_grace_time=300,
-            )
+            _reschedule_in(cred_type, RETRY_INTERVAL)
         else:
-            logger.warning(
-                "[%s] ❌ Refresh failed after %d attempts — will not retry until new tokens are saved.",
-                cred_type, RETRY_MAX,
-            )
-            _failed.add(cred_type)
+            # Fast retries exhausted. This does NOT mean "stop and wait for a
+            # human" (the credential still gets retried — see the `cred_type
+            # in _failed` branch above, taken on every subsequent failure);
+            # it means "alert once, then go quiet." _scheduled is deliberately
+            # left pointing at the current (still-stale) bucket — unlike a
+            # past version of this code, which popped it here and caused
+            # _scan_cache to misread the unchanged bucket as "new tokens
+            # detected" every 5 minutes, silently resetting this whole state
+            # machine and re-sending this alert on every cycle for as long as
+            # the credential stayed broken.
             _retry_count.pop(cred_type, None)
-            _scheduled.pop(cred_type, None)
+            _failed.add(cred_type)
+            _failed_since[cred_type] = time.time()
+            logger.warning(
+                "[%s] ❌ Refresh failed after %d attempts — backing off to a quiet "
+                "retry every %dm (will keep trying automatically; the upstream API "
+                "is sometimes intermittently flaky and recovers on its own).",
+                cred_type, RETRY_MAX, COOLDOWN_INTERVAL // 60,
+            )
             _tg_alert_ops(
                 f"⚠️ *Token Refresh Failed*\n\n"
                 f"*{label}* (`{cred_type}`) could not be auto-refreshed after {RETRY_MAX} attempts.\n"
-                f"Please re-authenticate it manually via *🔑 Refresh Auth* before its token expires."
+                f"It will keep retrying automatically every {COOLDOWN_INTERVAL // 60} minutes; "
+                f"re-authenticate manually via *🔑 Refresh Auth* if it's still failing later."
             )
+            _reschedule_in(cred_type, COOLDOWN_INTERVAL)
 
 
 def _scan_cache() -> None:

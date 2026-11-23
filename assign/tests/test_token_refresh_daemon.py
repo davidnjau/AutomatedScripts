@@ -10,8 +10,9 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -73,6 +74,8 @@ class TokenRefreshDaemonTestCase(unittest.TestCase):
         trd._scheduled.clear()
         trd._failed.clear()
         trd._retry_count.clear()
+        trd._failed_since.clear()
+        trd._escalated.clear()
         for job in trd.scheduler.get_jobs():
             trd.scheduler.remove_job(job.id)
 
@@ -148,6 +151,95 @@ class TestRefreshJobFailureRetries(TokenRefreshDaemonTestCase):
             trd._refresh_job("staff2")
         self.assertNotIn("staff2", trd._retry_count)
         self.assertNotIn("staff2", trd._failed)
+
+
+class TestRefreshJobCooldownAfterGiveUp(TokenRefreshDaemonTestCase):
+    """Regression coverage for the retry-storm bug: after the fast retries are
+    exhausted, _refresh_job must (a) keep retrying in the background rather
+    than stopping, (b) NOT re-send the alert on every subsequent failure, and
+    (c) leave _scheduled pointing at the still-failing bucket so _scan_cache
+    can't misread the unchanged token as "new tokens detected"."""
+
+    def _fail_until_given_up(self, cache):
+        with patch.object(trd, "_load_cache", return_value=cache), \
+             patch.object(trd, "_try_refresh_token", return_value=None), \
+             patch.object(trd, "_tg_alert_ops"):
+            for _ in range(trd.RETRY_MAX + 1):
+                trd._refresh_job("staff2")
+
+    def test_scheduled_bucket_is_not_cleared_on_give_up(self):
+        cache = {"staff2": {"access_token": "at", "jwt": "jwt", "refresh_token": "rt"}}
+        trd._scheduled["staff2"] = 999   # bucket set by the preceding _schedule_refresh call
+        self._fail_until_given_up(cache)
+        # Must still be set (to the SAME bucket) — not popped — so _scan_cache's
+        # "same bucket → no new tokens, keep waiting" check stays correct.
+        self.assertEqual(trd._scheduled.get("staff2"), 999)
+
+    def test_keeps_retrying_in_the_background_after_give_up(self):
+        cache = {"staff2": {"access_token": "at", "jwt": "jwt", "refresh_token": "rt"}}
+        self._fail_until_given_up(cache)
+        self.assertIn("staff2", trd._failed)
+        job = trd.scheduler.get_job("refresh_staff2")
+        self.assertIsNotNone(job)   # a cooldown retry is scheduled, not nothing
+
+    def test_no_repeat_alert_on_subsequent_cooldown_failures(self):
+        cache = {"staff2": {"access_token": "at", "jwt": "jwt", "refresh_token": "rt"}}
+        self._fail_until_given_up(cache)
+        with patch.object(trd, "_load_cache", return_value=cache), \
+             patch.object(trd, "_try_refresh_token", return_value=None), \
+             patch.object(trd, "_tg_alert_ops") as mock_alert:
+            for _ in range(10):   # many more quiet background failures
+                trd._refresh_job("staff2")
+        mock_alert.assert_not_called()
+
+    def test_escalation_alert_fires_once_after_threshold(self):
+        cache = {"staff2": {"access_token": "at", "jwt": "jwt", "refresh_token": "rt"}}
+        self._fail_until_given_up(cache)
+        trd._failed_since["staff2"] = time.time() - trd.ESCALATION_AFTER - 1
+        with patch.object(trd, "_load_cache", return_value=cache), \
+             patch.object(trd, "_try_refresh_token", return_value=None), \
+             patch.object(trd, "_tg_alert_ops") as mock_alert:
+            trd._refresh_job("staff2")   # crosses the threshold -> escalate
+            trd._refresh_job("staff2")   # still past threshold -> no 2nd escalation
+        self.assertEqual(mock_alert.call_count, 1)
+        self.assertIn("staff2", trd._escalated)
+
+    def test_success_clears_escalation_state(self):
+        cache = {"staff2": {"access_token": "at", "jwt": "jwt", "refresh_token": "rt"}}
+        self._fail_until_given_up(cache)
+        trd._escalated.add("staff2")
+        trd._failed_since["staff2"] = time.time()
+        with patch.object(trd, "_load_cache", return_value=cache), \
+             patch.object(trd, "_save_cache"), \
+             patch.object(trd, "_try_refresh_token", return_value=("new_at", "new_jwt", "new_rt")), \
+             patch.object(trd, "_decode_exp", return_value=None):
+            trd._refresh_job("staff2")
+        self.assertNotIn("staff2", trd._escalated)
+        self.assertNotIn("staff2", trd._failed_since)
+
+
+class TestTryRefreshTokenLogging(unittest.TestCase):
+    """The actual HTTP/exception reason a refresh failed must land at WARNING
+    (not DEBUG, which the daemon's logger is configured above) — otherwise it
+    never reaches daemon.log and a stuck credential is undiagnosable without
+    live-exec'ing into the container."""
+
+    def test_non_200_response_logs_reason_at_warning(self):
+        resp = MagicMock(status_code=401, text="Unauthorized")
+        with patch.object(trd, "_api_sess") as mock_sess:
+            mock_sess.post.return_value = resp
+            with self.assertLogs("token_refresh_daemon", level="WARNING") as cm:
+                result = trd._try_refresh_token("at", "jwt", "rt")
+        self.assertIsNone(result)
+        self.assertTrue(any("401" in line for line in cm.output))
+
+    def test_request_exception_logs_reason_at_warning(self):
+        with patch.object(trd, "_api_sess") as mock_sess:
+            mock_sess.post.side_effect = RuntimeError("connection reset")
+            with self.assertLogs("token_refresh_daemon", level="WARNING") as cm:
+                result = trd._try_refresh_token("at", "jwt", "rt")
+        self.assertIsNone(result)
+        self.assertTrue(any("connection reset" in line for line in cm.output))
 
 
 class TestRefreshJobMissingCache(TokenRefreshDaemonTestCase):
