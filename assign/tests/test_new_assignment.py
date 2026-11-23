@@ -21,6 +21,23 @@ from ardhisasa_auth import AuthTokens
 
 TOKENS = AuthTokens(access_token="acc", jwt="jwt")
 
+# recv_confirm auto-holds every successfully assigned ref (see
+# hold_tasks.auto_hold_ref) — module-level patch so NO test in this file,
+# regardless of class, ever touches the real saved_dlv_records.json.
+_module_patches = []
+
+
+def setUpModule():
+    p = patch.object(na, "auto_hold_ref")
+    p.start()
+    _module_patches.append(p)
+
+
+def tearDownModule():
+    for p in _module_patches:
+        p.stop()
+    _module_patches.clear()
+
 
 def _run(coro):
     return asyncio.run(coro)
@@ -311,6 +328,13 @@ class TestRecvCredChoice(unittest.TestCase):
 
 
 class TestRecvConfirm(unittest.TestCase):
+    def setUp(self):
+        # recv_confirm auto-holds every successfully assigned ref — stub it so
+        # tests don't touch the real saved_dlv_records.json.
+        self._p = patch.object(na, "auto_hold_ref")
+        self._p.start()
+        self.addCleanup(self._p.stop)
+
     def test_no_cancels_conversation(self):
         update = _make_update_with_callback("confirm:no")
         ctx = MagicMock()
@@ -330,6 +354,33 @@ class TestRecvConfirm(unittest.TestCase):
              patch.object(na.asyncio, "to_thread", new=AsyncMock(return_value=([], {}))):
             result = _run(na.recv_confirm(update, ctx))
         self.assertEqual(result, na.ConversationHandler.END)
+
+    def test_successful_assignment_is_auto_held(self):
+        """Every direct assignment is guarded against takeover from the
+        instant it's made — see hold_tasks.auto_hold_ref."""
+        update = _make_update_with_callback("confirm:yes")
+        ctx = MagicMock()
+        sess = na.Session(refs=["R1"], tokens=TOKENS, saved_valuer={"name": "Jane", "uid": "1", "account_number": "A1"})
+        sess.session = MagicMock()
+        sess.session.post.return_value = MagicMock(raise_for_status=lambda: None)
+        ctx.user_data = {"session": sess}
+        with patch.object(na, "persist_valuer"), \
+             patch.object(na, "persist_assignment"), \
+             patch.object(na.asyncio, "to_thread", new=AsyncMock(return_value=([], {}))):
+            _run(na.recv_confirm(update, ctx))
+        na.auto_hold_ref.assert_called_once_with("R1", "Jane", "1")
+
+    def test_failed_assignment_is_not_auto_held(self):
+        update = _make_update_with_callback("confirm:yes")
+        ctx = MagicMock()
+        sess = na.Session(refs=["R1"], tokens=TOKENS, saved_valuer={"name": "Jane", "uid": "1", "account_number": "A1"})
+        sess.session = MagicMock()
+        sess.session.post.side_effect = RuntimeError("boom")
+        ctx.user_data = {"session": sess}
+        with patch.object(na, "persist_valuer"), \
+             patch.object(na, "persist_assignment"):
+            _run(na.recv_confirm(update, ctx))
+        na.auto_hold_ref.assert_not_called()
 
     def test_assignment_tagged_direct(self):
         """New Assignment always assigns immediately (never via a queue like
@@ -509,6 +560,11 @@ class TestRecvConfirmMarkdownEscaping(unittest.TestCase):
     regression for telegram.error.BadRequest ("can't find end of the
     entity") when a valuer name contains a raw '_'/'*'. See common.md_escape."""
 
+    def setUp(self):
+        self._p = patch.object(na, "auto_hold_ref")
+        self._p.start()
+        self.addCleanup(self._p.stop)
+
     def test_assigning_message_and_summary_escape_valuer_name(self):
         update = _make_update_with_callback("confirm:yes")
         ctx = MagicMock()
@@ -530,6 +586,11 @@ class TestRecvConfirmMarkdownEscaping(unittest.TestCase):
 class TestRecvConfirmPersistsLookupContext(unittest.TestCase):
     """recv_confirm's post-lookup enrichment step — merges _post_assignment_report's
     per-ref extra context into the already-persisted assignment record."""
+
+    def setUp(self):
+        self._p = patch.object(na, "auto_hold_ref")
+        self._p.start()
+        self.addCleanup(self._p.stop)
 
     def test_enriches_assignment_with_post_assignment_context(self):
         update = _make_update_with_callback("confirm:yes")

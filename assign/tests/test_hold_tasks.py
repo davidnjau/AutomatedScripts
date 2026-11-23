@@ -102,6 +102,42 @@ class TestHoldTasksPersistence(unittest.TestCase):
         self.assertEqual(store["NEW_REF"]["status"], "assigned")
         self.assertEqual(store["NEW_REF"]["hold"]["held_valuer_name"], "Jane")
 
+
+class TestAutoHoldRef(unittest.TestCase):
+    """auto_hold_ref — the hook new_assignment.py/quick_assign.py/dlv_batch.py
+    all call the instant ANY assignment succeeds, so every assignment is
+    guarded against takeover from the start, not just explicitly-held ones."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self._patches = [
+            patch.object(dlv_core, "SAVED_HOLD_TASKS_FILE", os.path.join(self.tmpdir.name, "saved_hold_tasks.json")),
+            patch.object(dlv_core, "SAVED_DLV_BATCH_FILE", os.path.join(self.tmpdir.name, "saved_dlv_batch.json")),
+            patch.object(dlv_core, "SAVED_DLV_CLOSED_FILE", os.path.join(self.tmpdir.name, "saved_dlv_closed.json")),
+            patch.object(dlv_core, "SAVED_ASSIGNMENTS_FILE", os.path.join(self.tmpdir.name, "saved_assignments.json")),
+            patch.object(dlv_core, "SAVED_DLV_RECORDS_FILE", os.path.join(self.tmpdir.name, "saved_dlv_records.json")),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        self.tmpdir.cleanup()
+
+    def test_enrolls_the_ref(self):
+        ht.auto_hold_ref("REG/TSFR/ABC123", "Jane Doe", "uid-1")
+        held = ht.load_hold_tasks()
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0]["ref"], "REG/TSFR/ABC123")
+        self.assertEqual(held[0]["held_valuer_name"], "Jane Doe")
+        self.assertEqual(held[0]["held_valuer_uid"], "uid-1")
+        self.assertIn("held_at", held[0])
+
+    def test_save_failure_is_logged_not_raised(self):
+        with patch.object(ht, "save_hold_tasks", side_effect=RuntimeError("boom")):
+            ht.auto_hold_ref("REG/TSFR/ABC123", "Jane Doe", "uid-1")   # must not raise
+
     def test_concurrent_save_hold_tasks_and_save_dlv_batch_never_lose_a_write(self):
         """Regression: hold_tasks_job and dlv_batch_job both run on their own
         1-minute repeating job, each independently load-modify-saving the

@@ -67,6 +67,7 @@ from common import (
     persist_valuer,
 )
 from dlv_core import filter_own_records, load_dlv_batch, load_records_where, save_dlv_batch
+from hold_tasks import auto_hold_ref
 from endpoints import LRD_FIX_PARCEL_NUMBER_URL, STAMP_DUTY_FIX_APPLICATION_URL
 from new_assignment import _extract_refs_from_text, ocr_extract_refs
 import ocr_audit
@@ -299,6 +300,9 @@ def _qa_assign_or_queue(refs: List[str], valuer: Dict, workflow: str, user_id: i
                 "valuer_acct": acct, "tag": "Direct", "workflow": workflow,
                 "channel": "quick_assign", "qa_mode": "assigned", "added_by": user_id,
             })
+            # Guard it against takeover from the instant it's assigned — see
+            # hold_tasks.auto_hold_ref's docstring.
+            auto_hold_ref(ref, name, uid)
             out["assigned"].append(ref)
         except Exception as e:
             logger.info("Quick Assign: %s not directly assignable (%s) — queueing", ref, _safe_err(e))
