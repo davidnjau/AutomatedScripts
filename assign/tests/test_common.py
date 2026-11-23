@@ -186,6 +186,69 @@ class TestCategoryAccessPersistence(unittest.TestCase):
         self.assertEqual(common.load_category_access(), {"111": [common.BTN_CAT_LOOKUPS]})
 
 
+class TestReauth(unittest.TestCase):
+    """common.reauth / request_with_reauth — immediate OTP-free re-auth when a
+    live API call hits a 403 (retired token), without waiting for the daemon."""
+
+    def test_reauth_system_logins_and_persists(self):
+        from ardhisasa_auth import AuthTokens
+        with patch.object(common, "get_valid_tokens", return_value=None), \
+             patch.object(common, "system_login", return_value=(AuthTokens("AT", "JWT"), "RT")) as mock_sl, \
+             patch.object(common, "persist_tokens") as mock_persist, \
+             patch.object(common, "build_session"):
+            tokens = common.reauth("staff_valuer")
+        self.assertEqual(tokens.access_token, "AT")
+        mock_sl.assert_called_once()
+        mock_persist.assert_called_once_with("staff_valuer", "AT", "JWT", "RT")
+
+    def test_reauth_returns_fresh_cached_token_without_relogin(self):
+        from ardhisasa_auth import AuthTokens
+        # Another thread already re-authed while we waited for the lock.
+        with patch.object(common, "get_valid_tokens", return_value=AuthTokens("CACHED", "J")), \
+             patch.object(common, "system_login") as mock_sl:
+            tokens = common.reauth("staff2")
+        self.assertEqual(tokens.access_token, "CACHED")
+        mock_sl.assert_not_called()
+
+    def test_reauth_unknown_cred_returns_none(self):
+        self.assertIsNone(common.reauth("no_such_cred"))
+
+    def test_reauth_failure_returns_none(self):
+        with patch.object(common, "get_valid_tokens", return_value=None), \
+             patch.object(common, "system_login", side_effect=RuntimeError("403")), \
+             patch.object(common, "build_session"):
+            self.assertIsNone(common.reauth("staff_valuer"))
+
+    def test_request_with_reauth_retries_once_on_403(self):
+        from ardhisasa_auth import AuthTokens
+        sess = MagicMock()
+        sess.request.side_effect = [MagicMock(status_code=403),
+                                    MagicMock(status_code=200)]
+        with patch.object(common, "get_valid_tokens", return_value=AuthTokens("OLD", "J")), \
+             patch.object(common, "reauth", return_value=AuthTokens("NEW", "J2")) as mock_reauth:
+            resp = common.request_with_reauth("staff_valuer", "POST", "http://x", session=sess, json={"a": 1})
+        self.assertEqual(resp.status_code, 200)
+        mock_reauth.assert_called_once_with("staff_valuer")
+        self.assertEqual(sess.request.call_count, 2)
+
+    def test_request_with_reauth_no_retry_when_not_403(self):
+        from ardhisasa_auth import AuthTokens
+        sess = MagicMock()
+        sess.request.return_value = MagicMock(status_code=200)
+        with patch.object(common, "get_valid_tokens", return_value=AuthTokens("OLD", "J")), \
+             patch.object(common, "reauth") as mock_reauth:
+            resp = common.request_with_reauth("staff_valuer", "GET", "http://x", session=sess)
+        self.assertEqual(resp.status_code, 200)
+        mock_reauth.assert_not_called()
+        self.assertEqual(sess.request.call_count, 1)
+
+    def test_request_with_reauth_raises_if_no_token(self):
+        with patch.object(common, "get_valid_tokens", return_value=None), \
+             patch.object(common, "reauth", return_value=None):
+            with self.assertRaises(RuntimeError):
+                common.request_with_reauth("staff_valuer", "GET", "http://x", session=MagicMock())
+
+
 class TestAdminRecipients(unittest.TestCase):
     def test_returns_configured_admins(self):
         with patch.object(common, "ADMIN_IDS", {111, 222}), \

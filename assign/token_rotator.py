@@ -20,7 +20,7 @@ from typing import Callable, List, Optional
 import requests
 
 from ardhisasa_auth import AuthTokens
-from common import CRED_LABELS
+from common import CRED_LABELS, reauth
 
 
 class _AllTokensExhausted(Exception):
@@ -32,13 +32,40 @@ class _TokenRotator:
 
     def __init__(self, token_pairs: List[tuple]):
         # token_pairs: [(cred_type, AuthTokens), ...]
-        self._tokens = list(token_pairs)
-        self._idx    = 0
-        self._lock   = threading.Lock()
+        self._tokens    = list(token_pairs)
+        self._idx       = 0
+        self._lock      = threading.Lock()
+        self._reauthed  = set()   # indices already re-authed this run (don't loop)
 
     def current(self) -> Optional[AuthTokens]:
         with self._lock:
             return self._tokens[self._idx][1] if self._idx < len(self._tokens) else None
+
+    def reauth_current(self, failed: AuthTokens) -> Optional[AuthTokens]:
+        """Re-authenticate the CURRENT credential in place (via common.reauth)
+        and return the fresh token — the first thing to try on a 403, before
+        giving up on this credential and rotating to the next. Only attempted
+        once per credential per run (tracked in `_reauthed`); returns None if
+        already attempted, the token already moved on, or re-auth failed, so
+        the caller falls through to rotate(). The identity check mirrors
+        rotate()'s: only act if `failed` is still the current token."""
+        with self._lock:
+            if self._idx >= len(self._tokens) or self._tokens[self._idx][1] is not failed:
+                return self._tokens[self._idx][1] if self._idx < len(self._tokens) else None
+            if self._idx in self._reauthed:
+                return None   # already re-authed this one; let the caller rotate
+            cred_type = self._tokens[self._idx][0]
+            self._reauthed.add(self._idx)
+        # reauth() does its own per-credential locking + caching; call it
+        # outside our lock so we don't hold it across a network login.
+        fresh = reauth(cred_type)
+        if not fresh:
+            return None
+        with self._lock:
+            # Re-check nothing rotated past us while we were logging in.
+            if self._idx < len(self._tokens) and self._tokens[self._idx][0] == cred_type:
+                self._tokens[self._idx] = (cred_type, fresh)
+        return fresh
 
     def current_label(self) -> str:
         with self._lock:
@@ -96,6 +123,12 @@ def fetch_with_rotation(
         headers = headers_fn(tokens)
         resp = sess.get(url, headers=headers, params=params, timeout=30)
         if resp.status_code == 403:
+            # First try re-authenticating THIS credential (its token may have
+            # just been retired) and retry immediately — only if that still
+            # fails do we rotate to the next credential.
+            refreshed = rotator.reauth_current(tokens)
+            if refreshed is not None and refreshed is not tokens:
+                continue
             new_tokens = rotator.rotate(tokens)
             if new_tokens is None:
                 raise _AllTokensExhausted(f"All tokens exhausted (403) fetching {label}")

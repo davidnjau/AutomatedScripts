@@ -83,25 +83,58 @@ class TestFetchWithRotation(unittest.TestCase):
         with self.assertRaises(_AllTokensExhausted):
             fetch_with_rotation(fake_session, rotator, "http://x", {}, _HEADERS_FN)
 
-    def test_403_rotates_to_next_credential_then_succeeds(self):
+    def test_403_reauths_current_credential_then_succeeds_without_rotating(self):
+        # On a 403 the CURRENT credential is re-authed first; if that yields a
+        # fresh token the retry uses the SAME credential (no rotation).
         rotator = _TokenRotator([("staff", "tok1"), ("staff2", "tok2")])
         fake_session = MagicMock()
         fake_session.get.side_effect = [
             MagicMock(status_code=403),
             MagicMock(status_code=200, raise_for_status=lambda: None, json=lambda: {"ok": True}),
         ]
-        with patch("token_rotator.time.sleep"):
+        with patch("token_rotator.reauth", return_value="tok1_fresh"), \
+             patch("token_rotator.time.sleep"):
             result = fetch_with_rotation(fake_session, rotator, "http://x", {}, _HEADERS_FN, rotate_delay=1)
         self.assertEqual(result, {"ok": True})
-        self.assertEqual(rotator.current(), "tok2")
+        self.assertEqual(rotator.current(), "tok1_fresh")   # same cred, refreshed — not rotated
 
-    def test_403_on_last_credential_raises_all_tokens_exhausted(self):
+    def test_403_rotates_to_next_credential_when_reauth_fails(self):
+        rotator = _TokenRotator([("staff", "tok1"), ("staff2", "tok2")])
+        fake_session = MagicMock()
+        fake_session.get.side_effect = [
+            MagicMock(status_code=403),
+            MagicMock(status_code=200, raise_for_status=lambda: None, json=lambda: {"ok": True}),
+        ]
+        with patch("token_rotator.reauth", return_value=None), \
+             patch("token_rotator.time.sleep"):
+            result = fetch_with_rotation(fake_session, rotator, "http://x", {}, _HEADERS_FN, rotate_delay=1)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(rotator.current(), "tok2")   # reauth failed → rotated
+
+    def test_403_on_last_credential_raises_after_reauth_fails(self):
         rotator = _TokenRotator([("staff", "tok1")])
         fake_session = MagicMock()
         fake_session.get.return_value = MagicMock(status_code=403)
-        with patch("token_rotator.time.sleep"):
+        with patch("token_rotator.reauth", return_value=None), \
+             patch("token_rotator.time.sleep"):
             with self.assertRaises(_AllTokensExhausted):
                 fetch_with_rotation(fake_session, rotator, "http://x", {}, _HEADERS_FN)
+
+    def test_reauth_only_attempted_once_per_credential(self):
+        # If re-auth 'succeeds' but the credential still 403s, don't loop on it
+        # forever — rotate after the single re-auth attempt.
+        rotator = _TokenRotator([("staff", "tok1"), ("staff2", "tok2")])
+        fake_session = MagicMock()
+        fake_session.get.side_effect = [
+            MagicMock(status_code=403),   # tok1
+            MagicMock(status_code=403),   # tok1_fresh (still 403)
+            MagicMock(status_code=200, raise_for_status=lambda: None, json=lambda: {"ok": True}),  # tok2
+        ]
+        with patch("token_rotator.reauth", return_value="tok1_fresh"), \
+             patch("token_rotator.time.sleep"):
+            result = fetch_with_rotation(fake_session, rotator, "http://x", {}, _HEADERS_FN, rotate_delay=1)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(rotator.current(), "tok2")   # re-authed once, then rotated
 
     def test_exhausts_retries_on_persistent_5xx(self):
         rotator = _TokenRotator([("staff", "tok1")])
