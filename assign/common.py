@@ -1005,8 +1005,14 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
             "Assign and queue stamp-duty / land-rent valuation tasks to valuers, "
             "and guard assigned tasks against takeover."
         ),
+        # Trimmed to the Quick Assign path (+ Hold Tasks' held-queue viewer).
+        # New Assignment (BTN_ASSIGN, /assign) and DLV Batch (BTN_DLV_BATCH,
+        # its manual queue flow + 🔍 DLV Queue viewer) are intentionally hidden
+        # from the menu but still fully work via their command/exact button text
+        # (menu-hiding only, per this bot's access model) — and the background
+        # queue-drain + auto-hold jobs run regardless of these buttons.
         "buttons": [
-            BTN_QA_SD, BTN_QA_LRENT, BTN_ASSIGN, BTN_DLV_BATCH, BTN_HOLD_TASKS,
+            BTN_QA_SD, BTN_QA_LRENT, BTN_HOLD_TASKS,
         ],
     },
     BTN_CAT_BULK: {
