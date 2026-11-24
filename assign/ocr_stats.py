@@ -78,6 +78,18 @@ _SOURCE_LABELS = [
     ("none",      "No result (no GPU)"),
 ]
 
+# Per-source line icon, encoding the outcome at a glance: a billed GPU hit that
+# produced a ref (✅), a billed GPU hit that didn't (⚠️), the Claude Vision
+# fallback (👁), free local Tesseract (🔤), and a no-op where the GPU never ran
+# (⚪). Unknown/legacy source keys fall back to ▫️ in _os_stats_text.
+_SOURCE_ICONS = {
+    "glm-ocr":   "✅",
+    "glm-none":  "⚠️",
+    "claude":    "👁",
+    "tesseract": "🔤",
+    "none":      "⚪",
+}
+
 
 # ──────────────────────────────────────────────────────────
 # Storage
@@ -144,22 +156,22 @@ def _total_extractions(data: Dict) -> int:
 def _os_stats_text(data: Dict) -> str:
     """Render the full OCR-usage + credit screen (Markdown)."""
     counts = data.get("counts", {})
-    lines = ["🧮 *OCR Usage & GPU Credit*", "", "*Extractions (lifetime):*"]
+    lines = ["🧮 *OCR Usage & GPU Credit*", "", "📸 *Extractions (lifetime):*"]
     for key, label in _SOURCE_LABELS:
-        lines.append(f"  • {label}: {counts.get(key, 0)}")
+        lines.append(f"  {_SOURCE_ICONS.get(key, '▫️')} {label}: {counts.get(key, 0)}")
     # Include any unexpected source keys not in _SOURCE_LABELS.
     for key in counts:
         if key not in {k for k, _ in _SOURCE_LABELS}:
-            lines.append(f"  • {key}: {counts[key]}")
-    lines.append(f"  *Total:* {_total_extractions(data)}")
+            lines.append(f"  ▫️ {key}: {counts[key]}")
+    lines.append(f"  🔢 *Total:* {_total_extractions(data)}")
     lines.append("")
-    lines.append(f"Est. cost per GPU extraction: ${data.get('cost_per_extraction_usd', _DEFAULT_COST_PER_EXTRACTION):.4f}")
-    lines.append(f"Balance (last set): ${data.get('starting_balance_usd', 0.0):.2f}")
-    lines.append(f"Est. spent since then: ${data.get('spent_usd', 0.0):.2f}")
+    lines.append(f"🏷 Est. cost per GPU extraction: ${data.get('cost_per_extraction_usd', _DEFAULT_COST_PER_EXTRACTION):.4f}")
+    lines.append(f"💵 Balance (last set): ${data.get('starting_balance_usd', 0.0):.2f}")
+    lines.append(f"💸 Est. spent since then: ${data.get('spent_usd', 0.0):.2f}")
     unfinalised = data.get("unfinalised_usd", 0.0)
     if unfinalised:
-        lines.append(f"  ↳ of which not finalised (GPU ran, no ref): ${unfinalised:.2f}")
-    lines.append(f"*Est. remaining: ${_remaining(data):.2f}*")
+        lines.append(f"  ↳ ⚠️ of which not finalised (GPU ran, no ref): ${unfinalised:.2f}")
+    lines.append(f"💰 *Est. remaining: ${_remaining(data):.2f}*")
     lines.append("")
     lines.append(
         "ℹ️ _Approximate. Every GLM-OCR run hits the GPU and deducts credit — "
