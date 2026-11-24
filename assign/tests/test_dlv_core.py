@@ -405,6 +405,23 @@ class TestDlvQueuePersistence(unittest.TestCase):
         refs = {c["ref"] for c in dlv_core.load_dlv_closed()}
         self.assertEqual(refs, {"A", "B"})
 
+    def test_append_taken_prompt_broadcast_accumulates_on_the_record(self):
+        dlv_core.save_dlv_batch([{"ref": "A"}])
+        dlv_core.append_taken_prompt_broadcast("A", 111, 5000)
+        dlv_core.append_taken_prompt_broadcast("A", 222, 6001)
+        rec = dlv_core._load_consolidated()["A"]
+        self.assertEqual(rec["prompt_broadcasts"], [
+            {"chat_id": 111, "message_id": 5000},
+            {"chat_id": 222, "message_id": 6001},
+        ])
+        # And it survives the batch projection, so recv_db_taken_decision sees it.
+        item = next(i for i in dlv_core.load_dlv_batch() if i["ref"] == "A")
+        self.assertEqual(len(item["prompt_broadcasts"]), 2)
+
+    def test_append_taken_prompt_broadcast_is_a_noop_for_an_unknown_ref(self):
+        dlv_core.append_taken_prompt_broadcast("GHOST", 111, 5000)
+        self.assertEqual(dlv_core.load_dlv_batch(), [])
+
     def test_save_dlv_batch_never_touches_a_ref_already_transitioned_this_cycle(self):
         """Regression: save_dlv_batch(remaining) must not clobber a ref that
         _append_dlv_closed already moved to "completed"/"returned" this same
