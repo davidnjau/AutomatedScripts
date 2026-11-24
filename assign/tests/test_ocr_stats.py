@@ -129,6 +129,25 @@ class TestDerived(_TmpStore):
         self.assertIn("GLM-OCR (GPU, ref found): 3", text)
         self.assertIn("$29.81", text)   # remaining
 
+    def test_stats_text_prefixes_each_source_with_its_icon(self):
+        d = {"counts": {"glm-ocr": 1, "glm-none": 1, "claude": 1,
+                        "tesseract": 1, "none": 1},
+             "cost_per_extraction_usd": 0.02, "starting_balance_usd": 30.0,
+             "spent_usd": 0.04}
+        text = os_mod._os_stats_text(d)
+        self.assertIn("✅ GLM-OCR (GPU, ref found)", text)
+        self.assertIn("⚠️ GLM-OCR (GPU, no ref", text)
+        self.assertIn("👁 Claude Vision", text)
+        self.assertIn("🔤 Tesseract", text)
+        self.assertIn("⚪ No result (no GPU)", text)
+        self.assertIn("🔢 *Total:*", text)
+        self.assertIn("💰 *Est. remaining:", text)
+
+    def test_unknown_source_key_gets_the_fallback_icon(self):
+        d = {"counts": {"legacy-weird": 2}}
+        text = os_mod._os_stats_text(d)
+        self.assertIn("▫️ legacy-weird: 2", text)
+
 
 class TestParseUsd(unittest.TestCase):
     def test_parses_plain_number(self):
