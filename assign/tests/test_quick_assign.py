@@ -150,6 +150,20 @@ class TestEnqueue(unittest.TestCase):
         self.assertEqual(item["valuer_uid"], "u1")
         self.assertEqual(item["channel"], "quick_assign")
 
+    def test_enqueued_item_carries_queued_at_so_dlv_ref_check_finds_it(self):
+        # save_dlv_batch merges the whole item into the consolidated store, so
+        # queued_at persists onto the ref's record — and DLV Ref Check keys its
+        # "📥 DLV Batch Queue: ✅ Yes" check on exactly record["queued_at"]
+        # (dlv_ref_check._dc_format_record). Dropping queued_at here would make
+        # a queued Quick Assign ref read as "not queued" in DLV Ref Check even
+        # though it's in the queue. Lock the field in.
+        v = {"name": "Godwill", "uid": "u1", "account_number": "a1"}
+        with patch.object(qa, "load_dlv_batch", return_value=[]), \
+             patch.object(qa, "save_dlv_batch") as mock_save:
+            qa._qa_enqueue("CNTYINV/ABC1234567", v, "stamp_duty", 111, "2026-11-13T10:00:00")
+        item = mock_save.call_args[0][0][0]
+        self.assertEqual(item["queued_at"], "2026-11-13T10:00:00")
+
     def test_dedupes_already_queued(self):
         with patch.object(qa, "load_dlv_batch", return_value=[{"ref": "CNTYINV/ABC1234567"}]), \
              patch.object(qa, "save_dlv_batch") as mock_save:

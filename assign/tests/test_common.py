@@ -1068,15 +1068,18 @@ class TestMenuCategories(unittest.TestCase):
 
     def test_hidden_buttons_are_in_no_category(self):
         buttons = self._all_category_buttons()
+        # BTN_ASSIGN (New Assignment) and BTN_DLV_BATCH were deliberately
+        # trimmed from the menu — assignment goes through Quick Assign now —
+        # but still work via /assign and their exact button text.
         for btn in (common.BTN_APARTMENTS, common.BTN_SECTIONAL, common.BTN_AF_RESULTS,
                     common.BTN_VALUER_TASKS, common.BTN_ASSIGNMENTS, common.BTN_DLV_QUEUE,
-                    common.BTN_FETCH_TASKS):
+                    common.BTN_FETCH_TASKS, common.BTN_ASSIGN, common.BTN_DLV_BATCH):
             self.assertNotIn(btn, buttons)
 
     def test_every_other_button_is_in_exactly_one_category(self):
         buttons = self._all_category_buttons()
-        for btn in (common.BTN_ASSIGN, common.BTN_AUTO_FETCH,
-                    common.BTN_DLV_BATCH, common.BTN_BULK_EXPORT, common.BTN_EXPORT_STATUS,
+        for btn in (common.BTN_AUTO_FETCH,
+                    common.BTN_BULK_EXPORT, common.BTN_EXPORT_STATUS,
                     common.BTN_JOB_DIST, common.BTN_DLV_TASKS, common.BTN_BRIEFING,
                     common.BTN_HOLD_TASKS, common.BTN_INCREMENTAL, common.BTN_DLV_REPORT_SCHEDULE,
                     common.BTN_CUSTOM_EXCLUSIONS, common.BTN_LOOKUP, common.BTN_PARCEL_LOOKUP,
