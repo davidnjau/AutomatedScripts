@@ -318,6 +318,19 @@ class TestProcessHoldItem(unittest.TestCase):
         self.assertTrue(result["keep"])
         self.assertIn("boom", result["item"]["last_error"])
 
+    def test_transient_search_failure_does_not_release(self):
+        # Regression: a DlvSearchError (every DLV filter errored transiently)
+        # must KEEP the held ref for retry, not release it. Previously
+        # _search_ref_dlv swallowed the errors and returned None, which read
+        # as "no longer found" and falsely released still-valid holds on a
+        # network blip (seen live: RemoteDisconnected bursts releasing refs).
+        from dlv_core import DlvSearchError
+        with patch.object(ht, "_search_ref_dlv", side_effect=DlvSearchError("reset")):
+            result = self._run_item()
+        self.assertTrue(result["keep"])
+        self.assertIsNone(result["line"])
+        self.http_sess.post.assert_not_called()
+
     def test_takeover_names_with_markdown_special_chars_are_escaped(self):
         """Regression: an unescaped '_' in a valuer name raised
         telegram.error.BadRequest ("can't find end of the entity") and
