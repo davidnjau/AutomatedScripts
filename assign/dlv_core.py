@@ -375,6 +375,13 @@ def clear_hold_and_remove(refs: Iterable[str]) -> None:
             _save_consolidated(store)
 
 
+class DlvSearchError(Exception):
+    """Raised by _search_ref_dlv when the search could not complete (every
+    tried filter errored and no match was found) — distinct from a clean
+    "not found" (None). Lets callers retry instead of treating a transient
+    network failure as a confirmed miss."""
+
+
 # Status filters to probe per DLV request type — a queued ref's current status
 # isn't known in advance, so every relevant filter is tried until it's found.
 _DLV_COUNTY_FILTERS    = ["Ongoing", "Completed", "Returned"]
@@ -391,7 +398,15 @@ def _search_ref_dlv(tokens: AuthTokens, ref: str) -> Optional[Dict]:
     filter relevant to the ref's request type (County vs non-County) until
     found — a ref's current status isn't known ahead of the search, and
     checking a single filter misses refs that have moved on (e.g. Completed).
-    Returns the task dict (tagged with "_request_type") or None.
+    Returns the task dict (tagged with "_request_type") when found.
+
+    Returns None only when *every* filter was searched cleanly (HTTP 200) and
+    the ref matched none of them — a definitive "not found". If any filter's
+    request errored (timeout, connection reset, 403, 5xx) and no filter ever
+    returned a match, we cannot conclude the ref is gone, so this RAISES
+    DlvSearchError rather than returning None. Both callers treat an exception
+    as "keep for retry", so a transient blip no longer reads as "not found"
+    (which, for Hold Tasks, would falsely release a still-valid held ref).
     """
     request_type = _dlv_request_type(ref)
     filters = _DLV_COUNTY_FILTERS if request_type == "COUNTY_STAMP_DUTY" else _DLV_NONCOUNTY_FILTERS
@@ -401,6 +416,8 @@ def _search_ref_dlv(tokens: AuthTokens, ref: str) -> Optional[Dict]:
         "JWTAUTH":       f"Bearer {tokens.jwt}",
         "cparams":       CPARAMS_DLV,
     }
+    had_error = False
+    last_error = None
     for status_filter in filters:
         params = {
             "filter": status_filter, "role": "DLV", "request_type": request_type,
@@ -421,7 +438,14 @@ def _search_ref_dlv(tokens: AuthTokens, ref: str) -> Optional[Dict]:
                     task["_request_type"] = request_type
                     return task
         except Exception as e:
+            had_error = True
+            last_error = e
             logger.warning("DLV search failed for %s (%s/%s): %s", ref, request_type, status_filter, e)
+    if had_error:
+        # Never got a clean answer on at least one filter and found no match —
+        # can't distinguish "gone" from "search couldn't complete". Signal the
+        # failure so callers retry instead of treating it as a confirmed miss.
+        raise DlvSearchError(f"DLV search for {ref} could not complete: {last_error}")
     return None
 
 

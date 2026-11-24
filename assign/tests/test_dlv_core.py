@@ -31,6 +31,20 @@ class FakeResponse:
         return self._payload
 
 
+class ErrorResponse:
+    """A response whose raise_for_status() raises — simulates a transient
+    network/HTTP failure (timeout, connection reset, 5xx) on one filter."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def raise_for_status(self):
+        raise self._exc
+
+    def json(self):
+        return {}
+
+
 class FakeSession:
     """Records every .get() call and returns responses in call order."""
 
@@ -213,6 +227,42 @@ class TestSearchRefDlv(unittest.TestCase):
         with patch.object(dlv_core, "build_session", return_value=fake):
             task = dlv_core._search_ref_dlv(TOKENS, ref)
         self.assertIsNone(task)
+
+    def test_raises_when_every_filter_errors(self):
+        # A transient network failure on every filter (no clean 200 anywhere)
+        # must raise DlvSearchError, NOT return None — otherwise Hold Tasks
+        # misreads it as "ref gone" and falsely releases a still-valid hold.
+        ref = "REG/TSFR/ABC123"
+        responses = [ErrorResponse(ConnectionError("reset")) for _ in dlv_core._DLV_NONCOUNTY_FILTERS]
+        fake = FakeSession(responses)
+        with patch.object(dlv_core, "build_session", return_value=fake):
+            with self.assertRaises(dlv_core.DlvSearchError):
+                dlv_core._search_ref_dlv(TOKENS, ref)
+
+    def test_error_then_clean_hit_still_returns_task(self):
+        # A filter erroring transiently but a later filter finding the ref
+        # still returns the task — a partial failure that ultimately matched
+        # is not a failure.
+        ref = "REG/TSFR/ABC123"
+        fake = FakeSession([
+            ErrorResponse(ConnectionError("reset")),                    # Pending: errored
+            FakeResponse({"results": [{"reference_number": ref}]}),      # Ongoing: hit
+        ])
+        with patch.object(dlv_core, "build_session", return_value=fake):
+            task = dlv_core._search_ref_dlv(TOKENS, ref)
+        self.assertIsNotNone(task)
+
+    def test_clean_miss_after_error_still_raises(self):
+        # One filter errors, the rest cleanly miss — still can't conclude the
+        # ref is gone (the errored filter might have held it), so it raises.
+        ref = "REG/TSFR/ABC123"
+        responses = [ErrorResponse(ConnectionError("reset"))] + [
+            FakeResponse({"results": []}) for _ in dlv_core._DLV_NONCOUNTY_FILTERS[1:]
+        ]
+        fake = FakeSession(responses)
+        with patch.object(dlv_core, "build_session", return_value=fake):
+            with self.assertRaises(dlv_core.DlvSearchError):
+                dlv_core._search_ref_dlv(TOKENS, ref)
 
 
 class TestFetchRefDetailDlv(unittest.TestCase):
