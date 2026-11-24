@@ -50,13 +50,19 @@ def _run(coro):
 
 def _make_query_update(data):
     """A MagicMock update whose callback_query has the given data and mocked
-    async reply methods, matching the shape recv_db_* handlers expect."""
+    async reply methods, matching the shape recv_db_* handlers expect. Concrete
+    from_user / message ids so handlers that read them (e.g.
+    recv_db_taken_decision's 'Resolved by …' + clear-all step) get real values."""
     update = MagicMock()
     query = update.callback_query
     query.data = data
     query.answer = AsyncMock()
     query.edit_message_text = AsyncMock()
     query.message.reply_text = AsyncMock()
+    query.from_user.first_name = "Tester"
+    query.from_user.id = 999
+    query.message.chat_id = 111
+    query.message.message_id = 5000
     return update
 
 
@@ -900,15 +906,33 @@ class TestSendDbTakenPrompts(unittest.TestCase):
         bot.send_message = AsyncMock()
         newly_awaiting = [{"ref": "REF1", "valuer_name": "Jane Doe", "held_by": "X"},
                            {"ref": "REF2", "valuer_name": "John", "held_by": "Y"}]
-        _run(dlv_batch._send_db_taken_prompts(bot, [111, 222], newly_awaiting))
+        with patch.object(dlv_batch, "append_taken_prompt_broadcast"):
+            _run(dlv_batch._send_db_taken_prompts(bot, [111, 222], newly_awaiting))
         self.assertEqual(bot.send_message.call_count, 4)
 
     def test_one_bad_chat_does_not_block_the_rest(self):
         bot = MagicMock()
-        bot.send_message = AsyncMock(side_effect=[RuntimeError("blocked"), None])
+        ok = MagicMock(); ok.message_id = 777
+        bot.send_message = AsyncMock(side_effect=[RuntimeError("blocked"), ok])
         newly_awaiting = [{"ref": "REF1", "valuer_name": "Jane Doe", "held_by": "X"}]
-        _run(dlv_batch._send_db_taken_prompts(bot, [111, 222], newly_awaiting))
+        with patch.object(dlv_batch, "append_taken_prompt_broadcast") as mock_append:
+            _run(dlv_batch._send_db_taken_prompts(bot, [111, 222], newly_awaiting))
         self.assertEqual(bot.send_message.call_count, 2)
+        # The failed chat is skipped; the good one still records its broadcast.
+        mock_append.assert_called_once_with("REF1", 222, 777)
+
+    def test_records_a_broadcast_per_delivered_copy(self):
+        # Every successfully-sent prompt must record its (chat_id, message_id)
+        # so recv_db_taken_decision can later clear all copies for all users.
+        bot = MagicMock()
+        sent = MagicMock(); sent.message_id = 777
+        bot.send_message = AsyncMock(return_value=sent)
+        newly_awaiting = [{"ref": "REF1", "valuer_name": "Jane", "held_by": "X"}]
+        with patch.object(dlv_batch, "append_taken_prompt_broadcast") as mock_append:
+            _run(dlv_batch._send_db_taken_prompts(bot, [111, 222], newly_awaiting))
+        self.assertEqual(mock_append.call_count, 2)
+        mock_append.assert_any_call("REF1", 111, 777)
+        mock_append.assert_any_call("REF1", 222, 777)
 
 
 class TestDbResendStaleTakenPrompts(unittest.TestCase):
@@ -1064,6 +1088,46 @@ class TestRecvDbTakenDecision(unittest.TestCase):
         mock_save.assert_not_called()
         mock_persist.assert_not_called()
         self.assertIn("Already resolved", update.callback_query.edit_message_text.call_args[0][0])
+
+    def test_resolving_clears_every_delivered_copy_for_all_users(self):
+        # The prompt was broadcast to three chats (the tapped one 111/5000 plus
+        # two others). Resolving must edit the tapped copy AND both others, so
+        # it clears for every recipient — not just whoever answered.
+        update = _make_query_update("dbtaken:remove:REF1")
+        ctx = MagicMock()
+        ctx.bot.edit_message_text = AsyncMock()
+        item = self._item(prompt_broadcasts=[
+            {"chat_id": 111, "message_id": 5000},   # the tapped copy
+            {"chat_id": 222, "message_id": 6001},
+            {"chat_id": 333, "message_id": 6002},
+        ])
+        with patch.object(dlv_batch, "allowed", return_value=True), \
+             patch.object(dlv_batch, "load_dlv_batch", return_value=[item]), \
+             patch.object(dlv_batch, "save_dlv_batch"), \
+             patch.object(dlv_batch, "mark_removed"):
+            _run(dlv_batch.recv_db_taken_decision(update, ctx))
+        # Tapped copy edited via the callback query…
+        tapped_text = update.callback_query.edit_message_text.call_args[0][0]
+        self.assertIn("removed", tapped_text)
+        self.assertIn("Resolved by Tester", tapped_text)
+        # …and the two OTHER recipients' copies edited via the bot (tapped one skipped).
+        edited = {(c.kwargs["chat_id"], c.kwargs["message_id"])
+                  for c in ctx.bot.edit_message_text.call_args_list}
+        self.assertEqual(edited, {(222, 6001), (333, 6002)})
+
+    def test_reassign_resets_broadcasts_so_a_re_takeover_starts_fresh(self):
+        update = _make_query_update("dbtaken:reassign_new:REF1")
+        ctx = MagicMock()
+        ctx.bot.edit_message_text = AsyncMock()
+        item = self._item(prompt_broadcasts=[{"chat_id": 222, "message_id": 6001}])
+        with patch.object(dlv_batch, "allowed", return_value=True), \
+             patch.object(dlv_batch, "load_dlv_batch", return_value=[item]), \
+             patch.object(dlv_batch, "save_dlv_batch") as mock_save, \
+             patch.object(dlv_batch, "persist_assignment"), \
+             patch.object(dlv_batch, "mark_removed"):
+            _run(dlv_batch.recv_db_taken_decision(update, ctx))
+        requeued = next(i for i in mock_save.call_args[0][0] if i["ref"] == "REF1")
+        self.assertEqual(requeued["prompt_broadcasts"], [])
 
 
 class TestDbFormatBatchSummary(unittest.TestCase):

@@ -106,6 +106,7 @@ from dlv_core import (
     _classify_dlv_detail,
     _fetch_ref_detail_dlv,
     _search_ref_dlv,
+    append_taken_prompt_broadcast,
     filter_own_records,
     is_incremental_tag,
     load_dlv_batch,
@@ -566,13 +567,18 @@ def _db_taken_prompt_text(item: Dict) -> str:
 async def _send_db_taken_prompts(bot, chat_ids: List[int], newly_awaiting: List[Dict]) -> None:
     """Send one Reassign/Remove prompt per newly-awaiting ref to each given
     chat — best-effort per chat, matching the other notify loops in this
-    module (one bad chat must not block the rest)."""
+    module (one bad chat must not block the rest). Records every successfully
+    delivered (chat_id, message_id) on the ref's record via
+    append_taken_prompt_broadcast, so recv_db_taken_decision can later clear
+    ALL copies — not just the one tapped — when anyone resolves it."""
     for item in newly_awaiting:
+        ref    = item.get("ref", "")
         text   = _db_taken_prompt_text(item)
-        markup = _db_taken_keyboard(item.get("ref", ""))
+        markup = _db_taken_keyboard(ref)
         for chat_id in chat_ids:
             try:
-                await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
+                msg = await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
+                await asyncio.to_thread(append_taken_prompt_broadcast, ref, chat_id, msg.message_id)
             except Exception as e:
                 logger.warning("DLV batch taken-prompt send error for %s: %s", chat_id, e)
 
@@ -644,19 +650,19 @@ async def recv_db_taken_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("ℹ️ Already resolved — nothing to do.")
         return
 
-    remaining = [i for i in items if i.get("ref") != ref]
+    broadcasts = item.get("prompt_broadcasts", [])
+    remaining  = [i for i in items if i.get("ref") != ref]
 
     if action == "reassign_new":
         valuer_name = item.get("valuer_name", "")
-        requeued = {**item, "awaiting_decision": False, "held_by": "", "held_by_uid": "", "force_reassign": True}
+        # Reset prompt_broadcasts: the ref stays in the queue (force_reassign),
+        # so a later re-takeover must start a fresh broadcast list, not reuse
+        # these now-resolved message copies.
+        requeued = {**item, "awaiting_decision": False, "held_by": "", "held_by_uid": "",
+                    "force_reassign": True, "prompt_broadcasts": []}
         save_dlv_batch(remaining + [requeued])
-        await query.edit_message_text(
-            f"🔄 `{ref}` will be reassigned to *{md_escape(valuer_name)}* on the next processing cycle.",
-            parse_mode="Markdown",
-        )
-        return
-
-    if action == "maintain":
+        resolution = f"🔄 `{ref}` will be reassigned to *{md_escape(valuer_name)}* on the next processing cycle."
+    elif action == "maintain":
         held_by     = item.get("held_by", "")
         held_by_uid = item.get("held_by_uid", "")
         try:
@@ -672,15 +678,41 @@ async def recv_db_taken_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             logger.error("persist_assignment failed for %s: %s", ref, e)
         save_dlv_batch(remaining)
-        await query.edit_message_text(
-            f"🤝 `{ref}` kept with *{md_escape(held_by)}* in our records and removed from the queue.",
-            parse_mode="Markdown",
-        )
-        return
+        resolution = f"🤝 `{ref}` kept with *{md_escape(held_by)}* in our records and removed from the queue."
+    else:  # remove
+        mark_removed({ref})
+        save_dlv_batch(remaining)
+        resolution = f"🗑 `{ref}` removed from the DLV queue."
 
-    mark_removed({ref})
-    save_dlv_batch(remaining)
-    await query.edit_message_text(f"🗑 `{ref}` removed from the DLV queue.", parse_mode="Markdown")
+    # Name who acted, so the other recipients see it was handled (and by whom)
+    # rather than a silently-cleared prompt.
+    who  = query.from_user.first_name or str(query.from_user.id)
+    text = f"{resolution}\n\n_Resolved by {md_escape(who)}._"
+    await _db_clear_all_prompt_copies(ctx.bot, broadcasts, query, text)
+
+
+async def _db_clear_all_prompt_copies(bot, broadcasts: List[Dict], query, text: str) -> None:
+    """Edit every delivered copy of a resolved taken-decision prompt to `text`
+    (dropping its keyboard), so the decision clears for ALL recipients, not
+    just whoever tapped. Edits the tapped message via the callback query
+    (guaranteed to exist) and every other recorded (chat_id, message_id) via
+    the bot — each best-effort, since a copy may have been deleted or is
+    unchanged ('message is not modified')."""
+    tapped = (query.message.chat_id, query.message.message_id)
+    try:
+        await query.edit_message_text(text, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning("DLV taken-prompt edit (tapped) failed: %s", e)
+    for b in broadcasts:
+        if (b.get("chat_id"), b.get("message_id")) == tapped:
+            continue
+        try:
+            await bot.edit_message_text(
+                text, chat_id=b.get("chat_id"), message_id=b.get("message_id"), parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("DLV taken-prompt clear failed for %s/%s: %s",
+                           b.get("chat_id"), b.get("message_id"), e)
 
 
 async def _dlv_batch_job(context: ContextTypes.DEFAULT_TYPE) -> None:

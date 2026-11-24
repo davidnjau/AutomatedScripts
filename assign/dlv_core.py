@@ -299,6 +299,24 @@ def save_dlv_batch(items: List[Dict]) -> None:
         _save_consolidated(store)
 
 
+def append_taken_prompt_broadcast(ref: str, chat_id: int, message_id: int) -> None:
+    """Record one delivered copy (chat_id, message_id) of ref's 'taken by
+    another valuer' decision prompt. The prompt is broadcast to several users
+    (the queuer plus every admin), so dlv_batch.recv_db_taken_decision needs to
+    know every chat it landed in to edit them ALL when anyone resolves it —
+    otherwise the other recipients' copies linger with live buttons and the ref
+    could be double-handled. Locked read-modify-write against the consolidated
+    store, same discipline as save_dlv_batch. No-op if the ref has no record."""
+    with _DLV_STORE_LOCK:
+        store = _load_consolidated()
+        rec = store.get(ref)
+        if not rec:
+            return
+        rec.setdefault("prompt_broadcasts", []).append({"chat_id": chat_id, "message_id": message_id})
+        store[ref] = rec
+        _save_consolidated(store)
+
+
 def clear_dlv_batch() -> None:
     """Mark every currently-queued ref removed (bulk clear). Not called
     anywhere in the live bot today, but must still leave a status="removed"
