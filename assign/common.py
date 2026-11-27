@@ -898,6 +898,7 @@ BTN_ERROR_REPORT  = "📉 Error Report"
 BTN_DAEMON        = "🔄 Token Daemon"
 BTN_VALUERS       = "👥 Saved Valuers"
 BTN_DELETE        = "🗑 Delete Valuer"
+BTN_ADD_VALUER    = "➕ Add Valuer"
 BTN_FETCH_TASKS   = "📊 Fetch Tasks"
 BTN_DLV_TASKS     = "📋 DLV Tasks"
 BTN_AF_RESULTS    = "🗂 AF Results"
@@ -968,7 +969,7 @@ _MENU_BUTTON_FILTER = filters.Regex(
     f"^({re.escape(BTN_ASSIGN)}|{re.escape(BTN_DLV_BATCH)}|{re.escape(BTN_DLV_QUEUE)}"
     f"|{re.escape(BTN_AUTO_FETCH)}|{re.escape(BTN_ASSIGNMENTS)}|{re.escape(BTN_AUTH)}"
     f"|{re.escape(BTN_TOKEN_STATUS)}|{re.escape(BTN_ERROR_REPORT)}|{re.escape(BTN_DAEMON)}"
-    f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}"
+    f"|{re.escape(BTN_VALUERS)}|{re.escape(BTN_DELETE)}|{re.escape(BTN_ADD_VALUER)}"
     f"|{re.escape(BTN_FETCH_TASKS)}|{re.escape(BTN_AF_RESULTS)}|{re.escape(BTN_BULK_EXPORT)}"
     f"|{re.escape(BTN_EXPORT_STATUS)}|{re.escape(BTN_JOB_DIST)}|{re.escape(BTN_LOOKUP)}"
     f"|{re.escape(BTN_PARCEL_LOOKUP)}|{re.escape(BTN_PARCEL_WATCH)}|{re.escape(BTN_DLV_REF_CHECK)}"
@@ -1059,7 +1060,7 @@ _MENU_CATEGORIES: Dict[str, Dict[str, object]] = {
             "Manage the saved valuer list used across the bot (and, for admins, "
             "other users' menu access)."
         ),
-        "buttons": [BTN_VALUERS, BTN_DELETE],
+        "buttons": [BTN_VALUERS, BTN_DELETE, BTN_ADD_VALUER],
     },
     BTN_CAT_COMM: {
         "description": (

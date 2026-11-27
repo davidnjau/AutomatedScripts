@@ -41,6 +41,7 @@ COPY new_assignment.py .
 COPY bulk_export.py .
 COPY task_analytics.py .
 COPY access_control.py .
+COPY add_valuer.py .
 COPY ocr_stats.py .
 COPY blob_store.py .
 COPY ocr_audit.py .
