@@ -74,6 +74,7 @@ from common import (
     recv_menu_category,
 )
 import access_control
+import add_valuer
 import auto_fetch
 import ocr_stats
 import ocr_audit
@@ -792,6 +793,7 @@ def main():
     bulk_export.register(app)
     task_analytics.register(app)
     access_control.register(app)
+    add_valuer.register(app)
     ocr_stats.register(app)
     ocr_audit.register(app)
     post_board.register(app)

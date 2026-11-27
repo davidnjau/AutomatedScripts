@@ -1085,7 +1085,8 @@ class TestMenuCategories(unittest.TestCase):
                     common.BTN_CUSTOM_EXCLUSIONS, common.BTN_LOOKUP, common.BTN_PARCEL_LOOKUP,
                     common.BTN_PARCEL_WATCH, common.BTN_DLV_REF_CHECK, common.BTN_AUTH,
                     common.BTN_TOKEN_STATUS, common.BTN_ERROR_REPORT, common.BTN_VALUERS,
-                    common.BTN_DELETE, common.BTN_DAEMON, common.BTN_RESTART, common.BTN_HELP,
+                    common.BTN_DELETE, common.BTN_ADD_VALUER, common.BTN_DAEMON,
+                    common.BTN_RESTART, common.BTN_HELP,
                     common.BTN_TASK_ANALYTICS, common.BTN_PB_POST, common.BTN_PB_VIEW):
             self.assertEqual(buttons.count(btn), 1, f"{btn} should appear in exactly one category")
 
